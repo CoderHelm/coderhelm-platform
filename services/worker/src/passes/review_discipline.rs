@@ -36,6 +36,14 @@
 //! 6. **Approve when the pull request does what the ticket asks**
 //!    ([`criteria_met`]): once each criterion is proven both ways and CI is
 //!    green, what is left that isn't a shown defect is a follow-up note.
+//! 7. **A proof is asked for only where a tool can get it**
+//!    ([`unobtainable`]): a finding that asks for proof (a repeat run, a test
+//!    run) that CoderHelm's own rounds couldn't get because its sandbox
+//!    couldn't run it ([`unobtainable_items`]) is a note, judged on the
+//!    evidence they could get. An end-to-end fix's review once asked for 20
+//!    repeat runs the sandbox's network allowlist refused; the round handed
+//!    "add the hosts to CoderHelm's allowlist" to a person and the pull
+//!    request stayed held.
 
 use super::review_agent::{Evidence, Finding};
 use super::review_policy::demote;
@@ -106,6 +114,9 @@ pub struct Facts<'a> {
     pub criteria_proven: bool,
     /// No check fails on the head.
     pub ci_green: bool,
+    /// Findings whose proof CoderHelm's sandbox couldn't run
+    /// ([`unobtainable_items`]).
+    pub unobtainable: &'a [String],
 }
 
 /// A finding [`judge`] made a note, and why.
@@ -136,6 +147,7 @@ pub fn judge(findings: &mut [Finding], facts: &Facts<'_>) -> Vec<Made> {
             .or_else(|| opposite(f, facts.earlier))
             .or_else(|| deferred(f, facts.deferred, facts.changed_since_previous))
             .or_else(|| out_of_scope_asked(f, facts.people))
+            .or_else(|| unobtainable(f, facts.unobtainable))
             .or_else(|| follow_up(f, facts.criteria_proven, facts.ci_green));
         if let Some(why) = why {
             demote(f, &why);
@@ -433,6 +445,59 @@ pub fn criteria_met(proofs_json: &str, head: &str) -> Option<bool> {
             && c_failed == 0
             && c_passed > 0
     }))
+}
+
+/// Whether a finding asks for proof (a run, a repeat, evidence) rather than
+/// naming a defect in the code.
+fn asks_for_proof(f: &Finding) -> bool {
+    let t = format!("{} {}", f.title, f.body).to_lowercase();
+    [
+        "unproven",
+        "not proven",
+        "no proof",
+        "prove ",
+        "proof that",
+        "repeat run",
+        "repeat-each",
+        "runs in a row",
+        "never ran",
+        "wasn't run",
+        "was not run",
+        "not run",
+        "no run shows",
+    ]
+    .iter()
+    .any(|m| t.contains(m))
+}
+
+/// Rule 7: a proof CoderHelm's own rounds couldn't get with its tools.
+pub fn unobtainable(f: &Finding, items: &[String]) -> Option<String> {
+    if by_repo_rule(f) || !asks_for_proof(f) {
+        return None;
+    }
+    let line = super::own_review::thread_line(&f.file, f.line, &f.title);
+    let hit = items
+        .iter()
+        .find(|i| super::own_review_ledger::same_finding(i, &line))?;
+    let what = hit.rsplit_once(" (`").map_or(hit.as_str(), |(t, _)| t);
+    Some(format!(
+        "A note, not a block: the proof \"{what}\" asks for needs what CoderHelm's sandbox couldn't run on this run; the review judges the evidence its rounds could get, listed in their account."
+    ))
+}
+
+/// The findings whose proof CoderHelm's sandbox couldn't run, from its
+/// ledger: its rounds met its own environment (`Blocker::Tooling`) the
+/// first time and again after the environment was widened or the approach
+/// changed (`own_review_ledger::MAX_TOOLING`).
+pub fn unobtainable_items(ledger: &super::own_review_ledger::Ledger) -> Vec<String> {
+    use super::own_review_ledger::{Settled, MAX_TOOLING};
+    ledger
+        .findings
+        .iter()
+        .filter(|t| matches!(t.settled, None | Some(Settled::Noted { .. })))
+        .filter(|t| t.tooling >= MAX_TOOLING)
+        .map(|t| t.item.clone())
+        .collect()
 }
 
 /// The items CoderHelm's own rounds deferred, from its ledger.

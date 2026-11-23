@@ -221,7 +221,19 @@ pub async fn repeat_plan(
 /// The repeat run's counts on commit `sha`.
 pub async fn measure(r: &Runner<'_>, plan: &RepeatPlan, sha: &str) -> Result<Repeat, String> {
     let (_, out) = r.run_at(sha, &plan.install, Some(&plan.cmd)).await?;
-    test_package::parse_repeat(&out).ok_or_else(|| "the repeat run printed no counts".into())
+    counts_of(&out)
+}
+
+/// A repeat run's counts, or why it says nothing: tests that never started
+/// (no browser, the sandbox refused the site) failed on CoderHelm's own
+/// environment, not on the code, and are never counted as failures.
+pub fn counts_of(out: &str) -> Result<Repeat, String> {
+    if let Some(why) = common::stop_rules::tooling::runner_never_started(out) {
+        return Err(format!(
+            "the tests never started in CoderHelm's sandbox ({why}); CoderHelm's own environment, not the code"
+        ));
+    }
+    test_package::parse_repeat(out).ok_or_else(|| "the repeat run printed no counts".into())
 }
 
 /// Records the verdict on the run: a progress note and `test_nature`.

@@ -407,6 +407,10 @@ export class WorkerStack extends cdk.Stack {
           },
         },
         logging: { cloudWatch: { logGroup: sandboxLogGroup } },
+        // Playwright's browsers, kept on the build host between builds (the
+        // buildspec's `cache.paths`): an end-to-end run, page check or probe
+        // reuses the last download instead of fetching ~200 MB each time.
+        cache: codebuild.Cache.local(codebuild.LocalCacheMode.CUSTOM),
         // NO_SOURCE: the worker passes a presigned URL for the tarball + the
         // derived check command as env overrides. The buildspec fetches, extracts, runs the
         // checks, and emits a parseable verdict marker. The verdict is read from
@@ -463,6 +467,11 @@ export class WorkerStack extends cdk.Stack {
                   '  P=http://127.0.0.1:3128',
                   '  export HTTP_PROXY=$P HTTPS_PROXY=$P http_proxy=$P https_proxy=$P NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1',
                   '  export npm_config_proxy=$P npm_config_https_proxy=$P YARN_HTTP_PROXY=$P YARN_HTTPS_PROXY=$P',
+                  "  # Playwright's browser builds come through the proxy's own mirror: the",
+                  "  # CDN redirects them to a shared storage host no list should open.",
+                  '  export PLAYWRIGHT_DOWNLOAD_HOST=$P/__coderhelm/playwright',
+                  "  # Telemetry calls nobody needs, each a refused host in the log.",
+                  '  export NEXT_TELEMETRY_DISABLED=1 TURBO_TELEMETRY_DISABLED=1 CHECKPOINT_DISABLE=1',
                   '  echo "Sandbox network limited to the team allowlist"',
                   "fi",
                   "# SCRIPT (when $SCRIPT_CMD is set): a team skill's own script, run from the",
@@ -515,6 +524,7 @@ export class WorkerStack extends cdk.Stack {
               ],
             },
           },
+          cache: { paths: ["/root/.cache/ms-playwright/**/*"] },
         }),
       });
 

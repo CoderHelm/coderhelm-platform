@@ -1238,7 +1238,8 @@ writeFileSync(`${{out}}/shots.json`, JSON.stringify(results));
 /// The command that runs [`capture_script`] (saved as `capture.mjs`).
 pub fn capture_command() -> String {
     format!(
-        "npm init -y >/dev/null 2>&1; npm i --no-save --no-audit --no-fund playwright@{PLAYWRIGHT} >/dev/null 2>&1 && npx --no-install playwright install --with-deps chromium >/dev/null 2>&1 && node capture.mjs"
+        "npm init -y >/dev/null 2>&1; npm i --no-save --no-audit --no-fund playwright@{PLAYWRIGHT} >/dev/null 2>&1 && {} && node capture.mjs",
+        crate::e2e::test_package::BROWSER_INSTALL
     )
 }
 

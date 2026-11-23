@@ -773,9 +773,10 @@ pub fn leg_cmd(dir: &str, spec: &str, title: &str, target: &str) -> Option<Strin
         format!(" --grep {}", quote(&grep_of(title.trim()))?)
     };
     Some(format!(
-        "cd {dir} && npx --no-install playwright install --with-deps chromium >/dev/null 2>&1; \
+        "cd {dir} && {install}; \
          BASE_URL={t} PLAYWRIGHT_BASE_URL={t} PLAYWRIGHT_TEST_BASE_URL={t} E2E_BASE_URL={t} \
-         npx --no-install playwright test {spec}{grep} --retries=0 --workers=1 --reporter=line"
+         npx --no-install playwright test {spec}{grep} --retries=0 --workers=1 --reporter=line",
+        install = crate::e2e::test_package::BROWSER_INSTALL
     ))
 }
 

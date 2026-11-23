@@ -1673,7 +1673,7 @@ async fn check_packages(
                 }
             }
             if let Some((_, specs, dir)) = &repeat {
-                run.repeat = test_package::parse_repeat(&o.output);
+                run.repeat = super::test_bug::counts_of(&o.output).ok();
                 run.repeat_output = common::tail_str(&o.output, 3_000).to_string();
                 run.target = target.clone().unwrap_or_default();
                 run.specs = specs.iter().map(|s| format!("{dir}/{s}")).collect();

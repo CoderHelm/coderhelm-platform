@@ -35,6 +35,16 @@
 //!   [`Plan::Unfixed`]: CoderHelm's own limit, never a person's to-do. The
 //!   pull request is marked ready with it listed as a deferred note.
 //!
+//! A round that met CoderHelm's own environment ([`Blocker::Tooling`]: the
+//! sandbox's network allowlist refused a site, a browser couldn't be
+//! installed) is a block, never a person's step: a round that says only a
+//! person can add hosts to CoderHelm's allowlist is read as that block. The
+//! next round runs on the widened environment and, if the sandbox still
+//! can't, changes approach (the repository's CI on its own branch, or the
+//! evidence that can be had); after [`MAX_TOOLING`] such rounds the finding
+//! is CoderHelm's note and its review no longer holds on it
+//! (`review_discipline::unobtainable`).
+//!
 //! A round cut short by its step's time ([`Blocker::NoTime`]) is neither a
 //! stall nor a block: the check it started is owed, and the next round
 //! starts in a fresh step with its full time and runs that check first
@@ -57,6 +67,10 @@ pub const MAX_STALLED: u32 = 5;
 /// Rounds on one finding that a tool or a guard blocked, each followed by a
 /// round that removes the block.
 pub const MAX_BLOCKED: u32 = 3;
+/// Rounds on one finding that CoderHelm's own environment blocked (its
+/// sandbox's network allowlist, a browser it couldn't install): the first,
+/// and one more on the widened environment or another way.
+pub const MAX_TOOLING: u32 = 2;
 /// Rounds on one finding cut short by their step's time, each followed by a
 /// round in a fresh step with its full time. Only a safety bound: a check
 /// cut short is resumed, and a round that keeps being cut short points at
@@ -91,6 +105,10 @@ pub enum Blocker {
     NoTime,
     /// A tool call failed on its own input (an `edits` sent as a string).
     ToolInput,
+    /// CoderHelm's own environment couldn't run what the finding needs: the
+    /// sandbox's network allowlist refused a site, or a browser couldn't be
+    /// installed. CoderHelm's setup, never a person's.
+    Tooling,
 }
 
 impl Blocker {
@@ -102,6 +120,10 @@ impl Blocker {
                 "a check it started was cut short by its step's time, before it finished"
             }
             Blocker::ToolInput => "an edit failed on the tool's input shape",
+            Blocker::Tooling => {
+                "CoderHelm's sandbox couldn't run what the finding needs (its network allowlist \
+                 refused a site, or a browser couldn't be installed)"
+            }
         }
     }
 }
@@ -138,6 +160,12 @@ pub fn blockers_of(
         if text.contains("edit_file not applied") {
             add(Blocker::ToolInput);
         }
+    }
+    use common::stop_rules::tooling;
+    if tooling::tool_outputs(log).iter().any(|o| {
+        !tooling::blocked_hosts(o).is_empty() || tooling::runner_never_started(o).is_some()
+    }) {
+        add(Blocker::Tooling);
     }
     out
 }
@@ -178,6 +206,9 @@ pub struct Track {
     /// a stall nor a block, the next round resumes in a fresh step.
     #[serde(default)]
     pub cut_short: u32,
+    /// Rounds CoderHelm's own environment blocked ([`Blocker::Tooling`]).
+    #[serde(default)]
+    pub tooling: u32,
     /// What blocked the last round on it (empty when nothing did).
     #[serde(default)]
     pub last_blocked: Vec<Blocker>,
@@ -352,7 +383,11 @@ pub fn round_rules(ticket: &str) -> String {
          <the finding as listed> :: <the exact words from the ticket, a comment or the plan>`.\n- \
          A finding only a person can settle: write one line `{NEEDS_A_PERSON} <the finding as \
          listed> :: <one of: {}> :: <exactly what the person does>`. Nothing else makes a \
-         finding a person's.{ticket}",
+         finding a person's.\n- CoderHelm's own sandbox is never a person's: when its network \
+         allowlist refuses a site, a browser won't install or a tool is missing, say so in one \
+         line with the exact error, then get the proof another way (the repository's CI on this \
+         branch, read with `github_history`; a page check with `check_url`) and write what is \
+         proven and what is not.{ticket}",
         codes.join(", ")
     )
 }
@@ -419,6 +454,7 @@ impl Ledger {
                 continue;
             }
             t.attempts += 1;
+            let mut blocked = l.blocked.clone();
             let says =
                 |finding: &str| same_finding(finding, item) || norm(item).contains(&norm(finding));
             let quote = marked(&l.account, TICKET_CONFLICT)
@@ -445,11 +481,22 @@ impl Ledger {
                     Some((code, rest.get(1).map(|w| w.to_string()).unwrap_or_default()))
                 })
             {
-                t.person_claims += 1;
-                t.person_reason = code;
-                t.person_what = what;
+                if common::stop_rules::tooling::names_own_tooling(&what) {
+                    // "Add the hosts to CoderHelm's sandbox allowlist": its
+                    // own setup, a block the next round removes.
+                    if !blocked.contains(&Blocker::Tooling) {
+                        blocked.push(Blocker::Tooling);
+                    }
+                } else {
+                    t.person_claims += 1;
+                    t.person_reason = code;
+                    t.person_what = what;
+                }
             }
-            match round_ending(&l.blocked) {
+            if blocked.contains(&Blocker::Tooling) {
+                t.tooling += 1;
+            }
+            match round_ending(&blocked) {
                 RoundEnding::Honest => {
                     t.stalled += 1;
                     t.last_blocked.clear();
@@ -460,7 +507,7 @@ impl Ledger {
                 }
                 RoundEnding::Blocked => {
                     t.blocked += 1;
-                    t.last_blocked = l.blocked.clone();
+                    t.last_blocked = blocked.clone();
                 }
             }
             // Two honest rounds that said the same person-gate reason.
@@ -474,7 +521,10 @@ impl Ledger {
     }
 
     fn exhausted(t: &Track) -> bool {
-        t.stalled >= MAX_STALLED || t.blocked >= MAX_BLOCKED || t.cut_short >= MAX_CUT_SHORT
+        t.stalled >= MAX_STALLED
+            || t.blocked >= MAX_BLOCKED
+            || t.cut_short >= MAX_CUT_SHORT
+            || t.tooling >= MAX_TOOLING
     }
 
     /// A round ended and no review has read it yet: its account (proof it
@@ -709,6 +759,17 @@ pub fn instruction(approach: &Approach, focus: &[String]) -> String {
              fresh step with its full time. Run the check the last round's account names as not \
              confirmed first, as its own `bash` call, then finish what is left. Write a result \
              only from output you have here."
+        ),
+        Approach::Unblock(b) if b.contains(&Blocker::Tooling) => format!(
+            "\n\n## This round's approach\nThe last round on {what} didn't fail on the code: \
+             {}. That is CoderHelm's own environment, never a person's step, and the sandbox now \
+             reaches the team's own sites and Playwright's browser downloads. Run what the finding \
+             asks for again first, as its own `bash` call. If the sandbox still can't, change \
+             approach: read the repository's CI runs on this branch with `github_history` (the \
+             end-to-end workflow's results on this head are the proof), check the pages with \
+             `check_url`, and write what is proven and what is not, with the exact error. Never \
+             write a {NEEDS_A_PERSON} line for CoderHelm's sandbox, its allowlist or its tools.",
+            b.iter().map(|x| x.words()).collect::<Vec<_>>().join("; ")
         ),
         Approach::Unblock(b) => format!(
             "\n\n## This round's approach\nThe last round on {what} didn't fail on the code: {}. \

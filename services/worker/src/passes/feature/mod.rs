@@ -668,7 +668,7 @@ async fn sandbox_items(
                 items.push(Item::new(s.kind, status, format!("`{}` {verdict}", s.cmd)));
             }
             if repeat.is_some() {
-                let r: Option<Repeat> = test_package::parse_repeat(&o.output);
+                let r: Option<Repeat> = crate::passes::test_bug::counts_of(&o.output).ok();
                 let status = if r.is_some_and(|r| r.green()) {
                     Status::Pass
                 } else {
