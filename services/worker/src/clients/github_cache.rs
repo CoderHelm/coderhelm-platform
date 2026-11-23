@@ -112,16 +112,6 @@ pub fn put(key: &str, kept: Kept) {
     }
 }
 
-/// Forgets the read kept under `key`.
-pub fn forget(key: &str) {
-    if let Ok(mut s) = STORE.lock() {
-        if let Some(old) = s.reads.remove(key) {
-            s.bytes -= old.body.len();
-            s.order.retain(|k| k != key);
-        }
-    }
-}
-
 fn is_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -220,8 +210,6 @@ mod tests {
         // A newer answer replaces the one kept.
         put(&a, kept(5));
         assert_eq!(get(&a).unwrap().body.len(), 5);
-        forget(&a);
-        assert!(get(&a).is_none());
     }
 
     #[test]
