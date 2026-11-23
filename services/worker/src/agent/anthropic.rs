@@ -1460,11 +1460,14 @@ fn bedrock_body(request: &MessagesRequest) -> Result<Value, serde_json::Error> {
     let mut body = serde_json::to_value(request)?;
     if let Some(o) = body.as_object_mut() {
         o.remove("model");
+        // Bedrock has no server-side refusal fallback: it refuses the
+        // request ("fallbacks: Extra inputs are not permitted").
+        o.remove("fallbacks");
         o.insert("anthropic_version".into(), json!("bedrock-2023-05-31"));
         let header = beta_header(request);
         let betas: Vec<&str> = header
             .split(',')
-            .filter(|b| !b.is_empty() && *b != BETA_PROMPT_CACHING)
+            .filter(|b| !b.is_empty() && *b != BETA_PROMPT_CACHING && *b != BETA_FALLBACK_DEFAULT)
             .collect();
         if !betas.is_empty() {
             o.insert("anthropic_beta".into(), json!(betas));
@@ -1738,6 +1741,19 @@ mod tests {
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         // Prompt caching needs no beta on Bedrock.
         assert!(body.get("anthropic_beta").is_none());
+        // Bedrock refuses the server-side refusal fallback, so a Sonnet or
+        // Opus 5.5 request goes without it (and without its beta).
+        let mut r = request;
+        r.model = "claude-sonnet-5-5".into();
+        super::apply_model_family(&mut r, None, false);
+        assert_eq!(r.fallbacks, Some(json!("default")));
+        let body = super::bedrock_body(&r).unwrap();
+        assert!(body.get("fallbacks").is_none());
+        assert!(
+            !body["anthropic_beta"].to_string().contains("fallback"),
+            "{}",
+            body["anthropic_beta"]
+        );
     }
 
     /// A security run's coder spent nine replies thinking to the output

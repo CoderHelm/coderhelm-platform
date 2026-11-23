@@ -633,6 +633,17 @@ mod tests {
             std::env::var("APP_MAP_FLOWS_EVAL").expect("APP_MAP_FLOWS_EVAL"),
         );
         let (client, model) = super::super::review_eval::eval_client().await;
+        if std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock") {
+            // As a Bedrock install sends it (CHAT_EVAL_BEDROCK's pattern):
+            // Bedrock's request shape, no API-only fields.
+            common::model_provider::set_current(
+                common::model_provider::Settings {
+                    provider: common::model_provider::Provider::Bedrock,
+                    ..Default::default()
+                },
+                common::model_provider::Source::Deploy,
+            );
+        }
         let mut sets: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
