@@ -17,9 +17,13 @@
 //   result.b64    every script's --json result, the worksheets and the files
 //                 the model jobs need (gzipped JSON, base64)
 //   state.b64     root/floorplan as a gzipped tar (base64), for the next run
-//   graph.b64     floorplan/graph.json, gzipped (base64), when the build wrote one
+//   graph.b64     floorplan/graph.json with CoderHelm's additions (coderhelm/index.mjs:
+//                 screens, outside services, calls, infra, webhooks and data links),
+//                 gzipped (base64), when the build wrote one
 //
-// Vendored files are never edited; everything CoderHelm-specific is here.
+// Vendored files are never edited; everything CoderHelm-specific is here and in coderhelm/.
+// Floorplan's own graph.json stays as its build wrote it (refresh compares against it); the
+// additions go only into the copy handed back.
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
@@ -100,4 +104,20 @@ const tgz = path.join(HERE, 'state.tgz');
 const tar = spawnSync('tar', ['czf', tgz, '-C', ROOT, '--exclude=floorplan/index.html', '--exclude=floorplan/artifact.html', '--exclude=floorplan/serve.mjs', '--exclude=floorplan/query.mjs', '--exclude=floorplan/page-safety.mjs', 'floorplan'], { env });
 if (tar.status === 0) fs.writeFileSync(path.join(OUT, 'state.b64'), fs.readFileSync(tgz).toString('base64'));
 const graph = path.join(MAP, 'graph.json');
-if (result.build?.ok && fs.existsSync(graph)) fs.writeFileSync(path.join(OUT, 'graph.b64'), zlib.gzipSync(fs.readFileSync(graph)).toString('base64'));
+if (result.build?.ok && fs.existsSync(graph)) {
+  let json = fs.readFileSync(graph, 'utf8');
+  // hook H2: CoderHelm's detectors on the built map; a failure keeps Floorplan's map as it is
+  const t = Date.now();
+  try {
+    const { enrich } = await import('./coderhelm/index.mjs');
+    const scanFile = path.join(MAP, '.cache', 'scan.json');
+    const scan = fs.existsSync(scanFile) ? JSON.parse(fs.readFileSync(scanFile, 'utf8')) : {};
+    const g = await enrich({ root: ROOT, skill: SKILL, graph: JSON.parse(json), scan });
+    json = JSON.stringify(g);
+    result.coderhelm = { ok: true, ms: Date.now() - t, bytes: json.length, counts: g.extract?.counts, notes: g.extract?.notes };
+  } catch (e) {
+    result.coderhelm = { ok: false, ms: Date.now() - t, error: String(e?.stack || e).slice(0, 2000) };
+  }
+  fs.writeFileSync(path.join(OUT, 'graph.b64'), zlib.gzipSync(json).toString('base64'));
+  fs.writeFileSync(path.join(OUT, 'result.b64'), zlib.gzipSync(JSON.stringify(result)).toString('base64'));
+}

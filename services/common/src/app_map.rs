@@ -996,11 +996,58 @@ fn node(graph: &Value, id: &str) -> Option<Value> {
     arr(graph, "nodes").find(|n| n["id"] == id).cloned()
 }
 
-/// A short record for a map id (`n:`, `f:`, `r:`).
+/// Copies the fields `keys` that `from` has (and are not null) into `to`.
+fn keep(to: &mut Value, from: &Value, keys: &[&str]) {
+    for k in keys {
+        if !from[*k].is_null() {
+            to[*k] = from[*k].clone();
+        }
+    }
+}
+
+/// Where something on the map was found: up to `n` `file:line` places,
+/// with how each was found (`code`, or `inferred` from a name, a domain or
+/// an env key) — CoderHelm's detectors put these on what they add.
+fn evidence_json(v: &Value, n: usize) -> Value {
+    json!(arr(v, "evidence")
+        .take(n)
+        .map(|e| json!({"at": format!("{}:{}", e["file"].as_str().unwrap_or(""), e["line"].as_u64().unwrap_or(1)), "how": e["how"]}))
+        .collect::<Vec<_>>())
+}
+
+/// A part's own record: outside services say which vendor and how they were
+/// found, infra says which resource.
+fn node_json(x: &Value) -> Value {
+    let mut out =
+        json!({"id": x["id"], "label": x["label"], "kind": x["kind"], "summary": x["summary"]});
+    keep(
+        &mut out,
+        x,
+        &[
+            "level", "vendor", "how", "inferred", "category", "env", "services", "resource",
+            "domains",
+        ],
+    );
+    if x.get("evidence").is_some() {
+        out["evidence"] = evidence_json(x, 5);
+    }
+    out
+}
+
+/// A short record for a map id (`n:`, `f:`, `r:`, `screen:`).
 fn describe_ref(graph: &Value, id: &str) -> Value {
     if let Some(n) = id.strip_prefix("n:") {
         if let Some(x) = node(graph, n) {
-            return json!({"id": id, "label": x["label"], "kind": x["kind"], "summary": x["summary"]});
+            let mut d = node_json(&x);
+            d["id"] = json!(id);
+            if let Some(o) = d.as_object_mut() {
+                o.remove("evidence");
+            }
+            return d;
+        }
+    } else if id.starts_with("screen:") {
+        if let Some(s) = arr(graph, "screens").find(|s| s["id"] == id) {
+            return screen_json(s);
         }
     } else if let Some(p) = id.strip_prefix("f:") {
         if let Some(f) = arr(graph, "files").find(|f| f["p"] == p) {
@@ -1014,14 +1061,42 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
     json!({ "id": id })
 }
 
+/// A screen in short: where it is, which app and navigator hold it, and
+/// whether it needs a signed-in user.
+fn screen_json(s: &Value) -> Value {
+    let mut out = json!({"id": s["id"], "url": s["url"], "name": s["name"], "app": s["app"], "file": s["file"]});
+    let nav = &s["nav"];
+    if nav.is_object() {
+        keep(&mut out, nav, &["navigator", "group", "gate"]);
+        out["app"] = nav["app"].clone();
+    }
+    out
+}
+
+/// One link as the lookups return it. Links CoderHelm's detectors added
+/// carry where they were found; `nav` links name their screens, `trigger`
+/// links the function they start, `webhook` links the endpoint called back.
 fn link_json(graph: &Value, l: &Value) -> Value {
-    json!({
+    let mut out = json!({
         "from": describe_ref(graph, l["a"].as_str().unwrap_or("")),
         "to": describe_ref(graph, l["b"].as_str().unwrap_or("")),
         "kind": l["k"],
         "labels": l["labels"],
         "inferred": l["inferred"],
-    })
+    });
+    if l.get("evidence").is_some() {
+        out["evidence"] = evidence_json(l, 3);
+    }
+    if let Some(to) = l["to"].as_str() {
+        out["screen"] = describe_ref(graph, to);
+    }
+    for (k, key) in [("unit", "runs"), ("route", "endpoint")] {
+        if let Some(r) = l[k].as_str() {
+            out[key] = describe_ref(graph, r);
+        }
+    }
+    keep(&mut out, l, &["tables", "via"]);
+    out
 }
 
 /// The whole map in short: parts, screens, Health counts, repositories.
@@ -1029,11 +1104,25 @@ pub fn overview(graph: &Value) -> Value {
     json!({
         "project": graph["project"],
         "parts": arr(graph, "nodes").map(|n| json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").take(80).map(|s| json!({"id": s["id"], "url": s["url"], "name": s["name"], "file": s["file"]})).collect::<Vec<_>>(),
+        "screens": arr(graph, "screens").take(80).map(screen_json).collect::<Vec<_>>(),
+        "screen_count": screen_counts(graph),
         "health": graph["health"]["summary"],
         "repos": graph["meta"]["repos"],
         "counts": graph["meta"]["counts"],
     })
+}
+
+/// How many screens each app has (the overview lists the first 80).
+fn screen_counts(graph: &Value) -> Value {
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for s in arr(graph, "screens") {
+        let app = s["nav"]["app"]
+            .as_str()
+            .or(s["app"].as_str())
+            .unwrap_or("app");
+        *by.entry(app.to_string()).or_default() += 1;
+    }
+    json!(by)
 }
 
 /// One part: its sub-parts, files, endpoints, and the lines in and out.
@@ -1041,7 +1130,13 @@ pub fn part_view(graph: &Value, id: &str) -> Option<Value> {
     let n = node(graph, id)?;
     let children: Vec<Value> = arr(graph, "nodes")
         .filter(|c| c["parent"] == id)
-        .map(|c| json!({"id": c["id"], "label": c["label"], "kind": c["kind"], "summary": c["summary"]}))
+        .map(|c| {
+            let mut x = node_json(c);
+            if let Some(o) = x.as_object_mut() {
+                o.remove("evidence");
+            }
+            x
+        })
         .collect();
     let mut inside: BTreeSet<String> = BTreeSet::from([id.to_string()]);
     let mut grew = true;
@@ -1073,8 +1168,11 @@ pub fn part_view(graph: &Value, id: &str) -> Option<Value> {
         .take(200)
         .map(|l| link_json(graph, l))
         .collect();
+    let mut part = node_json(&n);
+    part["details"] = n["details"].clone();
+    part["stats"] = n["stats"].clone();
     Some(json!({
-        "part": {"id": n["id"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "details": n["details"], "stats": n["stats"]},
+        "part": part,
         "children": children,
         "files": files.iter().take(400).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"]})).collect::<Vec<_>>(),
         "endpoints": routes,
@@ -1096,9 +1194,21 @@ pub fn file_view(graph: &Value, path: &str) -> Option<Value> {
         .filter(|(_, r)| r["f"] == path)
         .map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "description": r["d"], "line": r["l"]}))
         .collect();
+    // the screens this file is, and the screens it registers (a navigator file)
+    let screens: Vec<Value> = arr(graph, "screens")
+        .filter(|s| {
+            s["file"] == path
+                || arr(&s["nav"], "evidence")
+                    .next()
+                    .is_some_and(|e| e["file"] == path)
+        })
+        .take(100)
+        .map(screen_json)
+        .collect();
     Some(json!({
         "file": {"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"], "repo": f["r"], "language": f["l"], "lines": f["loc"]},
         "endpoints": routes,
+        "screens": screens,
         "links": links,
     }))
 }
@@ -1114,9 +1224,23 @@ pub fn screen_view(graph: &Value, id_or_url: &str) -> Option<Value> {
             d
         })
         .collect();
+    let mut screen = screen_json(s);
+    screen["description"] = s["description"].clone();
+    if s["nav"].is_object() {
+        screen["evidence"] = evidence_json(&s["nav"], 3);
+    }
+    // where it leads, and what leads to it
+    let id = s["id"].as_str().unwrap_or("");
+    let file = format!("f:{}", s["file"].as_str().unwrap_or(""));
+    let nav: Vec<Value> = arr(graph, "links")
+        .filter(|l| l["k"] == "nav" && (l["to"] == id || l["a"] == file.as_str()))
+        .take(40)
+        .map(|l| link_json(graph, l))
+        .collect();
     Some(json!({
-        "screen": {"id": s["id"], "url": s["url"], "name": s["name"], "description": s["description"], "file": s["file"]},
+        "screen": screen,
         "behind": steps,
+        "navigation": nav,
     }))
 }
 
@@ -1141,10 +1265,10 @@ pub fn search(graph: &Value, q: &str) -> Value {
         words.iter().all(|w| hay.contains(w))
     };
     json!({
-        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["summary"], &n["id"]])).take(20).map(|n| json!({"id": n["id"], "label": n["label"], "kind": n["kind"], "summary": n["summary"]})).collect::<Vec<_>>(),
+        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["summary"], &n["id"], &n["vendor"], &json!(arr(n, "env").chain(arr(n, "hosts")).chain(arr(n, "domains")).chain(arr(n, "services")).filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))])).take(20).map(|n| { let mut x = node_json(n); if let Some(o) = x.as_object_mut() { o.remove("evidence"); } x }).collect::<Vec<_>>(),
         "files": arr(graph, "files").filter(|f| hit(&[&f["p"], &f["name"], &f["d"]])).take(30).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"]})).collect::<Vec<_>>(),
         "endpoints": arr(graph, "routes").enumerate().filter(|(_, r)| hit(&[&r["m"], &r["p"], &r["name"], &r["d"]])).take(30).map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "file": r["f"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"]])).take(20).map(|s| json!({"id": s["id"], "url": s["url"], "name": s["name"]})).collect::<Vec<_>>(),
+        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"]])).take(20).map(screen_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1578,7 +1702,12 @@ mod tests {
         .unwrap();
         stamp_repos(
             &mut g,
-            &folders(&["harbor/harbor-web".into(), "harbor/harbor-api".into()]),
+            &folders(&[
+                "harbor/harbor-web".into(),
+                "harbor/harbor-api".into(),
+                "harbor/harbor-mobile".into(),
+                "harbor/harbor-infra".into(),
+            ]),
         );
         g
     }
@@ -1920,7 +2049,9 @@ mod tests {
     fn lookups_follow_the_map() {
         let g = harbor();
         let o = overview(&g);
-        assert_eq!(o["parts"].as_array().unwrap().len(), 3);
+        let parts = o["parts"].as_array().unwrap();
+        assert_eq!(parts.iter().filter(|p| p["parent"].is_null()).count(), 8);
+        assert_eq!(o["screen_count"], json!({"harbor-mobile": 3, "web": 1}));
         let p = part_view(&g, "api").unwrap();
         assert_eq!(p["endpoints"][0]["path"], "/slips/:id/bookings");
         assert!(p["links"]
@@ -1951,12 +2082,110 @@ mod tests {
             BTreeSet::from(["api".to_string(), "web".to_string()])
         );
         let mini = sub_map(&g, &BTreeSet::from(["api".to_string()]));
-        assert_eq!(mini["files"].as_array().unwrap().len(), 3);
+        assert_eq!(mini["files"].as_array().unwrap().len(), 7);
         assert!(mini["links"]
             .as_array()
             .unwrap()
             .iter()
             .all(|l| l["a"].as_str().unwrap().starts_with("f:harbor-api")));
+    }
+
+    /// What CoderHelm's detectors add reads plainly in the lookups: outside
+    /// services say how they were found, infra says what it starts, links
+    /// say where they were found, screens say their app and sign-in gate.
+    #[test]
+    fn lookups_show_services_infra_screens_and_where_each_was_found() {
+        let g = harbor();
+        // an outside service found only from env names: inferred, with its env and evidence
+        let t = part_view(&g, "ext-tidewatch").unwrap();
+        assert_eq!(t["part"]["how"], "env");
+        assert_eq!(t["part"]["inferred"], true);
+        assert_eq!(t["part"]["env"], json!(["TIDEWATCH_API_URL"]));
+        assert_eq!(t["part"]["evidence"][0]["at"], "harbor-api/src/tides.js:1");
+        let into = &t["links"][0];
+        assert_eq!(into["from"]["path"], "harbor-api/src/tides.js");
+        assert_eq!(into["kind"], "http");
+        assert_eq!(into["evidence"][0]["how"], "inferred");
+        // Stripe, drawn by the architecture job, gains how it was found and its callback
+        let s = part_view(&g, "stripe").unwrap();
+        assert_eq!(s["part"]["how"], "catalog");
+        assert!(s["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["kind"] == "webhook"
+                && l["to"]["path"] == "harbor-api/src/webhooks.js"
+                && l["endpoint"]["path"] == "/webhooks/stripe"));
+        // infra: the cloud part lists what runs, and the bucket starts the receipt code
+        let c = part_view(&g, "cloud").unwrap();
+        let kids: Vec<&str> = c["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k["resource"].as_str())
+            .collect();
+        assert!(
+            kids.contains(&"lambda") && kids.contains(&"bucket"),
+            "{kids:?}"
+        );
+        let f = file_view(&g, "harbor-api/src/receipts/index.js").unwrap();
+        let links = f["links"].as_array().unwrap();
+        let trig = links.iter().find(|l| l["kind"] == "trigger").unwrap();
+        assert_eq!(trig["from"]["resource"], "bucket");
+        assert_eq!(trig["runs"]["label"], "Harbor receipts function");
+        assert_eq!(trig["inferred"], false);
+        assert!(links.iter().any(|l| l["kind"] == "deploy"
+            && l["evidence"].as_array().unwrap().iter().any(|e| e["at"]
+                .as_str()
+                .unwrap()
+                .starts_with("harbor-api/.github/workflows/deploy-receipts.yml"))));
+        // a nightly load writes the table an entity holds
+        let e = file_view(&g, "harbor-api/src/entities/slip.entity.ts").unwrap();
+        assert!(e["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["kind"] == "data"
+                && l["from"]["path"] == "harbor-infra/dags/nightly_slips.py"
+                && l["tables"] == json!(["slip"])));
+        // screens: the navigator file lists the screens it registers, with their gates
+        let nav = file_view(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
+        let gates: Vec<(&str, &str)> = nav["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap(), s["gate"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            gates,
+            vec![
+                ("SignIn", "signed_out"),
+                ("SlipDetail", "signed_in"),
+                ("Slips", "signed_in")
+            ]
+        );
+        let sv = screen_view(&g, "screen:mobile:/(Stack)/SlipDetail").unwrap();
+        assert_eq!(sv["screen"]["app"], "harbor-mobile");
+        assert_eq!(
+            sv["screen"]["evidence"][0]["at"],
+            "harbor-mobile/app/navigation/RootNavigator.tsx:18"
+        );
+        let came_from = &sv["navigation"][0];
+        assert_eq!(came_from["kind"], "nav");
+        assert_eq!(
+            came_from["from"]["path"],
+            "harbor-mobile/app/screens/Slips.tsx"
+        );
+        assert_eq!(came_from["screen"]["name"], "SlipDetail");
+        // search finds services by their env names and screens by their app
+        assert_eq!(
+            search(&g, "tidewatch_api_url")["parts"][0]["id"],
+            "ext-tidewatch"
+        );
+        assert_eq!(
+            search(&g, "harbor-mobile signin")["screens"][0]["gate"],
+            "signed_out"
+        );
     }
 
     /// The lookups Chat and /mcp share: they answer from the map, register

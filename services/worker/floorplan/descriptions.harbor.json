@@ -1,18 +1,96 @@
 {
   "floorplan/descriptions/api.json": {
     "files": {
-      "harbor-api/src/billing.js": { "name": "Card charges", "description": "Charges a boater's card through Stripe for a slip booking." },
-      "harbor-api/src/bookings.js": { "name": "Slip bookings", "description": "Takes a booking for a slip and charges for it." },
-      "harbor-api/src/server.js": { "name": "Booking service start", "description": "Starts the booking service and sends slip requests to the bookings code." }
+      "harbor-api/src/billing.js": {
+        "name": "Card charges",
+        "description": "Charges a boater's card through Stripe for a slip booking."
+      },
+      "harbor-api/src/bookings.js": {
+        "name": "Slip bookings",
+        "description": "Takes a booking for a slip and charges for it."
+      },
+      "harbor-api/src/server.js": {
+        "name": "Booking service start",
+        "description": "Starts the booking service and sends slip requests to the bookings code."
+      },
+      "harbor-api/src/webhooks.js": {
+        "name": "Payment callbacks",
+        "description": "Takes Stripe's payment events after it checks their signature."
+      },
+      "harbor-api/src/tides.js": {
+        "name": "Tide lookup",
+        "description": "Asks the tide service for the water level at a slip."
+      },
+      "harbor-api/src/entities/slip.entity.ts": {
+        "name": "Slip record",
+        "description": "The stored slip: its id and name."
+      },
+      "harbor-api/src/receipts/index.js": {
+        "name": "Receipt handler",
+        "description": "Reads each receipt uploaded to the receipts bucket."
+      }
     },
     "routes": {
-      "POST /slips/:id/bookings": { "name": "Book a slip", "description": "Books the slip and charges the boater's card." }
+      "POST /slips/:id/bookings": {
+        "name": "Book a slip",
+        "description": "Books the slip and charges the boater's card."
+      },
+      "POST /webhooks/stripe": {
+        "name": "Stripe payment events",
+        "description": "Stripe calls this when a payment changes."
+      }
     }
   },
   "floorplan/descriptions/web.json": {
     "files": {
-      "harbor-web/app/slips/[id]/page.tsx": { "name": "Slip page", "description": "Shows one slip with a button to book it." },
-      "harbor-web/lib/slips.ts": { "name": "Booking request", "description": "Sends the booking for a slip to the booking service." }
+      "harbor-web/app/slips/[id]/page.tsx": {
+        "name": "Slip page",
+        "description": "Shows one slip with a button to book it."
+      },
+      "harbor-web/lib/slips.ts": {
+        "name": "Booking request",
+        "description": "Sends the booking for a slip to the booking service."
+      }
+    }
+  },
+  "floorplan/descriptions/mobile.json": {
+    "files": {
+      "harbor-mobile/app/navigation/RootNavigator.tsx": {
+        "name": "App screens",
+        "description": "Lists the app's screens: sign in when signed out, the slips when signed in."
+      },
+      "harbor-mobile/app/lib/session.ts": {
+        "name": "Signed-in boater",
+        "description": "Says who is signed in, if anyone."
+      },
+      "harbor-mobile/app/lib/api.ts": {
+        "name": "Server requests",
+        "description": "Sends the app's requests to the booking service."
+      },
+      "harbor-mobile/app/screens/SignIn.tsx": {
+        "name": "Sign in",
+        "description": "Signs the boater in and opens the slips."
+      },
+      "harbor-mobile/app/screens/Slips.tsx": {
+        "name": "Slips",
+        "description": "Lists slips; tapping one opens it."
+      },
+      "harbor-mobile/app/screens/SlipDetail.tsx": {
+        "name": "Slip",
+        "description": "Shows one slip with a button to book it."
+      }
+    }
+  },
+  "floorplan/descriptions/cloud.json": {
+    "files": {
+      "harbor-infra/main.tf": {
+        "name": "Receipts setup",
+        "description": "The receipts bucket and the function that runs when a receipt is uploaded."
+      },
+      "harbor-infra/dags/nightly_slips.py": {
+        "name": "Nightly slip load",
+        "description": "Copies the day's slips into the booking database each night."
+      }
     }
   }
 }
