@@ -204,6 +204,7 @@ fn slug(s: &str) -> String {
 /// - a request a route handler makes comes after that route;
 /// - a screen comes before the screens it goes to (when that doesn't
 ///   contradict an order already set).
+///
 /// Returns (order, linked per step, how many blocks the code had nothing
 /// to say about, so their place is the model's).
 pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) {
@@ -273,6 +274,8 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
     // Constraints between blocks (a before b).
     let n = blocks.len();
     let mut after: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    // Blocks the code's evidence places (the entry pin doesn't count).
+    let mut placed_by_code = vec![false; n];
     let reaches = |after: &Vec<BTreeSet<usize>>, from: usize, to: usize| {
         let mut stack = vec![from];
         let mut seen = BTreeSet::new();
@@ -286,9 +289,11 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
         }
         false
     };
-    let mut add = |after: &mut Vec<BTreeSet<usize>>, a: usize, b: usize| {
+    let add = |after: &mut Vec<BTreeSet<usize>>, by_code: &mut Vec<bool>, a: usize, b: usize| {
         if a != b && !reaches(after, b, a) {
             after[a].insert(b);
+            by_code[a] = true;
+            by_code[b] = true;
         }
     };
     let screens: Vec<&String> = refs.iter().filter(|r| kind(r) == "screen").collect();
@@ -311,15 +316,15 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
         let mut prev = sb;
         for r in rs {
             let rb = block_of[r.as_str()];
-            add(&mut after, sb, rb);
-            add(&mut after, prev, rb);
+            add(&mut after, &mut placed_by_code, sb, rb);
+            add(&mut after, &mut placed_by_code, prev, rb);
             prev = rb;
         }
     }
     for a in &requests {
         for b in &requests {
             if a != b && links(a, b) && !owned.values().any(|v| v.contains(b)) {
-                add(&mut after, block_of[*a], block_of[*b]);
+                add(&mut after, &mut placed_by_code, block_of[*a], block_of[*b]);
             }
         }
     }
@@ -327,14 +332,16 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
     if let Some(e) = screens.first() {
         let eb = block_of[e.as_str()];
         for b in 0..blocks.len() {
-            add(&mut after, eb, b);
+            if b != eb && !reaches(&after, b, eb) {
+                after[eb].insert(b);
+            }
         }
     }
     // Navigation, in the model's order of the screens.
     for a in &screens {
         for b in next(a) {
             if kind(&b) == "screen" {
-                add(&mut after, block_of[*a], block_of[&b]);
+                add(&mut after, &mut placed_by_code, block_of[*a], block_of[&b]);
             }
         }
     }
@@ -346,9 +353,7 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
             indeg[*b] += 1;
         }
     }
-    let constrained: Vec<bool> = (0..n)
-        .map(|i| indeg[i] > 0 || !after[i].is_empty())
-        .collect();
+    let constrained = placed_by_code;
     let mut done = vec![false; n];
     let mut seq: Vec<usize> = Vec::new();
     for _ in 0..n {
