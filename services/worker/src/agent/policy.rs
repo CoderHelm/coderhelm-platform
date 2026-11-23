@@ -9,6 +9,8 @@
 //! fails when a tool executor is called anywhere else.
 
 use std::sync::Arc;
+
+use aws_sdk_dynamodb::types::AttributeValue;
 use std::time::{Duration, Instant};
 
 use common::agent_policy::approvals::Approval;
@@ -71,11 +73,56 @@ pub fn store(state: &WorkerState) -> Arc<dyn PolicyStore> {
 /// The sandbox's network allowlist for a team: the list when its network is
 /// limited, None when the team opened it. When the policy can't be read the
 /// default list applies (limited).
+///
+/// A limited list also holds what CoderHelm's own work in the sandbox needs
+/// (`agent_policy::sandbox::run_allowlist`): its tooling hosts, and the
+/// team's own hosts from its settings (its listed web domains, the test and
+/// preview addresses it saved). An end-to-end run once failed 20 of 20
+/// against the team's staging site and its preview, both refused by the
+/// proxy, while `check_url` read both pages; the run then asked a person to
+/// widen CoderHelm's own allowlist.
 pub async fn sandbox_egress(state: &WorkerState, team: &str) -> Option<Vec<String>> {
-    match store(state).load(team).await {
-        Ok(p) => p.sandbox.limit_egress.then(|| p.sandbox.egress.clone()),
-        Err(_) => Some(common::agent_policy::model::default_egress()),
+    let team_list = match store(state).load(team).await {
+        Ok(p) if !p.sandbox.limit_egress => return None,
+        Ok(p) => p.sandbox.egress.clone(),
+        Err(_) => common::agent_policy::model::default_egress(),
+    };
+    let own = own_hosts(state, team).await;
+    Some(common::agent_policy::sandbox::run_allowlist(
+        &team_list, &own,
+    ))
+}
+
+/// The team's own hosts from its settings: its listed web domains (what
+/// `check_url` reads), the test addresses in Tests settings and the preview
+/// addresses in each repository's preview access.
+async fn own_hosts(state: &WorkerState, team: &str) -> Vec<String> {
+    let domains = crate::passes::web_check::team_domains(state, team).await;
+    let mut addresses: Vec<String> = Vec::new();
+    let tests = common::e2e::store::Store::new(&state.dynamo, &state.config.tests_table_name);
+    if tests.enabled() {
+        if let Ok(s) = tests.settings(team).await {
+            addresses.extend(s.report_sources.iter().map(|r| r.target_url.clone()));
+        }
     }
+    let previews = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
+        .expression_attribute_values(":pk", AttributeValue::S(team.to_string()))
+        .expression_attribute_values(":sk", AttributeValue::S("PREVIEW_ACCESS#REPO#".into()))
+        .projection_expression("address")
+        .send()
+        .await;
+    if let Ok(o) = previews {
+        addresses.extend(
+            o.items()
+                .iter()
+                .filter_map(|i| i.get("address").and_then(|v| v.as_s().ok()).cloned()),
+        );
+    }
+    common::agent_policy::sandbox::own_hosts(&domains, &addresses)
 }
 
 /// How long a run waits for an answer: until two minutes before its

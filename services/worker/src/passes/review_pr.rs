@@ -3841,6 +3841,10 @@ async fn run_once(
         let ci_green = !findings.iter().any(|f| {
             super::review_rules::mandatory(f) == Some(super::review_rules::FAILING_CHECK_WHY)
         }) && base_failing.is_empty();
+        let unobtainable = own_ledger
+            .as_ref()
+            .map(super::review_discipline::unobtainable_items)
+            .unwrap_or_default();
         let made = super::review_discipline::judge(
             &mut findings,
             &super::review_discipline::Facts {
@@ -3850,6 +3854,7 @@ async fn run_once(
                 people: &people,
                 criteria_proven,
                 ci_green,
+                unobtainable: &unobtainable,
             },
         );
         for m in &made {

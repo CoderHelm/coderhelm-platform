@@ -438,6 +438,14 @@ pub fn check_steps(p: &TestPackage) -> Option<Vec<Step>> {
     Some(steps)
 }
 
+/// Installs Playwright's Chromium for a run. With its system packages
+/// first; when that step can't run (the sandbox's network allowlist refuses
+/// the OS package mirrors, so `--with-deps` fails before any browser is
+/// fetched), the browser alone: the build image already has the libraries
+/// it needs. Twenty builds in two weeks once ran their tests with no
+/// browser at all because the first form failed and its error was hidden.
+pub const BROWSER_INSTALL: &str = "{ npx --no-install playwright install --with-deps chromium >/dev/null 2>&1 || npx --no-install playwright install chromium >/dev/null 2>&1; }";
+
 /// The command that runs `specs` (relative to the package) `n` times
 /// against `target`, and prints the counts. `None` when the runner isn't
 /// known or a path can't be quoted.
@@ -472,7 +480,7 @@ pub fn repeat_cmd(
     let list = files.join(" ");
     Some(match runner {
         Runner::Playwright => format!(
-            "cd {dir} && npx --no-install playwright install --with-deps chromium >/dev/null 2>&1; \
+            "cd {dir} && {BROWSER_INSTALL}; \
              {}npx --no-install playwright test {list} --repeat-each={n} --retries=0 --reporter=line",
             env(&["BASE_URL", "PLAYWRIGHT_BASE_URL", "PLAYWRIGHT_TEST_BASE_URL"])
         ),

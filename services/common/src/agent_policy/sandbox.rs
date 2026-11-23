@@ -66,6 +66,113 @@ pub fn domain_allowed(list: &[String], host: &str) -> bool {
     list.iter().any(|e| domain_matches(e, host))
 }
 
+/// Hosts CoderHelm's own tooling in the sandbox needs, whatever list a team
+/// saved: the Playwright browser downloads its end-to-end runs, page checks
+/// and probes start with, GitHub's release downloads (`github.com` sends
+/// them there), and the Terraform registry its `terraform init
+/// -backend=false` check reads. A team that saved its list before one of
+/// these was a default never had it, and its runs then failed on
+/// CoderHelm's own setup. The Chrome for Testing build Playwright downloads
+/// is redirected to a shared storage host; that one is reached only through
+/// the proxy's Playwright mirror (`egress_proxy.py`), never listed.
+pub const TOOLING_HOSTS: &[&str] = &[
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    "playwright.azureedge.net",
+    "release-assets.githubusercontent.com",
+    "registry.terraform.io",
+];
+
+/// A shared hosting suffix: a template whose placeholder sits right before
+/// one of these names every customer of that host, never the team's own.
+fn shared_suffix(domain: &str) -> bool {
+    let labels = domain.split('.').filter(|l| !l.is_empty()).count();
+    labels < 3
+}
+
+/// The host of an address a team saved (`https://staging.example.com/x`,
+/// `https://pr-{pr}.preview.example.com`): the host itself, or, for a
+/// template, the domain its previews live under. `None` when the address
+/// has no host, or a template's domain would be a shared host's
+/// (`{pr}.vercel.app`): that is every customer's, not the team's.
+pub fn own_host_of(address: &str) -> Option<String> {
+    let rest = address
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| address.trim().strip_prefix("http://"))?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let domain = match host.rfind('}') {
+        None => host,
+        Some(i) => {
+            let after = &host[i + 1..];
+            // The labels after the one holding the placeholder.
+            let d = after.split_once('.').map(|(_, d)| d).unwrap_or("");
+            if d.is_empty() || shared_suffix(d) {
+                return None;
+            }
+            d.to_string()
+        }
+    };
+    (valid_domain(&domain) && !domain.contains('{')).then_some(domain)
+}
+
+/// The team's own hosts the sandbox reaches, from its settings only: the
+/// domains an admin listed as the team's own sites (the ones `check_url`
+/// reads) and the hosts of the test and preview addresses it saved. Never a
+/// host read from code or a ticket.
+pub fn own_hosts(web_domains: &[String], addresses: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let candidates = web_domains
+        .iter()
+        .map(|d| {
+            d.trim()
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|d| valid_domain(d))
+        .chain(addresses.iter().filter_map(|a| own_host_of(a)));
+    for d in candidates {
+        if !domain_allowed(&out, &d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// The list a run's sandbox builds get when the team limits the network:
+/// the team's own list, CoderHelm's tooling hosts ([`TOOLING_HOSTS`]) and
+/// the team's own hosts ([`own_hosts`]). Nothing else is added: a limited
+/// network stays limited.
+pub fn run_allowlist(team: &[String], own: &[String]) -> Vec<String> {
+    let mut list: Vec<String> = team
+        .iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let extra = TOOLING_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .chain(own.iter().cloned());
+    for h in extra {
+        if !domain_allowed(&list, &h) {
+            list.push(h);
+        }
+    }
+    list
+}
+
 /// A plain domain an admin may add (letters, digits, dots, dashes, an
 /// optional leading `*.`).
 pub fn valid_domain(d: &str) -> bool {
@@ -307,6 +414,49 @@ pub async fn remember(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_hosts_come_from_the_teams_settings_and_never_name_a_shared_host() {
+        assert_eq!(
+            own_host_of("https://staging.example.com/path?x=1").as_deref(),
+            Some("staging.example.com")
+        );
+        assert_eq!(
+            own_host_of("https://pr-{pr}.preview-web.example.com").as_deref(),
+            Some("preview-web.example.com")
+        );
+        // A placeholder right before a shared host names every customer.
+        assert_eq!(own_host_of("https://{pr}-web.vercel.app"), None);
+        assert_eq!(own_host_of("https://{branch}.example.com"), None);
+        assert_eq!(own_host_of("ftp://example.com"), None);
+        assert_eq!(own_host_of("https://"), None);
+        let own = own_hosts(
+            &["example.com".into(), "not a domain".into()],
+            &[
+                "https://staging.example.com".into(),
+                "https://app.example.org".into(),
+                "https://{pr}.vercel.app".into(),
+            ],
+        );
+        assert_eq!(own, vec!["example.com", "app.example.org"]);
+    }
+
+    #[test]
+    fn a_runs_list_adds_tooling_and_own_hosts_to_the_teams_and_nothing_else() {
+        let team = vec!["registry.npmjs.org".to_string(), "github.com".to_string()];
+        let list = run_allowlist(&team, &["example.com".to_string()]);
+        assert_eq!(&list[..2], &team[..]);
+        for h in TOOLING_HOSTS {
+            assert!(domain_allowed(&list, h), "{h}");
+        }
+        assert!(domain_allowed(&list, "staging.example.com"));
+        assert!(domain_allowed(&list, "pr-12.preview.example.com"));
+        assert!(!domain_allowed(&list, "storage.googleapis.com"));
+        assert!(!domain_allowed(&list, "evil.example.net"));
+        // Nothing listed twice.
+        let again = run_allowlist(&list, &["example.com".to_string()]);
+        assert_eq!(again, list);
+    }
 
     #[test]
     fn commands_match_only_when_plain() {

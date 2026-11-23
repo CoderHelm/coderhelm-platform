@@ -65,6 +65,7 @@ fn facts<'a>(earlier: &'a [Earlier], deferred: &'a [String], people: &'a [String
         people,
         criteria_proven: false,
         ci_green: true,
+        unobtainable: &[],
     }
 }
 

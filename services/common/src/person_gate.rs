@@ -944,6 +944,12 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     if asks_testing(a) {
         return Outcome::Do(Work::Own(one_line(&a.text)));
     }
+    // CoderHelm's own sandbox (its network allowlist, the browsers and
+    // tools it installs) is its own setup to fix and retry, never a
+    // person's step, whatever reason the writer gave.
+    if crate::stop_rules::tooling::names_own_tooling(&t) {
+        return Outcome::Do(Work::Own(one_line(&a.text)));
+    }
     if a.kind == Kind::Attempt {
         let cause = one_line(&a.why_not).to_lowercase();
         // Refused a workflow start, with a label that starts the same run:

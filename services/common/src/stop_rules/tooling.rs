@@ -236,6 +236,74 @@ pub fn egress_failure(who: &str, command: &str, output: &str) -> Option<ToolingF
     ))
 }
 
+/// Why a test runner's output says the tests never ran, from CoderHelm's
+/// own environment: the browser was never installed or couldn't be
+/// downloaded, or the sandbox refused the site the tests load. `None` when
+/// the tests ran (pass or fail). A repeat run on the base branch once
+/// counted 0 of 480 passing and called the test "not flaky, failing every
+/// run" when no browser had started.
+pub fn runner_never_started(output: &str) -> Option<String> {
+    for line in output.lines().map(str::trim) {
+        let l = line.to_lowercase();
+        let browser = l.contains("executable doesn't exist at")
+            || l.contains("failed to download chrom")
+            || l.contains("failed to download firefox")
+            || l.contains("failed to download webkit")
+            || l.contains("please run the following command to download new browsers");
+        // The browser's word for the sandbox's proxy refusing the site.
+        let refused = l.contains("err_tunnel_connection_failed");
+        if browser || refused {
+            return Some(crate::truncate_str(line, MAX_ERROR_CHARS).to_string());
+        }
+    }
+    None
+}
+
+/// Whether words a run wrote about something it couldn't do name
+/// CoderHelm's own environment: its sandbox, the sandbox's network
+/// allowlist, the browsers or tools it installs. That is CoderHelm's own
+/// setup to fix and retry, never a person's step. A fix round once ended
+/// "NEEDS A PERSON ... outside_reach: add the hosts to CoderHelm's sandbox
+/// network allowlist".
+pub fn names_own_tooling(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let marks = [
+        "coderhelm_egress_blocked",
+        "network allowlist",
+        "egress allowlist",
+        "sandbox allowlist",
+        "sandbox's allowlist",
+        "sandbox network",
+        "sandbox's network",
+        "err_tunnel_connection_failed",
+        "failed to download chrom",
+        "executable doesn't exist at",
+        "playwright install",
+        "isn't installed in coderhelm's sandbox",
+        "from a machine that can reach",
+    ];
+    if marks.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    let sandbox = t.contains("coderhelm's sandbox") || t.contains("the sandbox");
+    sandbox
+        && [
+            "can't reach",
+            "couldn't reach",
+            "cannot reach",
+            "can't run",
+            "couldn't run",
+            "cannot run",
+            "blocks",
+            "blocked",
+            "refused",
+            "can't download",
+            "couldn't download",
+        ]
+        .iter()
+        .any(|m| t.contains(m))
+}
+
 /// The first line of `output` that says the run's tooling failed, trimmed;
 /// `None` when nothing does. A host the sandbox refused, with a network
 /// error in the same output, comes first: the command failed because it
@@ -877,6 +945,43 @@ mod tests {
         assert!(blocked_hosts("grep CODERHELM_EGRESS_BLOCKED /tmp/egress.log").is_empty());
         assert!(blocked_hosts("CODERHELM_EGRESS_BLOCKED $(rm -rf /)").is_empty());
         assert!(blocked_hosts("all good").is_empty());
+    }
+
+    #[test]
+    fn a_runner_that_never_started_a_browser_is_told_from_tests_that_failed() {
+        let no_browser = "Running 20 tests using 2 workers\n  1) [chromium] › a.spec.ts:3:1 › t\n    Error: browserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome\n  20 failed\n";
+        assert!(runner_never_started(no_browser)
+            .unwrap()
+            .contains("Executable doesn't exist"));
+        let download = "Error: Failed to download Chrome for Testing 153.0.8010.12 (playwright chromium v1243), caused by\nError: Download failure, code=1";
+        assert!(runner_never_started(download).is_some());
+        let refused = "    Error: page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://staging.example.com/x\n  20 failed\nCODERHELM_EGRESS_BLOCKED staging.example.com\n";
+        assert!(runner_never_started(refused)
+            .unwrap()
+            .contains("ERR_TUNNEL_CONNECTION_FAILED"));
+        // Tests that ran and failed are a result.
+        let ran = "  1) a.spec.ts › t\n    Error: expect(received).toBe(expected)\n  1 failed\n  19 passed\n";
+        assert_eq!(runner_never_started(ran), None);
+    }
+
+    #[test]
+    fn words_about_coderhelms_own_sandbox_name_its_own_tooling() {
+        for t in [
+            "Add `staging.example.com` to CoderHelm's sandbox network allowlist",
+            "The sandbox's network allowlist blocks both sites the test can run against",
+            "run it from a machine that can reach the preview",
+            "net::ERR_TUNNEL_CONNECTION_FAILED on every run",
+            "the sandbox couldn't download chromium",
+        ] {
+            assert!(names_own_tooling(t), "{t}");
+        }
+        for t in [
+            "An org owner grants the app write access to the CMS",
+            "Set the payment provider's API key in the team's secrets",
+            "Fix is unproven: no repeat run shows the test passes",
+        ] {
+            assert!(!names_own_tooling(t), "{t}");
+        }
     }
 
     #[test]
