@@ -148,10 +148,107 @@ pub(crate) async fn from_ci(
         return Vec::new();
     };
     let mut out = Vec::new();
+    // The base branch's recent commits, read once, for a check its head
+    // didn't run (a path filter, or a check that runs only on some pushes).
+    let mut older: Option<Vec<String>> = None;
     for check in failing {
-        let base_failed = base_result(&checks, check);
-        let r = ci_repro::from_checks(head, &base_sha, check, base_failed);
+        let mut r = match base_result(&checks, check) {
+            Some(failed) => ci_repro::from_checks(head, &base_sha, check, Some(failed)),
+            None => {
+                if older.is_none() {
+                    older = Some(base_commits(github, owner, repo, base, &base_sha).await);
+                }
+                match nearest_base_run(github, owner, repo, older.as_deref().unwrap_or(&[]), check)
+                    .await
+                {
+                    Some((sha, failed)) => {
+                        let mut r = ci_repro::from_checks(head, &sha, check, Some(failed));
+                        r.base.note = format!(
+                            "the nearest commit on `{base}` that ran `{check}` (its head didn't)"
+                        );
+                        r
+                    }
+                    None => ci_repro::from_checks(head, &base_sha, check, None),
+                }
+            }
+        };
+        if !r.base.ran {
+            r.base.note = format!(
+                "`{check}` doesn't run on `{base}` (not on its head, nor on its last {} commits)",
+                MAX_BASE_COMMITS
+            );
+        }
         record(state, &msg.team_id, run_id, r.clone(), false).await;
+        out.push(r);
+    }
+    out
+}
+
+/// How many of the base branch's commits are read for a check its head
+/// didn't run.
+const MAX_BASE_COMMITS: usize = 10;
+
+/// The base branch's newest commits after its head, newest first.
+async fn base_commits(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    head_sha: &str,
+) -> Vec<String> {
+    github
+        .list_commits(owner, repo, base, (MAX_BASE_COMMITS + 1) as u32)
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c["sha"].as_str().map(str::to_string))
+        .filter(|s| !ci_repro::same_sha(s, head_sha))
+        .take(MAX_BASE_COMMITS)
+        .collect()
+}
+
+/// The newest of `commits` that ran `check`, with whether it failed there.
+async fn nearest_base_run(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    commits: &[String],
+    check: &str,
+) -> Option<(String, bool)> {
+    for sha in commits {
+        if let Ok(c) = github.list_ci_for_ref(owner, repo, sha).await {
+            if let Some(failed) = base_result(&c, check) {
+                return Some((sha.clone(), failed));
+            }
+        }
+    }
+    None
+}
+
+/// The failing tests' own results on the base branch, from their Tests
+/// records (the base branch's own runs, such as the end-to-end run after a
+/// staging deploy), kept on the run as `history` records. The base for a
+/// check that never runs on the base branch (a preview deploy's tests).
+pub(crate) async fn from_test_history(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    head: &str,
+    check: &str,
+    tests: &[String],
+) -> Vec<Record> {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let mut out = Vec::new();
+    for test in tests.iter().take(3) {
+        let Some((sha, failed, at)) =
+            super::e2e::base_result_of(state, &msg.team_id, &repo, test, &msg.base_branch).await
+        else {
+            continue;
+        };
+        let r = ci_repro::from_history(head, check, test, &msg.base_branch, (&sha, failed, &at));
+        record(state, &msg.team_id, run_id, r.clone(), true).await;
         out.push(r);
     }
     out

@@ -162,10 +162,10 @@ impl Record {
 
     /// One line for the run page and the pull request.
     pub fn line(&self) -> String {
-        let how = if self.source == "ci" {
-            "the check's own runs"
-        } else {
-            "run again in CoderHelm's sandbox"
+        let how = match self.source.as_str() {
+            "ci" => "the check's own runs",
+            "history" => "the test's own runs on the base branch",
+            _ => "run again in CoderHelm's sandbox",
         };
         let v = match self.verdict() {
             Verdict::ThisChange(w) => format!("This change's: {w}."),
@@ -260,6 +260,40 @@ pub fn from_checks(head: &str, base_sha: &str, check: &str, base_failed: Option<
         },
         source: "ci".into(),
         at: String::new(),
+    }
+}
+
+/// A failing test's comparison from its own runs: its newest result on the
+/// base branch (`(sha, failed, at)`, from the repository's test history)
+/// next to this head's failure. The base for a check that never runs on the
+/// base branch, such as a preview deploy's end-to-end tests.
+pub fn from_history(
+    head: &str,
+    check: &str,
+    test: &str,
+    base_branch: &str,
+    (sha, failed, at): (&str, bool, &str),
+) -> Record {
+    Record {
+        head: head.to_string(),
+        check: check.to_string(),
+        tests: vec![test.to_string()],
+        base: Leg {
+            target: format!("tests@{base_branch}@{}", short(sha)),
+            ran: true,
+            passed: u32::from(!failed),
+            failed: u32::from(failed),
+            note: format!("its newest run on `{base_branch}` ({at})"),
+        },
+        change: Leg {
+            target: format!("ci@{}", short(head)),
+            ran: true,
+            passed: 0,
+            failed: 1,
+            note: String::new(),
+        },
+        source: "history".into(),
+        at: at.to_string(),
     }
 }
 
@@ -1006,6 +1040,22 @@ mod tests {
                 "https://reports.example.com/pr-1/data/shot.jpeg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn a_test_red_on_the_base_branch_history_is_not_this_changes() {
+        let r = from_history(
+            "abc1234def",
+            "Deploy Preview",
+            "Drop-ins › filter",
+            "main",
+            ("fff9999aaa", true, "2026-11-23T17:30:00Z"),
+        );
+        assert!(matches!(r.verdict(), Verdict::NotThisChange(_)), "{r:?}");
+        assert!(r.line().contains("the test's own runs on the base branch"));
+        assert!(r.base.target.starts_with("tests@main@fff9999"));
+        let green = from_history("abc1234", "E", "t", "main", ("fff", false, ""));
+        assert!(matches!(green.verdict(), Verdict::ThisChange(_)));
     }
 
     #[test]
