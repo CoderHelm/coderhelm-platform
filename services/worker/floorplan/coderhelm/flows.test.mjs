@@ -268,7 +268,7 @@ test('a rebuild that changed nothing a journey stands on asks the model for noth
   const first = F.prepare(dir, GRAPH, null);
   assert.ok(first.todo, 'a first map asks for every entry');
   assert.ok(first.todo.entries.some((e) => e.key === 'screen:web:/login'));
-  assert.ok(first.todo.list.length > 0 && Object.keys(first.todo.table).length > 0);
+  assert.ok(first.todo.groups.length > 0 && first.todo.groups.every((g) => g.list.length > 0 && g.entries.length > 0) && Object.keys(first.todo.table).length > 0);
   // The cited lines go with the table, so the worker's checker needs no code.
   const t = Object.values(first.todo.table)[0];
   assert.ok(t.evidence[0].window.some((l) => l.includes(t.evidence[0].token)));

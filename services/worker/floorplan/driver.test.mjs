@@ -114,7 +114,8 @@ test('journeys kept from the last map are re-checked and drawn on it', () => {
   // The mobile app's sign-in screen (from the detectors) starts a journey:
   // the model is asked about it, with the candidates around it.
   assert.deepEqual(result.flows.todo.entries.map((e) => e.key), ['screen:mobile:/(Stack)/SignIn'], JSON.stringify(result.flows.report));
-  assert.match(result.flows.todo.list, /request POST \/slips\/:p\/bookings/);
+  assert.deepEqual(result.flows.todo.groups.map((g) => [g.family, g.app]), [["sign-in", "mobile"]]);
+  assert.match(result.flows.todo.groups[0].list, /request POST \/slips\/:p\/bookings/);
   assert.ok(result.flows.report.candidates >= 3);
   // A journey as the worker's model step would have stored it.
   const c = flows.candidates(graph, flows.reader(path.join(first, 'root')));

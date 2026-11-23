@@ -30,6 +30,8 @@ export const SCHEMA = 'coderhelm/flows@1';
 export const MAX_STEPS = 15;
 /** The candidate list the model reads, at most (characters). */
 export const MAX_LIST = 90_000;
+/** The candidate list of one journey family in one app, at most. */
+export const MAX_GROUP_LIST = 40_000;
 
 /** Words that make a screen the start of a journey. */
 export const WORDS = {
@@ -583,10 +585,13 @@ export function candidates(graph, read) {
     byKey.set(c.key, c);
     return c;
   };
-  const link = (a, b, why) => {
+  // An edge, with where the code makes it (closure depth, then line), so
+  // a journey's steps can be put in the order the code runs them.
+  let seq = 0;
+  const link = (a, b, why, rank = null) => {
     if (!a || !b || a === b) return;
     if (!edges.has(a.id)) edges.set(a.id, new Map());
-    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, why);
+    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, { why, rank, i: seq++ });
   };
 
   // Outside services, one candidate per node.
@@ -839,22 +844,22 @@ export function candidates(graph, read) {
       for (const x of ix.ext.get(f) || []) {
         const o = outside(x.node, f, x.link);
         if (!o) continue;
-        link(c, o, 'its handler uses it');
+        link(c, o, 'its handler uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
         for (const hi of hooksFor.get(x.node) || []) link(o, asyncRoute(hi), 'calls back');
       }
       for (const e of emitters.get(f) || []) {
         if (!inUse(ix, r, f, v.names, e.line)) continue;
-        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event');
+        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event', [v.d, e.line]);
       }
       for (const h of r.once('helpers', f, () => helperCalls(r.text(f)))) {
         if (!inUse(ix, r, f, v.names, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
-        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it');
+        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it', [v.d, h.line]);
       }
       for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
         if (!inUse(ix, r, f, v.names, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
-        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks');
+        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks', [v.d, h.line]);
       }
     }
   }
@@ -910,10 +915,10 @@ export function candidates(graph, read) {
     done.add(s.id);
     const files = closure(ix, r, classes, s.file);
     for (const [f, v] of files) {
-      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request');
+      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request', [v.d, x.line || 0]);
       for (const x of ix.ext.get(f) || []) {
         if (routes.some((rt) => rt.f === f)) continue;
-        link(s, outside(x.node, f, x.link), 'the screen uses it');
+        link(s, outside(x.node, f, x.link), 'the screen uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
       }
       // Step machines sit a few files down (page, then layout, then drawer).
       if (v.d > 3) continue;
@@ -929,7 +934,7 @@ export function candidates(graph, read) {
         const stepFiles = new Set(steps.map((x) => names.get(x.comp)).filter(Boolean));
         own = [];
         for (const [g, w] of closure(ix, r, classes, f, { skip: stepFiles })) {
-          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push(x.c);
+          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push({ c: x.c, rank: [w.d, x.line || 0] });
         }
         return own;
       };
@@ -952,10 +957,10 @@ export function candidates(graph, read) {
         const c = partScreen(to, st.comp, ev, s, st.step);
         if (!c) continue;
         stepScreens.set(c.id, { c, step: st.step, parentFile: f });
-        link(s, c, 'a step inside the page');
+        link(s, c, 'a step inside the page', [v.d, st.line]);
         if (prev) link(prev, c, 'the next step');
         prev = c;
-        for (const q of ownRequests()) link(c, q, 'the page makes this request for the step');
+        for (const q of ownRequests()) link(c, q.c, 'the page makes this request for the step', q.rank);
         visit(c);
       }
       // Forms the screen renders that no router registers.
@@ -1048,10 +1053,10 @@ export function fairOrder(list) {
 
 /** The candidates around an entry: screens within 2 navigation hops and
  * everything their requests reach. */
-export function subgraph(c, entry) {
+export function subgraph(c, entry, hops = 2) {
   const keep = new Set([entry.id]);
   let ring = [entry.id];
-  for (let hop = 0; hop < 2; hop++) {
+  for (let hop = 0; hop < hops; hop++) {
     const next = [];
     for (const id of ring) for (const [b] of c.edges.get(id) || []) {
       const x = byIdOf(c).get(b);
@@ -1111,7 +1116,7 @@ export function listText(c, ids) {
 
 /** The ids shown to the model for these entries, within MAX_LIST (each
  * candidate's line measured once, with all its edges: a bound). */
-export function shownFor(c, entryList) {
+export function shownFor(c, entryList, max = MAX_LIST, hops = 2) {
   const ids = new Set();
   const size = new Map();
   const cost = (id) => {
@@ -1120,9 +1125,9 @@ export function shownFor(c, entryList) {
   };
   let total = 0;
   for (const e of entryList) {
-    const add = [...subgraph(c, e)].filter((id) => !ids.has(id));
+    const add = [...subgraph(c, e, hops)].filter((id) => !ids.has(id));
     const more = add.reduce((n, id) => n + cost(id), 0);
-    if (ids.size && total + more > MAX_LIST) break;
+    if (ids.size && total + more > max) break;
     for (const id of add) ids.add(id);
     total += more;
   }
@@ -1203,7 +1208,12 @@ export function table(c, ids, read) {
         const lines = read.lines(e.file) || [];
         return { ...e, window: lines.slice(Math.max(0, e.line - 4), e.line + 3).map((t) => t.slice(0, 400)), from: Math.max(1, e.line - 3) };
       }),
-      next: [...(c.edges.get(x.id) || []).keys()].filter((b) => ids.has(b)),
+      // In the order the code makes them: by rank (depth, line), then the
+      // order they were found.
+      next: [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b)).sort(([, a], [, b]) => (a.rank && b.rank ? a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] : 0) || a.i - b.i).map(([b]) => b),
+      // Requests a step has only because its page makes them: they don't
+      // place the request under this step.
+      weak: [...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.why === 'the page makes this request for the step').map(([b]) => b),
     };
   }
   return out;
@@ -1229,11 +1239,30 @@ export function prepare(root, graph, prev) {
   const todoEntries = fairOrder(ent.filter((e) => redo.has(e.key)));
   let todo = null;
   if (todoEntries.length) {
-    const ids = shownFor(c, todoEntries);
+    // One model call per journey family per app, each with only the
+    // candidates around that family's entries (and its own list cap).
+    const fam = (e) => family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || 'other';
+    const appOf = (e) => e.app || (e.file || '').split('/')[0];
+    const groups = new Map();
+    for (const e of todoEntries) {
+      const k = `${fam(e)}\0${appOf(e)}`;
+      if (!groups.has(k)) groups.set(k, { family: fam(e), app: appOf(e), entries: [] });
+      groups.get(k).entries.push(e);
+    }
+    const all = new Set();
+    const out = [];
+    for (const g of groups.values()) {
+      // One journey family: the screens one hop away are enough (a form's
+      // steps and where it lands), which keeps each call small.
+      const ids = shownFor(c, g.entries, MAX_GROUP_LIST, 1);
+      if (!ids.size) continue;
+      for (const id of ids) all.add(id);
+      out.push({ family: g.family, app: g.app, list: listText(c, ids), entries: g.entries.filter((e) => ids.has(e.id)).map((e) => e.id) });
+    }
     todo = {
-      list: listText(c, ids),
-      table: table(c, ids, read),
-      entries: todoEntries.filter((e) => ids.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key), family: family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) })),
+      groups: out,
+      table: table(c, all, read),
+      entries: todoEntries.filter((e) => all.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key), family: fam(e), app: appOf(e) })),
       keep: kept.filter((f) => !redo.has(f.entry)).map((f) => ({ id: f.id, title: f.title })),
     };
   }

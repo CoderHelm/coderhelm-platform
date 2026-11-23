@@ -46,40 +46,56 @@ pub fn visible() -> bool {
 /// steps).
 const SHOWN_BY_DEFAULT: bool = false;
 
-/// The instructions the model reads.
+/// The instructions the model reads. The model chooses which candidates
+/// belong to each journey; the checker puts them in order from the code.
 pub const SYSTEM: &str = "You write user journeys for an app map. You see only a list of candidates that a static extractor found in the code; use no other knowledge of this code.
 
 ## The candidate list
-One line per candidate; the first word is its id. Each cites file:line.
+One line per candidate; the first word is its id.
 - `S..` screen: a routed screen, a step inside a page, or a form no router registers. `next[...]` are screens it goes to; `requests[...]` the requests it makes; `outside[...]` outside services it uses directly.
-- `R..` request: a call the app makes and the endpoint that answers it (call site, then handler). `outside[...]` are services its handler uses; `async[...]` callbacks it starts; `requests[...]` further requests its handler makes.
+- `R..` request: a call the app makes and the endpoint that answers it. `outside[...]` are services its handler uses; `async[...]` callbacks it starts; `requests[...]` further requests its handler makes.
 - `X..` outside service. `async[...]` are endpoints it calls back.
 - `A..` async callback: a webhook endpoint an outside service calls, an event and its listener, or webhooks the app sends out.
 
 ## Task
-1. Write the user journeys this app has: at least one for every family of entries the user message lists (sign in, sign up, password reset, booking, checkout and the like). The same family in two apps (a website and a mobile app) is two journeys. Add any other end-to-end journey that is clearly present, such as cancel a booking or update a payment method. Write up to 16 journeys.
-2. For each journey, pick and order steps the way a person lives them: the screen, each request it makes for this journey, the outside service behind each request, any callback that follows, then the next screen or the next step of the same form, and so on to where the journey ends. Start at a screen. Use 3 to 15 steps; prefer a complete journey to a short one.
-3. After each request, add the outside service its `outside[...]` names the first time the journey uses that service (a later use of the same service is folded into the first), and after a sign-in or sign-up, the request that loads the person's details and the screen they land on, when listed.
-4. Order requests by when the code makes them: `requests[...]` lists a screen's requests roughly in the order its code makes them. A payment or sign-up often ends with a callback (an `A..` webhook or event) after the outside service; put it after that service.
-5. Every step cites one candidate id in `ref`, from the list only. Prefer candidates connected to the steps before them through next, requests, outside or async; a step with no such connection must be the obvious next screen.
-6. `note` is one short sentence in plain words (under 15 words): what the person or the system does at that step. No arrows or symbols in place of words.
+The user message names one journey family in one app (for example sign in on the mobile app) and the screens it may start at.
+1. Write the journeys of that family in that app: usually one; more only when the app has clearly separate ways to do it.
+2. For each journey, choose every candidate that is part of it: the screens the person goes through (including the steps of a form), each request those screens make for this journey, the outside services behind those requests, the callbacks that follow, and the screen they land on. Choose by what the candidates connect to (next, requests, outside, async); leave out requests the screens make for other purposes.
+3. You don't need to order the steps: the code puts them in order. List the entry screen first.
+4. Every step cites one candidate id in `ref`, from the list only. `note` is one short sentence in plain words (under 15 words): what the person or the system does at that step. No arrows or symbols in place of words.
 
 ## Output
 Only JSON, no prose:
-{\"flows\": [{\"id\": \"sign-in\", \"title\": \"Sign in\", \"steps\": [{\"ref\": \"S3\", \"note\": \"...\"}]}], \"skipped\": [{\"flow\": \"...\", \"why\": \"...\"}]}";
+{\"flows\": [{\"id\": \"sign-in\", \"title\": \"Sign in\", \"steps\": [{\"ref\": \"S3\", \"note\": \"...\"}]}]}";
 
-/// What the model is asked: the entries to cover, the journeys already
-/// kept, and the candidate list.
-pub fn user_prompt(todo: &Value) -> String {
-    let entries: Vec<String> = todo["entries"]
+/// The groups the model is asked about, one call each: a journey family
+/// in one app with its own candidates. A todo from before groups is one
+/// group.
+pub fn groups(todo: &Value) -> Vec<Value> {
+    match todo["groups"].as_array() {
+        Some(g) if !g.is_empty() => g.clone(),
+        _ => vec![json!({
+            "family": "any",
+            "app": "",
+            "list": todo["list"],
+            "entries": todo["entries"].as_array().into_iter().flatten().filter_map(|e| e["id"].as_str()).collect::<Vec<_>>(),
+        })],
+    }
+}
+
+/// What the model is asked for one group: its family and app, the screens
+/// a journey may start at, the journeys already kept, and its candidates.
+pub fn user_prompt(todo: &Value, group: &Value) -> String {
+    let family = group["family"].as_str().unwrap_or("any");
+    let app = group["app"].as_str().unwrap_or("");
+    let entries: Vec<String> = group["entries"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|e| {
-            let id = e["id"].as_str()?;
+            let id = e.as_str()?;
             let label = todo["table"][id]["label"].as_str().unwrap_or("");
-            let family = e["family"].as_str().unwrap_or("other");
-            Some(format!("- {family}: {id} {label}"))
+            Some(format!("- {id} {label}"))
         })
         .collect();
     let keep: Vec<String> = todo["keep"]
@@ -88,11 +104,9 @@ pub fn user_prompt(todo: &Value) -> String {
         .flatten()
         .filter_map(|k| Some(format!("- {}", k["title"].as_str()?)))
         .collect();
-    let mut out = String::new();
+    let mut out = format!("## Journey family: {family}, in the app {app}\n\n");
     if !entries.is_empty() {
-        out.push_str(
-            "## Screens a journey may start at, by family (new or changed since the last map)\n",
-        );
+        out.push_str("## Screens it may start at\n");
         out.push_str(&entries.join("\n"));
         out.push_str("\n\n");
     }
@@ -102,7 +116,7 @@ pub fn user_prompt(todo: &Value) -> String {
         out.push_str("\n\n");
     }
     out.push_str("## Candidates\n");
-    out.push_str(todo["list"].as_str().unwrap_or(""));
+    out.push_str(group["list"].as_str().unwrap_or(""));
     out
 }
 
@@ -120,9 +134,9 @@ pub struct Checked {
     pub unknown: usize,
     pub citation: usize,
     pub folded: usize,
-    /// An outside service named again later in the same journey, folded
-    /// into its first use (its note says it is used again).
-    pub revisits: usize,
+    /// Steps the code's evidence couldn't place, kept where the model put
+    /// them relative to the others (drawn dashed).
+    pub model_ordered: usize,
     pub cut: usize,
     pub unlinked: usize,
     pub flows_dropped: usize,
@@ -180,19 +194,209 @@ fn slug(s: &str) -> String {
     out.trim_end_matches('-').chars().take(60).collect()
 }
 
+/// The chosen steps in order. Each request goes with the services its
+/// handler uses and the callbacks they start (right after it). Then the
+/// blocks keep the model's order except where the code says otherwise:
+/// - a screen comes before the requests it makes itself (a request belongs
+///   to the latest screen the model lists that makes it, so a form's own
+///   call belongs to the form, not the page around it);
+/// - a screen's requests come in the order its code makes them;
+/// - a request a route handler makes comes after that route;
+/// - a screen comes before the screens it goes to (when that doesn't
+///   contradict an order already set).
+/// Returns (order, linked per step, how many blocks the code had nothing
+/// to say about, so their place is the model's).
+pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) {
+    let chosen: BTreeSet<&str> = refs.iter().map(String::as_str).collect();
+    let pos = |id: &str| refs.iter().position(|r| r == id).unwrap_or(usize::MAX);
+    let kind = |id: &str| table[id]["kind"].as_str().unwrap_or("").to_string();
+    let next = |from: &str| -> Vec<String> {
+        table[from]["next"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str())
+            .filter(|x| chosen.contains(x))
+            .map(str::to_string)
+            .collect()
+    };
+    let links = |from: &str, to: &str| next(from).iter().any(|x| x == to);
+    let weak = |from: &str, to: &str| {
+        table[from]["weak"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x == to))
+    };
+    // Blocks: a request with its services and their callbacks; a screen
+    // with the services it uses that no chosen request leads to; anything
+    // else alone.
+    let mut block_of: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    for r in refs.iter().filter(|r| kind(r) == "request") {
+        let i = blocks.len();
+        let mut b = vec![r.clone()];
+        block_of.insert(r.clone(), i);
+        for o in next(r) {
+            let k = kind(&o);
+            if (k == "outside" || k == "async") && !block_of.contains_key(&o) {
+                block_of.insert(o.clone(), i);
+                b.push(o.clone());
+                for a in next(&o) {
+                    if kind(&a) == "async" && !block_of.contains_key(&a) {
+                        block_of.insert(a.clone(), i);
+                        b.push(a);
+                    }
+                }
+            }
+        }
+        blocks.push(b);
+    }
+    for s in refs.iter().filter(|r| kind(r) == "screen") {
+        let i = blocks.len();
+        let mut b = vec![s.clone()];
+        block_of.insert(s.clone(), i);
+        for o in next(s) {
+            let k = kind(&o);
+            if (k == "outside" || k == "async") && !block_of.contains_key(&o) {
+                block_of.insert(o.clone(), i);
+                b.push(o);
+            }
+        }
+        blocks.push(b);
+    }
+    for r in refs {
+        if !block_of.contains_key(r) {
+            block_of.insert(r.clone(), blocks.len());
+            blocks.push(vec![r.clone()]);
+        }
+    }
+    let head = |b: usize| blocks[b].iter().map(|x| pos(x)).min().unwrap_or(usize::MAX);
+    // Constraints between blocks (a before b).
+    let n = blocks.len();
+    let mut after: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let reaches = |after: &Vec<BTreeSet<usize>>, from: usize, to: usize| {
+        let mut stack = vec![from];
+        let mut seen = BTreeSet::new();
+        while let Some(x) = stack.pop() {
+            if x == to {
+                return true;
+            }
+            if seen.insert(x) {
+                stack.extend(after[x].iter().copied());
+            }
+        }
+        false
+    };
+    let mut add = |after: &mut Vec<BTreeSet<usize>>, a: usize, b: usize| {
+        if a != b && !reaches(after, b, a) {
+            after[a].insert(b);
+        }
+    };
+    let screens: Vec<&String> = refs.iter().filter(|r| kind(r) == "screen").collect();
+    let requests: Vec<&String> = refs.iter().filter(|r| kind(r) == "request").collect();
+    // The screen each request belongs to.
+    let mut owned: BTreeMap<&String, Vec<&String>> = BTreeMap::new();
+    for r in &requests {
+        let own = screens.iter().rev().find(|s| links(s, r) && !weak(s, r));
+        let any = screens.iter().rev().find(|s| links(s, r));
+        if let Some(s) = own.or(any) {
+            owned.entry(*s).or_default().push(*r);
+        }
+    }
+    for (s, rs) in &owned {
+        let mut rs: Vec<&&String> = rs.iter().collect();
+        // In the order the screen's code makes them.
+        let rank = |r: &String| next(s).iter().position(|x| x == r).unwrap_or(usize::MAX);
+        rs.sort_by_key(|r| rank(r));
+        let sb = block_of[*s];
+        let mut prev = sb;
+        for r in rs {
+            let rb = block_of[r.as_str()];
+            add(&mut after, sb, rb);
+            add(&mut after, prev, rb);
+            prev = rb;
+        }
+    }
+    for a in &requests {
+        for b in &requests {
+            if a != b && links(a, b) && !owned.values().any(|v| v.contains(b)) {
+                add(&mut after, block_of[*a], block_of[*b]);
+            }
+        }
+    }
+    // The entry (the first screen the model lists) comes first.
+    if let Some(e) = screens.first() {
+        let eb = block_of[e.as_str()];
+        for b in 0..blocks.len() {
+            add(&mut after, eb, b);
+        }
+    }
+    // Navigation, in the model's order of the screens.
+    for a in &screens {
+        for b in next(a) {
+            if kind(&b) == "screen" {
+                add(&mut after, block_of[*a], block_of[&b]);
+            }
+        }
+    }
+    // Stable topological order: of the blocks ready, the one the model
+    // lists first.
+    let mut indeg = vec![0usize; n];
+    for a in &after {
+        for b in a {
+            indeg[*b] += 1;
+        }
+    }
+    let constrained: Vec<bool> = (0..n)
+        .map(|i| indeg[i] > 0 || !after[i].is_empty())
+        .collect();
+    let mut done = vec![false; n];
+    let mut seq: Vec<usize> = Vec::new();
+    for _ in 0..n {
+        let pick = (0..n)
+            .filter(|i| !done[*i] && indeg[*i] == 0)
+            .min_by_key(|i| head(*i))
+            .or_else(|| (0..n).filter(|i| !done[*i]).min_by_key(|i| head(*i)));
+        let Some(i) = pick else { break };
+        done[i] = true;
+        seq.push(i);
+        for b in after[i].clone() {
+            indeg[b] = indeg[b].saturating_sub(1);
+        }
+    }
+    let mut placed = Vec::new();
+    let mut linked = Vec::new();
+    let mut by_model = 0;
+    for (k, i) in seq.iter().enumerate() {
+        if !constrained[*i] && k > 0 {
+            by_model += 1;
+        }
+        for (j, x) in blocks[*i].iter().enumerate() {
+            placed.push(x.clone());
+            linked.push(k == 0 || j > 0 || constrained[*i]);
+        }
+    }
+    (placed, linked, by_model)
+}
+
 /// The model's answer, checked against the candidate table: the journeys
-/// accepted, as stored (`flows.json`), and what was refused.
+/// accepted, as stored (`flows.json`), and what was refused. The model
+/// chooses the steps; their order comes from the code ([`order`]).
 pub fn check(answer: &Value, todo: &Value) -> (Vec<Value>, Checked) {
     let table = &todo["table"];
     let mut rep = Checked::default();
     let mut out: Vec<Value> = Vec::new();
     let mut ids: BTreeSet<String> = BTreeSet::new();
     for f in answer["flows"].as_array().into_iter().flatten() {
-        let mut steps: Vec<Value> = Vec::new();
         let mut refs: Vec<String> = Vec::new();
+        let mut notes: BTreeMap<String, String> = BTreeMap::new();
         for s in f["steps"].as_array().into_iter().flatten() {
             rep.steps += 1;
-            let r = s["ref"].as_str().unwrap_or("").trim().to_string();
+            let r = s["ref"]
+                .as_str()
+                .or(s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let c = &table[r.as_str()];
             if c.is_null() {
                 rep.unknown += 1;
@@ -204,55 +408,41 @@ pub fn check(answer: &Value, todo: &Value) -> (Vec<Value>, Checked) {
                 continue;
             }
             let note = plain(s["note"].as_str().unwrap_or(""), 160);
-            if c["kind"] == "outside" && refs.iter().any(|x| x == &r) && refs.last() != Some(&r) {
-                // A service used again by a later request is one step, at
-                // its first use; its note says it is used again.
-                rep.revisits += 1;
-                if let Some(i) = refs.iter().position(|x| x == &r) {
-                    let prev = steps[i]["note"].as_str().unwrap_or("").to_string();
-                    if !prev.contains("used again later") {
-                        steps[i]["note"] = json!(plain(
-                            &format!("{prev} It is used again later in this journey."),
-                            240
-                        ));
-                    }
-                }
-                continue;
-            }
-            if refs.last() == Some(&r) {
-                // The same step twice in a row is one step.
+            if refs.contains(&r) {
+                // The same step twice is one step.
                 rep.folded += 1;
-                if let Some(last) = steps.last_mut() {
-                    let prev = last["note"].as_str().unwrap_or("").to_string();
-                    if !note.is_empty() && note != prev {
-                        last["note"] = json!(plain(&format!("{prev} {note}"), 240));
-                    }
+                let prev = notes.get(&r).cloned().unwrap_or_default();
+                if !note.is_empty() && note != prev {
+                    notes.insert(r.clone(), plain(&format!("{prev} {note}"), 240));
                 }
                 continue;
             }
-            if steps.len() >= MAX_STEPS {
-                rep.cut += 1;
-                continue;
-            }
-            let linked = refs.is_empty()
-                || refs.iter().any(|p| {
-                    table[p.as_str()]["next"]
-                        .as_array()
-                        .is_some_and(|n| n.iter().any(|x| x == r.as_str()))
-                });
-            if !linked {
-                rep.unlinked += 1;
-            }
-            steps.push(json!({
-                "key": c["key"],
-                "kind": c["kind"],
-                "view": c["view"],
-                "note": note,
-                "evidence": ev.iter().map(|e| json!({"file": e["file"], "line": e["line"], "token": e["token"]})).collect::<Vec<_>>(),
-                "linked": linked,
-            }));
+            notes.insert(r.clone(), note);
             refs.push(r);
         }
+        let (mut ordered, mut linked, by_model) = order(&refs, table);
+        rep.model_ordered += by_model;
+        if ordered.len() > MAX_STEPS {
+            rep.cut += ordered.len() - MAX_STEPS;
+            ordered.truncate(MAX_STEPS);
+            linked.truncate(MAX_STEPS);
+        }
+        rep.unlinked += linked.iter().filter(|l| !**l).count();
+        let steps: Vec<Value> = ordered
+            .iter()
+            .zip(&linked)
+            .map(|(r, l)| {
+                let c = &table[r.as_str()];
+                json!({
+                    "key": c["key"],
+                    "kind": c["kind"],
+                    "view": c["view"],
+                    "note": notes.get(r).cloned().unwrap_or_default(),
+                    "evidence": c["evidence"].as_array().into_iter().flatten().map(|e| json!({"file": e["file"], "line": e["line"], "token": e["token"]})).collect::<Vec<_>>(),
+                    "linked": l,
+                })
+            })
+            .collect();
         if steps.len() < 3 || steps[0]["kind"] != "screen" {
             rep.flows_dropped += 1;
             continue;
@@ -459,18 +649,39 @@ pub async fn ask(
     todo: &Value,
     usage: &mut crate::models::TokenUsage,
 ) -> Result<(Vec<Value>, Checked, Value), String> {
-    let text = crate::agent::anthropic::converse_simple(
-        client,
-        model_id,
-        SYSTEM,
-        &user_prompt(todo),
-        usage,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let answer = parse_answer(&text).ok_or("the model's answer was not JSON")?;
-    let (flows, rep) = check(&answer, todo);
-    Ok((flows, rep, answer))
+    // One call per journey family in each app, a few at a time.
+    let groups = groups(todo);
+    let mut flows: Vec<Value> = Vec::new();
+    let mut failed = Vec::new();
+    for chunk in groups.chunks(4) {
+        let calls = chunk.iter().map(|g| async move {
+            let mut u = crate::models::TokenUsage::default();
+            let text = crate::agent::anthropic::converse_simple(
+                client,
+                model_id,
+                SYSTEM,
+                &user_prompt(todo, g),
+                &mut u,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            (text, u)
+        });
+        for (text, u) in futures::future::join_all(calls).await {
+            usage.merge(&u);
+            match text.map(|t| parse_answer(&t)) {
+                Ok(Some(a)) => flows.extend(a["flows"].as_array().cloned().unwrap_or_default()),
+                Ok(None) => failed.push("the model's answer was not JSON".to_string()),
+                Err(e) => failed.push(e),
+            }
+        }
+    }
+    if flows.is_empty() && !failed.is_empty() {
+        return Err(failed.join("; "));
+    }
+    let answer = json!({ "flows": flows });
+    let (out, rep) = check(&answer, todo);
+    Ok((out, rep, answer))
 }
 
 #[cfg(test)]
@@ -515,7 +726,9 @@ mod tests {
             {"id": "not-a-screen", "title": "Starts at a request", "steps": [{"ref": "R1", "note": "a"}, {"ref": "X1", "note": "b"}, {"ref": "S1", "note": "c"}]},
         ]});
         let (flows, rep) = check(&answer, &todo());
-        assert_eq!(flows.len(), 1, "{flows:#?}");
+        // The journey listed from its request comes out from its screen:
+        // the code orders it.
+        assert_eq!(flows.len(), 2, "{flows:#?}");
         let f = &flows[0];
         assert_eq!(f["entry"], "screen:web:/login");
         let keys: Vec<&str> = f["steps"]
@@ -545,9 +758,19 @@ mod tests {
         assert_eq!(f["steps"][2]["linked"], true);
         assert_eq!(rep.unknown, 1);
         assert_eq!(rep.folded, 1);
-        // Counted in every journey looked at, the dropped ones too.
-        assert_eq!(rep.unlinked, 2);
-        assert_eq!(rep.flows_dropped, 2);
+        assert_eq!(rep.unlinked, 1);
+        assert_eq!(rep.model_ordered, 1);
+        assert_eq!(rep.flows_dropped, 1);
+        let second: Vec<&str> = flows[1]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            second,
+            ["screen:web:/login", "req:POST /api/session", "n:okta"]
+        );
 
         // A cited line that no longer holds its token is refused.
         let mut moved = todo();
@@ -563,16 +786,18 @@ mod tests {
     }
 
     #[test]
-    fn a_service_used_again_later_is_one_step_at_its_first_use() {
+    fn the_code_orders_the_chosen_steps_and_the_model_places_only_what_it_cannot() {
         let mut t = todo();
         t["table"]["R2"] = json!({"key": "req:GET /me", "kind": "request", "view": "r:3", "label": "GET /me", "next": ["X1"],
             "evidence": [{"file": "harbor-web/lib/me.ts", "line": 2, "token": "/me", "from": 1, "window": ["", "  fetch('/me')"]}]});
+        // Listed out of order, the service twice: the code puts the screen,
+        // its request and the service behind it in order, once.
         let answer = json!({"flows": [{"id": "sign-in", "title": "Sign in", "steps": [
-            {"ref": "S1", "note": "Opens the page."},
-            {"ref": "R1", "note": "Posts the email."},
             {"ref": "X1", "note": "Okta checks it."},
-            {"ref": "R2", "note": "Loads the boater."},
+            {"ref": "R1", "note": "Posts the email."},
+            {"ref": "S1", "note": "Opens the page."},
             {"ref": "X1", "note": "Okta answers again."},
+            {"ref": "R2", "note": "Loads the boater."},
             {"ref": "S2", "note": "Lands on the slips."},
         ]}]});
         let (flows, rep) = check(&answer, &t);
@@ -582,6 +807,8 @@ mod tests {
             .iter()
             .map(|s| s["key"].as_str().unwrap())
             .collect();
+        // R2 and S2 have no edge from the steps before them: they keep the
+        // model's place (after R1's service and after R2), drawn dashed.
         assert_eq!(
             keys,
             [
@@ -594,9 +821,29 @@ mod tests {
         );
         assert_eq!(
             flows[0]["steps"][2]["note"],
-            "Okta checks it. It is used again later in this journey."
+            "Okta checks it. Okta answers again."
         );
-        assert_eq!(rep.revisits, 1);
+        let linked: Vec<bool> = flows[0]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["linked"] == true)
+            .collect();
+        assert_eq!(linked, [true, true, true, false, false]);
+        assert_eq!(rep.folded, 1);
+        assert_eq!(rep.model_ordered, 2);
+        // Order alone: a screen's requests by where its code makes them.
+        let mut t = todo();
+        t["table"]["S1"]["next"] = json!(["R2", "R1"]);
+        t["table"]["R2"] = json!({"key": "req:GET /csrf", "kind": "request", "view": "r:4", "label": "GET /csrf", "next": [],
+            "evidence": [{"file": "harbor-web/lib/csrf.ts", "line": 1, "token": "/csrf", "from": 1, "window": ["fetch('/csrf')"]}]});
+        let (o, l, m) = order(
+            &["R1".into(), "X1".into(), "S1".into(), "R2".into()],
+            &t["table"],
+        );
+        assert_eq!(o, ["S1", "R2", "R1", "X1"]);
+        assert_eq!(l, [true; 4]);
+        assert_eq!(m, 0);
     }
 
     #[test]
@@ -619,8 +866,10 @@ mod tests {
 
     #[test]
     fn the_prompt_lists_the_entries_the_kept_journeys_and_the_candidates() {
-        let p = user_prompt(&todo());
-        assert!(p.contains("- other: S1 web /login"));
+        let t = todo();
+        let p = user_prompt(&t, &groups(&t)[0]);
+        assert!(p.contains("- S1 web /login"));
+        assert!(p.contains("## Journey family: any"));
         assert!(p.contains("- Book a slip"));
         assert!(p.contains("R1 request POST /api/session"));
         assert!(!SYSTEM.contains('\u{2192}'));
@@ -718,12 +967,26 @@ mod tests {
                 &std::fs::read(dir.join(format!("{set}.todo.json"))).unwrap(),
             )
             .unwrap();
-            if todo["list"].as_str().unwrap_or("").is_empty() {
+            if groups(&todo)
+                .iter()
+                .all(|g| g["list"].as_str().unwrap_or("").is_empty())
+            {
                 continue;
             }
             let mut usage = crate::models::TokenUsage::default();
             let started = std::time::Instant::now();
-            let (flows, rep, answer) = ask(&client, &model, &todo, &mut usage).await.unwrap();
+            // A replayed answer (`<set>.replay.json`) goes through the same
+            // checker with no model call: how the code orders a given set.
+            let replay = std::fs::read(dir.join(format!("{set}.replay.json")))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            let (flows, rep, answer) = match replay {
+                Some(a) => {
+                    let (f, r) = check(&a, &todo);
+                    (f, r, a)
+                }
+                None => ask(&client, &model, &todo, &mut usage).await.unwrap(),
+            };
             println!(
                 "{set}: {} journeys, {:?}, {} in / {} out tokens, ${:.4}, {:.0}s",
                 flows.len(),
