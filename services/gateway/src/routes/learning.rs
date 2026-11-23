@@ -232,7 +232,7 @@ pub async fn get_health(
     )
     .await;
     let closed = closed_prs_of(&runs);
-    Ok(Json(health::build(
+    let mut page = health::build(
         &health::Inputs {
             events: &events,
             closed_prs: &closed,
@@ -247,7 +247,10 @@ pub async fn get_health(
             decisions: &decisions,
         },
         now,
-    )))
+    );
+    // Deploys stopping being recorded is a broken loop too.
+    super::analytics::add_deploy_health(&state, team, &mut page).await;
+    Ok(Json(page))
 }
 
 #[derive(Deserialize)]
