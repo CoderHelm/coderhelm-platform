@@ -139,7 +139,7 @@ jobs:
       # Each test in its own process, ended and failed under its own name
       # after two minutes (services/.config/nextest.toml).
       - if: steps.changes.outputs.run == 'true'
-        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest@0.9.151
       # The build on its own step, with its own time limit. --workspace
