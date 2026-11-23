@@ -181,6 +181,28 @@ export class MonitoringStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     unaskedAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+    // Each hourly check that found a team which records deploys most days
+    // with none recorded for two days while its bots kept working
+    // (services/common/src/deploy_stats.rs, `health`). The worker reads the
+    // hole back by itself; the alarm says the recording broke.
+    const deploysStalledMetric = new logs.MetricFilter(this, "DeployRecordsStalledFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"deploy_records_stalled"'),
+      metricNamespace: "CoderHelm/Analytics",
+      metricName: "DeployRecordsStalled",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.hours(1), statistic: "Sum" });
+    const deploysStalledAlarm = new cloudwatch.Alarm(this, "DeployRecordsStalledAlarm", {
+      alarmName: `${prefix}-deploy-records-stalled`,
+      alarmDescription:
+        "A team that records deploys most days recorded none for 48 hours while runs its bots triggered kept arriving. CoderHelm reads the missed deploys back from GitHub's run history; find why the workflow run webhooks stopped recording them.",
+      metric: deploysStalledMetric,
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    deploysStalledAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
     const modelRequeuedMetric = new logs.MetricFilter(this, "ModelErrorRequeuedFilter", {
       logGroup: workerLogs,
       filterPattern: logs.FilterPattern.literal('"model_error_requeued"'),

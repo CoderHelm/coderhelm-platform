@@ -1465,17 +1465,43 @@ async fn ask_for_deploy_backfill(state: &AppState, team: &str) {
 }
 
 /// Whether a completed workflow run from a webhook may be a deploy
-/// CoderHelm started: its app triggered it, or another bot pushed (a merge
-/// queue merging a PR CoderHelm merged). A person's run never is.
-pub fn deploy_run_worth_reading(run: &Value, bot_login: &str) -> bool {
-    let concluded = matches!(
-        run["conclusion"].as_str(),
-        Some("success" | "failure" | "timed_out" | "startup_failure" | "action_required")
-    );
-    let (_, kind) = common::deploy_stats::trigger(run);
-    concluded
-        && (common::deploy_stats::started_by_coderhelm(run, bot_login)
-            || (kind == "Bot" && run["event"] == "push"))
+/// CoderHelm started (`common::deploy_stats::worth_reading`).
+pub fn deploy_run_worth_reading(run: &Value, bot_login: Option<&str>) -> bool {
+    common::deploy_stats::worth_reading(run, bot_login)
+}
+
+/// The app's bot login: from its slug when this gateway can ask GitHub (it
+/// holds the app's key), else the one CoderHelm's token broker named on a
+/// hybrid install. None when neither is known yet.
+async fn app_bot_login(state: &AppState) -> Option<String> {
+    if let Some(slug) = crate::auth::github_app::app_slug(state).await {
+        return Some(format!("{slug}[bot]"));
+    }
+    common::hybrid::client::bot_login().filter(|l| !l.is_empty())
+}
+
+/// Counts a run a bot triggered that ran to an end (not skipped or
+/// cancelled) on the team's deploy health item
+/// (`common::deploy_stats::health`): the worker's check reads it as work
+/// going on, so deploys that stop being recorded while it does are seen.
+async fn note_bot_run(state: &AppState, team_id: &str, run: &Value) {
+    if !common::deploy_stats::worth_reading(run, None) {
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", av(team_id))
+        .key("sk", av(common::deploy_stats::health::SK))
+        .update_expression("SET bot_run_seen_at = :at ADD bot_runs :one")
+        .expression_attribute_values(":at", av(&Utc::now().to_rfc3339()))
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .send()
+        .await
+    {
+        warn!(error = %e, "Could not count a workflow run for deploy health");
+    }
 }
 
 /// The run fields the worker reads, so the message stays small.
@@ -1503,14 +1529,84 @@ pub fn deploy_run_fields(run: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Adds the deploy records loop to the Learning health page, from the
+/// worker's last check (`common::deploy_stats::health`): red while a busy
+/// team's deploys stopped being recorded, retrying while a hole is read
+/// back. Nothing is added for a team that never recorded one.
+pub async fn add_deploy_health(state: &AppState, team: &str, page: &mut Value) {
+    let get = |sk: &'static str| async move {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(team))
+            .key("sk", av(sk))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned())
+    };
+    let (health, progress) = tokio::join!(
+        get(common::deploy_stats::health::SK),
+        get(common::deploy_stats::BACKFILL_PROGRESS_SK)
+    );
+    let Some(h) = health else { return };
+    let state_s = s(&h, "state");
+    if state_s.is_empty() {
+        return;
+    }
+    let filling = progress
+        .as_ref()
+        .filter(|p| !matches!(p.get("done"), Some(AttributeValue::Bool(true))))
+        .map(|p| s(p, "gap_from"))
+        .filter(|g| !g.is_empty());
+    let n = |k: &str| {
+        h.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|x| x.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let l = common::deploy_stats::health::loop_of(
+        &state_s,
+        &s(&h, "newest_at"),
+        &s(&h, "checked_at"),
+        n("bot_runs").saturating_sub(n("bot_runs_mark")),
+        filling.as_deref(),
+    );
+    add_loop(page, l);
+}
+
+/// Appends a loop to the health page and keeps its `quiet`, `retrying` and
+/// `state` in step.
+pub fn add_loop(page: &mut Value, l: common::rewards::health::Loop) {
+    use common::rewards::health::State;
+    let key = l.key;
+    let st = l.state;
+    if let Some(loops) = page["loops"].as_array_mut() {
+        loops.push(json!(l));
+    }
+    let list = match st {
+        State::Quiet => "quiet",
+        State::Retrying => "retrying",
+        _ => return,
+    };
+    if let Some(a) = page[list].as_array_mut() {
+        a.push(json!(key));
+    }
+    if st == State::Quiet {
+        page["state"] = json!("red");
+    }
+}
+
 /// From a `workflow_run` webhook: queue the run for the worker when it may be
-/// a deploy CoderHelm started (`common::deploy_stats`).
+/// a deploy CoderHelm started (`common::deploy_stats`). A gateway that
+/// doesn't know the app's bot (a hybrid install's, with no app key of its
+/// own) still sends every bot's run: the worker knows its bot.
 pub async fn queue_deploy_run(state: &AppState, payload: &Value, team_id: &str) {
     let run = &payload["workflow_run"];
-    let Some(slug) = crate::auth::github_app::app_slug(state).await else {
-        return;
-    };
-    if !deploy_run_worth_reading(run, &format!("{slug}[bot]")) {
+    note_bot_run(state, team_id, run).await;
+    let bot = app_bot_login(state).await;
+    if !deploy_run_worth_reading(run, bot.as_deref()) {
         return;
     }
     let repo = &payload["repository"];
@@ -3004,40 +3100,64 @@ mod tests {
                 "repository": {"full_name": "acme/web"},
             })
         };
+        let known = Some(bot);
         assert!(deploy_run_worth_reading(
             &r(bot, "Bot", "pull_request", "success"),
-            bot
-        ));
-        assert!(deploy_run_worth_reading(
-            &r(bot, "Bot", "push", "failure"),
-            bot
+            known
         ));
         // A merge queue's push: the worker checks who merged.
         assert!(deploy_run_worth_reading(
             &r("github-merge-queue[bot]", "Bot", "push", "success"),
-            bot
+            known
         ));
         // A person's deploy never counts.
         assert!(!deploy_run_worth_reading(
             &r("someone", "User", "push", "success"),
-            bot
+            known
         ));
-        assert!(!deploy_run_worth_reading(
-            &r("someone", "User", "workflow_dispatch", "success"),
-            bot
-        ));
-        // Another bot's PR run, and a cancelled run.
         assert!(!deploy_run_worth_reading(
             &r("dependabot[bot]", "Bot", "pull_request", "success"),
-            bot
+            known
+        ));
+        // The bot unknown (a hybrid install's gateway, no app key): CoderHelm's
+        // run still goes, and the worker decides with its own bot.
+        assert!(deploy_run_worth_reading(
+            &r(bot, "Bot", "pull_request", "success"),
+            None
         ));
         assert!(!deploy_run_worth_reading(
-            &r(bot, "Bot", "push", "cancelled"),
-            bot
+            &r("someone", "User", "push", "success"),
+            None
         ));
         let f = deploy_run_fields(&r(bot, "Bot", "push", "success"));
         assert!(f.get("repository").is_none());
         assert_eq!(f["triggering_actor"]["login"], bot);
+    }
+
+    #[test]
+    fn a_stalled_deploy_record_turns_the_learning_health_page_red() {
+        let mut page = json!({"state": "ok", "quiet": [], "retrying": [], "loops": []});
+        add_loop(
+            &mut page,
+            common::deploy_stats::health::loop_of("stalled", "2026-11-06T21:26:48Z", "", 40, None),
+        );
+        assert_eq!(page["state"], "red");
+        assert_eq!(page["quiet"], json!(["deploy_records"]));
+        assert_eq!(page["loops"][0]["key"], "deploy_records");
+        assert_eq!(page["loops"][0]["state"], "quiet");
+        let mut page = json!({"state": "ok", "quiet": [], "retrying": [], "loops": []});
+        add_loop(
+            &mut page,
+            common::deploy_stats::health::loop_of(
+                "recording",
+                "2026-11-24T09:00:00Z",
+                "",
+                0,
+                Some("2026-11-06T21:26:48Z"),
+            ),
+        );
+        assert_eq!(page["state"], "ok");
+        assert_eq!(page["retrying"], json!(["deploy_records"]));
     }
 
     #[test]
