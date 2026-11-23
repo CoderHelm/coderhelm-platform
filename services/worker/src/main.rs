@@ -390,7 +390,10 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
     use models::WorkerMessage as M;
     match message {
         M::Ticket(_) | M::PlanExecute(_) | M::PlanTaskContinue(_) | M::JiraComment(_) => who::RUN,
-        M::Feedback(_) | M::Resume(_) => who::FIX_ROUND,
+        M::Feedback(_) => who::FIX_ROUND,
+        // The CI wait and the CI fix rounds it leads to: a run's own steps,
+        // which leave the last of the hour to reviews and people's answers.
+        M::Resume(_) => who::CI,
         M::Review(_) => who::REVIEW,
         M::MarkReady(_) => who::READY,
         M::AwaitMerge(_)

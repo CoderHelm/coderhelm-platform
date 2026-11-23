@@ -5849,6 +5849,7 @@ dependencies = [
  "common",
  "flate2",
  "futures",
+ "http",
  "jsonwebtoken",
  "lambda_runtime",
  "mentedb",
