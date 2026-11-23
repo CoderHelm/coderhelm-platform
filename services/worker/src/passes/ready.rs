@@ -177,8 +177,9 @@ pub struct Facts {
     /// A security fix's pull request (its description carries the security
     /// marker): it leaves draft only once the repository's CI passes.
     pub security: bool,
-    /// Its CI fix loop found every failing check failing on the base branch
-    /// too (`ci_end` = `red_on_base`): not this change's failure.
+    /// Its CI fix loop found its failing checks aren't this change's
+    /// (`common::ci_unrelated::not_ours`: red on the base branch too, or an
+    /// unrelated test).
     pub red_on_base: bool,
     /// The head's preview (`preview::advance`): a web change is ready only
     /// once its preview deploy and end-to-end checks passed on it, and only
@@ -1475,8 +1476,9 @@ async fn preview_of(ctx: &Ctx<'_>, pr: &serde_json::Value) -> Option<common::pre
     .await
 }
 
-/// Whether the run's CI fix loop ended because every failing check fails on
-/// the base branch too.
+/// Whether the run's CI fix loop ended because its failing checks aren't
+/// the change's: every one fails on the base branch too, or the failing
+/// test was shown to be outside the change (`common::ci_unrelated::not_ours`).
 async fn red_on_base(ctx: &Ctx<'_>) -> bool {
     let run_id = if ctx.run_id.is_empty() {
         super::review_pr::lookup_run_by_pr(ctx.state, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
@@ -1500,7 +1502,7 @@ async fn red_on_base(ctx: &Ctx<'_>) -> bool {
         .ok()
         .and_then(|o| o.item)
         .and_then(|i| i.get("ci_end").and_then(|v| v.as_s().ok()).cloned())
-        .is_some_and(|e| e == "red_on_base")
+        .is_some_and(|e| common::ci_unrelated::not_ours(&e))
 }
 
 /// Asks for the ready decision of a pull request again, now: the preview's

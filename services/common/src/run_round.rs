@@ -580,6 +580,134 @@ pub fn pushed_note(pushed: &[Pushed], files: &[String], wip: &str) -> String {
     )
 }
 
+// ── What a step that ran out of time settled ────────────────────────────────
+
+const SETTLED_START: &str = "\n\n## Settled by the steps before\n";
+/// The heading of the section a step too short to run its checks leaves
+/// (`implement::owed_first`).
+const OWED_HEADING: &str = "\n\n## Owed from the step before\n";
+
+/// The files a step's tool calls wrote and put back (`log`: its
+/// conversation), newest decision per file.
+pub fn step_trail(log: &[serde_json::Value]) -> (Vec<String>, Vec<String>) {
+    let mut written: Vec<String> = Vec::new();
+    let mut restored: Vec<String> = Vec::new();
+    let mut put = |path: &str, back: bool| {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        written.retain(|p| *p != path);
+        restored.retain(|p| *p != path);
+        if back {
+            restored.push(path);
+        } else {
+            written.push(path);
+        }
+    };
+    for entry in log {
+        let Some(blocks) = entry["content"].as_array() else {
+            continue;
+        };
+        for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
+            let input = &b["input"];
+            match b["name"].as_str().unwrap_or("") {
+                "restore_file" => put(input["path"].as_str().unwrap_or(""), true),
+                "write_file" | "edit_file" => put(input["path"].as_str().unwrap_or(""), false),
+                "batch_write" => {
+                    // A deleted file is part of the step's work too.
+                    for f in input["files"].as_array().into_iter().flatten() {
+                        put(f["path"].as_str().unwrap_or(""), false);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (written, restored)
+}
+
+/// A continuing round's instructions with what its steps so far settled,
+/// so the next step goes on from them instead of deciding them again: a
+/// review fix round ran out of time three steps in a row on one finding,
+/// each step reading the same files again and editing a file the step
+/// before had put back on purpose, then putting it back again. Replaces an
+/// earlier such section, keeping what it said.
+pub fn settled_first(feedback: &str, log: &[serde_json::Value]) -> String {
+    // The section sits before the "owed" one (`implement::owed_first`, which
+    // keeps what comes before its own heading).
+    let (head, owed) = match feedback.find(OWED_HEADING) {
+        Some(i) => feedback.split_at(i),
+        None => (feedback, ""),
+    };
+    let (base, mut written, mut restored) = match head.find(SETTLED_START) {
+        Some(i) => {
+            let (w, r) = settled_of(&head[i + SETTLED_START.len()..]);
+            (&head[..i], w, r)
+        }
+        None => (head, Vec::new(), Vec::new()),
+    };
+    let (w, r) = step_trail(log);
+    for p in w {
+        restored.retain(|x| *x != p);
+        if !written.contains(&p) {
+            written.push(p);
+        }
+    }
+    for p in r {
+        written.retain(|x| *x != p);
+        if !restored.contains(&p) {
+            restored.push(p);
+        }
+    }
+    if written.is_empty() && restored.is_empty() {
+        return format!("{base}{owed}");
+    }
+    let list = |v: &[String]| {
+        v.iter()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = format!(
+        "{base}{SETTLED_START}The steps before this one ran out of time; their work is \
+         committed on this branch. Go on from it: don't read again what you need only to \
+         re-decide these, and don't undo them unless the task names the file."
+    );
+    if !written.is_empty() {
+        out.push_str(&format!("\n- Written: {}", list(&written)));
+    }
+    if !restored.is_empty() {
+        out.push_str(&format!(
+            "\n- Put back to the base branch on purpose (leave them as they are): {}",
+            list(&restored)
+        ));
+    }
+    out.push_str(owed);
+    out
+}
+
+/// The files an earlier section listed.
+fn settled_of(section: &str) -> (Vec<String>, Vec<String>) {
+    let files = |line: &str| -> Vec<String> {
+        line.split('`')
+            .enumerate()
+            .filter(|(i, p)| i % 2 == 1 && !p.trim().is_empty())
+            .map(|(_, p)| p.trim().to_string())
+            .collect()
+    };
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    for l in section.lines() {
+        if l.starts_with("- Written:") {
+            w = files(l);
+        } else if l.starts_with("- Put back") {
+            r = files(l);
+        }
+    }
+    (w, r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +896,44 @@ mod tests {
                 k.label()
             );
         }
+    }
+
+    #[test]
+    fn a_continuing_step_is_told_what_the_steps_before_settled() {
+        use serde_json::json;
+        let call = |name: &str, path: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": {"path": path}}]});
+        let step1 = vec![
+            call("write_file", "e2e/tests/a.spec.ts"),
+            call("edit_file", "e2e/data/venues.ts"),
+            call("restore_file", "e2e/data/venues.ts"),
+        ];
+        let fb = settled_first("Fix the finding.", &step1);
+        assert!(
+            fb.starts_with("Fix the finding.\n\n## Settled by the steps before"),
+            "{fb}"
+        );
+        assert!(fb.contains("- Written: `e2e/tests/a.spec.ts`"), "{fb}");
+        assert!(
+            fb.contains("on purpose (leave them as they are): `e2e/data/venues.ts`"),
+            "{fb}"
+        );
+        // The next step's own decisions replace the section, keeping the rest.
+        let step2 = vec![call("edit_file", "apps/web/x.tsx")];
+        let fb2 = settled_first(&fb, &step2);
+        assert_eq!(fb2.matches("## Settled by the steps before").count(), 1);
+        assert!(
+            fb2.contains("- Written: `e2e/tests/a.spec.ts`, `apps/web/x.tsx`"),
+            "{fb2}"
+        );
+        assert!(fb2.contains("`e2e/data/venues.ts`"));
+        assert_eq!(settled_first("x", &[]), "x");
+        // The owed checks stay last, whole.
+        let owed = format!("Fix it.{OWED_HEADING}Run these first.");
+        let fb3 = settled_first(&owed, &step2);
+        assert!(
+            fb3.ends_with(&format!("{OWED_HEADING}Run these first.")),
+            "{fb3}"
+        );
+        assert!(fb3.contains("## Settled by the steps before"));
     }
 }

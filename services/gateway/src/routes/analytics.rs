@@ -585,6 +585,7 @@ fn gave_up_label(ci_end: &str, r: &RunRow) -> String {
         "budget" => "Fix attempts used up".into(),
         "stalled" => "Same failure after a fix".into(),
         "no_change" => "Fix found nothing to change".into(),
+        "unrelated_test" => "Failing test isn't the change's".into(),
         "no_progress" => "Fixes stopped changing the code".into(),
         "fix_error" => "Fix attempt errored".into(),
         "" if r.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => "Fix attempts used up".into(),
@@ -601,10 +602,12 @@ impl RunRow {
     fn ci_went_red(&self) -> bool {
         self.ci_fix_attempts > 0 || self.ci_reruns > 0 || !self.ci_red_on_base.is_empty()
     }
-    /// Red only on checks that already failed on the base branch: never its
-    /// own failure to fix.
+    /// Red only on failures that aren't its own: checks that already failed
+    /// on the base branch, or a test its fix round showed is outside the
+    /// change. Never its own failure to fix.
     fn red_only_on_base(&self) -> bool {
-        !self.ci_red_on_base.is_empty() && self.ci_fix_attempts == 0 && self.ci_reruns == 0
+        (!self.ci_red_on_base.is_empty() && self.ci_fix_attempts == 0 && self.ci_reruns == 0)
+            || self.ci_end == common::ci_unrelated::CI_END
     }
     fn ci_end_state(&self) -> CiEnd {
         if self.ci_last == "passed" {
@@ -623,6 +626,11 @@ impl RunRow {
             return CiEnd::Running;
         }
         if !self.ci_red_on_base.is_empty() && matches!(self.ci_end.as_str(), "" | "red_on_base") {
+            return CiEnd::RedOnBase;
+        }
+        // The fix round showed the failing test isn't the change's: red,
+        // but not the run's own failure (`common::ci_unrelated`).
+        if common::ci_unrelated::not_ours(&self.ci_end) {
             return CiEnd::RedOnBase;
         }
         CiEnd::GaveUp(gave_up_label(&self.ci_end, self))
@@ -3556,6 +3564,13 @@ mod tests {
             red("7", "running"),
             // Never red: not counted.
             run("8", 2, "completed"),
+            // Its fix round showed the failing test isn't the change's:
+            // completed, counted with the base branch's, never "ended wrong".
+            RunRow {
+                ci_end: "unrelated_test".into(),
+                ci_last: "failed".into(),
+                ..red("9", "completed")
+            },
         ];
         let refs: Vec<&RunRow> = runs.iter().collect();
         let ci = ci_outcomes(&refs);
@@ -3564,12 +3579,12 @@ mod tests {
         assert_eq!(ci["ended_wrong"]["completed_with_red_ci"], 2);
         assert_eq!(ci["ended_wrong"]["completed_after_stop"], 0);
         assert_eq!(ci["runs_with_red_ci"], 6);
-        assert_eq!(ci["red_on_base_runs"], 1);
+        assert_eq!(ci["red_on_base_runs"], 2);
         let o = &ci["outcomes"];
         assert_eq!(o["green_after_fix"], 1);
         assert_eq!(o["green_without_fix"], 1);
         assert_eq!(o["flaky"], 1);
-        assert_eq!(o["red_on_base"], 1);
+        assert_eq!(o["red_on_base"], 2);
         assert_eq!(o["gave_up"], 2);
         assert_eq!(o["running"], 1);
         assert_eq!(ci["fixed_by_coderhelm"], 1);

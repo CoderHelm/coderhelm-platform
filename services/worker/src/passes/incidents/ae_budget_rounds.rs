@@ -132,7 +132,14 @@ fn ci_only_rounds_without_progress_change_approach_then_end_with_the_cause() {
     let tried = feedback::auto_fix_rounds_tried(why);
     let cause = format!(
         "{}. {}",
-        resume::ci_failing_reason(&left, "error[E0425]: cannot find value", tried.len()),
+        resume::ci_failing_reason(
+            &left,
+            "error[E0425]: cannot find value",
+            resume::Tally {
+                rounds: tried.len() as u32,
+                pushed: tried.len() as u32,
+            }
+        ),
         tried.join("; ")
     );
     assert!(cause.contains("check-1, check-2"), "{cause}");
