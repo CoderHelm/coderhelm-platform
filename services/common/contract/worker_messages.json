@@ -16,7 +16,7 @@
     "webhook_send": {"type":"webhook_send","team_id":"TEAM#team-a","endpoint_id":"ep_01jbendpt4a7b0c3d6e9f2g5h8","event_id":"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W","delivery_id":"01hzzdelivery","due_at":1792416387},
     "relay_retry": {"type":"relay_retry","install_id":"ins_abcdefghijklmnopqrstuvwx","delivery_id":"01hzzdelivery","relay_delivery_id":"72d3162e-cc78-11e3-81ab-4c9367dc0958","event":"pull_request","source":"github"},
     "await_merge": {"type":"await_merge","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","base_branch":"main","self_authored":true,"attempts":1,"chain_id":"c","error_retries":0},
-    "app_map": {"type":"app_map","team_id":"TEAM#team-a","repo":"","step":"build"},
+    "app_map": {"type":"app_map","team_id":"TEAM#team-a","repo":"","step":"build","build":"0f9c2d4e8a7b4c1d9e6f3a2b1c0d9e8f","turn":2},
     "graph_index": {"type":"graph_index","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","branch":"main","changed_files":["a.rs"]},
     "release_notes": {"type":"release_notes","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","tag":"v1.0.0","sha":"abc","resend":"","check_branch":true},
     "restack": {"type":"restack","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","branch":"coderhelm/feature-a","before":"abc","after":"def"},

@@ -170,6 +170,19 @@ test("relay bodies held for retries are gone after two days", () => {
   assert.equal(rule.ExpirationInDays, 2);
 });
 
+test("the dashboard may read signed GETs from the data bucket (the App map), and still only its own origins", () => {
+  const cors = (t: any) => {
+    const bucket = Object.values(t.findResources("AWS::S3::Bucket")).find((b: any) => JSON.stringify(b.Properties.BucketName).includes("-data")) as any;
+    return bucket.Properties.CorsConfiguration.CorsRules;
+  };
+  const hostedRules = cors(hosted()["coderhelm-prod-storage"]);
+  assert.equal(hostedRules.length, 1);
+  assert.deepEqual([...hostedRules[0].AllowedMethods].sort(), ["GET", "HEAD", "PUT"]);
+  assert.ok(!hostedRules[0].AllowedOrigins.includes("*"), "the hosted dashboard's own origins");
+  const self = synth(resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] }));
+  assert.deepEqual([...cors(self["coderhelm-prod-storage"])[0].AllowedMethods].sort(), ["GET", "HEAD", "PUT"]);
+});
+
 test("a self-hosted install: relay intake, its own 404, no hosted-side parts", () => {
   const cfg = resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] });
   const t = synth(cfg);

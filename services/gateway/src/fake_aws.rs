@@ -1,5 +1,7 @@
 //! A small in-process stand-in for the AWS services sign-in calls (DynamoDB,
-//! Cognito and KMS), so tests run the real handlers end to end against
+//! Cognito and KMS) and the App map's (SQS messages it records, and S3
+//! objects kept in memory: put, get and head by key, with their content type,
+//! encoding and time), so tests run the real handlers end to end against
 //! records they set up. It speaks the services' JSON protocols on a local
 //! port; the SDK clients are pointed at it with an endpoint override.
 //!
@@ -17,7 +19,7 @@
 use axum::{
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Router,
 };
@@ -49,9 +51,54 @@ pub struct Store {
     /// Every transaction is cancelled (as when another write changed an
     /// item it checks in between).
     cancel_transactions: std::sync::atomic::AtomicBool,
+    /// SQS messages sent: `(queue url, body)`.
+    sent: Mutex<Vec<(String, String)>>,
+    /// S3 objects by path (`/bucket/key`).
+    objects: Mutex<HashMap<String, S3Object>>,
+}
+
+/// An object kept by the S3 stand-in.
+#[derive(Clone, Debug, Default)]
+pub struct S3Object {
+    pub body: Vec<u8>,
+    pub content_type: String,
+    pub content_encoding: String,
+    /// When it was written (unix seconds).
+    pub at: i64,
 }
 
 impl Store {
+    /// Keeps an object in the S3 stand-in, as a put would.
+    pub fn put_object(&self, bucket: &str, key: &str, body: Vec<u8>) {
+        self.objects.lock().unwrap().insert(
+            format!("/{bucket}/{key}"),
+            S3Object {
+                body,
+                at: chrono::Utc::now().timestamp(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// An object in the S3 stand-in.
+    pub fn object(&self, bucket: &str, key: &str) -> Option<S3Object> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(&format!("/{bucket}/{key}"))
+            .cloned()
+    }
+
+    /// The bodies of the SQS messages sent so far.
+    pub fn sent(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+
     /// Cancels every transaction from now on.
     pub fn cancel_transactions(&self) {
         self.cancel_transactions
@@ -244,18 +291,88 @@ fn ok(v: Value) -> Response {
         .into_response()
 }
 
-async fn handle(State(store): State<Arc<Store>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle(
+    State(store): State<Arc<Store>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let target = headers
         .get("x-amz-target")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // S3: objects by path, kept in memory; a read of one not there is not found.
+    if target.is_empty() && method == Method::PUT {
+        let h = |k: &str| {
+            headers
+                .get(k)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        store.objects.lock().unwrap().insert(
+            uri.path().to_string(),
+            S3Object {
+                body: body.to_vec(),
+                content_type: h("content-type"),
+                content_encoding: h("content-encoding"),
+                at: chrono::Utc::now().timestamp(),
+            },
+        );
+        return (StatusCode::OK, [("etag", "\"stand-in\"")], "").into_response();
+    }
+    if target.is_empty() && matches!(method, Method::GET | Method::HEAD) {
+        let Some(o) = store.objects.lock().unwrap().get(uri.path()).cloned() else {
+            return (
+                StatusCode::NOT_FOUND,
+                [("content-type", "application/xml")],
+                format!(
+                    "<Error><Code>NoSuchKey</Code><Message>no {}</Message></Error>",
+                    uri.path()
+                ),
+            )
+                .into_response();
+        };
+        let modified = chrono::DateTime::from_timestamp(o.at, 0)
+            .unwrap_or_default()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let mut r = if method == Method::HEAD {
+            StatusCode::OK.into_response()
+        } else {
+            (StatusCode::OK, o.body.clone()).into_response()
+        };
+        let hs = r.headers_mut();
+        hs.insert("last-modified", modified.parse().unwrap());
+        hs.insert("content-length", o.body.len().to_string().parse().unwrap());
+        if !o.content_type.is_empty() {
+            hs.insert("content-type", o.content_type.parse().unwrap());
+        }
+        if !o.content_encoding.is_empty() {
+            hs.insert("content-encoding", o.content_encoding.parse().unwrap());
+        }
+        return r;
+    }
     let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (service, op) = target.split_once('.').unwrap_or(("", ""));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match service {
         "DynamoDB_20120810" => dynamo(&store, op, &req),
         "AWSCognitoIdentityProviderService" => cognito(&store, op, &req),
         "TrentService" => kms(&store, op, &req),
+        "AmazonSQS" if op == "SendMessage" => {
+            let mut sent = store.sent.lock().unwrap();
+            sent.push((
+                req["QueueUrl"].as_str().unwrap_or("").to_string(),
+                req["MessageBody"].as_str().unwrap_or("").to_string(),
+            ));
+            let body = req["MessageBody"].as_str().unwrap_or("");
+            ok(json!({
+                "MessageId": format!("m-{}", sent.len()),
+                "MD5OfMessageBody": format!("{:x}", md5::compute(body.as_bytes())),
+            }))
+        }
         // Services without a JSON target (SES's REST API: the emails a flow
         // sends) are accepted and not checked.
         "" => ok(json!({ "MessageId": "stand-in" })),
@@ -892,6 +1009,8 @@ pub fn state(url: &str) -> Arc<crate::AppState> {
             users_table_name: "users".into(),
             settings_table_name: "settings".into(),
             repos_table_name: "repos".into(),
+            bucket_name: "bucket".into(),
+            ticket_queue_url: format!("{url}/queue/tickets"),
             cognito_user_pool_id: "pool".into(),
             cognito_client_id: "client".into(),
             secrets_key_id: "key".into(),
