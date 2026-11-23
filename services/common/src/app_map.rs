@@ -94,6 +94,18 @@ pub fn job_key(team_id: &str) -> String {
     format!("{}/job.json", s3_prefix(team_id))
 }
 
+/// The journeys the model is to write after a build (the sandbox's
+/// candidates and the entries to cover), until it has.
+pub fn flows_todo_key(team_id: &str) -> String {
+    format!("{}/flows-todo.json.gz", s3_prefix(team_id))
+}
+
+/// The worksheets a description step had no time left for, continued in
+/// the next step.
+pub fn describe_key(team_id: &str) -> String {
+    format!("{}/describe.json.gz", s3_prefix(team_id))
+}
+
 pub const STATUS_SK: &str = "STATUS";
 /// A build queued or running this long is treated as stuck.
 pub const STALE_SECS: i64 = 45 * 60;
@@ -144,6 +156,11 @@ pub struct Status {
     /// Repositories that map was made from.
     #[serde(default)]
     pub built_repos: u32,
+    /// Repositories the map left out, whole or in part, because every
+    /// repository together is larger than the snapshot holds (`owner/name`),
+    /// so the page can say which.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cut: Vec<String>,
 }
 
 impl Status {
@@ -180,6 +197,8 @@ pub fn queue_next(cur: Option<&Status>, now: i64, build: &str) -> Option<Status>
         },
         built: prev.built,
         built_repos: prev.built_repos,
+        // The map that is there now still left these out.
+        cut: prev.cut,
     })
 }
 
@@ -526,6 +545,14 @@ pub fn stamp_repos(graph: &mut Value, folders: &BTreeMap<String, String>) {
         .map(|(repo, folder)| (folder.clone(), json!(repo)))
         .collect();
     graph["coderhelm"] = json!({ "repos": m, "floorplan": FLOORPLAN_VERSION.trim() });
+}
+
+/// Records on the map the repositories its snapshot left out, whole or in
+/// part (`owner/name`), so the page can say so.
+pub fn stamp_cut(graph: &mut Value, cut: &[String]) {
+    if !cut.is_empty() {
+        graph["coderhelm"]["cut"] = json!(cut);
+    }
 }
 
 fn arr<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = &'a Value> {
@@ -1106,6 +1133,7 @@ pub fn overview(graph: &Value) -> Value {
         "parts": arr(graph, "nodes").map(|n| json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]})).collect::<Vec<_>>(),
         "screens": arr(graph, "screens").take(80).map(screen_json).collect::<Vec<_>>(),
         "screen_count": screen_counts(graph),
+        "journeys": arr(graph, "flows").take(60).map(|f| json!({"id": f["id"], "title": f["title"], "steps": f["steps"].as_array().map(|a| a.len()).unwrap_or(0)})).collect::<Vec<_>>(),
         "health": graph["health"]["summary"],
         "repos": graph["meta"]["repos"],
         "counts": graph["meta"]["counts"],
@@ -1244,6 +1272,60 @@ pub fn screen_view(graph: &Value, id_or_url: &str) -> Option<Value> {
     }))
 }
 
+/// One journey (flow) by its id or the words of its title: each step in
+/// order, what happens there, the map item it stands on and the file:line
+/// it cites.
+pub fn flow_view(graph: &Value, id_or_words: &str) -> Option<Value> {
+    let q = id_or_words.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let words: Vec<String> = q
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let f = arr(graph, "flows").find(|f| f["id"] == q).or_else(|| {
+        arr(graph, "flows").find(|f| {
+            let hay = format!(
+                "{} {} {}",
+                f["id"].as_str().unwrap_or(""),
+                f["title"].as_str().unwrap_or(""),
+                f["description"].as_str().unwrap_or("")
+            )
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ");
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+    })?;
+    let linked = f["coderhelm"]["linked"].as_array();
+    let steps: Vec<Value> = arr(f, "steps")
+        .enumerate()
+        .map(|(i, s)| {
+            let mut d = describe_ref(graph, s["ref"].as_str().unwrap_or(""));
+            d["step"] = json!(i + 1);
+            d["note"] = s["note"].clone();
+            if let Some(ev) = s["evidence"].as_array() {
+                d["cites"] = json!(ev
+                    .iter()
+                    .filter_map(|e| Some(format!(
+                        "{}:{}",
+                        e["file"].as_str()?,
+                        e["line"].as_u64()?
+                    )))
+                    .collect::<Vec<_>>());
+            }
+            if linked.and_then(|l| l.get(i)) == Some(&json!(false)) {
+                d["inferred"] = json!(true);
+            }
+            d
+        })
+        .collect();
+    Some(json!({
+        "journey": {"id": f["id"], "title": f["title"], "description": f["description"]},
+        "steps": steps,
+    }))
+}
+
 /// Parts, files, endpoints and screens whose names, descriptions or paths
 /// hold every word of the query.
 pub fn search(graph: &Value, q: &str) -> Value {
@@ -1253,7 +1335,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
         .take(8)
         .collect();
     if words.is_empty() {
-        return json!({"parts": [], "files": [], "endpoints": [], "screens": []});
+        return json!({"parts": [], "files": [], "endpoints": [], "screens": [], "journeys": []});
     }
     let hit = |texts: &[&Value]| {
         let hay: String = texts
@@ -1269,6 +1351,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
         "files": arr(graph, "files").filter(|f| hit(&[&f["p"], &f["name"], &f["d"]])).take(30).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"]})).collect::<Vec<_>>(),
         "endpoints": arr(graph, "routes").enumerate().filter(|(_, r)| hit(&[&r["m"], &r["p"], &r["name"], &r["d"]])).take(30).map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "file": r["f"]})).collect::<Vec<_>>(),
         "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"]])).take(20).map(screen_json).collect::<Vec<_>>(),
+        "journeys": arr(graph, "flows").filter(|f| hit(&[&f["id"], &f["title"], &f["description"]])).take(20).map(|f| json!({"id": f["id"], "title": f["title"]})).collect::<Vec<_>>(),
     })
 }
 
@@ -1352,7 +1435,17 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
     out["files"] = json!(files);
     out["routes"] = json!(routes);
     out["links"] = json!(links);
-    out["flows"] = json!([]);
+    // Journeys stay when every step is still on the smaller map.
+    out["flows"] = json!(arr(graph, "flows")
+        .filter_map(|f| {
+            let mut f = f.clone();
+            for s in f["steps"].as_array_mut()? {
+                let r = remap(s["ref"].as_str()?)?;
+                s["ref"] = json!(r);
+            }
+            Some(f)
+        })
+        .collect::<Vec<_>>());
     out["tour"] = json!([]);
     out["screens"] = json!([]);
     if let Some(o) = out.as_object_mut() {
@@ -1365,12 +1458,13 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
 // ── The map lookups (Chat and /mcp) ────────────────────────────────────────
 
 /// The map lookups, in the order they are offered.
-pub const TOOLS: [&str; 5] = [
+pub const TOOLS: [&str; 6] = [
     "map_overview",
     "map_find",
     "map_part",
     "map_screen",
     "map_file",
+    "map_flow",
 ];
 
 pub fn is_tool(name: &str) -> bool {
@@ -1381,11 +1475,12 @@ pub fn is_tool(name: &str) -> bool {
 pub fn tool_defs() -> Vec<Value> {
     let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
     vec![
-        json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
-        json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints and screens whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
+        json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the journeys (user flows such as sign in or checkout), the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
+        json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
         json!({"name": TOOLS[2], "description": "One part of the app map by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
         json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
         json!({"name": TOOLS[4], "description": "One file by its path on the app map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
+        json!({"name": TOOLS[5], "description": "One journey on the app map (a user flow such as sign in, password reset or checkout), by its id or the words of its title (like \"mobile sign in\"): every step in order, from the screen through the requests, the server code and outside services to the next screen, each with what happens there and the file:line it cites. Use it to walk someone through a flow.", "input_schema": obj(json!({"journey": {"type": "string"}}), &["journey"])}),
     ]
 }
 
@@ -1439,6 +1534,9 @@ impl Lookups {
             ),
             "map_file" => file_view(&self.graph, &s("path"))
                 .unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
+            "map_flow" => flow_view(&self.graph, &s("journey")).unwrap_or_else(
+                || json!({"error": "No journey has that id or title; map_overview lists them."}),
+            ),
             _ => json!({"error": "Unknown lookup."}),
         };
         let label = label(name, input);
@@ -1501,6 +1599,7 @@ pub fn label(name: &str, input: &Value) -> String {
         "map_part" => format!("Opened the part {} on the app map", s("id")),
         "map_screen" => format!("Followed the screen {} on the app map", s("screen")),
         "map_file" => format!("Opened {} on the app map", s("path")),
+        "map_flow" => format!("Walked through the journey {} on the app map", s("journey")),
         _ => name.to_string(),
     }
 }
@@ -2186,6 +2285,60 @@ mod tests {
             search(&g, "harbor-mobile signin")["screens"][0]["gate"],
             "signed_out"
         );
+    }
+
+    /// A journey: found by id or title words, each step described with
+    /// what happens there and the lines it cites; listed in the overview
+    /// and search; kept on a mini map that holds every step.
+    #[test]
+    fn a_journey_is_walked_step_by_step() {
+        let mut g = harbor();
+        g["flows"] = json!([{
+            "id": "book-a-slip", "title": "Book a slip", "description": "", "custom": true,
+            "coderhelm": {"linked": [true, true, false]},
+            "steps": [
+                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        for q in ["book-a-slip", "book slip", "Book a SLIP"] {
+            let v = flow_view(&g, q).unwrap();
+            assert_eq!(v["journey"]["title"], "Book a slip", "{q}");
+        }
+        assert!(flow_view(&g, "sign in").is_none());
+        assert!(flow_view(&g, "  ").is_none());
+        let v = flow_view(&g, "book-a-slip").unwrap();
+        let steps = v["steps"].as_array().unwrap();
+        assert_eq!(steps[1]["method"], "POST");
+        assert_eq!(
+            steps[1]["cites"],
+            json!(["harbor-web/lib/slips.ts:2", "harbor-api/src/bookings.js:5"])
+        );
+        assert_eq!(steps[2]["label"], "Stripe");
+        assert_eq!(steps[2]["inferred"], true);
+        assert!(steps[1].get("inferred").is_none());
+        assert_eq!(
+            overview(&g)["journeys"],
+            json!([{"id": "book-a-slip", "title": "Book a slip", "steps": 3}])
+        );
+        assert_eq!(search(&g, "slip")["journeys"][0]["id"], "book-a-slip");
+        let mut b = Lookups::new(g.clone());
+        let (_, label) = b.lookup("map_flow", &json!({"journey": "book a slip"}));
+        assert_eq!(
+            label,
+            "Walked through the journey book a slip on the app map"
+        );
+        assert_eq!(b.parts(), vec!["api", "stripe", "web"]);
+        // On a mini map that holds every step it stays; otherwise it goes.
+        let all = sub_map(
+            &g,
+            &BTreeSet::from(["api".into(), "web".into(), "stripe".into()]),
+        );
+        assert_eq!(all["flows"][0]["steps"][1]["ref"], "r:0");
+        let api = sub_map(&g, &BTreeSet::from(["api".to_string()]));
+        assert_eq!(api["flows"], json!([]));
+        assert!(TOOLS.contains(&"map_flow") && tool_defs().iter().any(|d| d["name"] == "map_flow"));
     }
 
     /// The lookups Chat and /mcp share: they answer from the map, register

@@ -57,6 +57,9 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 400 * 1024 * 1024;
 /// Description jobs run at the same time.
 const PARALLEL_JOBS: usize = 4;
+/// A description step stops starting jobs when less than this is left of
+/// the Lambda's time, and continues in a fresh step.
+const DESCRIBE_RESERVE: std::time::Duration = std::time::Duration::from_secs(4 * 60);
 
 /// The run in progress, kept between steps.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -76,6 +79,10 @@ pub struct Job {
     /// The heads the last finished map was made from.
     #[serde(default)]
     pub built: BTreeMap<String, String>,
+    /// Worksheets a description step had no time left for (by key); the
+    /// next step continues them (`describe_key`) before building.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
 }
 
 /// What to do after a sandbox step, from what Floorplan said.
@@ -166,12 +173,18 @@ fn first_error(v: &Value, fallback: &str) -> String {
 // ── Snapshot ───────────────────────────────────────────────────────────────
 
 /// A repository's files from GitHub's tarball (its one top folder removed),
-/// under `root/<folder>/`, leaving out large and binary files.
-pub fn repo_entries(tarball: &[u8], folder: &str, budget: &mut u64) -> Vec<(String, Vec<u8>)> {
+/// under `root/<folder>/`, leaving out large and binary files. The flag is
+/// true when the snapshot's budget ran out inside this repository, so the
+/// rest of it was left out.
+pub fn repo_entries(
+    tarball: &[u8],
+    folder: &str,
+    budget: &mut u64,
+) -> (Vec<(String, Vec<u8>)>, bool) {
     let mut out = Vec::new();
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
     let Ok(entries) = ar.entries() else {
-        return out;
+        return (out, false);
     };
     for mut e in entries.flatten() {
         if e.header().entry_type() != tar::EntryType::Regular || e.size() > MAX_FILE_BYTES {
@@ -191,12 +204,12 @@ pub fn repo_entries(tarball: &[u8], folder: &str, budget: &mut u64) -> Vec<(Stri
             continue;
         }
         if *budget < buf.len() as u64 {
-            break;
+            return (out, true);
         }
         *budget -= buf.len() as u64;
         out.push((format!("root/{folder}/{rel}"), buf));
     }
-    out
+    (out, false)
 }
 
 /// Floorplan's own files from the last run, under `root/`.
@@ -226,7 +239,10 @@ pub fn state_entries(tgz: &[u8]) -> Vec<(String, Vec<u8>)> {
 
 /// The sandbox's folder: the driver, the job, the vendored release and the
 /// snapshot.
-pub fn pack(job: &Value, files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+pub fn pack<'a, P: AsRef<str>>(
+    job: &Value,
+    files: impl IntoIterator<Item = (P, &'a [u8])>,
+) -> Result<Vec<u8>, String> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut tar = tar::Builder::new(gz);
     let mut add = |path: String, body: &[u8]| -> Result<(), String> {
@@ -246,7 +262,7 @@ pub fn pack(job: &Value, files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String>
         add(format!("coderhelm/{p}"), b)?;
     }
     for (p, b) in files {
-        add(p.clone(), b)?;
+        add(p.as_ref().to_string(), b)?;
     }
     tar.into_inner()
         .and_then(|g| g.finish())
@@ -293,6 +309,32 @@ fn glob_re(glob: &str) -> Option<regex::Regex> {
 }
 
 impl Snapshot {
+    /// The snapshot from the repositories' files, moved in (never copied:
+    /// the snapshot is the largest thing a step holds).
+    pub fn take(entries: Vec<(String, Vec<u8>)>) -> Self {
+        Self {
+            files: entries
+                .into_iter()
+                .filter_map(|(p, b)| Some((p.strip_prefix("root/")?.to_string(), b)))
+                .collect(),
+        }
+    }
+
+    /// The files under `root/` the sandbox gets: the repositories, then the
+    /// last map's own files (all of them, its cache too, from `state`; the
+    /// copies the model's tools read are not sent twice).
+    pub fn packed<'a>(
+        &'a self,
+        state: &'a [(String, Vec<u8>)],
+    ) -> impl Iterator<Item = (String, &'a [u8])> + 'a {
+        self.files
+            .iter()
+            .filter(|(p, _)| !p.starts_with("floorplan/"))
+            .map(|(p, b)| (format!("root/{p}"), b.as_slice()))
+            .chain(state.iter().map(|(p, b)| (p.clone(), b.as_slice())))
+    }
+
+    #[cfg(test)]
     pub fn from_entries(entries: &[(String, Vec<u8>)]) -> Self {
         Self {
             files: entries
@@ -515,6 +557,7 @@ async fn run_job(
     inputs: &[(&str, String)],
     snapshot: &Snapshot,
     usage: &mut TokenUsage,
+    deadline: Option<std::time::Instant>,
 ) -> Option<Value> {
     let (system, user, schema) = job_prompt(job, inputs)?;
     let wf: Value = serde_json::from_str(am::WORKFLOW_JSON).ok()?;
@@ -541,7 +584,7 @@ async fn run_job(
         ConverseOptions {
             max_turns: calls + 6,
             max_tokens: 16_000,
-            deadline: None,
+            deadline,
             effort: Some("low"),
         },
         None,
@@ -671,6 +714,15 @@ pub async fn after_push(state: &WorkerState, team_id: &str) {
 /// One step of a team's map: the message's turn of its build, taken once.
 pub async fn run(state: &WorkerState, msg: AppMapMessage) {
     let team_id = msg.team_id.clone();
+    if msg.step == "flows" {
+        // The journeys come after the map is ready, outside the build's
+        // turns; the step runs once (it takes its input before asking).
+        let call = flows_step(state, &team_id);
+        if let Err(e) = common::usage::with_feature(common::usage::feature::APP_MAP, call).await {
+            warn!(team_id, error = %e, "App map: the journeys step failed");
+        }
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let taken = am::update_status(
         &state.dynamo,
@@ -702,6 +754,50 @@ pub async fn run(state: &WorkerState, msg: AppMapMessage) {
         warn!(team_id, error = %e, "App map: the step failed");
         let _ = change(state, &team_id, |cur, now| am::failed(cur, &build, &e, now)).await;
     }
+}
+
+/// One output of the driver: the file itself, or its parts
+/// (`<name>.000`, `.001`, ...) joined in order. Base64, decoded.
+pub fn output(files: &[(String, String)], name: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let base = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
+    let mut parts: Vec<(String, &String)> = files
+        .iter()
+        .filter_map(|(f, b)| {
+            let n = base(f);
+            let rest = n.strip_prefix(name)?;
+            (rest.is_empty()
+                || (rest.len() == 4
+                    && rest.starts_with('.')
+                    && rest[1..].bytes().all(|c| c.is_ascii_digit())))
+            .then_some((n, b))
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort();
+    let joined: String = parts.iter().map(|(_, b)| b.trim()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(joined)
+        .ok()
+}
+
+/// The time a step has left before its Lambda stops (none in tests).
+fn time_left() -> Option<std::time::Duration> {
+    common::model_stream::time_left()
+}
+
+/// Whether a description step stops starting jobs and continues in a
+/// fresh step, with this much of the Lambda's time left.
+pub fn pause_describing(left: Option<std::time::Duration>) -> bool {
+    left.is_some_and(|t| t < DESCRIBE_RESERVE)
+}
+
+/// A deadline for one model job: the Lambda's, less a minute for writes.
+fn job_deadline() -> Option<std::time::Instant> {
+    time_left()
+        .map(|t| std::time::Instant::now() + t.saturating_sub(std::time::Duration::from_secs(60)))
 }
 
 async fn step(
@@ -787,19 +883,25 @@ async fn step(
             })
         })
         .await?;
-    } else {
+    } else if msg.step != "describe" {
         // The stage stays: putting the map together is part of the one
         // before it.
         progress(state, team_id, build, None, "Putting the map together").await?;
     }
 
-    // The snapshot: every repository at its head, and the last map's files.
+    // The snapshot: every repository at its head (moved into the snapshot
+    // as each is read, never copied), and the last map's own files.
     let mut budget = MAX_SNAPSHOT_BYTES;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut cut: Vec<String> = Vec::new();
     for (repo, sha) in &job.heads {
         let Some((owner, name)) = repo.split_once('/') else {
             continue;
         };
+        if budget == 0 {
+            cut.push(repo.clone());
+            continue;
+        }
         let folder = folders
             .get(repo)
             .cloned()
@@ -808,17 +910,66 @@ async fn step(
             .download_tarball(owner, name, sha)
             .await
             .map_err(|e| format!("{repo} couldn't be read: {e}"))?;
-        entries.extend(repo_entries(&tarball, &folder, &mut budget));
+        let (got, short) = repo_entries(&tarball, &folder, &mut budget);
+        drop(tarball);
+        if short {
+            budget = 0;
+            cut.push(repo.clone());
+        }
+        files.extend(got);
     }
-    if let Some(prev) = s3_get(state, &am::state_key(team_id)).await {
-        entries.extend(state_entries(&prev));
+    if !cut.is_empty() {
+        warn!(team_id, cut = ?cut, "App map: the repositories are larger than the snapshot holds; these were left out, whole or in part");
     }
-    let snapshot = Snapshot::from_entries(&entries);
+    // The status names what this build leaves out (and clears a cut that
+    // no longer happens).
+    let c = cut.clone();
+    change(state, team_id, |cur, now| {
+        if cur?.cut == c {
+            return cur.filter(|s| s.build == build).cloned();
+        }
+        let mut s = am::progress(cur, build, None, &cur?.step, now)?;
+        s.cut = c.clone();
+        Some(s)
+    })
+    .await?;
+    let prev = s3_get(state, &am::state_key(team_id))
+        .await
+        .map(|b| state_entries(&b))
+        .unwrap_or_default();
+    let mut snapshot = Snapshot::take(files);
+    // The model's tools also read the last map's own files (not its cache).
+    for (p, b) in &prev {
+        if let Some(rel) = p.strip_prefix("root/") {
+            if !rel.starts_with("floorplan/.cache") {
+                snapshot.files.insert(rel.to_string(), b.clone());
+            }
+        }
+    }
+    let provider = crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await
+    .map_err(|e| format!("no model for this team: {e}"))?;
+    if msg.step == "describe" {
+        // A description step that ran out of time: continue it with the
+        // same worksheets, then build.
+        let left: Value = s3_get(state, &am::describe_key(team_id))
+            .await
+            .and_then(|b| am::gunzip(&b, 64 * 1024 * 1024))
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let sheets: Vec<Value> = left["sheets"].as_array().cloned().unwrap_or_default();
+        let style = left["style"].as_str().unwrap_or("").to_string();
+        return describe(
+            state, team_id, &provider, &snapshot, sheets, &style, job, build, turn,
+        )
+        .await;
+    }
     let mode = if msg.step.is_empty() {
-        if entries
-            .iter()
-            .any(|(p, _)| p == "root/floorplan/graph.json")
-        {
+        if prev.iter().any(|(p, _)| p == "root/floorplan/graph.json") {
             "refresh"
         } else {
             "start"
@@ -836,8 +987,14 @@ async fn step(
         .iter()
         .filter_map(|(r, h)| Some((folders.get(r)?, h)))
         .collect();
-    let spec = json!({"mode": mode, "answers": job.answers, "branches": branches, "heads": heads});
-    let source = pack(&spec, &entries)?;
+    let spec = json!({
+        "mode": mode,
+        "answers": job.answers,
+        "branches": branches,
+        "heads": heads,
+        "flows": if super::app_map_flows::visible() { "visible" } else { "hidden" },
+    });
+    let source = pack(&spec, snapshot.packed(&prev))?;
 
     let sandbox = crate::clients::sandbox::SandboxClient::new(
         &state.codebuild,
@@ -860,21 +1017,11 @@ async fn step(
         )
         .await
         .map_err(|e| format!("the sandbox couldn't run Floorplan ({e})"))?;
-    let file = |n: &str| {
-        out.files
-            .iter()
-            .find(|(f, _)| f.ends_with(n))
-            .map(|(_, b)| b.clone())
-    };
-    let b64 = |s: String| -> Option<Vec<u8>> {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(s.trim())
-            .ok()
-    };
-    let result: Value = file("result.b64")
-        .and_then(b64)
-        .and_then(|b| am::gunzip(&b, 64 * 1024 * 1024))
+    if !out.dropped.is_empty() {
+        warn!(team_id, dropped = ?out.dropped, "App map: some of the sandbox's outputs couldn't be brought back");
+    }
+    let result: Value = output(&out.files, "result.b64")
+        .and_then(|b| am::gunzip(&b, 256 * 1024 * 1024))
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| {
             format!(
@@ -882,18 +1029,11 @@ async fn step(
                 common::truncate_str(out.output.lines().last().unwrap_or(""), 300)
             )
         })?;
-    if let Some(st) = file("state.b64").and_then(b64) {
+    if let Some(st) = output(&out.files, "state.b64") {
         s3_put(state, &am::state_key(team_id), st).await?;
     }
     job.answers.clear();
 
-    let provider = crate::agent::provider::ModelProvider::load_for_team(
-        &state.dynamo,
-        &state.config.settings_table_name,
-        team_id,
-    )
-    .await
-    .map_err(|e| format!("no model for this team: {e}"))?;
     let mut usage = TokenUsage::default();
     match decide(&result, &job) {
         Next::Architecture { job: name, item } => {
@@ -963,6 +1103,7 @@ async fn step(
                 &inputs,
                 &snapshot,
                 &mut usage,
+                job_deadline(),
             )
             .await
             .ok_or("the map's parts couldn't be worked out this time")?;
@@ -972,19 +1113,11 @@ async fn step(
         }
         Next::Describe(keys) => {
             job.desc_attempts += 1;
-            progress(
-                state,
-                team_id,
-                build,
-                Some(am::STAGES[2]),
-                "Describing each part, file and endpoint",
-            )
-            .await?;
             let style = result["describe"]["style"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let sheets: Vec<&Value> = result["worksheets"]
+            let sheets: Vec<Value> = result["worksheets"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -993,46 +1126,13 @@ async fn step(
                         .as_str()
                         .is_some_and(|k| keys.iter().any(|x| x == k))
                 })
+                .cloned()
                 .collect();
-            let light = state.config.light_model_id.clone();
-            for chunk in sheets.chunks(PARALLEL_JOBS) {
-                let runs = chunk.iter().map(|w| {
-                    let inputs = vec![
-                        (
-                            "Worksheet",
-                            w["worksheet"].as_str().unwrap_or("").to_string(),
-                        ),
-                        (
-                            "The file to fill in, as it stands",
-                            w["descriptions"].to_string(),
-                        ),
-                        ("Who you're writing for", style.clone()),
-                    ];
-                    let provider = &provider;
-                    let snapshot = &snapshot;
-                    let light = light.clone();
-                    async move {
-                        let mut u = TokenUsage::default();
-                        let a = run_job(
-                            state,
-                            provider,
-                            &light,
-                            "descriptions",
-                            &inputs,
-                            snapshot,
-                            &mut u,
-                        )
-                        .await;
-                        (w["descriptionsPath"].as_str().unwrap_or("").to_string(), a)
-                    }
-                });
-                for (path, answer) in futures::future::join_all(runs).await {
-                    if let Some(a) = answer {
-                        job.answers.insert(path, a);
-                    }
-                }
-            }
-            next_step(state, team_id, &job, build, turn).await
+            drop(result);
+            describe(
+                state, team_id, &provider, &snapshot, sheets, &style, job, build, turn,
+            )
+            .await
         }
         Next::Stop(why) => {
             s3_put(
@@ -1044,9 +1144,7 @@ async fn step(
             Err(why)
         }
         Next::Done => {
-            let graph = file("graph.b64")
-                .and_then(b64)
-                .ok_or("the build wrote no map")?;
+            let graph = output(&out.files, "graph.b64").ok_or("the build wrote no map")?;
             let json = am::gunzip(&graph, am::MAX_GRAPH_BYTES).ok_or("the map is too large")?;
             let mut g: Value = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
             am::stamp_repos(
@@ -1057,6 +1155,7 @@ async fn step(
                     .map(|(r, f)| (r.clone(), f.clone()))
                     .collect(),
             );
+            am::stamp_cut(&mut g, &cut);
             s3_put(
                 state,
                 &am::graph_key(team_id),
@@ -1092,11 +1191,204 @@ async fn step(
                 files = g["files"].as_array().map(|a| a.len()).unwrap_or(0),
                 screens = g["screens"].as_array().map(|a| a.len()).unwrap_or(0),
                 extract_ms = result["coderhelm"]["ms"].as_u64().unwrap_or(0),
+                flows = %result["flows"]["report"],
                 "App map: built"
             );
+            if let Some(e) = result["flows"]["error"].as_str() {
+                warn!(
+                    team_id,
+                    error = e,
+                    "App map: the journeys couldn't be prepared"
+                );
+            }
+            // Journeys the model must (re)write: a step of their own after
+            // the map is ready, so they never hold it up.
+            let todo = &result["flows"]["todo"];
+            if todo.is_object() {
+                let mut todo = todo.clone();
+                todo["heads"] = json!(job.built);
+                s3_put(
+                    state,
+                    &am::flows_todo_key(team_id),
+                    am::gzip(todo.to_string().as_bytes()),
+                )
+                .await?;
+                if !queue(state, team_id, "flows", build, 0, 0).await {
+                    warn!(team_id, "App map: the journeys step couldn't be queued");
+                }
+            }
             Ok(())
         }
     }
+}
+
+/// Describes worksheets on the light model, a few at a time. When the
+/// Lambda's time runs short it stops starting jobs, keeps what is done and
+/// the worksheets left, and continues in the build's next turn; then it
+/// builds.
+#[allow(clippy::too_many_arguments)]
+async fn describe(
+    state: &WorkerState,
+    team_id: &str,
+    provider: &crate::agent::provider::ModelProvider,
+    snapshot: &Snapshot,
+    sheets: Vec<Value>,
+    style: &str,
+    mut job: Job,
+    build: &str,
+    turn: u32,
+) -> Result<(), String> {
+    progress(
+        state,
+        team_id,
+        build,
+        Some(am::STAGES[2]),
+        "Describing each part, file and endpoint",
+    )
+    .await?;
+    let light = state.config.light_model_id.clone();
+    let mut left: Vec<Value> = sheets;
+    while !left.is_empty() {
+        if pause_describing(time_left()) {
+            info!(
+                team_id,
+                left = left.len(),
+                "App map: describing continues in a fresh step"
+            );
+            job.pending = left
+                .iter()
+                .filter_map(|w| w["key"].as_str().map(str::to_string))
+                .collect();
+            s3_put(
+                state,
+                &am::describe_key(team_id),
+                am::gzip(
+                    json!({"sheets": left, "style": style})
+                        .to_string()
+                        .as_bytes(),
+                ),
+            )
+            .await?;
+            return next_named(state, team_id, &job, build, turn, "describe").await;
+        }
+        let chunk: Vec<Value> = left.drain(..left.len().min(PARALLEL_JOBS)).collect();
+        let deadline = job_deadline();
+        let runs = chunk.iter().map(|w| {
+            let inputs = vec![
+                (
+                    "Worksheet",
+                    w["worksheet"].as_str().unwrap_or("").to_string(),
+                ),
+                (
+                    "The file to fill in, as it stands",
+                    w["descriptions"].to_string(),
+                ),
+                ("Who you're writing for", style.to_string()),
+            ];
+            let light = light.clone();
+            async move {
+                let mut u = TokenUsage::default();
+                let a = run_job(
+                    state,
+                    provider,
+                    &light,
+                    "descriptions",
+                    &inputs,
+                    snapshot,
+                    &mut u,
+                    deadline,
+                )
+                .await;
+                (w["descriptionsPath"].as_str().unwrap_or("").to_string(), a)
+            }
+        });
+        for (path, answer) in futures::future::join_all(runs).await {
+            if let Some(a) = answer {
+                job.answers.insert(path, a);
+            }
+        }
+    }
+    job.pending.clear();
+    next_step(state, team_id, &job, build, turn).await
+}
+
+/// The journeys step: the light model names journeys and picks and orders
+/// the sandbox's candidates; the checker keeps only cited steps. The result
+/// goes into the map's state (`flows.json`) and, when shown, the map.
+async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
+    use super::app_map_flows as fl;
+    let Some(todo) = s3_get(state, &am::flows_todo_key(team_id))
+        .await
+        .and_then(|b| am::gunzip(&b, 64 * 1024 * 1024))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return Ok(());
+    };
+    // Taken before the model is asked, so a message delivered twice asks
+    // once; if the answer is lost, the next build asks again.
+    let _ = state
+        .s3
+        .delete_object()
+        .bucket(&state.config.bucket_name)
+        .key(am::flows_todo_key(team_id))
+        .send()
+        .await;
+    let job: Job = s3_get(state, &am::job_key(team_id))
+        .await
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    // A newer build took over: its own journeys step follows it.
+    if todo["heads"] != json!(job.built) {
+        info!(team_id, "App map: journeys are for an older build, skipped");
+        return Ok(());
+    }
+    let provider = crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await
+    .map_err(|e| format!("no model for this team: {e}"))?;
+    common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
+    let mut usage = TokenUsage::default();
+    let client = provider.client();
+    let (new, rep, _) =
+        match fl::ask(&client, &state.config.light_model_id, &todo, &mut usage).await {
+            Ok(x) => x,
+            Err(e) => {
+                // The map stays as it is; the next build asks again.
+                warn!(team_id, error = %e, "App map: the journeys couldn't be written");
+                return Ok(());
+            }
+        };
+    info!(team_id, flows = new.len(), checked = ?rep, cost = usage.cost_usd, "App map: journeys written");
+    let tgz = s3_get(state, &am::state_key(team_id))
+        .await
+        .ok_or("the map's state is gone")?;
+    let store: Value = fl::read_from_tgz(&tgz, fl::STORE)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({"schema": fl::SCHEMA, "flows": []}));
+    let store = fl::merge(&store, &todo, new);
+    let tgz = fl::replace_in_tgz(&tgz, fl::STORE, store.to_string().as_bytes())?;
+    s3_put(state, &am::state_key(team_id), tgz).await?;
+    if fl::visible() {
+        if let Some(b) = s3_get(state, &am::graph_key(team_id)).await {
+            if let Some(mut g) = am::gunzip(&b, am::MAX_GRAPH_BYTES)
+                .and_then(|j| serde_json::from_slice::<Value>(&j).ok())
+            {
+                fl::put_in_graph(&mut g, &store);
+                s3_put(
+                    state,
+                    &am::graph_key(team_id),
+                    am::gzip(g.to_string().as_bytes()),
+                )
+                .await?;
+                // The page's copy and index, as after a build.
+                am::store_derived(&state.s3, &state.config.bucket_name, team_id, &g).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn next_step(
@@ -1106,13 +1398,25 @@ async fn next_step(
     build: &str,
     turn: u32,
 ) -> Result<(), String> {
+    next_named(state, team_id, job, build, turn, "build").await
+}
+
+/// Keeps the job and queues the build's next turn as step `name`.
+async fn next_named(
+    state: &WorkerState,
+    team_id: &str,
+    job: &Job,
+    build: &str,
+    turn: u32,
+    name: &str,
+) -> Result<(), String> {
     s3_put(
         state,
         &am::job_key(team_id),
         serde_json::to_vec(job).unwrap_or_default(),
     )
     .await?;
-    if queue(state, team_id, "build", build, turn, 0).await {
+    if queue(state, team_id, name, build, turn, 0).await {
         Ok(())
     } else {
         Err("the next step couldn't be queued".into())
@@ -1224,12 +1528,20 @@ mod tests {
         }
         let bytes = tar.into_inner().unwrap().finish().unwrap();
         let mut budget = MAX_SNAPSHOT_BYTES;
-        let e = repo_entries(&bytes, "harbor-api", &mut budget);
+        let (e, cut) = repo_entries(&bytes, "harbor-api", &mut budget);
+        assert!(!cut);
         assert_eq!(
             e.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
             vec!["root/harbor-api/src/server.js"]
         );
-        let packed = pack(&json!({"mode": "start"}), &e).unwrap();
+        // Past the snapshot's budget the rest of the repository is left
+        // out, and said so (the map's status names it).
+        let mut small = 4;
+        let (none, cut) = repo_entries(&bytes, "harbor-api", &mut small);
+        assert!(none.is_empty() && cut);
+        let snapshot = Snapshot::take(e);
+        let state = vec![("root/floorplan/graph.json".to_string(), b"{}".to_vec())];
+        let packed = pack(&json!({"mode": "start"}), snapshot.packed(&state)).unwrap();
         let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(&packed[..]));
         let names: Vec<String> = ar
             .entries()
@@ -1243,6 +1555,50 @@ mod tests {
         assert!(names.contains(&"app-map/fp/skills/floorplan/scripts/scan.mjs".to_string()));
         assert!(names.contains(&"app-map/fp/LICENSE".to_string()));
         assert!(names.contains(&"app-map/root/harbor-api/src/server.js".to_string()));
+        assert!(names.contains(&"app-map/root/floorplan/graph.json".to_string()));
+        assert!(names.contains(&"app-map/coderhelm/flows.mjs".to_string()));
+    }
+
+    #[test]
+    fn describing_continues_in_a_fresh_step_before_the_lambda_stops() {
+        use std::time::Duration;
+        assert!(!pause_describing(None));
+        assert!(!pause_describing(Some(Duration::from_secs(10 * 60))));
+        assert!(pause_describing(Some(Duration::from_secs(3 * 60))));
+        // What is left is kept with the job, and a job from before reads.
+        let job: Job = serde_json::from_str(r#"{"heads": {}}"#).unwrap();
+        assert!(job.pending.is_empty());
+        let j = Job {
+            pending: vec!["api".into()],
+            ..Default::default()
+        };
+        let back: Job = serde_json::from_str(&serde_json::to_string(&j).unwrap()).unwrap();
+        assert_eq!(back, j);
+    }
+
+    #[test]
+    fn a_large_output_comes_back_in_parts_joined_in_order() {
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(b"the whole map, in three parts");
+        let (a, rest) = b64.split_at(8);
+        let (b, c) = rest.split_at(8);
+        let files = vec![
+            ("out/graph.b64.002".to_string(), c.to_string()),
+            ("out/graph.b64.000".to_string(), a.to_string()),
+            ("out/result.b64".to_string(), b64.clone()),
+            ("out/graph.b64.001".to_string(), format!("{b}\n")),
+            ("out/graph.b64.other".to_string(), "x".to_string()),
+        ];
+        assert_eq!(
+            output(&files, "graph.b64").unwrap(),
+            b"the whole map, in three parts"
+        );
+        assert_eq!(
+            output(&files, "result.b64").unwrap(),
+            b"the whole map, in three parts"
+        );
+        assert!(output(&files, "state.b64").is_none());
     }
 
     #[test]

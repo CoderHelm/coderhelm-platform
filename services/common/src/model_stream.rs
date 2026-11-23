@@ -320,6 +320,12 @@ fn deadline() -> Option<tokio::time::Instant> {
     }
 }
 
+/// Time left before the deadline (the Lambda's, less the margin), or
+/// `None` when there is none (tests, local runs).
+pub fn time_left() -> Option<std::time::Duration> {
+    deadline().map(|d| d.saturating_duration_since(tokio::time::Instant::now()))
+}
+
 async fn until(d: Option<tokio::time::Instant>) {
     match d {
         Some(d) => tokio::time::sleep_until(d).await,

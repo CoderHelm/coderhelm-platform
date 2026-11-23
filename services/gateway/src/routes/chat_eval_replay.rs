@@ -890,6 +890,80 @@ mod tests {
         assert_eq!(mini["graph"]["schema"], "floorplan/graph@1");
     }
 
+    /// "Walk me through mobile sign-in" on a map with that journey: Chat
+    /// walks it with `map_flow`, every step citing its files, and the answer
+    /// cites the map with the parts the journey crosses.
+    #[tokio::test]
+    async fn offline_walk_me_through_mobile_sign_in_follows_the_journey() {
+        let c = ReplayCase {
+            name: "map: walk me through mobile sign-in".into(),
+            origin: "variant".into(),
+            intent: "how_to".into(),
+            history: Vec::new(),
+            question: "Walk me through mobile sign-in".into(),
+            wants: "The steps of signing in on the mobile app, in order, citing files.".into(),
+        };
+        let mut map = harbor_map();
+        // A made-up mobile app beside harbor's website: its sign-in screen,
+        // the session endpoint and Okta behind it.
+        map["files"].as_array_mut().unwrap().extend([
+            json!({"p": "harbor-mobile/src/screens/SignIn.tsx", "n": "web", "r": "harbor-mobile", "name": "Sign-in screen", "d": "Asks for the boater's email and password."}),
+            json!({"p": "harbor-api/src/sessions.js", "n": "api", "r": "harbor-api", "name": "Sessions", "d": "Signs a boater in."}),
+        ]);
+        map["routes"].as_array_mut().unwrap().push(json!({"f": "harbor-api/src/sessions.js", "m": "POST", "p": "/sessions", "l": 4, "name": "Sign in", "d": "Checks the password with Okta."}));
+        map["nodes"].as_array_mut().unwrap().push(json!({"id": "okta", "parent": null, "label": "Okta", "kind": "external", "summary": "Sign-in."}));
+        map["flows"] = json!([{
+            "id": "mobile-sign-in", "title": "Mobile sign-in", "description": "", "custom": true,
+            "coderhelm": {"entry": "screen:mobile:/(Auth)/SignIn", "linked": [true, true, true, true]},
+            "steps": [
+                {"ref": "f:harbor-mobile/src/screens/SignIn.tsx", "note": "The boater types their email and password.", "evidence": [{"file": "harbor-mobile/src/navigation/Auth.tsx", "line": 12}]},
+                {"ref": "r:1", "note": "The app posts them to the sessions endpoint.", "evidence": [{"file": "harbor-mobile/src/api.ts", "line": 30}, {"file": "harbor-api/src/sessions.js", "line": 4}]},
+                {"ref": "n:okta", "note": "Okta checks the password.", "evidence": [{"file": "harbor-api/src/sessions.js", "line": 1}]},
+                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater lands on their slips.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
+            ],
+        }]);
+        let (host, repos) = replay_fixture();
+        let store = work_store();
+        let steps: Vec<Step> = vec![
+            Box::new(|b| {
+                assert!(
+                    b["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["name"] == "map_flow"),
+                    "{}",
+                    b["tools"]
+                );
+                calls("m", "map_flow", json!({"journey": "mobile sign in"}))
+            }),
+            Box::new(|b| {
+                let r = super::super::chat_agent::testing::last_result(b);
+                assert!(r.contains("[S1]"), "{r}");
+                assert!(
+                    r.contains("harbor-mobile/src/navigation/Auth.tsx:12")
+                        && r.contains("harbor-api/src/sessions.js:4"),
+                    "{r}"
+                );
+                say("Signing in on the mobile app:\n1. The boater types their email and password on the sign-in screen (harbor-mobile/src/navigation/Auth.tsx:12) [S1].\n2. The app posts them to the sessions endpoint (harbor-api/src/sessions.js:4) [S1].\n3. Okta checks the password [S1].\n4. The boater lands on their slips [S1].")
+            }),
+        ];
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, reg, mini) = replay_with(&model, &host, &repos, &store, &c, Some(map)).await;
+        assert_eq!(out.calls, ["map_flow"]);
+        assert!(out.fin.grounded);
+        let cited = &out.fin.citations[0];
+        assert_eq!(cited.kind, common::app_map::SOURCE_KIND);
+        assert_eq!(
+            cited.title,
+            "Walked through the journey mobile sign in on the app map"
+        );
+        assert_eq!(reg.len(), 1);
+        let mini = mini.expect("a mini map");
+        assert_eq!(mini["parts"], json!(["api", "okta", "web"]));
+        assert_eq!(mini["graph"]["flows"][0]["id"], "mobile-sign-in");
+    }
+
     /// The same question with no map built: no map lookups are offered, and
     /// the answer is told to say so in one line and read the code.
     #[tokio::test]

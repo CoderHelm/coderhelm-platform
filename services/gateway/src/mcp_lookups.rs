@@ -8,7 +8,7 @@
 //! - `list_bases`, and the typed lookups: `find_tickets`,
 //!   `find_pull_requests`, `find_runs`, `find_findings`, `code_search`,
 //!   `read_file`, `code_symbol`, `history`, and the app map's lookups
-//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`), the
+//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`, `map_flow`), the
 //!   same ones Chat uses (`common::app_map::Lookups`), over the signed-in
 //!   team's own map.
 //!
@@ -63,6 +63,7 @@ pub const MAP_FIND: &str = "map_find";
 pub const MAP_PART: &str = "map_part";
 pub const MAP_SCREEN: &str = "map_screen";
 pub const MAP_FILE: &str = "map_file";
+pub const MAP_FLOW: &str = "map_flow";
 /// The dashboard route whose check decides a map read: the App map page.
 pub const MAP_ROUTE: &str = "app_map::get_map";
 
@@ -313,7 +314,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_OVERVIEW,
         title: "Read the app map",
-        description: "The team's app map in short, as CoderHelm drew it from every repository: each part of the app (its id, name, kind and what it does in plain words), the screens, the repositories and the open problems on it. Start here for how the app fits together.",
+        description: "The team's app map in short, as CoderHelm drew it from every repository: each part of the app (its id, name, kind and what it does in plain words), the screens, the journeys (user flows such as sign in or checkout), the repositories and the open problems on it. Start here for how the app fits together.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({}), &[]),
         output: None,
@@ -321,7 +322,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_FIND,
         title: "Search the app map",
-        description: "Searches the team's app map for parts, files, endpoints and screens whose names, descriptions or paths hold every word, with their ids for map_part, map_screen and map_file.",
+        description: "Searches the team's app map for parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word, with their ids for map_part, map_screen, map_file and map_flow.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slip." } }), &["query"]),
         output: None,
@@ -348,6 +349,14 @@ pub const TOOLS: &[Tool] = &[
         description: "One file on the team's app map by its path (the repository's folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to. Read the file's lines with read_file.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({ "path": { "type": "string", "description": "The file's path on the map." } }), &["path"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_FLOW,
+        title: "Walk through a journey on the app map",
+        description: "One journey through the team's app (a user flow such as sign in, password reset or checkout), step by step in order: the screens, the requests they make, the server code and outside services behind them, and the next screen, each with what happens there and the file:line it cites. Give the journey's id or the words of its title, like mobile sign in.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "journey": { "type": "string", "description": "A journey's id or title words, from map_overview or map_find." } }), &["journey"]),
         output: None,
     },
 ];
@@ -595,11 +604,12 @@ pub fn read_of(tool: &str, args: &Value) -> Result<Read, String> {
             Read::new(GITHUB_HISTORY, take(args, &keys))
         }
         MAP_OVERVIEW => Read::new(MAP_OVERVIEW, json!({})),
-        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE => {
+        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE | MAP_FLOW => {
             let key = match tool {
                 MAP_FIND => "query",
                 MAP_PART => "id",
                 MAP_SCREEN => "screen",
+                MAP_FLOW => "journey",
                 _ => "path",
             };
             let r = take(args, &[key]);
@@ -1789,6 +1799,7 @@ mod tests {
             (MAP_PART, json!({ "id": "api" })),
             (MAP_SCREEN, json!({ "screen": "/slips/:id" })),
             (MAP_FILE, json!({ "path": "harbor-api/src/bookings.js" })),
+            (MAP_FLOW, json!({ "journey": "book a slip" })),
         ];
         for k in FINDING_KINDS {
             v.push((FIND_FINDINGS, json!({ "kind": k })));
@@ -1820,7 +1831,8 @@ mod tests {
                 MAP_FIND,
                 MAP_PART,
                 MAP_SCREEN,
-                MAP_FILE
+                MAP_FILE,
+                MAP_FLOW
             ]
         );
         for t in &tools {
@@ -2035,7 +2047,8 @@ mod tests {
                 MAP_FIND,
                 MAP_PART,
                 MAP_SCREEN,
-                MAP_FILE
+                MAP_FILE,
+                MAP_FLOW
             ]
         );
         assert!(!names(BTreeSet::from([READ_SCOPE, WORK_SCOPE])).contains(&MAP_PART.to_string()));
@@ -2127,6 +2140,59 @@ mod tests {
             audit_detail(MAP_FILE, &json!({ "path": "harbor-api/src/x.js" }))
                 .contains("Code / app_map")
         );
+    }
+
+    /// A journey on /mcp: the same lookup as Chat's, every step citing its
+    /// file and line, cited back to the App map page.
+    #[test]
+    fn a_journey_is_walked_step_by_step_with_its_files() {
+        let mut g = harbor("harbor");
+        g["flows"] = json!([{
+            "id": "book-a-slip", "title": "Book a slip", "custom": true, "coderhelm": {"linked": [true, true, true]},
+            "steps": [
+                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks the booking service to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        let read = read_of(MAP_FLOW, &json!({ "journey": "book a slip" })).unwrap();
+        assert_eq!(read.lookup, MAP_FLOW);
+        assert_eq!(
+            scope_needed(MAP_FLOW, &json!({ "journey": "x" })),
+            Some(CODE_SCOPE)
+        );
+        assert!(read_of(MAP_FLOW, &json!({})).is_err());
+        let mut reg = Registry::default();
+        let (text, _) = map_read(Some(g.clone()), &mut reg, &read).unwrap();
+        assert!(text.contains("harbor-web/lib/slips.ts:2"), "{text}");
+        assert!(text.contains("Stripe charges the card."), "{text}");
+        let found = items(&reg, &read, "https://app.example");
+        assert_eq!(
+            found[0].title,
+            "Walked through the journey book a slip on the app map"
+        );
+        assert_eq!(
+            found[0].url,
+            "https://app.example/app-map?focus=api,stripe,web"
+        );
+        // Listed in the overview and found by search.
+        let (overview, _) = map_read(
+            Some(g.clone()),
+            &mut Registry::default(),
+            &read_of(MAP_OVERVIEW, &json!({})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            overview.contains("\"journeys\":[{\"id\":\"book-a-slip\""),
+            "{overview}"
+        );
+        let (found, _) = map_read(
+            Some(g),
+            &mut Registry::default(),
+            &read_of(MAP_FIND, &json!({ "query": "slip book" })).unwrap(),
+        )
+        .unwrap();
+        assert!(found.contains("\"title\":\"Book a slip\""), "{found}");
     }
 
     #[test]
