@@ -55,6 +55,10 @@ pub struct Store {
     sent: Mutex<Vec<(String, String)>>,
     /// S3 objects by path (`/bucket/key`).
     objects: Mutex<HashMap<String, S3Object>>,
+    /// Every DynamoDB call as IAM authorizes it: `(action, resource)`, the
+    /// resource being the table's name, or `table/index/name` for a query of
+    /// an index (a transaction is one action per item it writes).
+    dynamo_calls: Mutex<Vec<(String, String)>>,
 }
 
 /// An object kept by the S3 stand-in.
@@ -97,6 +101,12 @@ impl Store {
             .iter()
             .map(|(_, b)| b.clone())
             .collect()
+    }
+
+    /// The DynamoDB calls made so far, as `(action, resource)` (see
+    /// `dynamo_calls`), each once.
+    pub fn dynamo_calls(&self) -> std::collections::BTreeSet<(String, String)> {
+        self.dynamo_calls.lock().unwrap().iter().cloned().collect()
     }
 
     /// Cancels every transaction from now on.
@@ -393,6 +403,43 @@ async fn handle(
 
 // ── DynamoDB ────────────────────────────────────────────────────────
 
+/// Notes what IAM would authorize for one call: the action on its table (or
+/// the index it queries); a batch or a transaction, each table it names.
+fn record_call(store: &Store, op: &str, req: &Value) {
+    let mut calls = store
+        .dynamo_calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut note = |action: &str, resource: String| {
+        calls.push((format!("dynamodb:{action}"), resource));
+    };
+    match op {
+        "TransactWriteItems" | "TransactGetItems" => {
+            for t in req["TransactItems"].as_array().into_iter().flatten() {
+                if let Some((kind, w)) = t.as_object().and_then(|o| o.iter().next()) {
+                    let action = match kind.as_str() {
+                        "ConditionCheck" => "ConditionCheckItem".to_string(),
+                        k => format!("{k}Item"),
+                    };
+                    note(&action, w["TableName"].as_str().unwrap_or("").to_string());
+                }
+            }
+        }
+        "BatchGetItem" | "BatchWriteItem" => {
+            for t in req["RequestItems"].as_object().into_iter().flatten() {
+                note(op, t.0.clone());
+            }
+        }
+        _ => {
+            let table = req["TableName"].as_str().unwrap_or("").to_string();
+            match req["IndexName"].as_str() {
+                Some(i) => note(op, format!("{table}/index/{i}")),
+                None => note(op, table),
+            }
+        }
+    }
+}
+
 struct Ctx<'a> {
     names: &'a Value,
     values: &'a Value,
@@ -669,6 +716,7 @@ fn placeholders_match(w: &Value) {
 
 fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
     let table = req["TableName"].as_str().unwrap_or("").to_string();
+    record_call(store, op, req);
     if op == "TransactWriteItems" {
         for t in req["TransactItems"].as_array().into_iter().flatten() {
             if let Some((_, w)) = t.as_object().and_then(|o| o.iter().next()) {
@@ -973,6 +1021,36 @@ fn kms(store: &Store, op: &str, req: &Value) -> Response {
 
 /// The gateway's state with every AWS client pointed at the stand-in.
 pub fn state(url: &str) -> Arc<crate::AppState> {
+    state_with(url, |_| {})
+}
+
+/// The same, with every table named as its deployment's suffix (`users`,
+/// `plans`, `mcp-configs`; the main table is `main`), so a test can map
+/// each call to the table the infrastructure creates.
+pub fn state_all_tables(url: &str) -> Arc<crate::AppState> {
+    state_with(url, |c| {
+        for (field, name) in [
+            (&mut c.runs_table_name, "runs"),
+            (&mut c.analytics_table_name, "analytics"),
+            (&mut c.events_table_name, "events"),
+            (&mut c.jira_tokens_table_name, "jira-tokens"),
+            (&mut c.jira_events_table_name, "jira-events"),
+            (&mut c.plans_table_name, "plans"),
+            (&mut c.jira_config_table_name, "jira-config"),
+            (&mut c.aws_insights_table_name, "aws-insights"),
+            (&mut c.infra_table_name, "infra"),
+            (&mut c.banners_table_name, "banners"),
+            (&mut c.mcp_configs_table_name, "mcp-configs"),
+            (&mut c.waitlist_table_name, "waitlist"),
+            (&mut c.traces_table_name, "traces"),
+            (&mut c.tests_table_name, "tests"),
+        ] {
+            *field = name.to_string();
+        }
+    })
+}
+
+fn state_with(url: &str, tweak: impl FnOnce(&mut crate::models::Config)) -> Arc<crate::AppState> {
     use aws_sdk_dynamodb::config::{Credentials, SharedCredentialsProvider};
     let aws = aws_config::SdkConfig::builder()
         .behavior_version(aws_config::BehaviorVersion::latest())
@@ -990,7 +1068,7 @@ pub fn state(url: &str) -> Arc<crate::AppState> {
         "microsoft_client_secret": "ms-secret",
     }))
     .unwrap();
-    Arc::new(crate::AppState {
+    let mut state = crate::AppState {
         dynamo: aws_sdk_dynamodb::Client::new(&aws),
         sqs: aws_sdk_sqs::Client::new(&aws),
         ses: aws_sdk_sesv2::Client::new(&aws),
@@ -1017,7 +1095,9 @@ pub fn state(url: &str) -> Arc<crate::AppState> {
             ..Default::default()
         },
         cognito_client_secret: "cognito-secret".into(),
-    })
+    };
+    tweak(&mut state.config);
+    Arc::new(state)
 }
 
 #[cfg(test)]

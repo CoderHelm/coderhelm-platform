@@ -167,6 +167,22 @@ export class StreamingStack extends cdk.Stack {
         ],
       })
     );
+    // Every stream checks the session its token was minted from, as the
+    // gateway checks every request (routes::require_sso::check_scoped): the
+    // member's record (sign_in::check_member_session) and, on a hosted team
+    // that requires single sign-on, the team's name for the refusal
+    // (require_sso::team_words). Read only, one item at a time.
+    // infra/streaming-dynamodb.json lists what the stream routes call, and
+    // test/streaming-access.test.ts holds this role to it.
+    this.streamingFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem"],
+        resources: [
+          `arn:aws:dynamodb:${this.region}:${this.account}:table/${prefix}-users`,
+          `arn:aws:dynamodb:${this.region}:${this.account}:table/${prefix}-teams`,
+        ],
+      })
+    );
     // Plan chat opens a team's sealed MCP credentials for a tool call; it
     // never seals (the gateway does), so decrypt only.
     props.secretsKey.grantDecrypt(this.streamingFunction);
