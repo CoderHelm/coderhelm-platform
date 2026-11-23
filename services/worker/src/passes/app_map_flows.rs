@@ -59,7 +59,7 @@ One line per candidate; the first word is its id. Each cites file:line.
 ## Task
 1. Write the user journeys this app has: at least one for every family of entries the user message lists (sign in, sign up, password reset, booking, checkout and the like). The same family in two apps (a website and a mobile app) is two journeys. Add any other end-to-end journey that is clearly present, such as cancel a booking or update a payment method. Write up to 16 journeys.
 2. For each journey, pick and order steps the way a person lives them: the screen, each request it makes for this journey, the outside service behind each request, any callback that follows, then the next screen or the next step of the same form, and so on to where the journey ends. Start at a screen. Use 3 to 15 steps; prefer a complete journey to a short one.
-3. After each request, add the outside service its `outside[...]` names (the same service may appear again after a later request), and after a sign-in or sign-up, the request that loads the person's details and the screen they land on, when listed.
+3. After each request, add the outside service its `outside[...]` names the first time the journey uses that service (a later use of the same service is folded into the first), and after a sign-in or sign-up, the request that loads the person's details and the screen they land on, when listed.
 4. Order requests by when the code makes them: `requests[...]` lists a screen's requests roughly in the order its code makes them. A payment or sign-up often ends with a callback (an `A..` webhook or event) after the outside service; put it after that service.
 5. Every step cites one candidate id in `ref`, from the list only. Prefer candidates connected to the steps before them through next, requests, outside or async; a step with no such connection must be the obvious next screen.
 6. `note` is one short sentence in plain words (under 15 words): what the person or the system does at that step. No arrows or symbols in place of words.
@@ -120,6 +120,9 @@ pub struct Checked {
     pub unknown: usize,
     pub citation: usize,
     pub folded: usize,
+    /// An outside service named again later in the same journey, folded
+    /// into its first use (its note says it is used again).
+    pub revisits: usize,
     pub cut: usize,
     pub unlinked: usize,
     pub flows_dropped: usize,
@@ -201,6 +204,21 @@ pub fn check(answer: &Value, todo: &Value) -> (Vec<Value>, Checked) {
                 continue;
             }
             let note = plain(s["note"].as_str().unwrap_or(""), 160);
+            if c["kind"] == "outside" && refs.iter().any(|x| x == &r) && refs.last() != Some(&r) {
+                // A service used again by a later request is one step, at
+                // its first use; its note says it is used again.
+                rep.revisits += 1;
+                if let Some(i) = refs.iter().position(|x| x == &r) {
+                    let prev = steps[i]["note"].as_str().unwrap_or("").to_string();
+                    if !prev.contains("used again later") {
+                        steps[i]["note"] = json!(plain(
+                            &format!("{prev} It is used again later in this journey."),
+                            240
+                        ));
+                    }
+                }
+                continue;
+            }
             if refs.last() == Some(&r) {
                 // The same step twice in a row is one step.
                 rep.folded += 1;
@@ -542,6 +560,43 @@ mod tests {
             .unwrap()
             .iter()
             .all(|s| s["key"] != "n:okta"));
+    }
+
+    #[test]
+    fn a_service_used_again_later_is_one_step_at_its_first_use() {
+        let mut t = todo();
+        t["table"]["R2"] = json!({"key": "req:GET /me", "kind": "request", "view": "r:3", "label": "GET /me", "next": ["X1"],
+            "evidence": [{"file": "harbor-web/lib/me.ts", "line": 2, "token": "/me", "from": 1, "window": ["", "  fetch('/me')"]}]});
+        let answer = json!({"flows": [{"id": "sign-in", "title": "Sign in", "steps": [
+            {"ref": "S1", "note": "Opens the page."},
+            {"ref": "R1", "note": "Posts the email."},
+            {"ref": "X1", "note": "Okta checks it."},
+            {"ref": "R2", "note": "Loads the boater."},
+            {"ref": "X1", "note": "Okta answers again."},
+            {"ref": "S2", "note": "Lands on the slips."},
+        ]}]});
+        let (flows, rep) = check(&answer, &t);
+        let keys: Vec<&str> = flows[0]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "screen:web:/login",
+                "req:POST /api/session",
+                "n:okta",
+                "req:GET /me",
+                "screen:web:/slips"
+            ]
+        );
+        assert_eq!(
+            flows[0]["steps"][2]["note"],
+            "Okta checks it. It is used again later in this journey."
+        );
+        assert_eq!(rep.revisits, 1);
     }
 
     #[test]

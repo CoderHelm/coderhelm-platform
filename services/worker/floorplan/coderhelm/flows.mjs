@@ -439,6 +439,25 @@ export function sdkCalls(text) {
   return out;
 }
 
+/** Calls into an integration helper a handler leans on: a manager object
+ * (`eventManager.create(`), or a function that pays, mails, messages or
+ * checks out (`handlePayment(`, `sendEmailVerification(`). Declarations
+ * are not calls. */
+export function helperCalls(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const decl = (i) => /(function\s*|import\s*\{[^}]*|export\s*\{[^}]*|\bas\s*)$/.test(text.slice(Math.max(0, i - 60), i));
+  for (const m of text.matchAll(/\b([a-z]\w*Manager)\.(\w+)\(/g)) {
+    out.push({ name: `${m[1].charAt(0).toUpperCase()}${m[1].slice(1)}.${m[2]}`, line: at(m.index), token: `${m[1]}.${m[2]}` });
+  }
+  for (const m of text.matchAll(/\b((?:handle|send|charge|create|process)\w*(?:Payment|Email|Sms|Mail|Notification|Checkout|Subscription|Invoice)\w*)\s*\(/g)) {
+    if (decl(m.index)) continue;
+    out.push({ name: m[1], line: at(m.index), token: m[1] });
+  }
+  return out;
+}
+
 const isRouteHandlerFile = (f) => /\/route\.(m?[jt]s)$/.test(f) || /\/pages\/api\//.test(f);
 
 // ── Gap closer: async callbacks ───────────────────────────────────────────
@@ -625,7 +644,7 @@ export function candidates(graph, read) {
         if (h.how === 'di' && props.has(h.prop)) for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, v);
       }
     } else {
-      files = closure(ix, r, classes, start, { depth: 4, cap: 60 });
+      files = closure(ix, r, classes, start, { depth: 5, cap: 150 });
     }
     serverFiles.set(ri, files);
     return files;
@@ -826,6 +845,11 @@ export function candidates(graph, read) {
       for (const e of emitters.get(f) || []) {
         if (!inUse(ix, r, f, v.names, e.line)) continue;
         link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event');
+      }
+      for (const h of r.once('helpers', f, () => helperCalls(r.text(f)))) {
+        if (!inUse(ix, r, f, v.names, h.line)) continue;
+        const ev = cite(r, f, h.line, [h.token]);
+        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it');
       }
       for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
         if (!inUse(ix, r, f, v.names, h.line)) continue;
