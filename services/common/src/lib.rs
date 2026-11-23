@@ -102,6 +102,7 @@ pub mod alert_budget;
 /// Dockerfile base images: their package lists matched against OSV's
 /// distribution data, fixed by pinning the same tag to a newer digest.
 pub mod base_images;
+pub mod connected_access;
 /// The repository's deploy label as a verification gate: its workflow's
 /// runs on a head, the wait before ready, and putting the label back once
 /// per head.
@@ -111,6 +112,7 @@ pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
+pub mod followup_tickets;
 /// A team's branch, commit and PR title templates, and how they render.
 pub mod git_conventions;
 /// What an installation's token may read: permissions a feature uses when

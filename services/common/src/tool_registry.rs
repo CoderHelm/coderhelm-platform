@@ -144,6 +144,8 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     // Outside steps CoderHelm runs after the PR opens (worker outside_exec).
     ("start_workflow", Risk::Write),
     ("write_content", Risk::Write),
+    // Follow-up tickets a run files in the team's tracker (worker followups).
+    ("file_followup_tickets", Risk::Write),
     ("update_pr_description", Risk::Write),
     ("confluence_append", Risk::Write),
     // Release steps CoderHelm runs after a pull request (see the worker's

@@ -1305,6 +1305,7 @@ pub mod file_claims;
 mod finish_planned;
 pub mod fix_location;
 pub(crate) mod flaky;
+pub mod followups;
 pub mod formatter;
 pub(crate) mod generators;
 pub mod github_history;
@@ -3628,6 +3629,42 @@ async fn run_passes(
         warn!(run_id, why = %why, "Plan not usable after its repairs");
         close_memory(state, agent_memory.take()).await;
         return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
+    }
+
+    // Follow-up tickets the ticket's deliverable asks for are CoderHelm's:
+    // filed now in the source ticket's tracker, once (a retry files nothing
+    // twice), with one comment listing them; and a plan step that asks a
+    // person to connect a system CoderHelm reaches becomes CoderHelm's. A
+    // plan that codes nothing and leaves nothing for a person then ends
+    // here, delivered, instead of asking.
+    if !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+        && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+    {
+        let proposal = plan_result.proposal.clone();
+        if let Some(decision) = plan_result.fix.as_mut() {
+            let settled = followups::settle(state, &github, msg, run_id, decision, &proposal).await;
+            if let Some(settled) = settled.filter(|_| {
+                matches!(
+                    fix_route,
+                    fix_location::Route::OutsideOnly | fix_location::Route::Ask
+                ) && followups::nothing_left(decision, &plan_result.tasks, &msg.answers)
+            }) {
+                followups::finish_delivered(
+                    state,
+                    msg,
+                    run_id,
+                    decision,
+                    &proposal,
+                    &settled,
+                    usage,
+                    start,
+                    &used_mcp_ids,
+                )
+                .await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+        }
     }
 
     // Not knowing where the fix belongs is a question only when a person

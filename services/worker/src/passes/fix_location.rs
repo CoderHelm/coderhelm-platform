@@ -383,6 +383,10 @@ pub struct FixDecision {
     /// `habits`).
     #[serde(default)]
     pub habits: super::habits::Habits,
+    /// Follow-up tickets the ticket's deliverable asks for: CoderHelm files
+    /// them itself (`followups`), never a person.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followup_tickets: Vec<common::followup_tickets::Draft>,
 }
 
 /// One step of the whole job, and who does it.
@@ -1250,6 +1254,7 @@ A run does everything the ticket needs; work outside the code is the exception. 
 3. Only what no connection or permission lets CoderHelm do at all goes to a person (`by: person`). Each such step gives `reason`, one gate code (credential, grant, irreversible_choice, held_by_another, approval, outside_reach), says why (`why_person`, naming the missing connection or permission exactly) and how to grant it (`grant`); the run reports that requirement as not done. A person step without them is sent back, and if it still has none the run stops and asks. `by` defaults to `coderhelm`. These are always CoderHelm's, with the `tool` it uses: reading workflow runs and PR comments (`github_history`), running or re-running checks and end-to-end tests (`run_checks`, `start_workflow`), labels, page checks (`check_url`, never written as a `confirm.query`), posting lists on the ticket, tagging a release after one approval. A production release is one CoderHelm step that waits for one approval, never a person's chore. A tool that fails is CoderHelm's to work around, never a person's step.
 Give every step a `kind` and a `target`: the run picks each step's action from them, not from its wording.
 Each step says who does it: `this_pr` (this change), `other_repo` (a pull request in another repository, named in `repo`), `person` (a person or team, named in `owner`) or `vendor` (an outside company, named in `owner`). When the plan spans several repositories, order the `## owner/repo` groups in tasks.md in the order they must merge.
+When the ticket's deliverable includes follow-up tickets (an audit or a scoping ticket that ends in tickets for the fixes), write each one in `followup_tickets`. CoderHelm files them itself once the plan is written, through the team's ticket tracker (the source ticket's Jira project, linked to it; GitHub issues for a team without Jira), and posts the new keys on the ticket. Filing them is never a `person` step, an `outside_change` step or a question, and never a reason to ask for access.
 
 After the four openspec files, output this block (JSON, all fields required; `outside_change` is null for `code`):
 
@@ -1282,6 +1287,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
   },
   "history_check": "only when the prompt has a ticket history: each earlier pull request by number, what you reuse from it, what changes this time and why (and for one closed without a reason in its comments: who closed it and when); otherwise empty",
   "questions": ["each question only a person can answer, one decision each; [] when there are none"],
+  "followup_tickets": [{"summary": "one line: the ticket's title", "description": "what to do and where (files, lines, records), and how to tell it is done"}],
   "next_step": {"action": "only when `fix_location` is `unknown` because the next step is one you can't take: that ONE action for a person", "why_person": "the access or tool you lack", "outcomes": [{"if": "what the person sees", "means": "what that means for the fix"}]},
   "end_to_end": [
     {"step": "each step the ticket needs to work in production", "by": "this_pr | other_repo | person | vendor", "owner": "who does it (a team, a role, the vendor); empty for this_pr", "repo": "owner/repo for this_pr and other_repo steps"}

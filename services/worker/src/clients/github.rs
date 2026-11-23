@@ -5500,6 +5500,54 @@ impl GitHubClient {
         Ok((number, html_url))
     }
 
+    /// Create a GitHub issue with labels (GitHub makes a label that doesn't
+    /// exist yet) and return (issue_number, issue_url).
+    pub async fn create_labelled_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues");
+        let payload = serde_json::json!({ "title": title, "body": body, "labels": labels });
+        let data = self.post(&url, &payload).await?;
+        let number = data["number"].as_u64().unwrap_or(0);
+        let html_url = data["html_url"].as_str().unwrap_or("").to_string();
+        Ok((number, html_url))
+    }
+
+    /// The issues (open or closed, not pull requests) carrying `label`, as
+    /// (number, title, url), newest first, up to 100.
+    pub async fn issues_with_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<(u64, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/issues?state=all&per_page=100&labels={}",
+            urlencoding::encode(label)
+        );
+        let data = self.get(&url).await?;
+        Ok(data
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|i| i.get("pull_request").is_none())
+                    .filter_map(|i| {
+                        Some((
+                            i["number"].as_u64()?,
+                            i["title"].as_str()?.to_string(),
+                            i["html_url"].as_str().unwrap_or("").to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     // ─── Actions: E2E results ───────────────────────────────────
 
     /// POST that expects no response body (GitHub answers 201/204 empty).
@@ -6892,6 +6940,7 @@ mod body_limit_tests {
             "pub async fn create_pull_request(",
             "pub async fn update_pr_body(",
             "pub async fn create_issue(",
+            "pub async fn create_labelled_issue(",
             "pub async fn create_issue_comment(",
             "pub async fn edit_issue_comment(",
             "pub async fn create_pr_review(",
