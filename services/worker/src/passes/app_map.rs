@@ -242,6 +242,9 @@ pub fn pack(job: &Value, files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String>
     for (p, b) in FLOORPLAN_FILES {
         add(format!("fp/{p}"), b)?;
     }
+    for (p, b) in CODERHELM_FILES {
+        add(format!("coderhelm/{p}"), b)?;
+    }
     for (p, b) in files {
         add(p.clone(), b)?;
     }
@@ -1077,9 +1080,18 @@ async fn step(
                 am::finished(cur, build, n, "", now)
             })
             .await?;
+            if result["coderhelm"]["ok"] == json!(false) {
+                warn!(
+                    team_id,
+                    error = %common::truncate_str(result["coderhelm"]["error"].as_str().unwrap_or(""), 600),
+                    "App map: CoderHelm's detectors failed; the map is Floorplan's alone"
+                );
+            }
             info!(
                 team_id,
                 files = g["files"].as_array().map(|a| a.len()).unwrap_or(0),
+                screens = g["screens"].as_array().map(|a| a.len()).unwrap_or(0),
+                extract_ms = result["coderhelm"]["ms"].as_u64().unwrap_or(0),
                 "App map: built"
             );
             Ok(())
@@ -1226,6 +1238,8 @@ mod tests {
             .map(|x| x.path().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"app-map/driver.mjs".to_string()));
+        assert!(names.contains(&"app-map/coderhelm/index.mjs".to_string()));
+        assert!(names.contains(&"app-map/coderhelm/screens/react-navigation.mjs".to_string()));
         assert!(names.contains(&"app-map/fp/skills/floorplan/scripts/scan.mjs".to_string()));
         assert!(names.contains(&"app-map/fp/LICENSE".to_string()));
         assert!(names.contains(&"app-map/root/harbor-api/src/server.js".to_string()));

@@ -23,6 +23,7 @@ export function workdir(answers, mode) {
   fs.cpSync(path.join(HERE, 'fixtures', 'harbor'), path.join(dir, 'root'), { recursive: true });
   fs.cpSync(VENDOR, path.join(dir, 'fp'), { recursive: true });
   fs.copyFileSync(path.join(HERE, 'driver.mjs'), path.join(dir, 'driver.mjs'));
+  fs.cpSync(path.join(HERE, 'coderhelm'), path.join(dir, 'coderhelm'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ mode, answers, heads: { 'harbor-web': 'a1', 'harbor-api': 'b2' } }));
   return dir;
 }
@@ -42,18 +43,19 @@ export function drive(dir) {
 
 /** A map as committed for the Rust adapter's tests: nothing that changes run to run. */
 export function stable(graph) {
-  return { ...graph, meta: { ...graph.meta, generatedAt: '2026-11-21T00:00:00.000Z', scanAt: '2026-11-21T00:00:00.000Z', root: '/sandbox/root' } };
+  const extract = graph.extract && { ...graph.extract, ms: Object.fromEntries(Object.keys(graph.extract.ms || {}).map((k) => [k, 0])) };
+  return { ...graph, meta: { ...graph.meta, generatedAt: '2026-11-21T00:00:00.000Z', scanAt: '2026-11-21T00:00:00.000Z', root: '/sandbox/root' }, ...(extract ? { extract } : {}) };
 }
 
 /** The parts of a map the adapter relies on. */
 export function shape(graph) {
   return {
     schema: graph.schema,
-    nodes: graph.nodes.map((n) => [n.id, n.kind, n.label]),
+    nodes: graph.nodes.map((n) => [n.id, n.kind, n.label, n.level ?? null]),
     files: graph.files.map((f) => [f.p, f.n, f.r, f.name]),
     routes: graph.routes.map((r) => [r.f, r.m, r.p, r.name]),
     links: graph.links.map((l) => [l.a, l.b, l.k]).sort(),
-    screens: (graph.screens || []).map((s) => [s.id, s.file, s.behind.map((b) => b.id)]),
+    screens: (graph.screens || []).map((s) => [s.id, s.file, s.behind.map((b) => b.id), s.nav?.gate ?? null]),
     health: (graph.health?.issues || []).map((i) => [i.id, i.kind, i.severity, i.items]),
     tour: graph.tour.map((t) => t.ref),
   };

@@ -1,0 +1,14 @@
+name: Deploy receipts
+on:
+  push:
+    paths: ['src/receipts/**']
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload the function
+        working-directory: src/receipts
+        run: |
+          zip -r receipts.zip .
+          aws lambda update-function-code --function-name harbor-receipts --zip-file fileb://receipts.zip

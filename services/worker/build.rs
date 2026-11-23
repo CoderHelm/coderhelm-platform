@@ -67,7 +67,8 @@ fn write_incidents(root: &Path) {
 /// Lists every file of the vendored Floorplan release (`vendor/floorplan`)
 /// into `$OUT_DIR/floorplan_files.rs` as `(path, bytes)` pairs, for
 /// `passes::app_map` to send to the sandbox. The files are included as they
-/// are: nothing in the vendored folder is edited.
+/// are: nothing in the vendored folder is edited. CoderHelm's own detectors
+/// (`floorplan/coderhelm`) go beside them as `CODERHELM_FILES`.
 fn write_floorplan(root: &Path) {
     let dir = root.join("../../vendor/floorplan");
     println!("cargo:rerun-if-changed={}", dir.display());
@@ -78,6 +79,26 @@ fn write_floorplan(root: &Path) {
     for p in &all {
         let rel = p
             .strip_prefix(&dir)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+        out.push_str(&format!(
+            "    ({rel:?}, include_bytes!({:?})),\n",
+            abs.to_string_lossy()
+        ));
+    }
+    out.push_str("];\n");
+    // CoderHelm's own detectors, run by the driver after Floorplan's build
+    let ours = root.join("floorplan/coderhelm");
+    println!("cargo:rerun-if-changed={}", ours.display());
+    let mut mine = Vec::new();
+    files(&ours, &mut mine);
+    mine.sort();
+    out.push_str("/// CoderHelm's detectors (services/worker/floorplan/coderhelm), as `(path, bytes)`.\npub(crate) const CODERHELM_FILES: &[(&str, &[u8])] = &[\n");
+    for p in &mine {
+        let rel = p
+            .strip_prefix(&ours)
             .unwrap_or(p)
             .to_string_lossy()
             .replace('\\', "/");
