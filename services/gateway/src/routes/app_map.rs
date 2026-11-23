@@ -52,6 +52,36 @@ pub async fn queue_build(
             return Err(None);
         }
     };
+    send_build(state, team_id, st).await.ok_or(None)
+}
+
+/// Builds the map again when the one there now was made by another
+/// extractor than this release's (`common::app_map::queue_for_extractor`):
+/// once per release, through the same one-build-at-a-time conditional write,
+/// so two pages read at once queue one build. The map there now is served
+/// meanwhile. `None` when nothing was queued.
+pub async fn queue_release_build(state: &AppState, team_id: &str) -> Option<am::Status> {
+    let table = &state.config.settings_table_name;
+    let st = match am::queue_release_build(&state.dynamo, table, team_id).await {
+        Ok(Some(st)) => st,
+        Ok(None) => return None,
+        Err(e) => {
+            error!("app map: could not mark a release's build queued: {e}");
+            return None;
+        }
+    };
+    info!(
+        team_id,
+        extractor = am::EXTRACTOR_VERSION,
+        "App map: made by another extractor, built again"
+    );
+    send_build(state, team_id, st).await
+}
+
+/// Sends a queued build's first message; when it can't be sent, the build is
+/// marked failed (`None`).
+async fn send_build(state: &AppState, team_id: &str, st: am::Status) -> Option<am::Status> {
+    let table = &state.config.settings_table_name;
     let msg = crate::models::WorkerMessage::AppMap(crate::models::AppMapMessage {
         team_id: team_id.to_string(),
         build: st.build.clone(),
@@ -69,7 +99,7 @@ pub async fn queue_build(
     {
         Ok(_) => {
             info!(team_id, "App map: build queued");
-            Ok(st)
+            Some(st)
         }
         Err(e) => {
             error!("app map: could not queue a build: {e}");
@@ -79,7 +109,7 @@ pub async fn queue_build(
                 am::failed(cur, &st.build, why, now)
             })
             .await;
-            Err(None)
+            None
         }
     }
 }
@@ -95,6 +125,14 @@ pub fn shown_state(st: Option<&am::Status>, has_map: bool, now: i64) -> (&'stati
         (false, Some(s)) if s.state == "ready" => ("empty", false),
         _ => ("not_built", false),
     }
+}
+
+/// Whether reading the page asks for the map to be built again because the
+/// map there now was made by another extractor than this release's (a
+/// build already queued or running builds with this one anyway).
+pub fn needs_release_build(st: Option<&am::Status>, has_map: bool, now: i64) -> bool {
+    !st.is_some_and(|s| s.is_running(now))
+        && am::made_by_another_extractor(st, has_map, am::EXTRACTOR_VERSION)
 }
 
 /// The map there now, as far as the status page needs it: when it was
@@ -138,6 +176,9 @@ pub fn status_view(st: Option<&am::Status>, map: MapFacts, team_repos: u32, now:
         "built_repos": if map.has_map { built_repos } else { 0 },
         "now": now,
         "floorplan": am::FLOORPLAN_VERSION.trim(),
+        // `release` while the map is built again because this release
+        // extracts more than the one that made it; the page says so.
+        "reason": if st.is_some_and(|s| am::rebuilding_for_release(s, now)) { "release" } else { "" },
     })
 }
 
@@ -224,6 +265,13 @@ pub async fn get_map(
         },
         None => MapFacts::default(),
     };
+    // A map made by another extractor than this release's is built again
+    // (once), and served as it is until the new one is there.
+    if needs_release_build(st.as_ref(), facts.has_map, now) {
+        if let Some(new) = queue_release_build(&state, team).await {
+            st = Some(new);
+        }
+    }
     // The first visit starts the first build.
     if shown_state(st.as_ref(), facts.has_map, now).0 == "not_built" {
         match queue_build(&state, team).await {
@@ -806,6 +854,56 @@ mod tests {
     }
 
     #[test]
+    fn a_map_from_another_extractor_is_built_again_once_and_served_meanwhile() {
+        let now = 10_000;
+        let older = am::Status {
+            state: "ready".into(),
+            at: now - 60,
+            built: now - 86_400,
+            built_repos: 2,
+            extractor: "0000000000000000".into(),
+            ..Default::default()
+        };
+        // Made by another extractor: the page asks for one build.
+        assert!(needs_release_build(Some(&older), true, now));
+        let q = am::queue_for_extractor(Some(&older), now, "b1", am::EXTRACTOR_VERSION).unwrap();
+        // The next read (or a second read at once, after the conditional
+        // write) asks for none, and the old map is served, updating, with
+        // the reason the page words.
+        assert!(!needs_release_build(Some(&q), true, now + 1));
+        assert!(am::queue_for_extractor(Some(&q), now + 1, "b2", am::EXTRACTOR_VERSION).is_none());
+        let facts = MapFacts {
+            has_map: true,
+            written_at: now - 86_400,
+            repos: 2,
+        };
+        let v = status_view(Some(&q), facts, 0, now + 1);
+        assert_eq!(
+            (v["state"].as_str(), v["updating"].as_bool()),
+            (Some("ready"), Some(true))
+        );
+        assert_eq!(v["reason"], "release");
+        // A build that failed is not asked for again on every visit.
+        let running = am::take_turn(Some(&q), "b1", 0, now + 2).unwrap();
+        let f = am::failed(Some(&running), "b1", "x", now + 3).unwrap();
+        assert!(!needs_release_build(Some(&f), true, now + 4));
+        assert_eq!(status_view(Some(&f), facts, 0, now + 4)["reason"], "");
+        // Made by this extractor: nothing asked, no reason given.
+        let current = am::Status {
+            extractor: am::EXTRACTOR_VERSION.into(),
+            ..older.clone()
+        };
+        assert!(!needs_release_build(Some(&current), true, now));
+        assert_eq!(status_view(Some(&current), facts, 0, now)["reason"], "");
+        // No map yet: the first visit's build, not this one.
+        assert!(!needs_release_build(None, false, now));
+        // A push's build running: it builds with this extractor anyway.
+        let pushed = am::queue_next(Some(&older), now, "p1").unwrap();
+        assert!(!needs_release_build(Some(&pushed), true, now + 1));
+        assert_eq!(status_view(Some(&pushed), facts, 0, now + 1)["reason"], "");
+    }
+
+    #[test]
     fn the_build_state_reads_plainly() {
         let st = |s: &str, at: i64| am::Status {
             state: s.into(),
@@ -950,6 +1048,72 @@ mod tests {
         assert_eq!(f.store.sent().len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_release_queues_one_build_for_a_map_another_extractor_made() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#harbor";
+        let now = chrono::Utc::now().timestamp();
+        let made_by = |extractor: &'static str| {
+            let dynamo = state.dynamo.clone();
+            async move {
+                am::update_status(&dynamo, "settings", team, |_| {
+                    Some(am::Status {
+                        state: "ready".into(),
+                        at: now - 60,
+                        built: now - 86_400,
+                        built_repos: 2,
+                        extractor: extractor.into(),
+                        ..Default::default()
+                    })
+                })
+                .await
+                .unwrap();
+            }
+        };
+        // Made by this release's extractor: nothing is queued.
+        made_by(am::EXTRACTOR_VERSION).await;
+        assert!(queue_release_build(&state, team).await.is_none());
+        assert!(f.store.sent().is_empty());
+        // Made by another: six page reads at the same moment queue one build.
+        made_by("0000000000000000").await;
+        let reads = (0..6).map(|_| queue_release_build(&state, team));
+        let queued = futures::future::join_all(reads)
+            .await
+            .into_iter()
+            .flatten()
+            .count();
+        assert_eq!(queued, 1);
+        assert_eq!(f.store.sent().len(), 1);
+        let st = am::status(&state.dynamo, "settings", team).await.unwrap();
+        assert_eq!(st.state, "queued");
+        assert_eq!(st.asked_extractor, am::EXTRACTOR_VERSION);
+        // The map there now is still the one shown, marked as updating.
+        let v = status_view(
+            Some(&st),
+            MapFacts {
+                has_map: true,
+                written_at: now - 86_400,
+                repos: 2,
+            },
+            0,
+            now,
+        );
+        assert_eq!(
+            (v["state"].as_str(), v["reason"].as_str()),
+            (Some("ready"), Some("release"))
+        );
+        // A later read while it runs, and after it failed: none more.
+        assert!(queue_release_build(&state, team).await.is_none());
+        am::update_status(&state.dynamo, "settings", team, |cur| {
+            am::failed(cur, &st.build, "x", now)
+        })
+        .await
+        .unwrap();
+        assert!(queue_release_build(&state, team).await.is_none());
+        assert_eq!(f.store.sent().len(), 1);
+    }
+
     #[test]
     fn the_status_says_when_it_started_how_long_it_takes_and_when_the_map_was_built() {
         let now = 50_000;
@@ -971,6 +1135,7 @@ mod tests {
                 "last_build": "building", "note": "", "started_at": now - 120, "repos": 12,
                 "estimate": {"low_secs": 15 * 60, "high_secs": 30 * 60},
                 "built_at": 0, "built_repos": 0, "now": now, "floorplan": am::FLOORPLAN_VERSION.trim(),
+                "reason": "",
             })
         );
         // Built: when, and from how many repositories; nothing running.
