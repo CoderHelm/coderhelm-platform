@@ -70,6 +70,20 @@ pub fn graph_key(team_id: &str) -> String {
     format!("{}/graph.json.gz", s3_prefix(team_id))
 }
 
+/// The page's copy of the map ([`viewer_copy`]), written with the map: gzipped
+/// JSON stored with `Content-Encoding: gzip`, so the browser reads it
+/// straight from the bucket (a short-lived signed URL) and unzips it itself.
+pub fn view_key(team_id: &str) -> String {
+    format!("{}/view.json.gz", s3_prefix(team_id))
+}
+
+/// The map's small index ([`MapIndex`], gzipped JSON), written with the map:
+/// what the read API needs to place Recent work and Health on it without
+/// reading the map itself.
+pub fn index_key(team_id: &str) -> String {
+    format!("{}/index.json.gz", s3_prefix(team_id))
+}
+
 /// Floorplan's own files from the last run (a gzipped tar of `floorplan/`).
 pub fn state_key(team_id: &str) -> String {
     format!("{}/state.tgz", s3_prefix(team_id))
@@ -518,37 +532,14 @@ fn arr<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = &'a Value> {
     v[k].as_array().into_iter().flatten()
 }
 
-fn files_set(graph: &Value) -> BTreeSet<String> {
-    arr(graph, "files")
-        .filter_map(|f| f["p"].as_str().map(str::to_string))
+/// The parent of each part, read once.
+fn parents(graph: &Value) -> HashMap<&str, &str> {
+    arr(graph, "nodes")
+        .filter_map(|n| Some((n["id"].as_str()?, n["parent"].as_str()?)))
         .collect()
 }
 
-/// A repository path on the map (`folder/path`), when the map has that file.
-/// `path` may already start with `owner/name/` (a run across several
-/// repositories keeps paths that way).
-pub fn map_path(graph: &Value, repo: &str, path: &str) -> Option<String> {
-    let folders = repo_of_folder(graph);
-    let files = files_set(graph);
-    let path = path.trim_start_matches("./");
-    for (folder, r) in &folders {
-        if let Some(rest) = path.strip_prefix(&format!("{r}/")) {
-            let p = format!("{folder}/{rest}");
-            return files.contains(&p).then_some(p);
-        }
-    }
-    let folder = folders
-        .iter()
-        .find(|(_, r)| r.eq_ignore_ascii_case(repo))
-        .map(|(f, _)| f.clone())?;
-    let p = format!("{folder}/{path}");
-    files.contains(&p).then_some(p)
-}
-
-fn top_node(graph: &Value, id: &str) -> String {
-    let parents: HashMap<&str, &str> = arr(graph, "nodes")
-        .filter_map(|n| Some((n["id"].as_str()?, n["parent"].as_str()?)))
-        .collect();
+fn top_of(parents: &HashMap<&str, &str>, id: &str) -> String {
     let mut cur = id;
     for _ in 0..20 {
         match parents.get(cur) {
@@ -559,21 +550,115 @@ fn top_node(graph: &Value, id: &str) -> String {
     cur.to_string()
 }
 
-/// The top-level part holding most of a repository's files.
-fn repo_node(graph: &Value, repo: &str) -> Option<String> {
-    let folder = repo_of_folder(graph)
-        .into_iter()
-        .find(|(_, r)| r.eq_ignore_ascii_case(repo))
-        .map(|(f, _)| f)?;
-    let mut count: BTreeMap<String, usize> = BTreeMap::new();
-    for f in arr(graph, "files") {
-        if f["r"].as_str() == Some(folder.as_str()) {
-            if let Some(n) = f["n"].as_str() {
-                *count.entry(top_node(graph, n)).or_default() += 1;
+fn top_node(graph: &Value, id: &str) -> String {
+    top_of(&parents(graph), id)
+}
+
+/// A repository path on the map (`folder/path`), when the map has that file.
+/// `path` may already start with `owner/name/` (a run across several
+/// repositories keeps paths that way).
+pub fn map_path(graph: &Value, repo: &str, path: &str) -> Option<String> {
+    MapIndex::of(graph).map_path(repo, path)
+}
+
+/// One of Floorplan's own checks, as the index keeps it: enough to tell
+/// whether a CoderHelm finding stands at the same place, and to count it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexIssue {
+    pub id: String,
+    pub severity: String,
+    /// (file on the map, line or 0).
+    #[serde(default)]
+    pub locations: Vec<(String, u64)>,
+}
+
+/// What the read API needs to place CoderHelm's Recent work and Health on a
+/// map, without the map: written at build time with the map
+/// ([`index_key`]), a few hundred bytes per file on the map instead of the
+/// whole map, and every placement a lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapIndex {
+    /// Folder on the map to `owner/name`.
+    pub repos: BTreeMap<String, String>,
+    /// Every file on the map (`folder/path`).
+    pub files: BTreeSet<String>,
+    /// `owner/name` (lower case) to the top-level part holding most of its
+    /// files: where a finding with no file on the map sits.
+    pub repo_parts: BTreeMap<String, String>,
+    /// Floorplan's own checks, in the map's order.
+    pub issues: Vec<IndexIssue>,
+    /// Whether the map has a Health section at all.
+    pub has_health: bool,
+}
+
+impl MapIndex {
+    pub fn of(graph: &Value) -> Self {
+        let repos: BTreeMap<String, String> = repo_of_folder(graph).into_iter().collect();
+        let files = arr(graph, "files")
+            .filter_map(|f| f["p"].as_str().map(str::to_string))
+            .collect();
+        let parents = parents(graph);
+        let mut count: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
+        for f in arr(graph, "files") {
+            if let (Some(r), Some(n)) = (f["r"].as_str(), f["n"].as_str()) {
+                *count
+                    .entry(r)
+                    .or_default()
+                    .entry(top_of(&parents, n))
+                    .or_default() += 1;
             }
         }
+        let repo_parts = repos
+            .iter()
+            .filter_map(|(folder, repo)| {
+                let part = count
+                    .get(folder.as_str())?
+                    .iter()
+                    .max_by_key(|(_, c)| **c)
+                    .map(|(n, _)| n.clone())?;
+                Some((repo.to_ascii_lowercase(), part))
+            })
+            .collect();
+        let issues = arr(&graph["health"], "issues")
+            .filter(|i| i["source"].is_null() || i["source"] == "floorplan")
+            .map(|i| IndexIssue {
+                id: i["id"].as_str().unwrap_or("").to_string(),
+                severity: i["severity"].as_str().unwrap_or("low").to_string(),
+                locations: locations(i).into_iter().collect(),
+            })
+            .collect();
+        Self {
+            repos,
+            files,
+            repo_parts,
+            issues,
+            has_health: graph.get("health").is_some(),
+        }
     }
-    count.into_iter().max_by_key(|(_, c)| *c).map(|(n, _)| n)
+
+    /// A repository path on the map (`folder/path`), when the map has that
+    /// file. `path` may already start with `owner/name/`.
+    pub fn map_path(&self, repo: &str, path: &str) -> Option<String> {
+        let path = path.trim_start_matches("./");
+        for (folder, r) in &self.repos {
+            if let Some(rest) = path.strip_prefix(&format!("{r}/")) {
+                let p = format!("{folder}/{rest}");
+                return self.files.contains(&p).then_some(p);
+            }
+        }
+        let folder = self
+            .repos
+            .iter()
+            .find(|(_, r)| r.eq_ignore_ascii_case(repo))
+            .map(|(f, _)| f)?;
+        let p = format!("{folder}/{path}");
+        self.files.contains(&p).then_some(p)
+    }
+
+    /// The top-level part holding most of a repository's files.
+    pub fn repo_node(&self, repo: &str) -> Option<String> {
+        self.repo_parts.get(&repo.to_ascii_lowercase()).cloned()
+    }
 }
 
 // ── Overlays ───────────────────────────────────────────────────────────────
@@ -621,14 +706,14 @@ pub fn severity_level(s: &str) -> &'static str {
 /// The map's `recent` from CoderHelm's runs: one task per run, one item per
 /// file it changed that is on the map. A run with no file on the map is left
 /// out.
-pub fn recent_from_runs(graph: &Value, runs: &[WorkItem]) -> Option<Value> {
+pub fn recent_from_runs(idx: &MapIndex, runs: &[WorkItem]) -> Option<Value> {
     let mut tasks = Vec::new();
     let mut items = Vec::new();
     for w in runs {
         let mut ids: Vec<String> = w
             .files
             .iter()
-            .filter_map(|f| map_path(graph, &w.repo, f))
+            .filter_map(|f| idx.map_path(&w.repo, f))
             .map(|p| format!("f:{p}"))
             .collect();
         ids.dedup();
@@ -668,7 +753,7 @@ pub fn recent_from_runs(graph: &Value, runs: &[WorkItem]) -> Option<Value> {
 
 /// CoderHelm's findings as Floorplan health issues. A finding in a
 /// repository the map doesn't have is left out.
-pub fn issues_from_findings(graph: &Value, found: &[HealthItem]) -> Vec<Value> {
+pub fn issues_from_findings(idx: &MapIndex, found: &[HealthItem]) -> Vec<Value> {
     let label = |k: &str| match k {
         "security" => "security",
         "infrastructure" => "infrastructure",
@@ -681,12 +766,12 @@ pub fn issues_from_findings(graph: &Value, found: &[HealthItem]) -> Vec<Value> {
             let placed: Vec<(String, u32)> = h
                 .files
                 .iter()
-                .filter_map(|(f, line)| Some((map_path(graph, &h.repo, f)?, *line)))
+                .filter_map(|(f, line)| Some((idx.map_path(&h.repo, f)?, *line)))
                 .collect();
             let mut items: Vec<String> = placed.iter().map(|(p, _)| format!("f:{p}")).collect();
             items.dedup();
             if items.is_empty() {
-                items.push(format!("n:{}", repo_node(graph, &h.repo)?));
+                items.push(format!("n:{}", idx.repo_node(&h.repo)?));
             }
             Some(json!({
                 "id": format!("coderhelm:{}:{}", h.kind, h.id),
@@ -716,26 +801,9 @@ fn locations(issue: &Value) -> BTreeSet<(String, u64)> {
         .collect()
 }
 
-/// The map with CoderHelm's overlays in Floorplan's own fields. With
-/// `runs`, they replace the map's recent work; with `found`, CoderHelm's
-/// findings join Floorplan's checks (each marked with its `source`; a
-/// Floorplan issue at the same file and line as a CoderHelm one is dropped).
-/// Floorplan's own checks are always labelled as Floorplan's.
-pub fn with_overlays(
-    mut graph: Value,
-    runs: Option<&[WorkItem]>,
-    found: Option<&[HealthItem]>,
-) -> Value {
-    if let Some(runs) = runs {
-        match recent_from_runs(&graph, runs) {
-            Some(r) => graph["recent"] = r,
-            None => {
-                if let Some(o) = graph.as_object_mut() {
-                    o.remove("recent");
-                }
-            }
-        }
-    }
+/// Floorplan's checks labelled as Floorplan's, with Health's counts: the
+/// map as the page's copy holds it before any of CoderHelm's overlays.
+fn labelled(mut graph: Value) -> Value {
     let mut issues: Vec<Value> = graph["health"]["issues"]
         .as_array()
         .cloned()
@@ -748,25 +816,102 @@ pub fn with_overlays(
             }
         }
     }
-    if let Some(found) = found {
-        let ours = issues_from_findings(&graph, found);
-        let taken: BTreeSet<(String, u64)> = ours.iter().flat_map(locations).collect();
-        issues.retain(|i| i["source"] != "floorplan" || locations(i).is_disjoint(&taken));
-        issues.extend(ours);
+    if graph.get("health").is_some() || !issues.is_empty() {
+        graph["health"]["summary"] = json!(summary_of(
+            issues
+                .iter()
+                .map(|i| i["severity"].as_str().unwrap_or("low"))
+        ));
+        graph["health"]["issues"] = json!(issues);
     }
+    graph
+}
+
+fn summary_of<'a>(severities: impl Iterator<Item = &'a str>) -> Value {
     let (mut high, mut medium, mut low) = (0, 0, 0);
-    for i in &issues {
-        match i["severity"].as_str().unwrap_or("low") {
+    for s in severities {
+        match s {
             "high" => high += 1,
             "medium" => medium += 1,
             _ => low += 1,
         }
     }
-    if graph.get("health").is_some() || !issues.is_empty() {
-        graph["health"]["issues"] = json!(issues);
-        graph["health"]["summary"] = json!({"high": high, "medium": medium, "low": low});
+    json!({"high": high, "medium": medium, "low": low})
+}
+
+/// CoderHelm's overlays for a map, from its index alone: a small payload the
+/// page lays over its copy of the map ([`apply_overlays`]).
+///
+/// - `recent` (with `runs`): the map's Recent work, `null` for none;
+/// - `health` (with `found`): CoderHelm's findings to `add`, the ids of
+///   Floorplan's checks to `drop` (one at the same file and line as a
+///   CoderHelm finding is not shown twice), and Health's `summary`.
+pub fn overlays(idx: &MapIndex, runs: Option<&[WorkItem]>, found: Option<&[HealthItem]>) -> Value {
+    let mut out = json!({});
+    if let Some(runs) = runs {
+        out["recent"] = recent_from_runs(idx, runs).unwrap_or(Value::Null);
     }
-    graph
+    if let Some(found) = found {
+        let ours = issues_from_findings(idx, found);
+        let taken: BTreeSet<(String, u64)> = ours.iter().flat_map(locations).collect();
+        let (dropped, kept): (Vec<&IndexIssue>, Vec<&IndexIssue>) = idx
+            .issues
+            .iter()
+            .partition(|i| i.locations.iter().any(|l| taken.contains(l)));
+        if idx.has_health || !idx.issues.is_empty() || !ours.is_empty() {
+            let summary = summary_of(
+                kept.iter()
+                    .map(|i| i.severity.as_str())
+                    .chain(ours.iter().map(|i| i["severity"].as_str().unwrap_or("low"))),
+            );
+            out["health"] = json!({
+                "add": ours,
+                "drop": dropped.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+                "summary": summary,
+            });
+        }
+    }
+    out
+}
+
+/// Lays [`overlays`] over the page's copy of the map, as the page does.
+pub fn apply_overlays(mut view: Value, o: &Value) -> Value {
+    if let Some(r) = o.get("recent") {
+        if r.is_null() {
+            if let Some(m) = view.as_object_mut() {
+                m.remove("recent");
+            }
+        } else {
+            view["recent"] = r.clone();
+        }
+    }
+    if let Some(h) = o.get("health").filter(|h| h.is_object()) {
+        let drop: BTreeSet<&str> = arr(h, "drop").filter_map(Value::as_str).collect();
+        let mut issues: Vec<Value> = arr(&view["health"], "issues")
+            .filter(|i| {
+                i["source"] != "floorplan" || !i["id"].as_str().is_some_and(|id| drop.contains(id))
+            })
+            .cloned()
+            .collect();
+        issues.extend(arr(h, "add").cloned());
+        view["health"]["issues"] = json!(issues);
+        view["health"]["summary"] = h["summary"].clone();
+    }
+    view
+}
+
+/// The map with CoderHelm's overlays in Floorplan's own fields. With
+/// `runs`, they replace the map's recent work; with `found`, CoderHelm's
+/// findings join Floorplan's checks (each marked with its `source`; a
+/// Floorplan issue at the same file and line as a CoderHelm one is dropped).
+/// Floorplan's own checks are always labelled as Floorplan's.
+pub fn with_overlays(
+    graph: Value,
+    runs: Option<&[WorkItem]>,
+    found: Option<&[HealthItem]>,
+) -> Value {
+    let idx = MapIndex::of(&graph);
+    apply_overlays(labelled(graph), &overlays(&idx, runs, found))
 }
 
 /// The copy the page gets: read-only (Floorplan's exported mode, so the
@@ -777,6 +922,72 @@ pub fn for_viewer(mut graph: Value, now: &str) -> Value {
     graph["meta"]["agent"] = json!("none");
     graph["meta"]["exported"] = json!({ "at": now, "by": "Coderhelm" });
     graph
+}
+
+/// The page's copy of a freshly built map ([`view_key`]): Floorplan's checks
+/// labelled, read-only, without the sandbox's folder. CoderHelm's overlays
+/// are laid over it on the page.
+pub fn viewer_copy(graph: &Value, now: &str) -> Value {
+    for_viewer(labelled(graph.clone()), now)
+}
+
+/// The page's copy and the index of a map, gzipped, as they are stored.
+pub fn derived(graph: &Value, now: &str) -> (Vec<u8>, Vec<u8>) {
+    let view = gzip(viewer_copy(graph, now).to_string().as_bytes());
+    let index = gzip(&serde_json::to_vec(&MapIndex::of(graph)).unwrap_or_default());
+    (view, index)
+}
+
+/// Writes the page's copy and the index of `graph` next to it (the worker
+/// after each build; the read API once for a map built before they
+/// existed). The copy is stored as JSON with `Content-Encoding: gzip`, so the
+/// browser unzips it itself.
+pub async fn store_derived(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    team_id: &str,
+    graph: &Value,
+) -> Result<MapIndex, String> {
+    let (view, index) = derived(graph, &chrono::Utc::now().to_rfc3339());
+    s3.put_object()
+        .bucket(bucket)
+        .key(view_key(team_id))
+        .content_type("application/json")
+        .content_encoding("gzip")
+        .cache_control("private, no-cache")
+        .body(aws_sdk_s3::primitives::ByteStream::from(view))
+        .send()
+        .await
+        .map_err(|e| format!("app map: could not keep the page's copy: {e}"))?;
+    // The index last: a reader that finds it current finds the copy current.
+    s3.put_object()
+        .bucket(bucket)
+        .key(index_key(team_id))
+        .content_type("application/gzip")
+        .body(aws_sdk_s3::primitives::ByteStream::from(index))
+        .send()
+        .await
+        .map_err(|e| format!("app map: could not keep the map's index: {e}"))?;
+    Ok(MapIndex::of(graph))
+}
+
+/// The team's map index and when it was written (unix seconds), if any.
+pub async fn load_index(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    team_id: &str,
+) -> Option<(MapIndex, i64)> {
+    let obj = s3
+        .get_object()
+        .bucket(bucket)
+        .key(index_key(team_id))
+        .send()
+        .await
+        .ok()?;
+    let at = obj.last_modified().map(|t| t.secs()).unwrap_or(0);
+    let bytes = obj.body.collect().await.ok()?.into_bytes();
+    let json = gunzip(&bytes, MAX_GRAPH_BYTES)?;
+    Some((serde_json::from_slice(&json).ok()?, at))
 }
 
 // ── Lookups (read API and Ask) ─────────────────────────────────────────────
@@ -1481,6 +1692,220 @@ mod tests {
             .iter()
             .any(|i| i["source"] == "floorplan" && i["id"] == "no-auth:harbor-api"));
         assert_eq!(g["health"]["summary"]["high"], 1);
+    }
+
+    /// The page's copy and the index are written together from a built map;
+    /// overlays placed with the stored index and laid over the stored copy
+    /// are what the map with its overlays always was.
+    #[test]
+    fn overlays_from_the_index_match_the_map_with_its_overlays() {
+        let runs = [WorkItem {
+            repo: "harbor/harbor-api".into(),
+            ticket: "DOCK-42".into(),
+            title: "Stop double bookings".into(),
+            files: vec!["src/bookings.js".into()],
+            ..Default::default()
+        }];
+        let found = [
+            HealthItem {
+                kind: "security".into(),
+                id: "f1".into(),
+                title: "Prototype pollution".into(),
+                severity: "P1".into(),
+                repo: "harbor/harbor-api".into(),
+                files: vec![("src/bookings.js".into(), 5)],
+                link: "/security/detail?id=f1".into(),
+            },
+            HealthItem {
+                kind: "logs".into(),
+                id: "l1".into(),
+                title: "Bookings time out".into(),
+                severity: "warning".into(),
+                repo: "harbor/harbor-web".into(),
+                files: vec![],
+                link: "/logs?finding=l1".into(),
+            },
+        ];
+        let now = "2026-11-21T00:00:00Z";
+        let (view, index) = derived(&harbor(), now);
+        let view: Value = serde_json::from_slice(&gunzip(&view, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let idx: MapIndex =
+            serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        assert_eq!(idx, MapIndex::of(&harbor()));
+        assert_eq!(view["meta"]["exported"]["by"], "Coderhelm");
+        assert!(view["meta"]["root"].is_null());
+        for (r, f) in [
+            (Some(&runs[..]), Some(&found[..])),
+            (Some(&runs[..]), None),
+            (None, Some(&found[..])),
+            (Some(&[][..]), Some(&[][..])),
+        ] {
+            let o = overlays(&idx, r, f);
+            let mut want = for_viewer(with_overlays(harbor(), r, f), now);
+            let mut got = apply_overlays(view.clone(), &o);
+            // Recent work is stamped when it is made.
+            for g in [&mut want, &mut got] {
+                if let Some(r) = g.get_mut("recent") {
+                    r["updatedAt"] = json!("");
+                }
+            }
+            assert_eq!(got, want);
+        }
+        // The Floorplan check at the same file and line is dropped by id.
+        let o = overlays(&idx, None, Some(&found));
+        assert_eq!(o["health"]["drop"], json!(["no-auth:harbor-api"]));
+        assert_eq!(idx.repo_node("HARBOR/harbor-web").as_deref(), Some("web"));
+    }
+
+    /// A made-up map the size of a large team's: `files` files in 12 parts
+    /// across 9 repositories, three lines per file, 20 Floorplan checks.
+    fn synthetic(files: usize) -> Value {
+        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let folders = folders(&repos);
+        let nodes: Vec<Value> = (0..12)
+            .map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service", "summary": "Looks after berths.", "stats": {"files": files / 12}}))
+            .collect();
+        let fs: Vec<Value> = (0..files)
+            .map(|i| {
+                let r = &repos[i % 9];
+                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes.", "h": "0123456789abcdef", "s": [], "sig": ""})
+            })
+            .collect();
+        let links: Vec<Value> = (0..files * 3)
+            .map(|i| json!({"a": format!("f:{}", fs[i % files]["p"].as_str().unwrap()), "b": format!("f:{}", fs[(i * 7 + 13) % files]["p"].as_str().unwrap()), "k": "import", "w": 1}))
+            .collect();
+        let issues: Vec<Value> = (0..20)
+            .map(|i| json!({"id": format!("open-endpoints:{}", fs[i * 17]["p"].as_str().unwrap()), "kind": "open-endpoints", "severity": if i % 3 == 0 { "high" } else { "medium" }, "title": "An endpoint anyone can call", "detail": "", "items": [format!("f:{}", fs[i * 17]["p"].as_str().unwrap())], "notes": {}, "locations": [{"file": fs[i * 17]["p"], "line": 10}], "fix": ""}))
+            .collect();
+        let mut g = json!({
+            "schema": GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "meta": {"root": "/tmp/x", "agent": "claude", "repos": repos},
+            "nodes": nodes, "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
+            "health": {"issues": issues, "checked": [], "appWide": []},
+        });
+        stamp_repos(&mut g, &folders);
+        g
+    }
+
+    /// What a page view costs at a large team's map size: before, the read API
+    /// read and parsed the whole map, placed each run's and finding's files
+    /// by scanning the map's files for each one, and sent the whole map back;
+    /// now it reads the small index, places them by lookup and sends a
+    /// signed address with the overlays. `APP_MAP_BENCH_GRAPH=<graph.json.gz>`
+    /// measures a map on disk instead of the made-up one.
+    #[test]
+    fn a_page_view_reads_the_small_index_never_the_whole_map() {
+        use std::time::Instant;
+        let graph = match std::env::var("APP_MAP_BENCH_GRAPH") {
+            Ok(p) => serde_json::from_slice(
+                &gunzip(&std::fs::read(p).unwrap(), MAX_GRAPH_BYTES).unwrap(),
+            )
+            .unwrap(),
+            Err(_) => synthetic(4_000),
+        };
+        let paths: Vec<(String, String)> = arr(&graph, "files")
+            .filter_map(|f| {
+                let folder = f["r"].as_str()?;
+                let repo = graph["coderhelm"]["repos"][folder].as_str()?;
+                let p = f["p"].as_str()?.strip_prefix(&format!("{folder}/"))?;
+                Some((repo.to_string(), p.to_string()))
+            })
+            .collect();
+        // The most the page asks for: 60 runs of 20 files, 200 findings of 2.
+        let runs: Vec<WorkItem> = (0..60)
+            .map(|i| WorkItem {
+                repo: paths[i % paths.len()].0.clone(),
+                ticket: format!("DOCK-{i}"),
+                title: "Tidy the berths".into(),
+                files: (0..20)
+                    .map(|j| paths[(i * 31 + j * 7) % paths.len()].1.clone())
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        let found: Vec<HealthItem> = (0..200)
+            .map(|i| HealthItem {
+                kind: "security".into(),
+                id: format!("f{i}"),
+                title: "An advisory".into(),
+                severity: "P2".into(),
+                repo: paths[i % paths.len()].0.clone(),
+                files: if i % 4 == 0 {
+                    vec![]
+                } else {
+                    vec![
+                        (paths[(i * 13) % paths.len()].1.clone(), 3),
+                        ("package.json".into(), 0),
+                    ]
+                },
+                link: format!("/security/detail?id=f{i}"),
+            })
+            .collect();
+        let stored = gzip(graph.to_string().as_bytes());
+        let (view, index) = derived(&graph, "2026-11-21T00:00:00Z");
+
+        // Before: the whole map read, the overlays placed on it, all of it sent.
+        let t = Instant::now();
+        let g: Value = serde_json::from_slice(&gunzip(&stored, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let mut placed = 0;
+        for w in &runs {
+            placed += w
+                .files
+                .iter()
+                .filter(|f| map_path(&g, &w.repo, f).is_some())
+                .count();
+        }
+        for h in &found {
+            placed += h
+                .files
+                .iter()
+                .filter(|(f, _)| map_path(&g, &h.repo, f).is_some())
+                .count();
+        }
+        let before_body = json!({"status": {}, "graph": for_viewer(with_overlays(g, Some(&runs), Some(&found)), "now")}).to_string();
+        let before = t.elapsed();
+
+        // Now: the index read, the overlays placed with it, an address sent.
+        let t = Instant::now();
+        let idx: MapIndex =
+            serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let o = overlays(&idx, Some(&runs), Some(&found));
+        let after_body = json!({"status": {}, "graph": null, "graph_url": "https://bucket.s3.us-east-1.amazonaws.com/app-map/t/view.json.gz?X-Amz-Signature=0", "overlays": o}).to_string();
+        let after = t.elapsed();
+
+        eprintln!(
+            "app map page view: {} files, {} placed; before {:?} and {} bytes sent; now {:?} and {} bytes sent; the map read by the browser: {} bytes gzipped, index {} bytes gzipped",
+            arr(&graph, "files").count(),
+            placed,
+            before,
+            before_body.len(),
+            after,
+            after_body.len(),
+            view.len(),
+            index.len(),
+        );
+        assert!(placed > 0);
+        assert!(after_body.len() < 1_000_000, "{} bytes", after_body.len());
+        assert!(
+            index.len() * 4 < stored.len(),
+            "the index is a fraction of the map"
+        );
+        // Generous for a debug build on a shared runner; a release build is
+        // a few milliseconds.
+        assert!(after.as_millis() < 1_000, "{after:?}");
+        assert!(after < before);
+        // The page lays the overlays over the copy and gets the same map.
+        let view: Value = serde_json::from_slice(&gunzip(&view, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let mut got = apply_overlays(view, &o);
+        let mut want = for_viewer(
+            with_overlays(graph, Some(&runs), Some(&found)),
+            "2026-11-21T00:00:00Z",
+        );
+        for g in [&mut want, &mut got] {
+            g["recent"]["updatedAt"] = json!("");
+        }
+        assert_eq!(got["health"], want["health"]);
+        assert_eq!(got["recent"], want["recent"]);
     }
 
     #[test]

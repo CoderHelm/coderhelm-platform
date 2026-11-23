@@ -22,8 +22,11 @@
 //! runs the scan or the refresh; `build` writes the model jobs' answers and
 //! builds. The map is kept in the bucket (`common::app_map::graph_key`), with
 //! Floorplan's own files for the next refresh (`state_key`) and the step's
-//! job (`job_key`). Recent work and Health are added when the page reads the
-//! map (`common::app_map::with_overlays`), so they are always current.
+//! job (`job_key`). Next to the map go the page's copy (`view_key`, which
+//! the browser reads from the bucket itself) and the map's small index
+//! (`index_key`), so reading the page never reads the whole map. Recent work
+//! and Health are placed with the index when the page is read
+//! (`common::app_map::overlays`), so they are always current.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -1057,6 +1060,9 @@ async fn step(
                 am::gzip(g.to_string().as_bytes()),
             )
             .await?;
+            // The page's copy and the index the read API places overlays
+            // with, so a page view never reads the whole map.
+            am::store_derived(&state.s3, &state.config.bucket_name, team_id, &g).await?;
             job.built = job.heads.clone();
             job.arch_attempts = 0;
             job.desc_attempts = 0;

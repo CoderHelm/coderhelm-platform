@@ -731,6 +731,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         // App map: the team's app across its repositories, made with Floorplan
         // (vendor/floorplan) and read through common::app_map.
         .route("/app-map", get(routes::app_map::get_map))
+        .route("/app-map/graph", get(routes::app_map::graph))
         .route("/app-map/part", get(routes::app_map::part))
         .route("/app-map/file", get(routes::app_map::file))
         .route("/app-map/screen", get(routes::app_map::screen))

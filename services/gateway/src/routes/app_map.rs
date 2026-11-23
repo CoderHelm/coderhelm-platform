@@ -5,8 +5,13 @@
 //! signed-in team's own map: another team's part, file or screen is simply
 //! not found.
 //!
-//! - `GET /api/app-map?recent=1&health=1`: the build status and the map
-//!   (the first visit starts the first build);
+//! - `GET /api/app-map?recent=1&health=1`: the build status, a short-lived
+//!   signed address of the page's copy of the map (the browser reads it from
+//!   the bucket), and Recent work and Health as a small payload the page lays
+//!   over it (the first visit starts the first build); `graph=0`: the status
+//!   only;
+//! - `GET /api/app-map/graph`: the page's copy through the API, as stored,
+//!   for a browser that can't reach the bucket;
 //! - `GET /api/app-map/part?id=`, `/file?path=`, `/screen?id=`, `/search?q=`:
 //!   lookups;
 //! - questions about the map are Chat's: Chat offers the map lookups
@@ -162,7 +167,23 @@ pub struct MapQuery {
     pub graph: Option<u8>,
 }
 
-/// GET /api/app-map — the build status and the map, ready for the viewer.
+/// How long the signed address of the page's copy of the map stays good.
+pub const VIEW_URL_SECS: u64 = 15 * 60;
+
+/// Where the page reads the map when the bucket can't be reached from the
+/// browser (`GET /api/app-map/graph`, the same bytes through the API).
+pub const VIEW_FALLBACK: &str = "/api/app-map/graph";
+
+/// GET /api/app-map — the build status, where to read the map, and
+/// CoderHelm's overlays for it.
+///
+/// The map itself never passes through here: the worker writes the page's
+/// copy at build time (`common::app_map::view_key`, gzipped JSON the browser
+/// unzips), and the answer carries a short-lived signed address for it
+/// (`graph_url`). Recent work and Health come as a small payload
+/// (`overlays`) placed with the map's index (`common::app_map::MapIndex`),
+/// which the page lays over the map. A map built before the copy and the
+/// index existed gets them written here once.
 pub async fn get_map(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -170,82 +191,181 @@ pub async fn get_map(
 ) -> Result<Json<Value>, StatusCode> {
     let table = &state.config.settings_table_name;
     let bucket = &state.config.bucket_name;
+    let team = claims.team_id.as_str();
     let status_only = q.graph == Some(0);
-    let (graph, written, mut st) = tokio::join!(
+    let (written, index, mut st) = tokio::join!(
+        am::graph_written_at(&state.s3, bucket, team),
         async {
             if status_only {
                 None
             } else {
-                am::load_graph_dated(&state.s3, bucket, &claims.team_id).await
+                am::load_index(&state.s3, bucket, team).await
             }
         },
-        async {
-            if status_only {
-                am::graph_written_at(&state.s3, bucket, &claims.team_id).await
-            } else {
-                None
-            }
-        },
-        am::status(&state.dynamo, table, &claims.team_id),
+        am::status(&state.dynamo, table, team),
     );
     let now = chrono::Utc::now().timestamp();
-    let facts = match (&graph, written) {
-        (Some((g, at)), _) => MapFacts {
-            has_map: true,
-            written_at: *at,
-            repos: am::repo_count(g),
-        },
-        (None, Some(at)) => MapFacts {
+    // The index is written after the map (and the page's copy before the
+    // index): one older than the map belongs to an earlier map.
+    let index = match (index, written) {
+        (Some((idx, at)), Some(map_at)) if at + 1 >= map_at => Some(idx),
+        (_, Some(_)) if !status_only => backfill(&state, team).await,
+        _ => None,
+    };
+    let facts = match written {
+        Some(at) => MapFacts {
             has_map: true,
             written_at: at,
-            repos: st.as_ref().map(|s| s.built_repos).unwrap_or(0),
+            repos: index
+                .as_ref()
+                .map(|i| i.repos.len() as u32)
+                .or(st.as_ref().map(|s| s.built_repos))
+                .unwrap_or(0),
         },
-        (None, None) => MapFacts::default(),
+        None => MapFacts::default(),
     };
     // The first visit starts the first build.
     if shown_state(st.as_ref(), facts.has_map, now).0 == "not_built" {
-        match queue_build(&state, &claims.team_id).await {
+        match queue_build(&state, team).await {
             Ok(new) => st = Some(new),
             Err(Some(running)) => st = Some(running),
-            Err(None) => st = am::status(&state.dynamo, table, &claims.team_id).await,
+            Err(None) => st = am::status(&state.dynamo, table, team).await,
         }
     }
     let running = st.as_ref().is_some_and(|s| s.is_running(now));
     let team_repos = if running && st.as_ref().is_some_and(|s| s.repos == 0) {
-        team_repo_count(&state, &claims.team_id).await
+        team_repo_count(&state, team).await
     } else {
         0
     };
     let status = status_view(st.as_ref(), facts, team_repos, now);
-    let Some((graph, _)) = graph else {
+    let (Some(idx), false) = (index, status_only) else {
         return Ok(Json(json!({ "status": status, "graph": Value::Null })));
     };
+    let url = view_url(&state, team).await.map_err(|e| {
+        error!("app map: could not sign the map's address: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let overlays = overlays_for(&state, team, &idx, &q).await;
+    Ok(Json(json!({
+        "status": status,
+        "graph": Value::Null,
+        "graph_url": url,
+        "graph_fallback": VIEW_FALLBACK,
+        "graph_at": facts.written_at,
+        "overlays": overlays,
+    })))
+}
+
+/// Writes the page's copy and the index of a map built before they existed
+/// (or by a worker that didn't write them), once; `None` when the map can't
+/// be read.
+async fn backfill(state: &AppState, team: &str) -> Option<am::MapIndex> {
+    let bucket = &state.config.bucket_name;
+    let graph = am::load_graph(&state.s3, bucket, team).await?;
+    match am::store_derived(&state.s3, bucket, team, &graph).await {
+        Ok(idx) => {
+            info!(team_id = team, "App map: wrote the page's copy and index");
+            Some(idx)
+        }
+        Err(e) => {
+            error!("{e}");
+            None
+        }
+    }
+}
+
+/// A signed GET for the page's copy of the team's map.
+async fn view_url(state: &AppState, team: &str) -> Result<String, String> {
+    let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(
+        VIEW_URL_SECS,
+    ))
+    .map_err(|e| e.to_string())?;
+    let req = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(am::view_key(team))
+        .presigned(cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(req.uri().to_string())
+}
+
+/// Plans read at once for Recent work's "why".
+const WHY_AT_ONCE: usize = 8;
+
+/// CoderHelm's Recent work and Health for the map (each when asked for),
+/// placed with the map's index.
+async fn overlays_for(state: &AppState, team: &str, idx: &am::MapIndex, q: &MapQuery) -> Value {
+    use futures::StreamExt;
     let days = 14;
     let (runs, found) = tokio::join!(
         async {
-            if q.recent == Some(1) {
-                Some(recent_runs(&state, &claims.team_id, days).await)
-            } else {
-                None
+            if q.recent != Some(1) {
+                return None;
             }
+            let mut runs = recent_runs(state, team, days).await;
+            // Only runs that are on the map are shown: read the plans of
+            // those, a few at a time.
+            runs.retain(|w| w.files.iter().any(|f| idx.map_path(&w.repo, f).is_some()));
+            let asks: Vec<(String, String)> = runs
+                .iter()
+                .take(25)
+                .map(|w| (w.ticket.clone(), w.repo.clone()))
+                .collect();
+            let whys: Vec<String> = futures::stream::iter(asks)
+                .map(|(ticket, repo)| async move { plan_why(state, team, &ticket, &repo).await })
+                .buffered(WHY_AT_ONCE)
+                .collect()
+                .await;
+            for (w, why) in runs.iter_mut().zip(whys) {
+                w.why = why;
+            }
+            Some(runs)
         },
         async {
             if q.health == Some(1) {
-                Some(health(&state, &claims.team_id, days).await)
+                Some(health(state, team, days).await)
             } else {
                 None
             }
         },
     );
-    let mut runs = runs;
-    if let Some(runs) = runs.as_mut() {
-        for w in runs.iter_mut().take(25) {
-            w.why = plan_why(&state, &claims.team_id, &w.ticket, &w.repo).await;
-        }
-    }
-    let graph = am::with_overlays(graph, runs.as_deref(), found.as_deref());
-    let graph = am::for_viewer(graph, &chrono::Utc::now().to_rfc3339());
-    Ok(Json(json!({ "status": status, "graph": graph })))
+    am::overlays(idx, runs.as_deref(), found.as_deref())
+}
+
+/// GET /api/app-map/graph — the page's copy of the map through the API, as
+/// stored (gzipped JSON the browser unzips), for a browser that can't reach
+/// the bucket. The bytes are passed on, never read.
+pub async fn graph(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    let obj = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(am::view_key(&claims.team_id))
+        .send()
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let bytes = obj
+        .body
+        .collect()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .into_bytes();
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CONTENT_ENCODING, "gzip"),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 fn bounded(s: &str, max: usize) -> Result<(), StatusCode> {
@@ -560,9 +680,32 @@ pub fn infra_item(r: &Value) -> Option<HealthItem> {
 
 const OPEN_SECURITY: &[&str] = &["open", "fixing", "pr_open", "no_fix"];
 
+/// CoderHelm's open findings that name a repository, its four sources read
+/// at once.
 async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+    let (security, infra, logs, alerts) = tokio::join!(
+        super::security::load_findings(state, team_id),
+        super::infra_security::load_records(state, team_id),
+        common::log_findings::list_findings(
+            &state.dynamo,
+            &state.config.aws_insights_table_name,
+            team_id,
+            200,
+        ),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+            .expression_attribute_values(":p", AttributeValue::S(team_id.to_string()))
+            .expression_attribute_values(":s", AttributeValue::S("ALERT_EVENT#".into()))
+            .scan_index_forward(false)
+            .limit(200)
+            .send(),
+    );
     let mut out = Vec::new();
-    if let Ok(found) = super::security::load_findings(state, team_id).await {
+    if let Ok(found) = security {
         for (f, _) in found {
             let v = serde_json::to_value(&f).unwrap_or_default();
             if OPEN_SECURITY.contains(&str_at(&v, &["status"])) {
@@ -570,7 +713,7 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
             }
         }
     }
-    if let Ok(records) = super::infra_security::load_records(state, team_id).await {
+    if let Ok(records) = infra {
         for r in records {
             let v = serde_json::to_value(&r).unwrap_or_default();
             if !matches!(str_at(&v, &["status"]), "fixed" | "dismissed" | "resolved") {
@@ -578,14 +721,7 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
             }
         }
     }
-    if let Ok(found) = common::log_findings::list_findings(
-        &state.dynamo,
-        &state.config.aws_insights_table_name,
-        team_id,
-        200,
-    )
-    .await
-    {
+    if let Ok(found) = logs {
         for f in found {
             if f.fix_repo.is_empty() || matches!(f.status.as_str(), "dismissed" | "resolved") {
                 continue;
@@ -602,19 +738,7 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
         }
     }
     // Alerts of the last `days` days that named a repository.
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
-    if let Ok(page) = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :p AND begins_with(sk, :s)")
-        .expression_attribute_values(":p", AttributeValue::S(team_id.to_string()))
-        .expression_attribute_values(":s", AttributeValue::S("ALERT_EVENT#".into()))
-        .scan_index_forward(false)
-        .limit(200)
-        .send()
-        .await
-    {
+    if let Ok(page) = alerts {
         for it in page.items() {
             let s = |k: &str| {
                 it.get(k)
@@ -927,5 +1051,143 @@ mod tests {
             .iter()
             .any(|i| i["source"] == "coderhelm"
                 && i["items"] == json!(["f:harbor-api/src/bookings.js"])));
+    }
+
+    /// A made-up map the size of a large team's: `files` files in 12 parts
+    /// across 9 repositories, three lines per file.
+    fn big_map(files: usize) -> Value {
+        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let folders = am::folders(&repos);
+        let fs: Vec<Value> = (0..files)
+            .map(|i| {
+                let r = &repos[i % 9];
+                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes."})
+            })
+            .collect();
+        let links: Vec<Value> = (0..files * 3)
+            .map(|i| json!({"a": format!("f:{}", fs[i % files]["p"].as_str().unwrap()), "b": format!("f:{}", fs[(i * 7 + 13) % files]["p"].as_str().unwrap()), "k": "import", "w": 1}))
+            .collect();
+        let mut g = json!({
+            "schema": am::GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "meta": {"root": "/tmp/x", "agent": "claude"},
+            "nodes": (0..12).map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service"})).collect::<Vec<_>>(),
+            "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
+            "health": {"issues": [{"id": "open-endpoints:x", "severity": "high", "title": "Open", "items": [], "locations": [{"file": "yard0/src/area0/berth_0_keeper.ts", "line": 3}]}]},
+        });
+        am::stamp_repos(&mut g, &folders);
+        g
+    }
+
+    async fn read_map(state: &Arc<AppState>, team: &str) -> Value {
+        let q = MapQuery {
+            recent: Some(1),
+            health: Some(1),
+            ..Default::default()
+        };
+        let Json(body) = get_map(State(state.clone()), Extension(admin(team)), Query(q))
+            .await
+            .unwrap();
+        body
+    }
+
+    /// The page gets where to read the map and a small payload of overlays,
+    /// never the map: the copy and the index are read from the bucket (and
+    /// written once for a map built before they existed), and the copy
+    /// itself comes from the bucket, or through the API as stored.
+    #[tokio::test]
+    async fn the_page_gets_an_address_for_the_map_and_small_overlays() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#harbor";
+        // No map yet: no address.
+        let first = read_map(&state, "TEAM#marina").await;
+        assert!(first["graph_url"].is_null() && first["graph"].is_null());
+
+        // A map built before the page's copy and its index existed.
+        f.store.put_object(
+            "bucket",
+            &am::graph_key(team),
+            am::gzip(harbor().to_string().as_bytes()),
+        );
+        let body = read_map(&state, team).await;
+        assert_eq!(body["status"]["state"], "ready");
+        assert!(body["graph"].is_null(), "the map itself is never sent");
+        let url = body["graph_url"].as_str().unwrap();
+        assert!(
+            url.contains("/bucket/app-map/TEAM_harbor/view.json.gz?")
+                && url.contains("X-Amz-Signature=")
+                && url.contains(&format!("X-Amz-Expires={VIEW_URL_SECS}")),
+            "{url}"
+        );
+        assert_eq!(body["graph_fallback"], VIEW_FALLBACK);
+        assert!(body["graph_at"].as_i64().unwrap() > 0);
+        // Written once, as the browser reads it.
+        let view = f.store.object("bucket", &am::view_key(team)).unwrap();
+        assert_eq!(view.content_type, "application/json");
+        assert_eq!(view.content_encoding, "gzip");
+        let copy: Value =
+            serde_json::from_slice(&am::gunzip(&view.body, am::MAX_GRAPH_BYTES).unwrap()).unwrap();
+        assert!(copy["meta"]["root"].is_null());
+        assert_eq!(copy["meta"]["agent"], "none");
+        assert!(f.store.object("bucket", &am::index_key(team)).is_some());
+        // Overlays: no runs, Floorplan's own checks counted.
+        assert!(body["overlays"]["recent"].is_null());
+        let summary = &body["overlays"]["health"]["summary"];
+        assert_eq!(summary, &copy["health"]["summary"]);
+        // Read again: the copy is not written again.
+        let at = view.at;
+        read_map(&state, team).await;
+        assert_eq!(
+            f.store.object("bucket", &am::view_key(team)).unwrap().at,
+            at
+        );
+
+        // Through the API: the stored bytes, for the browser to unzip.
+        let r = graph(State(state.clone()), Extension(admin(team)))
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["content-encoding"], "gzip");
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.to_vec(), view.body);
+        // Another team's copy is not this team's.
+        assert!(graph(State(state.clone()), Extension(admin("TEAM#marina")))
+            .await
+            .is_err());
+    }
+
+    /// A page view at a large team's map size, through the real handler: the
+    /// answer is small and quick, however large the map.
+    #[tokio::test]
+    async fn a_page_view_of_a_large_map_is_small_and_quick() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#dockyard";
+        let map = am::gzip(big_map(4_000).to_string().as_bytes());
+        let map_len = map.len();
+        f.store.put_object("bucket", &am::graph_key(team), map);
+        let am::MapIndex { .. } = am::store_derived(
+            &state.s3,
+            "bucket",
+            team,
+            &am::load_graph(&state.s3, "bucket", team).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let t = std::time::Instant::now();
+        let body = read_map(&state, team).await;
+        let took = t.elapsed();
+        let size = body.to_string().len();
+        let view = f.store.object("bucket", &am::view_key(team)).unwrap();
+        eprintln!(
+            "app map page view, 4,000 files: {took:?}, {size} bytes answered; the map is {map_len} bytes gzipped, the page's copy {} bytes gzipped",
+            view.body.len()
+        );
+        assert!(body["graph_url"].is_string());
+        assert!(size < 1_000_000, "{size} bytes");
+        // Debug build, every call through the local stand-in.
+        assert!(took.as_millis() < 1_000, "{took:?}");
     }
 }
