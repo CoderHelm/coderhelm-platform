@@ -246,14 +246,118 @@ function readsContext(ix, r, file, name) {
 
 // ── Closures ──────────────────────────────────────────────────────────────
 
+/** Lines that are part of an import statement. */
+function importLines(lines) {
+  const out = new Set();
+  let open = false;
+  lines.forEach((t, i) => {
+    if (open || /^\s*import\b/.test(t) || /^\s*(const|let|var)\s+[\w{},\s]+=\s*require\(/.test(t)) {
+      out.add(i);
+      open = /^\s*import\b/.test(t) || open ? !/\bfrom\s*['"]|^\s*import\s*['"]|\)\s*;?\s*$/.test(t) : false;
+    }
+  });
+  return out;
+}
+
+/** Where `file` first runs what it imports from `to` (1-based; 0 when
+ * unknown): the first line outside the imports that names it. A hook that
+ * hands back functions (`const { mutate: pay } = usePay()`) runs when
+ * those are called, so its line is the first call of what it hands back. */
+export function useLine(ix, r, file, to, names) {
+  return r.once('use:' + to + ':' + (names || []).join(','), file, () => {
+    const lines = r.lines(file) || [];
+    const skip = importLines(lines);
+    const ids = new Set((names || []).filter((n) => n !== 'default' && n !== '*'));
+    const def = (ix.syms.get(to) || []).find((x) => x.kind === 'default');
+    if (def && def.name !== 'default' && !(names || []).some((n) => n.startsWith('this.'))) ids.add(def.name);
+    const base = path.posix.basename(to).replace(/\.\w+$/, '');
+    if (!(names || []).some((n) => n.startsWith('this.'))) ids.add(base === 'index' ? path.posix.basename(path.posix.dirname(to)) : base);
+    const named = [...ids].filter((n) => /^(this\.)?[A-Za-z_$][\w$]*$/.test(n));
+    if (!named.length) return 0;
+    // A call, a render or a `this.x.` use runs it; a type or a mention
+    // doesn't, so it counts only when nothing runs it.
+    const alt = named.map(esc).join('|');
+    const runs = new RegExp('(?:\\b(?:' + alt + ')\\s*(?:<[^>()]*>)?\\(|<(?:' + alt + ')\\b|\\b(?:' + alt + ')\\.\\w+\\s*\\()');
+    const re = new RegExp('\\b(' + alt + ')\\b');
+    let at = lines.findIndex((t, i) => !skip.has(i) && runs.test(t));
+    if (at < 0) at = lines.findIndex((t, i) => !skip.has(i) && re.test(t));
+    if (at < 0) return 0;
+    const m = /^\s*(?:const|let|var)\s+(\{[^}]*\}|\[[^\]]*\]|[\w$]+)\s*=\s*(?:await\s+)?(use[A-Z]\w*)\s*\(/.exec(lines[at]);
+    if (m) {
+      const bound = m[1].replace(/[{}[\]]/g, '').split(',').map((x) => x.split(':').pop().trim().replace(/\s*=.*$/, '')).filter((x) => /^[A-Za-z_$][\w$]*$/.test(x));
+      if (bound.length) {
+        const call = new RegExp('\\b(' + bound.map(esc).join('|') + ')(\\.(mutate|mutateAsync|trigger|refetch|execute))?\\s*\\(');
+        const later = lines.findIndex((t, i) => i > at && call.test(t));
+        if (later >= 0) return later + 1;
+      }
+    }
+    return at + 1;
+  });
+}
+
+/** The names a file runs what it imports by: the imported names, and what
+ * a hook among them hands back (`const { login } = useFlow()`). */
+function runNames(lines, names) {
+  const out = new Set((names || []).filter((n) => /^[A-Za-z_$][\w$]*$/.test(n) && n !== 'default'));
+  for (const t of lines) {
+    const m = /^\s*(?:const|let|var)\s+(\{[^}]*\}|\[[^\]]*\]|[\w$]+)\s*=\s*(?:await\s+)?(use[A-Z]\w*)\s*\(/.exec(t);
+    if (!m || !out.has(m[2])) continue;
+    for (const x of m[1].replace(/[{}[\]]/g, '').split(',')) {
+      const b = x.split(':').pop().trim().replace(/\s*=.*$/, '');
+      if (/^[A-Za-z_$][\w$]*$/.test(b)) out.add(b);
+    }
+  }
+  return [...out];
+}
+
+/** The functions a rendered component is handed (`onContinue={handleLogin}`,
+ * `onDone={() => save()}`), read from its tag on `line` (1-based). */
+export function propHandlers(lines, line) {
+  const out = [];
+  for (let i = line - 1; i < Math.min(lines.length, line + 40); i++) {
+    const t = lines[i];
+    for (const m of t.matchAll(/\b(on[A-Z]\w*)=\{\s*([A-Za-z_$][\w$]*)\s*\}/g)) out.push({ prop: m[1], fn: m[2] });
+    for (const m of t.matchAll(/\b(on[A-Z]\w*)=\{[^}]*?=>\s*(?:void\s+)?([A-Za-z_$][\w$]*)\s*\(/g)) out.push({ prop: m[1], fn: m[2] });
+    if (i > line - 1 && /\/>|^\s*>/.test(t)) break;
+  }
+  return out;
+}
+
+/** Where a function declared in a file runs (1-based lines, from its
+ * declaration to its closing brace), or null. */
+export function bodyRange(lines, name) {
+  const decl = new RegExp('^\\s*(?:export\\s+)?(?:(?:const|let|var)\\s+' + esc(name) + '\\s*=|(?:async\\s+)?function\\s+' + esc(name) + '\\b)');
+  const a = lines.findIndex((t) => decl.test(t));
+  if (a < 0) return null;
+  let depth = 0;
+  let opened = false;
+  for (let i = a; i < lines.length; i++) {
+    for (const ch of lines[i].replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""').replace(/\/\/.*$/, '')) {
+      if (ch === '{' || ch === '(') { depth++; opened = true; } else if (ch === '}' || ch === ')') depth--;
+    }
+    if (opened && depth <= 0) return [a + 1, i + 1];
+  }
+  return [a + 1, lines.length];
+}
+
+/** Run order between two places in the code: each is the chain of lines
+ * from the start file down to the call (where each file runs the next,
+ * then the call's own line), so calls made by statements earlier in a
+ * function come first, however deep the code they go through. */
+export function runOrder(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+}
+
 /** The files a start file reaches, symbol-aware: file to the names used
- * from it (null: all of it). */
+ * from it (null: all of it), how deep, and the chain of lines (`at`) where
+ * each file on the way runs the next. */
 export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = null } = {}) {
-  const seen = new Map([[start, { d: 0, names: null }]]);
+  const seen = new Map([[start, { d: 0, names: null, at: [], via: null }]]);
   const queue = [start];
   while (queue.length) {
     const f = queue.shift();
-    const { d, names } = seen.get(f);
+    const { d, names, at, via } = seen.get(f);
     if (d >= depth) continue;
     const body = slice(r, f, names && [...names], ix);
     const edges = [...(ix.imports.get(f) || []), ...hiddenImports(ix, r, classes, f)];
@@ -276,7 +380,8 @@ export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = nu
         continue;
       }
       if (seen.size >= cap) continue;
-      seen.set(e.to, { d: d + 1, names: use });
+      const how = e.prop ? ['this.' + e.prop] : e.names;
+      seen.set(e.to, { d: d + 1, names: use, at: [...at, useLine(ix, r, f, e.to, how)], via: via || e.to });
       queue.push(e.to);
     }
   }
@@ -364,6 +469,8 @@ export function routeHops(text) {
 // ── Calls the map has no link for ─────────────────────────────────────────
 
 const HTTP_FN = String.raw`(?:fetch|axios(?:\.\w+)?|\w*[Hh]ttp(?:Client)?\.\w+|\w*[Cc]lient\.(?:get|post|put|patch|delete)|\w*(?:[Gg]et|[Pp]ost|[Pp]ut|[Pp]atch|[Dd]elete|[Rr]equest)|\$fetch)`;
+// A call to an HTTP client (or a query hook, or a URL being built).
+const HTTP_NEAR = new RegExp(HTTP_FN + String.raw`\s*(?:<[^>()]*>)?\(|\buse\w*(?:Query|Mutation)\s*\(|\bnew\s+URL\(|\burl\s*[:=]`);
 const METHOD_NEAR = /\b(?:method:\s*['"](\w+)['"]|\.(get|post|put|patch|delete)\s*[<(]|(?:api|http|mapi)?(Get|Post|Put|Patch|Delete)\s*[<(])/i;
 
 /** Calls written in one file: `fetch('/x')`, `apiPost(`${base}/x`)`,
@@ -588,11 +695,16 @@ export function candidates(graph, read) {
   // An edge, with where the code makes it (closure depth, then line), so
   // a journey's steps can be put in the order the code runs them.
   let seq = 0;
+  // `rank` is where: { d: how deep, at: the chain of lines (runOrder) }.
   const link = (a, b, why, rank = null) => {
     if (!a || !b || a === b) return;
     if (!edges.has(a.id)) edges.set(a.id, new Map());
-    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, { why, rank, i: seq++ });
+    const had = edges.get(a.id).get(b.id);
+    if (!had) edges.get(a.id).set(b.id, { why, rank, i: seq++ });
+    // Reached again by a closer or earlier path: that one is where it runs.
+    else if (rank && had.rank && (rank.d < had.rank.d || (rank.d === had.rank.d && runOrder(rank.at, had.rank.at) < 0))) had.rank = rank;
   };
+  const at = (v, line) => ({ d: v.d, at: [...(v.at || []), line || 0] });
 
   // Outside services, one candidate per node.
   const outside = (nodeId, viaFile, viaLink) => {
@@ -644,9 +756,13 @@ export function candidates(graph, read) {
       for (let i = a + 1; i < lines.length; i++) if (/^\s*@(Get|Post|Put|Patch|Delete|All|Head|Options)\(/.test(lines[i])) { b = i; break; }
       const body = lines.slice(a, b).join('\n');
       const props = new Set([...body.matchAll(/this\.(\w+)\./g)].map((m) => m[1]));
-      files = new Map([[start, { d: 0, names: null }]]);
+      // In the controller itself, only the handler method's own lines.
+      files = new Map([[start, { d: 0, names: null, at: [], span: [a + 1, b] }]]);
       for (const h of hiddenImports(ix, r, classes, rt.f)) {
-        if (h.how === 'di' && props.has(h.prop)) for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, v);
+        if (!(h.how === 'di' && props.has(h.prop))) continue;
+        // The service runs where the handler first calls it.
+        const call = lines.findIndex((t, i) => i >= a && i < b && t.includes('this.' + h.prop + '.'));
+        for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, { ...v, d: v.d + 1, at: [call + 1, ...v.at] });
       }
     } else {
       files = closure(ix, r, classes, start, { depth: 5, cap: 150 });
@@ -687,10 +803,17 @@ export function candidates(graph, read) {
     const key = `req:${method} ${p}`;
     const callEv = lit ? { file: site.file, line: lit.at, token: lit.token || lit.raw } : cite(r, site.file, site.line, [rt.p, ...segs(rt.p).reverse()]);
     const handEv = handlerAt(ri);
-    const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how });
+    // A path only named near a call (an `endpoint:` in a log record) is
+    // not where the request is made: a site with a call to an HTTP client
+    // around it is.
+    const at0 = (callEv?.line || site.line) - 1;
+    const real = how !== 'matched' || !lines || lines.slice(Math.max(0, at0 - 8), at0 + 3).some((t) => HTTP_NEAR.test(t));
+    const had = byKey.get(key);
+    if (had && real && !had.real && callEv) { had.evidence[0] = callEv; had.real = true; }
+    const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how, all: /\*|\[\.\.\./.test(rt.p || '') ? rt.f : null, real });
     if (!c) return null;
     if (!callsByFile.has(site.file)) callsByFile.set(site.file, []);
-    callsByFile.get(site.file).push({ c, line: callEv?.line || site.line });
+    callsByFile.get(site.file).push({ c, line: callEv?.line || site.line, real });
     return c;
   };
   for (const l of graph.links || []) {
@@ -837,29 +960,32 @@ export function candidates(graph, read) {
     hooksFor.set(id, webhookRoutes.filter((ri) => words.some((w) => (routes[ri].p + ' ' + routes[ri].f).toLowerCase().includes(w))));
   }
 
+  const usedAt = (f, v, line) => (v.span ? line >= v.span[0] && line <= v.span[1] : inUse(ix, r, f, v.names, line));
   for (const c of [...list]) {
     if (c.kind !== 'request' || c.route == null) continue;
     const files = behindRoute(c.route);
     for (const [f, v] of files) {
       for (const x of ix.ext.get(f) || []) {
+        const el = x.link?.evidence?.[0]?.line;
+        if (v.span && el && !usedAt(f, v, el)) continue;
         const o = outside(x.node, f, x.link);
         if (!o) continue;
-        link(c, o, 'its handler uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
+        link(c, o, 'its handler uses it', at(v, x.link?.evidence?.[0]?.line));
         for (const hi of hooksFor.get(x.node) || []) link(o, asyncRoute(hi), 'calls back');
       }
       for (const e of emitters.get(f) || []) {
-        if (!inUse(ix, r, f, v.names, e.line)) continue;
-        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event', [v.d, e.line]);
+        if (!usedAt(f, v, e.line)) continue;
+        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event', at(v, e.line));
       }
       for (const h of r.once('helpers', f, () => helperCalls(r.text(f)))) {
-        if (!inUse(ix, r, f, v.names, h.line)) continue;
+        if (!usedAt(f, v, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
-        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it', [v.d, h.line]);
+        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it', at(v, h.line));
       }
       for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
-        if (!inUse(ix, r, f, v.names, h.line)) continue;
+        if (!usedAt(f, v, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
-        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks', [v.d, h.line]);
+        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks', at(v, h.line));
       }
     }
   }
@@ -908,6 +1034,54 @@ export function candidates(graph, read) {
     return c;
   };
 
+  // The requests a page runs through the functions it hands a component on
+  // `line`: in the handler's own statements first, then down the code
+  // each statement runs. Each handler is a way through the step of its
+  // own (submit, sign up instead), so its requests keep together, in the
+  // order its statements make them.
+  const fileClosures = new Map();
+  const closureOf = (f) => {
+    if (!fileClosures.has(f)) fileClosures.set(f, closure(ix, r, classes, f, { depth: 4, cap: 80 }));
+    return fileClosures.get(f);
+  };
+  const handed = (f, line, to) => {
+    const lines = r.lines(f) || [];
+    const own = r.lines(to) || [];
+    const out = [];
+    for (const { prop, fn } of propHandlers(lines, line)) {
+      const span = bodyRange(lines, fn);
+      if (!span) continue;
+      const [a, b] = span;
+      // The step runs the handler where its code calls the prop, so the
+      // handler's requests come in there among the step's own.
+      const called = own.findIndex((t) => new RegExp('\\b(?:props\\.)?' + esc(prop) + '\\s*(?:\\?\\.)?\\(').test(t)) + 1;
+      const inSpan = (k) => k >= a && k <= b;
+      for (const x of callsByFile.get(f) || []) if (made(x) && x.line != null && inSpan(x.line)) out.push({ c: x.c, rank: { d: 0, at: [called, a, x.line] } });
+      const byFile = new Map();
+      for (const e of ix.imports.get(f) || []) {
+        if (isTest(e.to) || NOISE_DIR.test('/' + e.to)) continue;
+        if (!byFile.has(e.to)) byFile.set(e.to, []);
+        byFile.get(e.to).push(...(e.names || []));
+      }
+      for (const [h, imported] of byFile) {
+        const names = runNames(lines, imported);
+        if (!names.length) continue;
+        const alt = names.map(esc).join('|');
+        const re = new RegExp('\\b(?:' + alt + ')\\s*(?:<[^>()]*>)?\\(|<(?:' + alt + ')\\b');
+        const k = lines.findIndex((t, n) => inSpan(n + 1) && re.test(t));
+        if (k < 0) continue;
+        for (const [g, w] of closureOf(h)) {
+          for (const x of callsByFile.get(g) || []) {
+            if (!made(x) || x.line == null || !inUse(ix, r, g, g === h ? new Set(names) : w.names, x.line)) continue;
+            out.push({ c: x.c, rank: { d: 0, at: [called, a, k + 1, ...w.at, x.line] } });
+          }
+        }
+      }
+    }
+    return out;
+  };
+  // A site that only names a request another site makes for real.
+  const made = (x) => x.real !== false || !x.c.real;
   // Per-screen closures, with the steps inside each page.
   const done = new Set();
   const visit = (s) => {
@@ -915,10 +1089,10 @@ export function candidates(graph, read) {
     done.add(s.id);
     const files = closure(ix, r, classes, s.file);
     for (const [f, v] of files) {
-      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request', [v.d, x.line || 0]);
+      for (const x of callsByFile.get(f) || []) if (made(x) && (x.line == null || inUse(ix, r, f, v.names, x.line))) link(s, x.c, 'the screen makes this request', at(v, x.line));
       for (const x of ix.ext.get(f) || []) {
         if (routes.some((rt) => rt.f === f)) continue;
-        link(s, outside(x.node, f, x.link), 'the screen uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
+        link(s, outside(x.node, f, x.link), 'the screen uses it', at(v, x.link?.evidence?.[0]?.line));
       }
       // Step machines sit a few files down (page, then layout, then drawer).
       if (v.d > 3) continue;
@@ -934,7 +1108,7 @@ export function candidates(graph, read) {
         const stepFiles = new Set(steps.map((x) => names.get(x.comp)).filter(Boolean));
         own = [];
         for (const [g, w] of closure(ix, r, classes, f, { skip: stepFiles })) {
-          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push({ c: x.c, rank: [w.d, x.line || 0] });
+          for (const x of callsByFile.get(g) || []) if (made(x) && (x.line == null || inUse(ix, r, g, w.names, x.line))) own.push({ c: x.c, rank: at(w, x.line) });
         }
         return own;
       };
@@ -957,9 +1131,12 @@ export function candidates(graph, read) {
         const c = partScreen(to, st.comp, ev, s, st.step);
         if (!c) continue;
         stepScreens.set(c.id, { c, step: st.step, parentFile: f });
-        link(s, c, 'a step inside the page', [v.d, st.line]);
+        link(s, c, 'a step inside the page', at(v, st.line));
         if (prev) link(prev, c, 'the next step');
         prev = c;
+        // What the page hands the step to run (its submit handler): those
+        // requests are the step's own, in the order the handler makes them.
+        for (const q of handed(f, st.line, to)) link(c, q.c, 'the step runs this request', q.rank);
         for (const q of ownRequests()) link(c, q.c, 'the page makes this request for the step', q.rank);
         visit(c);
       }
@@ -1208,9 +1385,17 @@ export function table(c, ids, read) {
         const lines = read.lines(e.file) || [];
         return { ...e, window: lines.slice(Math.max(0, e.line - 4), e.line + 3).map((t) => t.slice(0, 400)), from: Math.max(1, e.line - 3) };
       }),
-      // In the order the code makes them: by rank (depth, line), then the
-      // order they were found.
-      next: [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b)).sort(([, a], [, b]) => (a.rank && b.rank ? a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] : 0) || a.i - b.i).map(([b]) => b),
+      // In the order the code runs them (runOrder), then the order they
+      // were found.
+      next: [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b)).sort(([, a], [, b]) => (a.rank && b.rank ? runOrder(a.rank.at, b.rank.at) : 0) || a.i - b.i).map(([b]) => b),
+      // How deep in the code behind it each outside service or callback
+      // is (0: its own file): the request whose handler calls a service
+      // most directly is the one the service step goes with.
+      near: Object.fromEntries([...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.rank && /^[XA]/.test(b)).map(([b, e]) => [b, e.rank.d])),
+      // A route that takes every path under it (`/api/*`, a proxy): the
+      // file that forwards them (the requests through it all reach what it
+      // forwards to).
+      ...(x.kind === 'request' && x.all ? { all: x.all } : {}),
       // Requests a step has only because its page makes them: they don't
       // place the request under this step.
       weak: [...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.why === 'the page makes this request for the step').map(([b]) => b),
