@@ -497,6 +497,52 @@ fn not_sent_message(url: &str, why: common::github_budget::Hold) -> String {
     )
 }
 
+/// Keeps a successful read GitHub gave a validator (or one that can't
+/// change), so the next ask costs nothing (`github_cache`), and hands the
+/// caller the same response. Anything else passes through as it came.
+async fn keep_read(
+    key: &str,
+    url: &str,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    use super::github_cache as cache;
+    let h = resp.headers();
+    let etag = h
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let small = resp
+        .content_length()
+        .is_none_or(|n| n as usize <= cache::MAX_ENTRY_BYTES);
+    let json = h
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.contains("json") || t.contains("diff") || t.contains("patch"));
+    if resp.status() != reqwest::StatusCode::OK
+        || !small
+        || !json
+        || (etag.is_empty() && !cache::immutable(url))
+    {
+        return Ok(resp);
+    }
+    let headers: Vec<(String, String)> = cache::KEPT_HEADERS
+        .iter()
+        .filter_map(|n| Some((n.to_string(), h.get(*n)?.to_str().ok()?.to_string())))
+        .collect();
+    let body = resp.bytes().await?.to_vec();
+    let kept = cache::Kept {
+        etag,
+        headers,
+        body,
+    };
+    let again = kept
+        .response(url)
+        .ok_or("a kept read could not be answered")?;
+    cache::put(key, kept);
+    Ok(again)
+}
+
 /// Records that the installation is rate limited until `until` (epoch
 /// seconds).
 pub fn mark_limited(installation_id: u64, until: u64) {
@@ -1461,7 +1507,8 @@ impl GitHubClient {
     /// its response reports is recorded, and it isn't sent at all when the
     /// hour's budget is spent or (for background work) is the runs'
     /// (`common::github_budget`): the caller gets the rate limit it would
-    /// have met, with the wait.
+    /// have met, with the wait. A read made before is asked conditionally
+    /// and a read that can't change isn't asked again (`github_cache`).
     async fn send_tracked(
         &self,
         req: reqwest::RequestBuilder,
@@ -1476,6 +1523,23 @@ impl GitHubClient {
             branch_moved_by(r.method().as_str(), r.url().path(), body)
         });
         let now = Self::now_epoch();
+        let kept = built.as_ref().and_then(|r| self.kept_read(r));
+        if let Some((key, url)) = &kept {
+            if super::github_cache::immutable(url) {
+                if let Some(resp) = super::github_cache::get(key).and_then(|k| k.response(url)) {
+                    super::github_budget::served_kept(self.installation_id, now);
+                    return Ok(resp);
+                }
+            }
+        }
+        let asked = kept
+            .as_ref()
+            .and_then(|(key, _)| super::github_cache::get(key))
+            .filter(|k| !k.etag.is_empty());
+        let req = match &asked {
+            Some(k) => req.header(reqwest::header::IF_NONE_MATCH, k.etag.as_str()),
+            None => req,
+        };
         if let common::github_budget::Spend::Hold { why, wait_secs } =
             super::github_budget::admit(self.installation_id, now)
         {
@@ -1502,10 +1566,54 @@ impl GitHubClient {
         observe_budget(self.installation_id, resp.headers());
         let limited = note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
         super::github_budget::responded(self.installation_id, resp.status().as_u16(), limited, now);
+        if resp.status() != reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(r) = &built {
+                super::github_budget::route_sent(
+                    self.installation_id,
+                    super::github_budget::route_of(r.method().as_str(), r.url().as_str()),
+                    now,
+                );
+            }
+        }
         if let (Some((owner, repo, branch)), true) = (moving, resp.status().is_success()) {
             note_branch_moved(self.installation_id, &owner, &repo, &branch);
         }
-        Ok(resp)
+        let Some((key, url)) = kept else {
+            return Ok(resp);
+        };
+        // Unchanged since it was kept: GitHub didn't count it, and the
+        // caller reads what it answered then.
+        if let (Some(k), reqwest::StatusCode::NOT_MODIFIED) = (&asked, resp.status()) {
+            if let Some(again) = k.response(&url) {
+                return Ok(again);
+            }
+        }
+        keep_read(&key, &url, resp).await
+    }
+
+    /// The key and URL a request's answer is kept under, when it is a read
+    /// of GitHub's API that may be kept: a GET whose caller didn't ask
+    /// conditionally itself (`unchanged` reads the 304 it asked for).
+    fn kept_read(&self, r: &reqwest::Request) -> Option<(String, String)> {
+        let url = r.url().as_str();
+        if r.method() != reqwest::Method::GET
+            || r.headers().contains_key(reqwest::header::IF_NONE_MATCH)
+            || !(is_github_url(url) || cfg!(test))
+            || url.contains("/tarball/")
+            || url.contains("/zipball/")
+            || url.contains("/logs")
+        {
+            return None;
+        }
+        let accept = r
+            .headers()
+            .get(reqwest::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        Some((
+            super::github_cache::key(self.installation_id, url, accept),
+            url.to_string(),
+        ))
     }
 
     /// GitHub refusing this installation's requests right now: why, and until
@@ -7059,8 +7167,9 @@ mod budget_tests {
             assert_eq!(pr["state"], "open");
             let validators = c.take_validators();
             assert_eq!(validators, vec![(url.clone(), "\"v1\"".to_string())]);
-            // Not recording any more.
-            c.get(&url).await.unwrap();
+            // Not recording any more. The same read again is asked with its
+            // validator, comes back 304 and reads as it did.
+            assert_eq!(c.get(&url).await.unwrap()["state"], "open");
             assert!(c.take_validators().is_empty());
 
             assert!(c.unchanged(&validators).await);
@@ -7076,8 +7185,8 @@ mod budget_tests {
         assert_eq!(
             spent[who::SWEEP_PR_WATCH],
             ledger::Counts {
-                sent: 3,
-                not_modified: 1,
+                sent: 2,
+                not_modified: 2,
                 ..Default::default()
             }
         );
@@ -7121,7 +7230,54 @@ mod budget_tests {
         let spent = counts(id);
         assert_eq!(spent[who::SWEEP_SECURITY].held, 1);
         assert_eq!(spent[who::SWEEP_SECURITY].sent, 0);
-        assert_eq!(spent[who::RUN].sent, 2);
+        // The run's second read of the same pull request came back 304.
+        assert_eq!(spent[who::RUN].sent, 1);
+        assert_eq!(spent[who::RUN].not_modified, 1);
+    }
+
+    /// The same read made again by any code in the process is asked
+    /// conditionally and costs nothing while it is unchanged; a read named
+    /// by a full commit SHA is never asked twice; a write is never kept.
+    #[tokio::test]
+    async fn a_read_made_before_costs_nothing_and_one_that_cant_change_is_not_asked_again() {
+        use std::sync::atomic::Ordering;
+        let id = 920_004;
+        let (base, hits) = github(4_000).await;
+        let pr = format!("{base}/repos/o/r/pulls/9");
+        let blob = format!("{base}/repos/o/r/git/blobs/0123456789abcdef0123456789abcdef01234567");
+        ledger::scoped(who::RUN, async {
+            // Two clients, as two passes of one step make: one process.
+            for c in [client(id), client(id)] {
+                for _ in 0..3 {
+                    assert_eq!(c.get(&pr).await.unwrap()["state"], "open");
+                    assert_eq!(c.get(&blob).await.unwrap()["state"], "open");
+                }
+            }
+            // Another installation's reads are its own.
+            let other = client(id + 1);
+            other.get(&pr).await.unwrap();
+        })
+        .await;
+        // The pull request: once whole, five times 304. The blob: once.
+        // The other installation: once.
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + 5 + 1 + 1);
+        let spent = counts(id);
+        assert_eq!(
+            spent[who::RUN],
+            ledger::Counts {
+                sent: 2,
+                not_modified: 5,
+                cached: 5,
+                ..Default::default()
+            }
+        );
+        counts(id + 1);
+        let routes = ledger::drain_routes(id);
+        assert_eq!(
+            ledger::routes_field(&routes),
+            "run GET /repos/:o/:r/git/blobs/:sha=1; run GET /repos/:o/:r/pulls/:n=1"
+        );
+        ledger::drain_routes(id + 1);
     }
 
     /// Once GitHub says the hour's budget is gone, no caller sends another

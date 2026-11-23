@@ -13,7 +13,12 @@
 //! - pass history: the same, at [`MAX_PASSES`], keeping [`KEEP_PASSES`];
 //!   the oldest are dropped (the passes are in the traces too).
 //!
-//! The normal append costs nothing extra: the condition is checked by
+//! - a progress note the run already wrote last, less than
+//!   [`NOTE_REPEAT_SECS`] ago, isn't written again: retries and steps that
+//!   overlap once wrote "Waiting for GitHub's hourly limit" four times in two
+//!   minutes. The repeat is counted on the record (`last_note_repeats`).
+//!
+//! The normal append costs nothing extra: the conditions are checked by
 //! DynamoDB on the write itself.
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -30,6 +35,8 @@ pub const MAX_NOTE_CHARS: usize = 1000;
 pub const MAX_PASSES: usize = 200;
 /// Pass history entries kept after a trim.
 pub const KEEP_PASSES: usize = 150;
+/// How long the note written last stays one note when it is written again.
+pub const NOTE_REPEAT_SECS: i64 = 15 * 60;
 
 /// How many of a list's oldest entries go before one more is appended, so
 /// that it then holds `keep`. Zero below `max`.
@@ -64,23 +71,91 @@ fn conditional(e: &impl std::fmt::Debug) -> bool {
     format!("{e:?}").contains("ConditionalCheckFailed")
 }
 
-/// Append one progress note, keeping the list bounded.
+/// The earliest time a note written last still counts as a repeat, for a
+/// write at `now`. Timestamps are stored as RFC 3339 in UTC, so they order
+/// as strings.
+pub fn repeat_cutoff(now: chrono::DateTime<chrono::Utc>) -> String {
+    (now - chrono::Duration::seconds(NOTE_REPEAT_SECS)).to_rfc3339()
+}
+
+/// Append one progress note, keeping the list bounded. The note written
+/// last, written again within [`NOTE_REPEAT_SECS`], stays one note: the
+/// repeat is counted instead.
 pub async fn append_note(t: &Target<'_>, message: &str) {
-    let now = chrono::Utc::now().to_rfc3339();
+    let at = chrono::Utc::now();
+    let now = at.to_rfc3339();
+    let text = note_text(message);
+    let cutoff = repeat_cutoff(at);
     let entry = AttributeValue::M(HashMap::from([
-        ("message".to_string(), s(&note_text(message))),
+        ("message".to_string(), s(&text)),
         ("timestamp".to_string(), s(&now)),
     ]));
-    let _ = append(
-        t,
-        "progress_notes",
-        entry,
-        &now,
-        MAX_NOTES,
-        KEEP_NOTES,
-        None,
-    )
-    .await;
+    for attempt in 0..2 {
+        let res = t
+            .dynamo
+            .update_item()
+            .table_name(t.table)
+            .key("team_id", s(t.team_id))
+            .key("run_id", s(t.run_id))
+            .update_expression(
+                "SET #l = list_append(if_not_exists(#l, :empty), :entry), updated_at = :t, \
+                 last_note = :msg, last_note_at = :t, last_note_repeats = :zero",
+            )
+            .condition_expression(
+                "(attribute_not_exists(#l) OR size(#l) < :max) AND \
+                 (attribute_not_exists(last_note) OR last_note <> :msg OR last_note_at < :cut)",
+            )
+            .expression_attribute_names("#l", "progress_notes")
+            .expression_attribute_values(":entry", AttributeValue::L(vec![entry.clone()]))
+            .expression_attribute_values(":empty", AttributeValue::L(vec![]))
+            .expression_attribute_values(":t", s(&now))
+            .expression_attribute_values(":msg", s(&text))
+            .expression_attribute_values(":cut", s(&cutoff))
+            .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+            .expression_attribute_values(":max", AttributeValue::N(MAX_NOTES.to_string()))
+            .send()
+            .await;
+        let Err(e) = res else {
+            return;
+        };
+        if !conditional(&e) {
+            warn!(run_id = t.run_id, error = %e, "Could not write a progress note");
+            return;
+        }
+        // The same note as the last one, a moment ago: counted, not written.
+        if count_repeat(t, &text, &cutoff, &now).await {
+            return;
+        }
+        if attempt == 0 {
+            trim(t, "progress_notes", MAX_NOTES, KEEP_NOTES).await;
+        } else {
+            warn!(
+                run_id = t.run_id,
+                attr = "progress_notes",
+                "Run list still at its bound after a trim"
+            );
+        }
+    }
+}
+
+/// Counts one more writing of the note written last, when it is `text` and
+/// was written after `cutoff`. False when it isn't (the write was refused
+/// for the list's bound instead).
+async fn count_repeat(t: &Target<'_>, text: &str, cutoff: &str, now: &str) -> bool {
+    t.dynamo
+        .update_item()
+        .table_name(t.table)
+        .key("team_id", s(t.team_id))
+        .key("run_id", s(t.run_id))
+        .update_expression("ADD last_note_repeats :one SET last_note_repeat_at = :t")
+        .condition_expression("last_note = :msg AND last_note_at >= :cut")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .expression_attribute_values(":t", s(now))
+        .expression_attribute_values(":msg", s(text))
+        .expression_attribute_values(":cut", s(cutoff))
+        .send()
+        .await
+        .is_ok()
 }
 
 /// Append to `attr` (with `updated_at`, and any extra SET clause), keeping
@@ -257,6 +332,43 @@ mod tests {
             2000,
             "every note is kept or archived"
         );
+    }
+
+    /// The note written last is a repeat for a quarter of an hour, and the
+    /// stored timestamps order as their strings do.
+    #[test]
+    fn a_note_written_again_soon_after_is_a_repeat() {
+        use chrono::TimeZone;
+        let at = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 23, 21, 54, 18)
+            .unwrap();
+        let cut = repeat_cutoff(at);
+        assert_eq!(cut, "2026-11-23T21:39:18+00:00");
+        // The four notes of 21:52 to 21:54 all fall after the cutoff of the
+        // last; a note from 21:38 doesn't.
+        for (earlier, repeat) in [
+            ("2026-11-23T21:52:39.512391044+00:00", true),
+            ("2026-11-23T21:39:18+00:00", true),
+            ("2026-11-23T21:38:59.999+00:00", false),
+            ("2026-11-22T23:59:59+00:00", false),
+        ] {
+            assert_eq!(earlier >= cut.as_str(), repeat, "{earlier}");
+        }
+        // What chrono writes for a note's time sorts the same way.
+        let later = (at + chrono::Duration::milliseconds(1)).to_rfc3339();
+        assert!(later.as_str() > at.to_rfc3339().as_str());
+    }
+
+    /// The write itself refuses the repeat: one conditional write, no read.
+    #[test]
+    fn the_repeat_is_refused_by_the_write_itself() {
+        let src = include_str!("run_lists.rs");
+        let at = src.find("pub async fn append_note").unwrap();
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("last_note <> :msg OR last_note_at < :cut"));
+        assert!(body.contains("count_repeat"));
+        assert!(!body.contains("get_item"));
     }
 
     #[test]
