@@ -1,6 +1,6 @@
 # ds. `ds_deploys_recorded_on_every_install`
 
-**What happened:** The Insights line of deploys CoderHelm started went flat on November 6 and stayed flat for 17 days, on an install that reached GitHub through CoderHelm's token broker. That gateway had no GitHub App key of its own, so asking GitHub for the app's slug failed, and `queue_deploy_run` dropped every completed workflow run before it reached the worker, with nothing in any log. Every record the team had came from the one-time backfill, which read history up to November 6 and was marked done, so the hole was never read back and nothing said the line had stopped.
+**What happened:** The Insights line of deploys CoderHelm started went flat and stayed flat for weeks, on an install that reached GitHub through CoderHelm's token broker. That gateway had no GitHub App key of its own, so asking GitHub for the app's slug failed, and `queue_deploy_run` dropped every completed workflow run before it reached the worker, with nothing in any log. Every record the team had came from the one-time backfill, which read history up to the day the line stopped and was marked done, so the hole was never read back and nothing said the line had stopped.
 
 **The guarantee:**
 - A gateway that can't name the app's bot still sends every run a bot triggered, using the broker's bot login when it has one. The worker decides with its own bot, before it asks GitHub anything.
