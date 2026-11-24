@@ -4680,6 +4680,7 @@ async fn fix_context(
         .await,
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: common::merged_ticket::note_of(run_record),
     };

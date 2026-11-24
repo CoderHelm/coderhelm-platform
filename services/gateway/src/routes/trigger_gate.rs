@@ -228,11 +228,10 @@ pub fn github_retry_gesture(payload: &serde_json::Value) -> bool {
 /// Whether `label` is the team's trigger label: the label itself (case
 /// ignored), or the label with a repository pinned after it
 /// (`coderhelm:acme/web`). One rule for the Jira trigger and for
-/// [`jira_retry_gesture`].
+/// [`jira_retry_gesture`]. A follow-up label (`coderhelm:followup:ABC-1`,
+/// `coderhelm-followup`) is never a trigger.
 pub fn is_trigger_label(label: &str, trigger_label: &str) -> bool {
-    let trigger = trigger_label.trim().to_ascii_lowercase();
-    let label = label.trim().to_ascii_lowercase();
-    !trigger.is_empty() && (label == trigger || label.starts_with(&format!("{trigger}:")))
+    common::followup_tickets::is_trigger_label(label, trigger_label)
 }
 
 /// A person's retry gesture on a Jira ticket, read from the event's

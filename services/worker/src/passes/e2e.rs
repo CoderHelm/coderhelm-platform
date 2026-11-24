@@ -1848,6 +1848,7 @@ fn ticket_on(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: Some(run_id.to_string()),
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     }
@@ -2201,6 +2202,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 answers: Vec::new(),
                 related: Vec::new(),
                 new_run_id: None,
+                followup_of: None,
                 after_merge: false,
                 merged_note: None,
             };

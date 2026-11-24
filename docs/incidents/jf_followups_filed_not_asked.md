@@ -8,7 +8,7 @@
   - in the source ticket's Jira project;
   - linked to the source with the site's "relates to" link type;
   - typed by the project: the type asked for, else Task, else the project's first standard type. Jira keeps a project's default type in its issue type scheme, which the app's scopes can't read;
-  - labelled `coderhelm`, `coderhelm:<repo>` and `coderhelm:followup:<source>`.
+  - labelled `coderhelm-followup` and `coderhelm:followup:<source>`, never with the team's trigger label (see `jh_followups_never_cascade`).
 - The team's agent permissions decide first (`file_followup_tickets`, a write). Each draft is filed once per source ticket: the worker keeps what it filed, and the app finds a ticket it already filed with the same summary and follow-up label. So a retried run never files twice.
 - One comment on the source ticket lists the new keys.
 - A refusal is said exactly. A missing project permission is named, with where a Jira admin grants it, and the remaining drafts are posted on the ticket. It is never "connect Jira".

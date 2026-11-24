@@ -8,8 +8,9 @@
 //!
 //! - in the source ticket's Jira project, through the Coderhelm app's
 //!   create-ticket trigger, each linked to the source ("relates to"),
-//!   typed by the project and labelled `coderhelm`, `coderhelm:<repo>` and
-//!   `coderhelm:followup:<source>` ([`labels`]);
+//!   typed by the project and labelled `coderhelm-followup` and
+//!   `coderhelm:followup:<source>` ([`labels`]), never with the team's
+//!   trigger label, so a follow-up never starts a run by itself;
 //! - for a team with no Jira (a GitHub issue), as issues in the repository
 //!   when the GitHub App may write issues;
 //! - with neither, the drafts go into the ticket comment and the run
@@ -26,6 +27,11 @@
 //! the source ticket lists what was filed ([`comment`]). A refusal is said
 //! as exactly what was refused ([`refusal`]): a missing project permission
 //! by its name, never "connect Jira".
+//!
+//! Follow-ups never cascade: a run on a follow-up files none of its own
+//! ([`depth_refusal`]), one source files at most [`DAILY_CAP_PER_SOURCE`] a
+//! day, and the gateway starts no run on a follow-up from its label or
+//! assignee ([`held_comment`]); a person starts it from CoderHelm.
 
 use serde::{Deserialize, Serialize};
 
@@ -435,14 +441,147 @@ pub fn project_of(key: &str) -> Option<&str> {
     ok.then_some(p)
 }
 
-/// The labels a follow-up carries: CoderHelm's usual two, and the source's.
-pub fn labels(repo: &str, source: &str) -> Vec<String> {
-    let mut v = vec!["coderhelm".to_string()];
-    if !repo.trim().is_empty() {
-        v.push(format!("coderhelm:{}", repo.trim()));
+/// The label that marks a ticket as a follow-up CoderHelm filed. It is never
+/// a trigger: a ticket carrying it starts no run by itself.
+pub const MARKER_LABEL: &str = "coderhelm-followup";
+
+/// The start of the label naming a follow-up's source
+/// (`coderhelm:followup:ABC-12`).
+pub const SOURCE_LABEL_PREFIX: &str = "coderhelm:followup:";
+
+/// The most follow-ups CoderHelm files from one source ticket in one day
+/// (UTC), across every run on it. A run past it files nothing more and says
+/// so in its comment.
+pub const DAILY_CAP_PER_SOURCE: u32 = 10;
+
+/// The label every follow-up of `source` carries.
+pub fn source_label(source: &str) -> String {
+    format!("{SOURCE_LABEL_PREFIX}{}", source.trim())
+}
+
+/// Whether `label` is one of CoderHelm's follow-up labels (the marker or a
+/// source label), case and spacing aside.
+pub fn is_followup_label(label: &str) -> bool {
+    let l = label.trim().to_ascii_lowercase();
+    l == MARKER_LABEL || l.starts_with(SOURCE_LABEL_PREFIX)
+}
+
+/// Whether `label` is the team's trigger label: the label itself (case
+/// ignored), or the label with a repository pinned after it
+/// (`coderhelm:acme/web`). A follow-up label is never a trigger, whatever
+/// the team's trigger is.
+pub fn is_trigger_label(label: &str, trigger_label: &str) -> bool {
+    let trigger = trigger_label.trim().to_ascii_lowercase();
+    let label = label.trim().to_ascii_lowercase();
+    !trigger.is_empty()
+        && !is_followup_label(&label)
+        && (label == trigger || label.starts_with(&format!("{trigger}:")))
+}
+
+/// The labels a follow-up carries: the marker and the source's label, and
+/// never one the team's trigger (`trigger_label`) matches, so filing a
+/// follow-up never starts a run on it. No repository label either: on the
+/// default trigger, `coderhelm:<repo>` is itself a trigger.
+pub fn labels(source: &str, trigger_label: &str) -> Vec<String> {
+    [MARKER_LABEL.to_string(), source_label(source)]
+        .into_iter()
+        .filter(|l| !is_trigger_label(l, trigger_label))
+        .filter(|l| !l.trim().eq_ignore_ascii_case(trigger_label.trim()))
+        .collect()
+}
+
+/// The source of a follow-up, from its labels (`coderhelm:followup:ABC-12`
+/// gives `ABC-12`); `Some("")` when only the marker is there; `None` when
+/// the ticket carries neither.
+pub fn source_of_labels<S: AsRef<str>>(labels: &[S]) -> Option<String> {
+    let mut marked = false;
+    for l in labels {
+        let l = l.as_ref().trim();
+        if l.len() > SOURCE_LABEL_PREFIX.len()
+            && l[..SOURCE_LABEL_PREFIX.len()].eq_ignore_ascii_case(SOURCE_LABEL_PREFIX)
+        {
+            return Some(l[SOURCE_LABEL_PREFIX.len()..].to_ascii_uppercase());
+        }
+        if l.eq_ignore_ascii_case(MARKER_LABEL) {
+            marked = true;
+        }
     }
-    v.push(format!("coderhelm:followup:{}", source.trim()));
-    v
+    marked.then(String::new)
+}
+
+/// The sentence every filed follow-up's description ends with
+/// ([`description`]), so a run on the ticket knows it is one even when its
+/// labels were not sent (an older Jira app, a retry from the run record).
+const FILED_BY: &str = ", filed by CoderHelm from that ticket's findings.";
+
+/// Whether a ticket's text is a follow-up CoderHelm filed ([`description`]).
+pub fn is_followup_body(body: &str) -> bool {
+    body.contains("A follow-up of ") && body.contains(FILED_BY)
+}
+
+/// The source a follow-up's text names (`A follow-up of ABC-12 (...)`):
+/// `None` when the text is no follow-up's, `Some("")` when it names no key.
+pub fn source_of_body(body: &str) -> Option<String> {
+    if !is_followup_body(body) {
+        return None;
+    }
+    let after = body.rsplit("A follow-up of ").next().unwrap_or("");
+    let word: String = after
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ',' && *c != '(')
+        .collect();
+    Some(if project_of(&word).is_some() || word.starts_with('#') {
+        word
+    } else {
+        String::new()
+    })
+}
+
+/// The settings record naming a filed follow-up by its own key, so the
+/// gateway and the worker tell a follow-up from any other ticket.
+pub fn of_record_sk(key: &str) -> String {
+    format!("FOLLOWUP_OF#{}", key.trim().to_ascii_uppercase())
+}
+
+/// The settings record counting the follow-ups filed from `source` on
+/// `day` (`YYYY-MM-DD`, UTC).
+pub fn day_record_sk(source: &str, day: &str) -> String {
+    format!("FOLLOWUP_DAY#{}#{day}", source.trim().to_ascii_uppercase())
+}
+
+/// Why a run on a follow-up files none of its own (depth one).
+pub fn depth_refusal(source: &str) -> String {
+    if source.trim().is_empty() {
+        "this ticket is itself a follow-up CoderHelm filed, and a follow-up never files follow-ups of its own".into()
+    } else {
+        format!(
+            "this ticket is itself a follow-up CoderHelm filed from {}, and a follow-up never files follow-ups of its own",
+            source.trim()
+        )
+    }
+}
+
+/// Why a draft was not filed: the source's daily limit is reached.
+pub fn daily_cap_refusal(source: &str) -> String {
+    format!(
+        "CoderHelm files at most {DAILY_CAP_PER_SOURCE} follow-ups a day from {}, and that many are filed today",
+        source.trim()
+    )
+}
+
+/// The one comment on a follow-up ticket that got the trigger label or was
+/// assigned to CoderHelm: no run starts on its own, and how a person starts
+/// one.
+pub fn held_comment(source: &str) -> String {
+    let from = if source.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" from {}", source.trim())
+    };
+    format!(
+        "This ticket is a follow-up CoderHelm filed{from}, so CoderHelm doesn't start a run on it from its label or assignee. \
+         To have CoderHelm work it, start it in CoderHelm: Start a run with this ticket's key (the dashboard, or start_run in a connected app)."
+    )
 }
 
 fn strip_marks(s: &str) -> String {
@@ -576,9 +715,7 @@ pub fn description(d: &Draft, source: &str, source_title: &str, run_url: &str) -
     } else {
         format!("{source} ({})", source_title.trim())
     };
-    s.push_str(&format!(
-        "\n\nA follow-up of {from}, filed by CoderHelm from that ticket's findings."
-    ));
+    s.push_str(&format!("\n\nA follow-up of {from}{FILED_BY}"));
     if !run_url.trim().is_empty() {
         s.push_str(&format!(" The run: {}", run_url.trim()));
     }
@@ -1213,8 +1350,64 @@ mod tests {
         assert_eq!(project_of("#12"), None);
         assert_eq!(project_of("abc-1"), None);
         assert_eq!(
-            labels("o/r", "ABC-12"),
-            vec!["coderhelm", "coderhelm:o/r", "coderhelm:followup:ABC-12"]
+            labels("ABC-12", "coderhelm"),
+            vec!["coderhelm-followup", "coderhelm:followup:ABC-12"]
         );
+    }
+
+    #[test]
+    fn followup_labels_never_carry_the_trigger() {
+        for trigger in ["coderhelm", "CoderHelm", "ai", "coderhelm-followup", "x:y"] {
+            let l = labels("ABC-12", trigger);
+            assert!(
+                l.iter().all(|x| !is_trigger_label(x, trigger)),
+                "{trigger}: {l:?}"
+            );
+            assert!(l.contains(&"coderhelm:followup:ABC-12".to_string()));
+        }
+        // A team whose trigger is the marker itself gets the source label only.
+        assert_eq!(
+            labels("ABC-1", "coderhelm-followup"),
+            vec!["coderhelm:followup:ABC-1"]
+        );
+        // The follow-up labels are never a trigger, even on the default.
+        assert!(!is_trigger_label("coderhelm:followup:ABC-1", "coderhelm"));
+        assert!(!is_trigger_label("coderhelm-followup", "coderhelm"));
+        assert!(is_trigger_label("coderhelm", "coderhelm"));
+        assert!(is_trigger_label("coderhelm:acme/web", "coderhelm"));
+        assert!(!is_trigger_label("coderhelmish", "coderhelm"));
+    }
+
+    #[test]
+    fn a_followup_is_known_by_its_labels_or_text() {
+        assert_eq!(
+            source_of_labels(&["coderhelm", "coderhelm:followup:abc-10"]),
+            Some("ABC-10".into())
+        );
+        assert_eq!(
+            source_of_labels(&["coderhelm-followup"]),
+            Some(String::new())
+        );
+        assert_eq!(source_of_labels(&["coderhelm", "coderhelm:acme/web"]), None);
+        let body = description(
+            &Draft {
+                summary: "Fix alt".into(),
+                description: "Add alt text.".into(),
+            },
+            "ABC-1",
+            "Audit",
+            "https://app/runs/detail?id=r",
+        );
+        assert!(is_followup_body(&body), "{body}");
+        assert_eq!(source_of_body(&body), Some("ABC-1".into()));
+        assert!(!is_followup_body("Add alt text to the images."));
+        assert_eq!(source_of_body("Add alt text to the images."), None);
+        assert_eq!(of_record_sk("abc-9"), "FOLLOWUP_OF#ABC-9");
+        assert_eq!(
+            day_record_sk("abc-1", "2026-11-24"),
+            "FOLLOWUP_DAY#ABC-1#2026-11-24"
+        );
+        assert!(held_comment("ABC-1").contains("from ABC-1"));
+        assert!(depth_refusal("ABC-1").contains("never files follow-ups"));
     }
 }

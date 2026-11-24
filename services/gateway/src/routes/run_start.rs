@@ -243,6 +243,20 @@ async fn jira_ticket(
     claims: &Claims,
     key: &str,
 ) -> Result<(TicketMessage, String), ApiError> {
+    // A follow-up another one of its family already covers is not started:
+    // the duplicates of the family close themselves first.
+    if let Some(root) = super::followup_dedupe::root_of(state, &claims.team_id, key).await {
+        let report = super::followup_dedupe::sweep(state, &claims.team_id, &root, true).await;
+        if let Some(c) = report.plan.covering(key) {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                &format!(
+                    "{key} is a duplicate of {} ({}). CoderHelm didn't start it; the work continues there.",
+                    c.keep, c.topic
+                ),
+            ));
+        }
+    }
     let runs = common::log_findings::runs_for_ticket(
         &state.dynamo,
         &state.config.runs_table_name,
@@ -252,6 +266,16 @@ async fn jira_ticket(
     .await
     .map_err(|e| internal("Runs of a ticket not read", e))?;
     let Some(latest) = runs.iter().max_by(|a, b| a.run_id.cmp(&b.run_id)) else {
+        // A follow-up CoderHelm filed: its label and assignee start no run
+        // (`jira_webhook`), so a person starts it here, from CoderHelm's
+        // record of it.
+        if let Some(record) =
+            super::jira_webhook::followup_record(state, &claims.team_id, key).await
+        {
+            if let Some(message) = followup_message(state, claims, key, &record).await? {
+                return Ok((message, key.to_string()));
+            }
+        }
         return Err(fail(
             StatusCode::NOT_FOUND,
             &format!("CoderHelm hasn't received {key} from Jira yet. Start it from Jira the way your team does, or give a task and a repository instead."),
@@ -290,9 +314,120 @@ async fn jira_ticket(
     Ok((message, key.to_string()))
 }
 
+/// What CoderHelm's record of a follow-up keeps of the ticket: the text the
+/// last event sent (`held_*`), else what CoderHelm filed. `None` when it
+/// keeps no title.
+pub(crate) fn followup_ticket(
+    record: &std::collections::HashMap<String, AttributeValue>,
+) -> Option<(String, String, String, String, Option<String>)> {
+    let s = |k: &str| {
+        record
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let pick = |a: &str, b: &str| Some(s(a)).filter(|v| !v.is_empty()).unwrap_or_else(|| s(b));
+    let title = pick("held_title", "title");
+    if title.is_empty() {
+        return None;
+    }
+    Some((
+        title,
+        pick("held_body", "body"),
+        s("repo"),
+        s("source"),
+        Some(s("held_type")).filter(|t| !t.is_empty()),
+    ))
+}
+
+/// A person's start of a follow-up no run has worked yet.
+async fn followup_message(
+    state: &AppState,
+    claims: &Claims,
+    key: &str,
+    record: &std::collections::HashMap<String, AttributeValue>,
+) -> Result<Option<TicketMessage>, ApiError> {
+    let Some((title, body, repo, source, ticket_type)) = followup_ticket(record) else {
+        return Ok(None);
+    };
+    let installation_id = super::api::get_team_installation_id(state, &claims.team_id)
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "Connect GitHub to CoderHelm first (Settings, GitHub).",
+            )
+        })?;
+    let hash = common::ticket_context_hash(&title, &body, &[]);
+    let gate = trigger_gate::gate_ticket_trigger(
+        state,
+        &claims.team_id,
+        key,
+        Some(&hash),
+        true,
+        false,
+        None,
+        false,
+    )
+    .await;
+    if let Some(refused) = gate_refusal(&gate) {
+        return Err(refused);
+    }
+    let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+    Ok(Some(TicketMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        source: TicketSource::Jira,
+        ticket_id: key.to_string(),
+        title,
+        body,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        issue_number: 0,
+        sender: claims
+            .github_login
+            .clone()
+            .unwrap_or_else(|| claims.email.clone()),
+        requester: common::requester::Requester::member(
+            claims.github_login.as_deref(),
+            &claims.email,
+        ),
+        image_attachments: vec![],
+        ticket_type,
+        // Depth one: this run files no follow-ups of its own.
+        followup_of: Some(source),
+        ..Default::default()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_followup_starts_from_coderhelms_record() {
+        let a = |v: &str| AttributeValue::S(v.into());
+        let mut r = std::collections::HashMap::new();
+        r.insert("title".to_string(), a("Fix alt"));
+        r.insert("body".to_string(), a("Add alt text."));
+        r.insert("repo".to_string(), a("acme/web"));
+        r.insert("source".to_string(), a("ABC-1"));
+        let (t, b, repo, src, ty) = followup_ticket(&r).unwrap();
+        assert_eq!(
+            (t.as_str(), b.as_str(), repo.as_str(), src.as_str(), ty),
+            ("Fix alt", "Add alt text.", "acme/web", "ABC-1", None)
+        );
+        // What the last event sent wins over what CoderHelm filed.
+        r.insert("held_title".to_string(), a("Fix alt on cards"));
+        r.insert("held_type".to_string(), a("Bug"));
+        let (t, _, _, _, ty) = followup_ticket(&r).unwrap();
+        assert_eq!(
+            (t.as_str(), ty.as_deref()),
+            ("Fix alt on cards", Some("Bug"))
+        );
+        assert!(followup_ticket(&std::collections::HashMap::new()).is_none());
+    }
 
     #[test]
     fn tickets_are_github_issues_or_jira_keys() {

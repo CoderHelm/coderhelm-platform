@@ -173,12 +173,9 @@ fn the_stuck_run_s_eight_drafts_come_from_its_proposal() {
         }
     );
     assert_eq!(
-        ft::labels("acme/web", "ABC-8989"),
-        vec![
-            "coderhelm",
-            "coderhelm:acme/web",
-            "coderhelm:followup:ABC-8989"
-        ]
+        // Never the trigger label (see `jh_followups_never_cascade`).
+        ft::labels("ABC-8989", "coderhelm"),
+        vec!["coderhelm-followup", "coderhelm:followup:ABC-8989"]
     );
 }
 

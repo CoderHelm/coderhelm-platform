@@ -1234,6 +1234,11 @@ pub struct TicketMessage {
     /// that picks the answers up). A continuation keeps its own id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_run_id: Option<String>,
+    /// The source ticket, when this ticket is a follow-up CoderHelm filed
+    /// (`followup_tickets`): a run on it files no follow-ups of its own.
+    /// Empty when it is known to be one but not from where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_of: Option<String>,
     /// A person asked for this run after the ticket's pull request merged
     /// (Retry on a run that ended on the merge, or a command or dashboard
     /// start on the GitHub issue whose run did), so the run skips the
@@ -1354,6 +1359,7 @@ impl Default for TicketMessage {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            followup_of: None,
             after_merge: false,
             merged_note: None,
         }
