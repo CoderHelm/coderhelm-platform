@@ -697,6 +697,15 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             // waiting for someone to open Analytics.
             let resumed = as_sweep(who::SWEEP_DEPLOYS, passes::deploy_stats::sweep(&state)).await;
             info!(resumed, "Deploys backfill sweep done");
+            // Merged changes no release tag holds (merged while nothing was
+            // listening, or before this CoderHelm release): a release window
+            // opens, hourly at most and once after each release.
+            let opened = as_sweep(
+                who::SWEEP_PR_WATCH,
+                passes::review_actions::release_catch_up(&state),
+            )
+            .await;
+            info!(opened = ?opened, "Release catch-up done");
         }
         models::WorkerMessage::ReviewTidy(msg) => {
             if let Err(e) = passes::review_tidy::run(&state, &msg).await {

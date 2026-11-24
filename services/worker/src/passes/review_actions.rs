@@ -1018,6 +1018,207 @@ async fn retry_or_wait(
     retry_or_record(state, msg, error).await;
 }
 
+// ── Catch-up: merged but never released ────────────────────────────────────
+
+/// How often each repository's default branch is looked at for merges no
+/// release tag holds yet.
+pub const CATCH_UP_EVERY_SECS: i64 = 3_600;
+
+/// Pure: whether a repository's catch-up is due. It is, the first time,
+/// after CoderHelm itself was released (its version changed since the last
+/// look), and an hour after the last look.
+pub fn catch_up_due(last: Option<(i64, &str)>, now: i64, version: &str) -> bool {
+    match last {
+        None => true,
+        Some((at, v)) => v != version || now - at >= CATCH_UP_EVERY_SECS,
+    }
+}
+
+/// What the catch-up does with one repository, from what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUp {
+    /// The head is in a release tag already.
+    Released,
+    /// The repository has never released by tag: nothing to catch up.
+    NoReleases,
+    /// A release window is already waiting, or the release is blocked
+    /// (shown on the Releases page): left to it.
+    Waiting,
+    /// Merged and not released: a window opens.
+    Open,
+}
+
+/// Pure: the catch-up's decision. `head_in_newest` is whether the newest
+/// release tag contains the head (None when it wasn't compared).
+pub fn catch_up(
+    head: &str,
+    releases: &[(String, String)],
+    head_in_newest: Option<bool>,
+    window_waiting: bool,
+    blocked: bool,
+) -> CatchUp {
+    if releases.is_empty() {
+        return CatchUp::NoReleases;
+    }
+    if releases.iter().any(|(_, sha)| sha == head) || head_in_newest == Some(true) {
+        return CatchUp::Released;
+    }
+    if window_waiting || blocked {
+        return CatchUp::Waiting;
+    }
+    CatchUp::Open
+}
+
+/// Every repository whose team releases merged changes (`auto_tag`), at
+/// most hourly and once after each CoderHelm release: a default-branch head
+/// no release tag holds (changes merged while nothing was listening) gets a
+/// release window, which then tags it by the usual rules (a green head only,
+/// a freeze waits, a held budget waits). Returns the repositories opened.
+pub async fn release_catch_up(state: &WorkerState) -> Vec<String> {
+    let version = std::env::var("CODERHELM_VERSION").unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    let mut opened = Vec::new();
+    let mut installs: std::collections::HashMap<String, Option<u64>> = Default::default();
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_PR_WATCH,
+    );
+    for c in super::review_configs::all(state, "release-catch-up").await {
+        let on = c
+            .item
+            .get("auto_tag")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false);
+        let Some((owner, repo)) = c.repo.split_once('/') else {
+            continue;
+        };
+        if !on {
+            continue;
+        }
+        let marker = format!("RELEASECATCHUP#{}", c.repo);
+        let last = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", super::attr_s(&c.team_id))
+            .key("sk", super::attr_s(&marker))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item)
+            .map(|i| {
+                let at = i
+                    .get("at")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let v = i
+                    .get("version")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                (at, v)
+            });
+        if !catch_up_due(last.as_ref().map(|(a, v)| (*a, v.as_str())), now, &version) {
+            continue;
+        }
+        let iid = match installs.get(&c.team_id) {
+            Some(v) => *v,
+            None => {
+                let v = super::review_reminder::team_installation_id(state, &c.team_id).await;
+                installs.insert(c.team_id.clone(), v);
+                v
+            }
+        };
+        let Some(iid) = iid else {
+            continue;
+        };
+        // A held budget: looked at again on a later sweep, never marked done.
+        if !budget.allows(state, iid, 4).await {
+            continue;
+        }
+        let Ok(github) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            iid,
+            &state.http,
+        ) else {
+            continue;
+        };
+        let cfg = OnApproveConfig::load(state, &c.team_id, owner, repo).await;
+        let read = async {
+            let branch = github.get_default_branch(owner, repo).await?;
+            let head = github.get_ref(owner, repo, &branch).await?;
+            let tags = github.list_tags(owner, repo).await?;
+            let releases = super::release_run::releases_newest_first(&tags, &cfg.tag_prefix);
+            let head_in_newest = match releases.first() {
+                Some((_, sha)) if sha != &head => Some(super::release_notes::tag_on_branch(
+                    &github.compare_status(owner, repo, &head, sha).await?,
+                )),
+                _ => None,
+            };
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                branch,
+                head,
+                releases,
+                head_in_newest,
+            ))
+        };
+        let (branch, head, releases, head_in_newest) = match read.await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(repo = %c.repo, error = %e, "Release catch-up: could not read the branch and its tags");
+                continue;
+            }
+        };
+        let waiting = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", super::attr_s(&c.team_id))
+            .key("sk", super::attr_s(&format!("TAGSWEEP#{}", c.repo)))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item)
+            .is_some();
+        let blocked = release_blocked(state, &c.team_id, owner, repo)
+            .await
+            .is_some();
+        let decided = catch_up(&head, &releases, head_in_newest, waiting, blocked);
+        if decided == CatchUp::Open {
+            let pr = github
+                .pulls_for_commit(owner, repo, &head)
+                .await
+                .ok()
+                .and_then(|prs| {
+                    prs.iter()
+                        .find(|p| p["merged_at"].is_string())
+                        .and_then(|p| p["number"].as_u64())
+                })
+                .unwrap_or(0);
+            info!(repo = %c.repo, head = %short_sha(&head), "Release catch-up: merged changes no tag holds — a release window opens");
+            schedule_tag_sweep(
+                state, &cfg, &c.team_id, iid, owner, repo, pr, &branch, false,
+            )
+            .await;
+            opened.push(c.repo.clone());
+        }
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", super::attr_s(&c.team_id))
+            .item("sk", super::attr_s(&marker))
+            .item("at", super::attr_n(now as u64))
+            .item("version", super::attr_s(&version))
+            .item("ttl", super::attr_n((now + 30 * 86_400) as u64))
+            .send()
+            .await;
+    }
+    opened
+}
+
 /// Failed cuts retried before the failure is shown on the Releases page.
 const MAX_TAG_ATTEMPTS: u32 = 3;
 

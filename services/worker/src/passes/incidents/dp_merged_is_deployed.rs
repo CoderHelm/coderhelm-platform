@@ -77,7 +77,10 @@ fn the_tag_deploy_is_a_step_after_the_merge() {
     assert!(matches!(s.trigger, Some(On::Tag(_))));
     assert!(s.after_merge);
     // Before the merge it waits; after, it starts.
-    assert_eq!(release_run::next(std::slice::from_ref(&s), 0, false), Next::Wait);
+    assert_eq!(
+        release_run::next(std::slice::from_ref(&s), 0, false),
+        Next::Wait
+    );
     assert_eq!(release_run::next(&[s], 0, true), Next::Start);
 }
 
@@ -246,4 +249,72 @@ fn the_tag_deploy_follows_the_tags_own_commit() {
     let team = tick.find("team_release(").unwrap();
     let gate = tick.find(".check(Request {").unwrap();
     assert!(team < gate);
+}
+
+#[test]
+fn merges_from_before_the_release_are_caught_up() {
+    use review_actions::CatchUp;
+    let releases = vec![
+        ("v1.4.12".to_string(), "t12".to_string()),
+        ("v1.4.11".to_string(), "t11".to_string()),
+    ];
+    // The head is past the newest tag, nothing waits: a window opens.
+    assert_eq!(
+        review_actions::catch_up("h", &releases, Some(false), false, false),
+        CatchUp::Open
+    );
+    // Tagged already, or inside the newest tag: nothing to do.
+    assert_eq!(
+        review_actions::catch_up("t12", &releases, None, false, false),
+        CatchUp::Released
+    );
+    assert_eq!(
+        review_actions::catch_up("h", &releases, Some(true), false, false),
+        CatchUp::Released
+    );
+    // A window already waits, or the release is blocked (a red head, shown on
+    // the Releases page): left to it.
+    assert_eq!(
+        review_actions::catch_up("h", &releases, Some(false), true, false),
+        CatchUp::Waiting
+    );
+    assert_eq!(
+        review_actions::catch_up("h", &releases, Some(false), false, true),
+        CatchUp::Waiting
+    );
+    // A repository that never released by tag is never started on one.
+    assert_eq!(
+        review_actions::catch_up("h", &[], None, false, false),
+        CatchUp::NoReleases
+    );
+}
+
+#[test]
+fn the_catch_up_runs_after_each_release_and_hourly() {
+    let now = 10_000;
+    assert!(review_actions::catch_up_due(None, now, "1.2.0"));
+    assert!(!review_actions::catch_up_due(
+        Some((now - 600, "1.2.0")),
+        now,
+        "1.2.0"
+    ));
+    // CoderHelm was released since the last look.
+    assert!(review_actions::catch_up_due(
+        Some((now - 600, "1.1.9")),
+        now,
+        "1.2.0"
+    ));
+    assert!(review_actions::catch_up_due(
+        Some((now - 3_600, "1.2.0")),
+        now,
+        "1.2.0"
+    ));
+    // The scheduled sweep runs it, and an open window goes through the same
+    // sweep (green head, freeze, budget) as any release.
+    let main = include_str!("../../main.rs");
+    assert!(main.contains("passes::review_actions::release_catch_up(&state)"));
+    let src = include_str!("../review_actions.rs");
+    let c = &src[src.find("pub async fn release_catch_up(").unwrap()..];
+    assert!(c.contains("schedule_tag_sweep("));
+    assert!(c.contains("budget.allows("));
 }
