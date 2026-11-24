@@ -810,6 +810,14 @@ pub struct TagSweepMessage {
     /// Failed cuts so far (retries back off, then the failure is recorded).
     #[serde(default)]
     pub attempt: u32,
+    /// A commit that landed on the default branch (a push, whoever merged):
+    /// the message opens the repository's release window, or joins the one
+    /// waiting, instead of releasing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merged_sha: String,
+    /// Looks at the branch head's CI that found it still running.
+    #[serde(default)]
+    pub ci_waits: u32,
 }
 
 /// An armed auto-merge job. Bound to the reviewed head; a later commit aborts it

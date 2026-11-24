@@ -2321,6 +2321,7 @@ pub async fn release_now(
         sweep_id,
         manual: true,
         attempt: 0,
+        ..Default::default()
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
     info!(owner, name, "Release now: queued from dashboard");

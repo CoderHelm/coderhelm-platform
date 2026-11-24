@@ -4144,6 +4144,39 @@ fn restack_message(
     })
 }
 
+/// The release a push to the default branch joins: its head commit, for
+/// the worker to fold into the repository's waiting release window. None for
+/// a deleted branch or a push that moved nothing.
+fn release_on_push(
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Option<crate::models::TagSweepMessage> {
+    let after = payload["after"].as_str().unwrap_or("");
+    if payload["deleted"].as_bool().unwrap_or(false)
+        || after.is_empty()
+        || after.bytes().all(|b| b == b'0')
+        || payload["before"].as_str() == Some(after)
+    {
+        return None;
+    }
+    let branch = payload["ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .unwrap_or("");
+    Some(crate::models::TagSweepMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        base_branch: branch.to_string(),
+        merged_sha: after.to_string(),
+        ..Default::default()
+    })
+}
+
 async fn handle_push(
     state: &AppState,
     payload: &Value,
@@ -4186,6 +4219,17 @@ async fn handle_push(
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
         return Ok(StatusCode::OK);
+    }
+    // Commits merged into the default branch, by CoderHelm or by people:
+    // the repository's release (its batched tag) covers them. The worker
+    // reads the team's release settings and does nothing when they are off.
+    if let Some(m) = release_on_push(payload, installation_id, team_id, owner, name) {
+        let _ = send_to_queue(
+            state,
+            &state.config.ticket_queue_url,
+            &WorkerMessage::TagSweep(m),
+        )
+        .await;
     }
     // Knowledge sources reading this repository's docs sync now.
     super::knowledge_sources::on_push(state, team_id, &format!("{owner}/{name}")).await;
@@ -5038,6 +5082,34 @@ pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String>
     .await
     .ok()?;
     limits.reached(&totals).map(|hit| limit_reason(&hit))
+}
+
+#[cfg(test)]
+mod release_on_push_tests {
+    use super::release_on_push;
+    use serde_json::json;
+
+    #[test]
+    fn a_merge_into_the_default_branch_joins_the_release() {
+        let p = json!({
+            "ref": "refs/heads/main",
+            "before": "1111111111111111111111111111111111111111",
+            "after": "2222222222222222222222222222222222222222",
+        });
+        let m = release_on_push(&p, 7, "TEAM#t", "o", "r").unwrap();
+        assert_eq!(m.merged_sha, "2222222222222222222222222222222222222222");
+        assert_eq!(m.base_branch, "main");
+        assert_eq!((m.repo_owner.as_str(), m.repo_name.as_str()), ("o", "r"));
+        assert!(!m.manual && m.sweep_id.is_empty() && m.delay_remaining_secs == 0);
+    }
+
+    #[test]
+    fn a_deleted_or_unmoved_branch_releases_nothing() {
+        let deleted = json!({"ref": "refs/heads/main", "deleted": true, "after": "0000000000000000000000000000000000000000"});
+        assert!(release_on_push(&deleted, 7, "T", "o", "r").is_none());
+        let same = json!({"ref": "refs/heads/main", "before": "abc", "after": "abc"});
+        assert!(release_on_push(&same, 7, "T", "o", "r").is_none());
+    }
 }
 
 #[cfg(test)]
