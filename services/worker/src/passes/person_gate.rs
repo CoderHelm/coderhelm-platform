@@ -425,8 +425,8 @@ mod tests {
             ..Default::default()
         };
         let mut open = vec![
-            f("Should the venue pages say Summer Camp?"),
-            f("Which heading should the venue pages use?"),
+            f("Should the marina pages say Seasonal Slips?"),
+            f("Which heading should the marina pages use?"),
             f("Add the PAYMENTS_KEY secret."),
         ];
         let person = person_items(&open);

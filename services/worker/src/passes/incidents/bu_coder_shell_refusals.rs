@@ -6,7 +6,7 @@
 //! saved. A week of runs showed the same wall for other shapes: reads
 //! chained with `;`, `git show`/`git log`, and `corepack enable && pnpm
 //! install && <test>` chains. Meanwhile every `pnpm ...` command the
-//! sandbox did run ended with exit 127 after about 36s: the sandbox ran the
+//! sandbox did run ended with exit 127 after about half a minute: the sandbox ran the
 //! bare command, with no install and no pnpm, and the coder sent the same
 //! command again and again.
 //!
@@ -33,8 +33,8 @@ const CHECKS: &str =
 #[test]
 fn the_page_checks_run_as_fetches() {
     for line in [
-        "curl -sI https://www.example.com/program-portals/1",
-        "curl -sS -m 20 https://www.example.com/statics/portal-embed.js",
+        "curl -sI https://www.example.com/booking-portal/1",
+        "curl -sS -m 20 https://www.example.com/assets/booking-embed.js",
     ] {
         match classify(line) {
             Shell::Fetch(f) => assert_eq!(f.urls.len(), 1, "{line}"),

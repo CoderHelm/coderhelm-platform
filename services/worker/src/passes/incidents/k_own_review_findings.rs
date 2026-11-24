@@ -30,15 +30,15 @@ const OLD: &str = "Approved with notes";
 /// The three findings the review posted, as the model answered them.
 fn the_three_findings() -> Vec<Finding> {
     serde_json::from_value(serde_json::json!([
-        {"file": "jobs/common/upsert.py", "line": 1204, "severity": "medium", "category": "correctness",
+        {"file": "jobs/common/upsert.py", "line": 204, "severity": "medium", "category": "correctness",
          "evidence": "unverified-concern",
          "title": "Kept updated_at hides the row from both incremental cursors",
-         "body": "`jobs/common/upsert.py:1204` keeps updated_at while other columns change; the watermark in `jobs/sync_utils.py:357` reads MAX(updated_at), so the change never reaches the index until the nightly rebuild."},
-        {"file": "jobs/common/upsert.py", "line": 1163, "severity": "low", "category": "correctness",
+         "body": "`jobs/common/upsert.py:204` keeps updated_at while other columns change; the watermark in `jobs/sync_utils.py:57` reads MAX(updated_at), so the change never reaches the index until the nightly rebuild."},
+        {"file": "jobs/common/upsert.py", "line": 163, "severity": "low", "category": "correctness",
          "evidence": "verified-defect", "basis": "data",
          "title": "Ties on the sort key still flip between runs",
-         "body": "A query on the source table found 9 groups with tied start dates. Most look old, so the impact is likely small."},
-        {"file": "jobs/sync_pipeline.py", "line": 1328, "severity": "medium", "category": "convention",
+         "body": "A query on the source table found several groups with tied start dates. Most look old, so the impact is likely small."},
+        {"file": "jobs/sync_pipeline.py", "line": 328, "severity": "medium", "category": "convention",
          "evidence": "verified-defect",
          "title": "Skipped records get no WARNING and no count",
          "body": "The team rules ask for a WARNING with the record id and a count in the run summary; `if not start: continue` skips silently."}

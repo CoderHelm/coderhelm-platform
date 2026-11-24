@@ -59,7 +59,7 @@ use crate::passes::outside_work::{
 use crate::passes::release_plan::{self, Deploy, Env, Mechanics, On};
 
 /// The page check the planner wrote where a GROQ query belongs.
-const PAGE_CHECK_QUERY: &str = "check_url https://www.site.example/{north,south,east,west}/programmes/register find ['Programme registration','Open registration in a new tab']";
+const PAGE_CHECK_QUERY: &str = "check_url https://www.site.example/{north,south,east,west}/slips/book find ['Slip booking','Open booking in a new tab']";
 
 fn step(by: &str, kind: &str, target: &str, text: &str, how: &str) -> NoteStep {
     NoteStep {
@@ -82,13 +82,13 @@ fn step(by: &str, kind: &str, target: &str, text: &str, how: &str) -> NoteStep {
 fn the_steps() -> Vec<NoteStep> {
     vec![
         NoteStep {
-            values: vec!["draft=false".into(), "labels += CI:E2E, E2E:programmes".into()],
-            ..step("coderhelm", "e2e", "staging", "Open the PR ready for review, then add labels CI:E2E and E2E:programmes keeping existing labels", "GitHub PR and labels API")
+            values: vec!["draft=false".into(), "labels += CI:E2E, E2E:slips".into()],
+            ..step("coderhelm", "e2e", "staging", "Open the PR ready for review, then add labels CI:E2E and E2E:slips keeping existing labels", "GitHub PR and labels API")
         },
-        step("coderhelm", "verify", "staging", "Run e2e eslint on the two new e2e files; record exit 0", "sandbox: cd e2e && pnpm install --ignore-workspace && npx eslint pages/register.ts tests/register.spec.ts"),
+        step("coderhelm", "verify", "staging", "Run e2e eslint on the two new e2e files; record exit 0", "sandbox: cd e2e && pnpm install --ignore-workspace && npx eslint pages/book-slip.ts tests/book-slip.spec.ts"),
         step("coderhelm", "verify", "staging", "Confirm 'Deploy Preview' and 'E2E on preview' ran (not skipped) and the spec passed; read the framing result; if refused, flag it on the ticket and stop", "github_history workflow_runs and the PR e2e comment"),
         NoteStep {
-            why_person: "Only read access to the vendor's programs API; no portal admin".into(),
+            why_person: "Only read access to the vendor's booking API; no portal admin".into(),
             grant: "None via a connection".into(),
             ..step("person", "other", "production", "Only if framing is refused: allow the site and the preview hosts in frame-ancestors", "the vendor's portal settings")
         },
@@ -112,8 +112,8 @@ fn the_note() -> OutsideChange {
         confirm: Some(Confirm {
             query: PAGE_CHECK_QUERY.into(),
             expect: "200 and all strings".into(),
-            page: "/north/programmes/register".into(),
-            e2e: "e2e/tests/register.spec.ts passes, not skipped".into(),
+            page: "/north/slips/book".into(),
+            e2e: "e2e/tests/book-slip.spec.ts passes, not skipped".into(),
             ..Default::default()
         }),
         ..Default::default()
@@ -178,7 +178,7 @@ fn the_old_results() -> OutsideChange {
         c.steps[i].result = old.clone();
     }
     c.steps[0].done = true;
-    c.steps[0].result = "added `CI:E2E`, `E2E:programmes` to #12".into();
+    c.steps[0].result = "added `CI:E2E`, `E2E:slips` to #12".into();
     c.steps[6].result = "not done: the repository has no production deploy workflow CoderHelm can start (it deploys with `cd apps/studio && npm run deploy` or `cd apps/studio && npm run deploy:production`); grant: add a deploy workflow with a manual start (`workflow_dispatch:` in its triggers)".into();
     c.confirm.as_mut().unwrap().result =
         "the query failed: the read API returned 400 Bad Request".into();
@@ -187,14 +187,14 @@ fn the_old_results() -> OutsideChange {
 
 /// The comment the ticket got, as it was posted (names made up).
 const OLD_COMMENT: &str = "**Needed from you:**\n\
-1. Confirm 'Deploy Preview' and 'E2E on preview' ran (not skipped) and the spec passed; read the framing result: github_history workflow_runs and the PR e2e comment. CoderHelm could not: ran `a page check find ['Programme registration']`: the read API returned 400 Bad Request. (a person on the team)\n\
+1. Confirm 'Deploy Preview' and 'E2E on preview' ran (not skipped) and the spec passed; read the framing result: github_history workflow_runs and the PR e2e comment. CoderHelm could not: ran `a page check find ['Slip booking']`: the read API returned 400 Bad Request. (a person on the team)\n\
 2. Tag the v* production release under approval: deploy-production.yml on v* tag. CoderHelm could not: the repository has no production deploy workflow CoderHelm can start (it deploys with `cd apps/studio && npm run deploy`). To let it: add a deploy workflow with a manual start (`workflow_dispatch:` in its triggers). (a person on the team)\n\
 \n\
 **What CoderHelm does and checked**\n\
-- Run e2e eslint on the two new e2e files; record exit 0: sandbox: cd e2e && npx eslint pages/register.ts. CoderHelm could not: ran `a page check find ['Programme registration']`: the read API returned 400 Bad Request.\n\
-- After merging: a page check the four paths on the preview, for 200 and the iframe title. CoderHelm could not: ran `a page check find ['Programme registration']`: the read API returned 400 Bad Request.\n\
+- Run e2e eslint on the two new e2e files; record exit 0: sandbox: cd e2e && npx eslint pages/book-slip.ts. CoderHelm could not: ran `a page check find ['Slip booking']`: the read API returned 400 Bad Request.\n\
+- After merging: a page check the four paths on the preview, for 200 and the iframe title. CoderHelm could not: ran `a page check find ['Slip booking']`: the read API returned 400 Bad Request.\n\
 - cache purge-all --env prod --yes, then a page check the four production paths. CoderHelm does this once step 7 is done.\n\
-- Look at /north/programmes/register. CoderHelm cannot: how a page looks is a judgement only a person can make.\n";
+- Look at /north/slips/book. CoderHelm cannot: how a page looks is a judgement only a person can make.\n";
 
 #[test]
 fn every_step_gets_its_own_action_and_the_page_check_never_reaches_the_cms() {
@@ -234,8 +234,8 @@ fn every_step_gets_its_own_action_and_the_page_check_never_reaches_the_cms() {
     assert_eq!(
         checks[0].1,
         vec![
-            "Programme registration".to_string(),
-            "Open registration in a new tab".to_string()
+            "Slip booking".to_string(),
+            "Open booking in a new tab".to_string()
         ]
     );
     // The release's steps: the next tag under one approval, the purge, the
@@ -282,7 +282,7 @@ fn as_executed() -> OutsideChange {
         match ow::action_for(s, &a, &snapshot) {
             Action::Label(..) => {
                 s.done = true;
-                s.result = "added `CI:E2E`, `E2E:programmes` to #12".into();
+                s.result = "added `CI:E2E`, `E2E:slips` to #12".into();
             }
             Action::HeadChecks(_) => {
                 assert_eq!(checks_verdict(&checks), Some(Ok(2)));
@@ -510,7 +510,7 @@ fn a_reply_names_the_person_never_their_account_id() {
         id: "c1".into(),
         author: "557058:0f0e0000-aaaa-bbbb-cccc-000000000000".into(),
         author_id: "557058:0f0e0000-aaaa-bbbb-cccc-000000000000".into(),
-        text: "Skip the H1 and intro copy. Just use the title.".into(),
+        text: "Leave out the heading and intro text; the page title is enough.".into(),
         ..Default::default()
     };
     // Under an older comment: a quote of it, no name, no header.
@@ -518,7 +518,7 @@ fn a_reply_names_the_person_never_their_account_id() {
     assert!(!b.contains("557058"), "{b}");
     assert_eq!(
         b,
-        "\"Skip the H1 and intro copy. Just use the title.\"\n\nDone."
+        "\"Leave out the heading and intro text; the page title is enough.\"\n\nDone."
     );
     // Under the newest: only the answer.
     let named = Heard {

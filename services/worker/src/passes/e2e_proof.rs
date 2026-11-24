@@ -638,8 +638,8 @@ mod tests {
     fn proof(base: Leg, change: Leg) -> Proof {
         Proof {
             criterion: "Only one chip shows".into(),
-            page: "/acme/camps".into(),
-            test: "e2e/camps.spec.ts › one chip".into(),
+            page: "/acme/slips".into(),
+            test: "e2e/slips.spec.ts › one chip".into(),
             record: Record {
                 head: "abc1234".into(),
                 base,

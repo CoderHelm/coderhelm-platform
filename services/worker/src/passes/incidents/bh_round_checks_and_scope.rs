@@ -1,10 +1,10 @@
-//! bh. A fix round edited 15 files (+866 lines) and ended with "Ran the
+//! bh. A fix round edited many files and ended with "Ran the
 //! checks · not run: not enough time left": it had kept editing until the
 //! step had no room for a sandbox build, and nothing ran the checks after
 //! it. Two of its edits read "Didn't apply: Edited · refused: outside the
 //! round's files", one a test of a file the round changed, with no file
 //! named on the run page. The live log drew "Edited · 1 change" and
-//! "Rewrote · +19 −14" with no file, and a group of reads with an empty
+//! "Rewrote · +12 −8" with no file, and a group of reads with an empty
 //! name ("Read 2 files and searched once · , scrollWidth ...").
 //!
 //! Guarantee: once the branch has unchecked edits and the step has room
@@ -37,7 +37,7 @@ fn a_round_with_unchecked_edits_runs_its_checks_before_it_is_done() {
         told.contains("Call run_checks now") && told.contains("about 6 min"),
         "{told}"
     );
-    // 15 edited files, no check ran after them: owed to the settle stage.
+    // Many edited files, no check ran after them: owed to the settle stage.
     assert!(checks_owed(true, true));
     assert!(!checks_owed(true, false));
     assert!(

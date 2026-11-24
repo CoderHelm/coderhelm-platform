@@ -8,7 +8,7 @@
 //! completed the run through an ending that skips the review step every
 //! other ending goes through. Nobody was ever asked to review the new head.
 //! The verdict shown was the true last one, on the commit before the fix.
-//! The run's count of passes (12) ended nothing: the ceiling is 300.
+//! The run's count of passes ended nothing: the ceiling is far above it.
 //!
 //! Guarantee: a run never rests as completed with its own reviewer's
 //! verdict missing on the head or asking for changes. Every completion
@@ -168,7 +168,7 @@ fn every_ending_looks_at_the_pull_request() {
     // A pass count never ended the run in the incident: the ceiling is far
     // above any run's passes.
     let totals = crate::passes::run_ceiling::Totals {
-        passes: 12,
+        passes: 15,
         ..Default::default()
     };
     assert_eq!(totals.over(), None);

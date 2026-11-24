@@ -632,7 +632,7 @@ pub(crate) mod tests {
                 "country": "US",
                 "headers": headers,
                 "uri": "/listings",
-                "args": "sport=a&sport=b&token=secret",
+                "args": "slip=a&slip=b&token=secret",
                 "httpMethod": "GET"
             },
             "labels": [{"name": "awswaf:clientip:geo:country:US"}],

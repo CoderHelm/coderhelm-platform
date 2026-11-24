@@ -747,9 +747,9 @@ mod tests {
     /// not blocked; and a failed fix never blocks.
     #[test]
     fn a_stale_or_dead_unrelated_verdict_never_blocks_the_pull_request() {
-        let spec = "e2e/tests/site/venue-subnav-more-menu.spec.ts";
+        let spec = "e2e/tests/site/marina-subnav-more-menu.spec.ts";
         let saved = Record {
-            pr: 1501,
+            pr: 101,
             runs: vec![100],
             tests: vec![Attribution {
                 test: "More menu on a phone".into(),

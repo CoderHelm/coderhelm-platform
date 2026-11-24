@@ -33,7 +33,7 @@ use std::collections::HashSet;
 const OLD: &str = "inconclusive";
 const MERGE: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const LATER: &str = "f9e8d7c6b5a40312";
-const MERGED_AT: &str = "2026-10-28T15:00:00Z";
+const MERGED_AT: &str = "2030-03-12T15:00:00Z";
 
 fn at(min: i64) -> String {
     let t =

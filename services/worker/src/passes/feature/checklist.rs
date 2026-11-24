@@ -866,9 +866,9 @@ mod tests {
 
     #[test]
     fn counts_the_cases_the_acceptance_criteria_list() {
-        let body = "Build the filter.\n\nAcceptance criteria:\n- Shows all events by default\n- Filters by venue\n1. Filters by date\n\n## Notes\n- not a case\n";
+        let body = "Build the filter.\n\nAcceptance criteria:\n- Shows all events by default\n- Filters by marina\n1. Filters by date\n\n## Notes\n- not a case\n";
         assert_eq!(acceptance_cases(body, ""), 3);
-        let spec = "### Scenario: default\nGiven...\n### Scenario: by venue\n";
+        let spec = "### Scenario: default\nGiven...\n### Scenario: by marina\n";
         assert_eq!(acceptance_cases("No criteria here", spec), 2);
     }
 
@@ -878,7 +878,7 @@ mod tests {
             (
                 "src/filter.test.ts".to_string(),
                 "added".to_string(),
-                "+it('shows all', () => {})\n+  test('by venue', () => {})\n+const x = 1\n"
+                "+it('shows all', () => {})\n+  test('by marina', () => {})\n+const x = 1\n"
                     .to_string(),
             ),
             (

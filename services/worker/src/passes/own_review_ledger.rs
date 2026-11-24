@@ -1030,9 +1030,9 @@ mod tests {
     /// The shape of the finding the run deferred: a one-line config
     /// omission, with its file and line. The second review words it
     /// differently and its line moved.
-    const NAV: &str = "Site navbar and footer still render on the portal page; signup-portal isn't in settings.blankLayout (`apps/web/src/lib/routing/renderers.tsx:1632`)";
-    const NAV_LATER: &str = "The site navbar and footer still render on the portal pages because `signup-portal` isn't in settings.blankLayout (`apps/web/src/lib/routing/renderers.tsx:1636`)";
-    const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/signup.spec.ts:121`)";
+    const NAV: &str = "Site navbar and footer still render on the portal page; booking-portal isn't in settings.bareLayout (`apps/web/src/lib/routing/renderers.tsx:132`)";
+    const NAV_LATER: &str = "The site navbar and footer still render on the portal pages because `booking-portal` isn't in settings.bareLayout (`apps/web/src/lib/routing/renderers.tsx:136`)";
+    const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/booking.spec.ts:121`)";
 
     fn ended(l: &mut Ledger, focus: &[&str], blocked: Vec<Blocker>, account: &str) {
         l.start_round(&focus.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn a_finding_the_ticket_rules_out_is_settled_by_the_ticket_not_deferred() {
-        let ticket = "### Ticket: Sign-up pages\nEmbed the portal.\n\n### Comment on the ticket by a person\nKeep your site's header and footer. You do not need to remove the footer.";
+        let ticket = "### Ticket: Booking pages\nEmbed the portal.\n\n### Comment on the ticket by a person\nKeep the site's own header and footer on these pages. The footer can stay.";
         let mut l = Ledger::default();
         let open = vec![NAV.to_string()];
         l.observe(&open, ticket);
@@ -1181,7 +1181,7 @@ mod tests {
             &mut l,
             &[NAV],
             vec![],
-            &format!("{TICKET_CONFLICT} {NAV} :: \"Keep your site's header and footer\""),
+            &format!("{TICKET_CONFLICT} {NAV} :: \"Keep the site's own header and footer\""),
         );
         l.observe(&open, ticket);
         match l.decide(&open, 0.0, 200.0) {

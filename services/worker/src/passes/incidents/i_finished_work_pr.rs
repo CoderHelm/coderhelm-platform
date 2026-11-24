@@ -1,5 +1,5 @@
-//! i. A run finished 32 of 33 planned tasks, the check before the pull
-//! request still found one not done after its fix round, and the run ended
+//! i. A run finished all but one of its planned tasks, the check before the
+//! pull request still found one not done after its fix round, and the run ended
 //! with no pull request: the work stayed on a branch nobody looked at. Once
 //! it opened a draft instead, the planned work was left for a person.
 //!
@@ -25,7 +25,7 @@ const CARD: &str =
 const MAP: &str = "The card block is not mapped in `apps/web/src/blocks/index.ts`.";
 
 fn now() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2026-10-28T16:00:00Z")
+    chrono::DateTime::parse_from_rfc3339("2030-03-12T16:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc)
 }

@@ -851,7 +851,7 @@ mod e2e_rule_tests {
             },
             Widening {
                 kind: Kind::Parallel,
-                path: "dags/camps.py".into(),
+                path: "dags/charters.py".into(),
                 what: "`A_MAP` next to the existing `B_MAP`".into(),
             },
         ]);

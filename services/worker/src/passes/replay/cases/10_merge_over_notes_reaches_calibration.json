@@ -1,6 +1,6 @@
 {
   "name": "A person merging over an approval with notes still teaches calibration, both ways",
-  "about": "Since the reviewer approves with notes instead of requesting changes, 'approved over block' and 'merged over block' found no block and were logged as not judged (90 in a week), and comments left open were scored only on CoderHelm's own PRs, so a category the team ignored never reached downgrade or suppress. At close every thread now records: untouched at merge is left open, lines changed or CoderHelm resolving it is acted on, a person resolving it unchanged is dismissed. Words under it stay the judge's; an FYI asks for nothing.",
+  "about": "Since the reviewer approves with notes instead of requesting changes, 'approved over block' and 'merged over block' found no block and were logged as not judged (dozens a week), and comments left open were scored only on CoderHelm's own PRs, so a category the team ignored never reached downgrade or suppress. At close every thread now records: untouched at merge is left open, lines changed or CoderHelm resolving it is acted on, a person resolving it unchanged is dismissed. Words under it stay the judge's; an FYI asks for nothing.",
   "case": "learning_threads",
   "input": {
     "merged": true,

@@ -4,7 +4,7 @@
 //! review, and said they "should have been raised then". On CoderHelm's own
 //! pull request each late note was still chained into the work that holds
 //! the merge, so each one cost a push and a review. Why they were late:
-//! the checks that find them (#742's smallest-change checks, with no model)
+//! the checks that find them (the smallest-change checks, with no model)
 //! started running after the earlier rounds were reviewed, so the review
 //! blamed itself for a miss it couldn't have made; and three more ways a
 //! first review leaves findings for later were open in the code: the
@@ -31,19 +31,19 @@ use crate::passes::review_rules::wider_findings;
 use std::collections::{HashMap, HashSet};
 
 const FILTERS: &str = "apps/web/src/utils/filterMaps.ts";
-const TEST: &str = "apps/web/src/test/components/filter-nav-sport-grid.test.tsx";
+const TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
 
 fn the_two() -> Vec<Finding> {
     wider_findings(&[
         Widening {
             kind: Kind::Parallel,
             path: FILTERS.into(),
-            what: "`dedupeSportOptionsBySlug` next to the existing `dedupeSportsBySlug`".into(),
+            what: "`dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`".into(),
         },
         Widening {
             kind: Kind::TestSize,
             path: TEST.into(),
-            what: "236 added lines against 41 lines of changed code".into(),
+            what: "240 added lines against 40 lines of changed code".into(),
         },
     ])
 }
@@ -61,7 +61,7 @@ fn changed_since_previous() -> HashMap<String, HashSet<u64>> {
 fn round4() -> Round {
     Round {
         number: 4,
-        previous_head: Some("395769a".into()),
+        previous_head: Some("ddd4444".into()),
     }
 }
 
@@ -211,16 +211,16 @@ fn a_review_cut_by_its_steps_goes_on_in_a_second_pass() {
     assert_eq!(review_agent::opened_files(&messages), vec![FILTERS]);
     let first: review_agent::ReviewOutput = serde_json::from_value(serde_json::json!({
         "summary": "First pass.",
-        "findings": [{"file": FILTERS, "line": 3, "title": "Dropdown lists one sport twice", "body": "b"}]
+        "findings": [{"file": FILTERS, "line": 3, "title": "Dropdown lists one dock twice", "body": "b"}]
     }))
     .unwrap();
     let prompt = review_agent::continue_prompt("PR: x", &first, &[FILTERS.to_string()]);
     assert!(prompt.contains("ran out of tool"));
-    assert!(prompt.contains("Dropdown lists one sport twice"));
+    assert!(prompt.contains("Dropdown lists one dock twice"));
     let second: review_agent::ReviewOutput = serde_json::from_value(serde_json::json!({
         "summary": "Second pass.",
         "findings": [
-            {"file": FILTERS, "line": 3, "title": "Dropdown lists one sport twice", "body": "b"},
+            {"file": FILTERS, "line": 3, "title": "Dropdown lists one dock twice", "body": "b"},
             {"file": TEST, "line": 9, "title": "Test asserts the old order", "body": "b"}
         ]
     }))

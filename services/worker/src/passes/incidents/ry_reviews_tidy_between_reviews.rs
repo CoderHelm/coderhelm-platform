@@ -1,8 +1,8 @@
 //! ry. Two pull requests on a web app, read by a person who asked whether
-//! CoderHelm's approvals and resolved comments could go away after a while
-//! because "it becomes too much".
+//! CoderHelm's approvals and resolved comments could go away after a while,
+//! because there was too much of them to read.
 //!
-//! On the first, CoderHelm's "Approved with notes" review from four days
+//! On the first, CoderHelm's "Approved with notes" review from days
 //! earlier still stood in full: the file table, the "Why approved" line, a
 //! risk block with bars, an FYI list of unconfirmed items, Verification,
 //! Tests, "Earlier comments" and the rating footer. Under it a person's
@@ -10,7 +10,7 @@
 //! earlier review only got out of the way when a new one was posted, and a
 //! re-review with nothing new to say posts nothing.
 //!
-//! On the second, an inline thread of CoderHelm's 18 hours old was still
+//! On the second, an inline thread of CoderHelm's from the day before was still
 //! open: "Blocking (failing check): Lint & Type Check and Deploy Preview
 //! are red on this head … I could not read the logs". It was about a head
 //! two pushes back; the checks on the head had passed since.
@@ -37,12 +37,12 @@ const HEAD: &str = "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432";
 fn long_approval() -> String {
     [
         "## PR Overview",
-        "Adds the camp registration status to the camp cards.",
-        "| File | What |\n|---|---|\n| `apps/web/src/camps/card.tsx` | Shows the status |",
+        "Adds the slip booking status to the slip cards.",
+        "| File | What |\n|---|---|\n| `apps/web/src/slips/card.tsx` | Shows the status |",
         "✅ **Approved with notes**: nothing blocks the merge; 2 notes below are for a look.",
         "_Why approved: nothing blocks (no required rule broken, no failing check)._",
         "#### Risk: low\n`██░░░░░░░░` 2/10",
-        "#### FYI: facts worth confirming\n- The vendor's open date field.",
+        "#### FYI: facts worth confirming\n- The booking vendor's open date field.",
         "#### Verification\n- typecheck passed",
         "#### Tests\n- e2e covers the closed branch only",
         "#### Earlier comments\n1 settled and resolved · 0 still open",
@@ -71,7 +71,7 @@ fn pr(state: PrState) -> rs::PrNow {
     p
 }
 
-/// The first screenshot: after the person's push the four-day-old approval
+/// The first screenshot: after the person's push the days-old approval
 /// is one line naming the commit it approved; the person's review is not
 /// touched; a second run does nothing.
 #[test]
@@ -230,7 +230,7 @@ fn a_persons_unanswered_reply_keeps_the_thread() {
 #[test]
 fn a_finding_on_code_that_left_the_diff_settles() {
     let mut now = pr(PrState::Open);
-    now.changed_paths = Some(vec!["apps/web/src/camps/card.tsx".into()]);
+    now.changed_paths = Some(vec!["apps/web/src/slips/card.tsx".into()]);
     let t = rs::tidy(&[], &failing_check_thread(false), &now);
     assert_eq!(t.resolve, vec![("T1".to_string(), Settled::FileGone)]);
 }

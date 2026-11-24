@@ -37,8 +37,8 @@ const OLD_ROUND: &str = "the last fix round didn't finish";
 const OLD_NOTE: &str = "has CI failures — fixing";
 
 const SEC_BRANCH: &str = "coderhelm/security-updates-2026-01-05-a1b2c3";
-const THUMBS_LOCK: &str = "lambdas/thumbs/package-lock.json";
-const CLIPS_LOCK: &str = "lambdas/clips/package-lock.json";
+const PHOTOS_LOCK: &str = "lambdas/photos/package-lock.json";
+const INVOICES_LOCK: &str = "lambdas/invoices/package-lock.json";
 const ROOT_LOCK: &str = "pnpm-lock.yaml";
 
 /// The fixture monorepo with two npm packages that keep lockfiles of their
@@ -48,12 +48,12 @@ fn tree() -> Vec<String> {
     tree.extend(
         [
             "pnpm-workspace.yaml",
-            "lambdas/thumbs/package.json",
-            THUMBS_LOCK,
-            "lambdas/thumbs/index.mjs",
-            "lambdas/clips/package.json",
-            CLIPS_LOCK,
-            "lambdas/clips/index.mjs",
+            "lambdas/photos/package.json",
+            PHOTOS_LOCK,
+            "lambdas/photos/index.mjs",
+            "lambdas/invoices/package.json",
+            INVOICES_LOCK,
+            "lambdas/invoices/index.mjs",
         ]
         .iter()
         .map(|p| p.to_string()),
@@ -67,9 +67,9 @@ fn pr_changes() -> Vec<String> {
     [
         "package.json",
         "apps/web/package.json",
-        "lambdas/thumbs/package.json",
-        "lambdas/clips/package.json",
-        "lambdas/thumbs/index.test.mjs",
+        "lambdas/photos/package.json",
+        "lambdas/invoices/package.json",
+        "lambdas/photos/index.test.mjs",
     ]
     .iter()
     .map(|p| p.to_string())
@@ -79,7 +79,7 @@ fn pr_changes() -> Vec<String> {
 /// The three failing workflows' logs, as GitHub Actions printed them.
 fn ci_logs() -> String {
     [
-        "Workflow 'Deploy Thumbs Lambda' failed",
+        "Workflow 'Deploy Photos Lambda' failed",
         "2026-01-05T10:00:01.0000000Z npm error code EUSAGE",
         "2026-01-05T10:00:01.0000000Z npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.",
         "2026-01-05T10:00:01.0000000Z npm error Invalid: lock file's undici@6.28.1 does not satisfy undici@8.12.4",
@@ -109,29 +109,30 @@ async fn out_of_sync_lockfiles_are_regenerated_by_code_before_any_model_round() 
     // doesn't answer for the nested packages).
     let tools = generators::lockfiles_to_repair(&tree(), &pr_changes());
     let locks: Vec<&str> = tools.iter().map(|t| t.lockfile.as_str()).collect();
-    assert_eq!(locks, vec![CLIPS_LOCK, THUMBS_LOCK, ROOT_LOCK]);
+    assert_eq!(locks, vec![INVOICES_LOCK, PHOTOS_LOCK, ROOT_LOCK]);
     assert_eq!(
         tools.iter().map(|t| t.manager).collect::<Vec<_>>(),
         ["npm", "npm", "pnpm"]
     );
     // A pull request that changes one nested manifest regenerates that
     // package's lockfile alone, and one that changes no manifest, none.
-    let one = generators::lockfiles_to_repair(&tree(), &["lambdas/clips/package.json".to_string()]);
+    let one =
+        generators::lockfiles_to_repair(&tree(), &["lambdas/invoices/package.json".to_string()]);
     assert_eq!(one.len(), 1);
-    assert_eq!(one[0].lockfile, CLIPS_LOCK);
+    assert_eq!(one[0].lockfile, INVOICES_LOCK);
     assert!(generators::lockfiles_to_repair(
         &tree(),
         &["apps/web/src/blocks/hero.tsx".to_string()]
     )
     .is_empty());
     // A lockfile edited by hand is written again by its manager too.
-    let hand = generators::lockfiles_to_repair(&tree(), &[THUMBS_LOCK.to_string()]);
+    let hand = generators::lockfiles_to_repair(&tree(), &[PHOTOS_LOCK.to_string()]);
     assert_eq!(hand.len(), 1);
 
     // One sandbox build, each manager in its own folder, never a frozen
     // install.
     let cmd = ls::repair_command(&tools);
-    assert!(cmd.contains("cd 'lambdas/thumbs' && ((npm install --package-lock-only"));
+    assert!(cmd.contains("cd 'lambdas/photos' && ((npm install --package-lock-only"));
     assert!(cmd.contains("pnpm install --lockfile-only --ignore-scripts"));
     assert!(!cmd.contains("--frozen-lockfile)") && !cmd.contains("npm ci"));
 
@@ -139,19 +140,19 @@ async fn out_of_sync_lockfiles_are_regenerated_by_code_before_any_model_round() 
     // and a manifest one manager reformatted on the way.
     let archive = tarball(&[
         (
-            CLIPS_LOCK,
-            b"{\"lockfileVersion\":3,\"clips\":true}".to_vec(),
+            INVOICES_LOCK,
+            b"{\"lockfileVersion\":3,\"invoices\":true}".to_vec(),
         ),
         (
-            THUMBS_LOCK,
-            b"{\"lockfileVersion\":3,\"thumbs\":true}".to_vec(),
+            PHOTOS_LOCK,
+            b"{\"lockfileVersion\":3,\"photos\":true}".to_vec(),
         ),
         (
             ROOT_LOCK,
             b"lockfileVersion: '9.0'\noverrides:\n  undici: 8.12.4\n".to_vec(),
         ),
         (
-            "lambdas/clips/package.json",
+            "lambdas/invoices/package.json",
             b"{ \"reformatted\": true }".to_vec(),
         ),
     ]);
@@ -171,14 +172,14 @@ async fn out_of_sync_lockfiles_are_regenerated_by_code_before_any_model_round() 
     )
     .await;
     let (files, repair) = generators::read_lock_repair(&tools, &o);
-    assert_eq!(repair.written, vec![CLIPS_LOCK, THUMBS_LOCK, ROOT_LOCK]);
+    assert_eq!(repair.written, vec![INVOICES_LOCK, PHOTOS_LOCK, ROOT_LOCK]);
     assert!(
         repair.failed.is_empty() && repair.not_run.is_none(),
         "{repair:?}"
     );
     // Only lockfiles are committed.
     let committed: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(committed, vec![CLIPS_LOCK, THUMBS_LOCK, ROOT_LOCK]);
+    assert_eq!(committed, vec![INVOICES_LOCK, PHOTOS_LOCK, ROOT_LOCK]);
     let mut gh = FakeGitHub::new();
     gh.commit(
         "lockfile repair",
@@ -236,7 +237,7 @@ async fn out_of_sync_lockfiles_are_regenerated_by_code_before_any_model_round() 
 async fn a_lockfile_its_manager_cannot_write_is_named_and_the_others_still_land() {
     let tools = generators::lockfiles_to_repair(&tree(), &pr_changes());
     let archive = tarball(&[
-        (CLIPS_LOCK, b"{\"lockfileVersion\":3}".to_vec()),
+        (INVOICES_LOCK, b"{\"lockfileVersion\":3}".to_vec()),
         (ROOT_LOCK, b"lockfileVersion: '9.0'\n".to_vec()),
     ]);
     let log = codebuild_log(&[
@@ -258,9 +259,9 @@ async fn a_lockfile_its_manager_cannot_write_is_named_and_the_others_still_land(
     .await;
     let (files, repair) = generators::read_lock_repair(&tools, &o);
     assert_eq!(files.len(), 2);
-    assert_eq!(repair.written, vec![CLIPS_LOCK, ROOT_LOCK]);
+    assert_eq!(repair.written, vec![INVOICES_LOCK, ROOT_LOCK]);
     assert_eq!(repair.failed.len(), 1);
-    assert_eq!(repair.failed[0].0, THUMBS_LOCK);
+    assert_eq!(repair.failed[0].0, PHOTOS_LOCK);
     assert!(
         repair.failed[0].1.contains("acme-streams@9.9.9"),
         "{:?}",
@@ -323,7 +324,7 @@ fn a_retry_of_a_dependency_fix_rebuilds_its_change_from_its_plan() {
 #[test]
 fn a_model_cannot_write_a_lockfile() {
     for path in [
-        THUMBS_LOCK,
+        PHOTOS_LOCK,
         ROOT_LOCK,
         "yarn.lock",
         "services/Cargo.lock",
@@ -342,7 +343,7 @@ fn a_model_cannot_write_a_lockfile() {
     }
     for path in [
         "package.json",
-        "lambdas/thumbs/index.mjs",
+        "lambdas/photos/index.mjs",
         "docs/lockfiles.md",
     ] {
         assert!(implement::lockfile_write_refusal(path).is_none(), "{path}");

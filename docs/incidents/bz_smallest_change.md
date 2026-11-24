@@ -2,12 +2,12 @@
 
 **What happened:** Two pull requests did far more than their tickets, and guessed where they should have measured.
 
-- **The camps ticket:** a data-pipeline ticket asked to link four camps to a second sport.
+- **The charters ticket:** a data-pipeline ticket asked to link four charters to a second activity.
   - The plan named the right overrides map, then reused the link helper that deletes every link it isn't given, on a sync that only inserted. Links nobody asked about were deleted.
   - The build wrote a second map and helpers beside the existing one.
   - It added counters, warnings and a log level change in shared code, because the data rules asked for reporting on any skip.
-  - It added a 432-line test with fake hooks and an invented payload.
-  - Every round reinstalled the test dependencies, about 25 minutes of builds in one run.
+  - It added a test hundreds of lines long with fake hooks and an invented payload.
+  - Every round reinstalled the test dependencies, many minutes of builds in one run.
 - **The portal ticket:** a web ticket's vendor end-to-end tests were written before anyone looked at the vendor's page, then rewritten on guesses. A criterion ("no double scrollbars") was met by changing the test to expect the vendor's behaviour instead of changing the page.
 
 **The guarantee:**

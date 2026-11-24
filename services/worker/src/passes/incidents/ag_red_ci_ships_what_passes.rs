@@ -1,5 +1,5 @@
-//! ag. After #646 three ways were left for a run to end badly over red
-//! checks or a refused landing:
+//! ag. After an earlier change three ways were left for a run to end badly
+//! over red checks or a refused landing:
 //!
 //! - a dependency fix whose pull request's CI stayed red had its work taken
 //!   apart by planned task (one task per lockfile: a lockfile put back
@@ -16,10 +16,10 @@
 //! dependency fix takes out its newest commit of verified bumps, defers
 //! those bumps with what CI printed and keeps the commits before it, again
 //! while CI stays red, never emptying the pull request. Any other run is
-//! no longer taken apart at all (`ci-gates`, 2026-11-17): its rounds stop
-//! after two pushed fixes per failing test, with the test named, and the
-//! branch keeps its work. A stopped run's lockfiles are
-//! written by their package managers before its pull request opens. Every
+//! no longer taken apart at all: its rounds stop after two pushed fixes
+//! per failing test, with the test named, and the branch keeps its work. A
+//! stopped run's lockfiles are written by their package managers before
+//! its pull request opens. Every
 //! kind of fix round takes the same classified decision about a fault:
 //! while it may continue it runs again, keeping its work when only the
 //! landing failed.
@@ -120,8 +120,8 @@ fn a_dependency_fix_with_red_ci_defers_only_the_set_that_breaks_it() {
 }
 
 /// A ticket run's plan is no longer taken apart task by task to turn CI
-/// green (speedboat pull requests lost seven and one of their files that
-/// way, with tests left behind that expected them): only a dependency
+/// green (ticket runs' pull requests lost planned files that way, with
+/// tests left behind that expected them): only a dependency
 /// run's bumps come out, and the source says so.
 #[test]
 fn a_plan_is_never_taken_apart_to_turn_ci_green() {

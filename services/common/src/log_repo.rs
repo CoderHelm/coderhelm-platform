@@ -930,7 +930,7 @@ const NOT_OWN_SYMBOLS: &[&str] = &[
 const MAX_SYMBOLS: usize = 2;
 
 /// Pure: the class or logger names the error's own lines carry (`ERROR
-/// [SearchIndexService]`, `at SearchIndexService.query`,
+/// [AvailabilityService]`, `at AvailabilityService.query`,
 /// `com.acme.billing.InvoiceJob`): identifiers in CamelCase with two words
 /// at least, not a runtime's or a framework's, most mentioned first. Each is
 /// looked for as a definition (`class <name>`) in the team's code.

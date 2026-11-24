@@ -34,7 +34,7 @@ fn ending_after(reply: &str, done: u32, total: u32) -> (Vec<supervisor::Rung>, s
     let mut rungs = Vec::new();
     if facts.blocker.is_none() {
         // The branch didn't move: each step after the reply is a stall.
-        let mark = steps::progress_mark("a8c8814", "implement");
+        let mark = steps::progress_mark("aaa1112", "implement");
         let mut prev = Some(mark.clone());
         let mut stalled = 0;
         for _ in 0..12 {

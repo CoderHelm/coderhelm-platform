@@ -1,10 +1,10 @@
 //! am. A dependency security run's pull request had the right code after a
 //! review round and the wrong description:
 //!
-//! - its table still showed the plan: five packages as major version jumps
-//!   ("2.3.1 to 4.0.4 (major)") when the final manifest keeps each inside
-//!   its current major through a scoped override, and a headline that
-//!   counted twenty major versions;
+//! - its table still showed the plan: several packages as major version
+//!   jumps ("2.3.1 to 4.0.4 (major)") when the final manifest keeps each
+//!   inside its current major through a scoped override, and a headline
+//!   that counted major versions the head no longer makes;
 //! - its count of fixed advisories had never been compared with what the
 //!   final lockfile installs;
 //! - the round that fixed the code wrote "I can't edit the PR description

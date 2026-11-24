@@ -1048,7 +1048,7 @@ mod tests {
             json!({
                 "id": 11, "in_reply_to_id": 10,
                 "user": user("dev-one", "User"), "author_association": "MEMBER",
-                "body": "I don't want this program to show even after it changes from an unpublished state to published state",
+                "body": "Keep this program off the site even after it moves from unpublished to published.",
             }),
             json!({
                 "id": 12, "in_reply_to_id": 10,
@@ -1208,7 +1208,7 @@ mod tests {
         assert!(p.contains("src/listing.py:12"));
         assert!(p.contains("+    \"2002\","));
         assert!(p.contains("12 | HIDDEN_PROGRAM_IDS"));
-        assert!(p.contains("- dev-one: I don't want this program to show"));
+        assert!(p.contains("- dev-one: Keep this program off the site"));
         assert!(!p.contains("Coverage unchanged"));
     }
 

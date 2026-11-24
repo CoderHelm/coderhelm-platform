@@ -71,7 +71,7 @@ fn with_open_pr() -> FakeGitHub {
 }
 
 fn now() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2026-10-28T15:00:00Z")
+    chrono::DateTime::parse_from_rfc3339("2030-03-14T15:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc)
 }

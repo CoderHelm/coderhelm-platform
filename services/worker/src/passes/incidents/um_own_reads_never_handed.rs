@@ -1,6 +1,6 @@
 //! um. Runs handed people reads CoderHelm does itself. One asked a person
 //! to "read the Deploy Preview e2e result" because its app lacked Actions
-//! write; reading a run needs no write. Another stopped with six
+//! write; reading a run needs no write. Another stopped with several
 //! requirements "that need access CoderHelm doesn't have", the first being
 //! to confirm the preview's e2e ran and passed. A third deferred a review
 //! finding to a person: "check DevTools on the preview for the analytics
@@ -22,7 +22,7 @@ fn reading_results_and_pages_is_coderhelms_own() {
     let asks = [
         Ask {
             kind: Kind::Attempt,
-            text: "Read the Deploy Preview e2e result for the register pages".into(),
+            text: "Read the Deploy Preview e2e result for the booking pages".into(),
             why_not: "the GitHub App lacks Actions: write".into(),
             ..Default::default()
         },

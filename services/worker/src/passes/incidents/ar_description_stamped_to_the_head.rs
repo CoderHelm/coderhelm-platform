@@ -1,7 +1,7 @@
 //! ar. A dependency run's pull request was described from a head, and then
 //! the head moved on without it. A feedback round changed an override in
 //! the manifest and the description was rebuilt on that commit, where the
-//! lockfile still resolved the old version ("1.4.4-lts.1, not moved on the
+//! lockfile still resolved the old version ("1.6.2-lts.1, not moved on the
 //! head"). The lockfile was regenerated in the commits after it, the run's
 //! checks ran again and the run completed. The description still said not
 //! moved, still counted the advisory as not fixed, still listed the package
@@ -47,8 +47,8 @@ fn unit() -> FixUnit {
         bundle: true,
         bumps: vec![Bump {
             package: "xml-kit".into(),
-            from: "1.4.4-lts.1".into(),
-            to: "2.0.3".into(),
+            from: "1.6.2-lts.1".into(),
+            to: "2.1.0".into(),
             major: true,
             manifest: "pnpm-lock.yaml".into(),
         }],
@@ -61,8 +61,8 @@ fn finding() -> (Finding, FindingState) {
         Finding {
             id: "f-1".into(),
             package: "xml-kit".into(),
-            version: "1.4.4-lts.1".into(),
-            fixed_version: Some("2.0.3".into()),
+            version: "1.6.2-lts.1".into(),
+            fixed_version: Some("2.1.0".into()),
             manifest: "pnpm-lock.yaml".into(),
             advisory: Advisory {
                 primary: "GHSA-xxxx-0009".into(),
@@ -79,7 +79,7 @@ fn at(head_version: &str) -> LockAt {
     let copies = |v: &str| Some(vec![("xml-kit".to_string(), v.to_string())]);
     LockAt {
         path: "pnpm-lock.yaml".into(),
-        base: copies("1.4.4-lts.1"),
+        base: copies("1.6.2-lts.1"),
         head: copies(head_version),
         why: String::new(),
     }
@@ -106,18 +106,18 @@ fn described(sha: &str, resolved: &str) -> String {
 #[test]
 fn a_description_of_an_earlier_head_is_rebuilt_for_the_head() {
     let (h1, h2) = ("1111111aaaa", "2222222bbbb");
-    let on_manifest = described(h1, "1.4.4-lts.1");
-    assert!(on_manifest.contains("1.4.4-lts.1, not moved on the head"));
+    let on_manifest = described(h1, "1.6.2-lts.1");
+    assert!(on_manifest.contains("1.6.2-lts.1, not moved on the head"));
     assert!(on_manifest.contains("Not fixed on the head: GHSA-xxxx-0009"));
     assert!(description::is_current(&on_manifest, h1));
     // The lockfile is regenerated: another head.
     assert!(!description::is_current(&on_manifest, h2), "stale: rebuilt");
-    let fresh = described(h2, "2.0.3");
+    let fresh = described(h2, "2.1.0");
     let rebuilt = description::with_stamp(&security_fixes::rebuilt_body(&on_manifest, &fresh), h2);
     let mut end = Ending::default();
     end.said(rebuilt.clone());
     assert!(
-        end.says("| `xml-kit` | 1.4.4-lts.1 to 2.0.3 (major) |"),
+        end.says("| `xml-kit` | 1.6.2-lts.1 to 2.1.0 (major) |"),
         "{rebuilt}"
     );
     assert!(end.says("Fixes 1 of 1 advisory"), "{rebuilt}");
@@ -133,8 +133,8 @@ fn a_description_of_an_earlier_head_is_rebuilt_for_the_head() {
 /// for a head already replaced it writes nothing.
 #[test]
 fn a_review_never_writes_back_the_description_it_started_with() {
-    let read_at_start = described("1111111aaaa", "1.4.4-lts.1");
-    let now = described("2222222bbbb", "2.0.3");
+    let read_at_start = described("1111111aaaa", "1.6.2-lts.1");
+    let now = described("2222222bbbb", "2.1.0");
     let section = own_review::section(&["Scope the override (`package.json:12`)".to_string()]);
     // The old way: the section added to the copy read at the start.
     let clobbered =
@@ -146,7 +146,7 @@ fn a_review_never_writes_back_the_description_it_started_with() {
     // On the description as it is now.
     let edited = completeness::with_section(&now, Section::OpenFindings, section);
     assert!(!edited.contains("not moved on the head"));
-    assert!(edited.contains("1.4.4-lts.1 to 2.0.3 (major)"));
+    assert!(edited.contains("1.6.2-lts.1 to 2.1.0 (major)"));
     assert!(edited.contains("Scope the override"));
     assert!(
         description::is_current(&edited, "2222222bbbb"),
@@ -271,7 +271,7 @@ fn a_finding_on_coderhelms_own_pull_request_is_acted_on() {
     };
     let stale = f(serde_json::json!({
         "title": "The PR description still says xml-kit was not moved",
-        "body": "pnpm-lock.yaml resolves xml-kit to 2.0.3; the description's table still lists `1.4.4-lts.1, not moved on the head` and counts its advisory as not fixed.",
+        "body": "pnpm-lock.yaml resolves xml-kit to 2.1.0; the description's table still lists `1.6.2-lts.1, not moved on the head` and counts its advisory as not fixed.",
         "category": "wording", "severity": "low", "optional": true
     }));
     let improvement = f(

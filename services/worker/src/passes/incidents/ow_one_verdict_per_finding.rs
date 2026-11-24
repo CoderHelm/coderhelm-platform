@@ -1,5 +1,5 @@
-//! ow. CoderHelm's own pull request fixed a sport filter that listed one
-//! sport twice. A later review of it listed findings under "Holding the
+//! ow. CoderHelm's own pull request fixed a dock filter that listed one
+//! dock twice. A later review of it listed findings under "Holding the
 //! merge" that the same review said no longer applied: the earlier thread
 //! about the dropdown, whose code the fix rounds had replaced, and two
 //! findings the review itself had kept as notes ("on code that hasn't
@@ -24,14 +24,14 @@ use crate::passes::review_policy::{self, demote, named_holding, LATE_NOTE};
 use crate::passes::review_verdict::{HoldKind, Verdict};
 
 const FILTERS: &str = "apps/web/src/utils/filterMaps.ts";
-const TEST: &str = "apps/web/src/test/components/filter-nav-sport-grid.test.tsx";
+const TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
 
 /// The earlier thread: its code was replaced by the fix rounds.
 fn earlier_thread_line() -> String {
     own_review::thread_line(
         FILTERS,
-        632,
-        "**Drop-ins sport dropdown can now list one sport twice**\n\nTwo sport ids share a slug.",
+        120,
+        "**Day-slip dock dropdown can now list one dock twice**\n\nTwo dock ids share a slug.",
     )
 }
 
@@ -41,12 +41,12 @@ fn late() -> Vec<Finding> {
         crate::passes::minimal_change::Widening {
             kind: crate::passes::minimal_change::Kind::Parallel,
             path: FILTERS.into(),
-            what: "`dedupeSportOptionsBySlug` next to the existing `dedupeSportsBySlug`".into(),
+            what: "`dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`".into(),
         },
         crate::passes::minimal_change::Widening {
             kind: crate::passes::minimal_change::Kind::TestSize,
             path: TEST.into(),
-            what: "236 added lines against 41 lines of changed code".into(),
+            what: "240 added lines against 40 lines of changed code".into(),
         },
     ]);
     for f in out.iter_mut() {
@@ -56,8 +56,8 @@ fn late() -> Vec<Finding> {
 }
 
 /// The model's summary, as it wrote it.
-const SUMMARY: &str = "The fix keeps one option per sport slug. The earlier dropdown comment \
-     on `apps/web/src/utils/filterMaps.ts` about listing one sport twice no longer applies: \
+const SUMMARY: &str = "The fix keeps one option per dock slug. The earlier dropdown comment \
+     on `apps/web/src/utils/filterMaps.ts` about listing one dock twice no longer applies: \
      the new helper replaced that code.";
 
 /// The review's body from its parts, the way `review_pr` writes them.
@@ -76,7 +76,7 @@ fn body(verdict: &Verdict, notes: usize, summary: &str, held_late: &[Finding]) -
 fn the_old_assembly_gave_findings_two_verdicts_and_the_check_names_them() {
     let held = late();
     let own_open = own_review::required(&[], &held);
-    let open = [(FILTERS.to_string(), 632u64, earlier_thread_line())];
+    let open = [(FILTERS.to_string(), 120u64, earlier_thread_line())];
     let open: Vec<(String, u64, String)> = open
         .iter()
         .map(|(p, l, t)| (p.clone(), *l, format!("**{t}**")))
@@ -114,7 +114,7 @@ fn every_finding_has_one_verdict() {
     let src = include_str!("../review_pr.rs");
     assert!(src.contains("let own_open: Vec<String> = if own_open.is_empty() {"));
 
-    let open = vec![(FILTERS.to_string(), 632u64, earlier_thread_line())];
+    let open = vec![(FILTERS.to_string(), 120u64, earlier_thread_line())];
     let late_keys: Vec<Key> = held.iter().map(Key::of_finding).collect();
     let settled = one::settle(one::Inputs {
         holding: named_holding(&[], &open, &[], false, &own_open, &[]),
@@ -142,9 +142,9 @@ fn resolved_and_gone_threads_never_hold() {
         id: id.into(),
         root_id: 1,
         path: path.into(),
-        line: 632,
+        line: 120,
         outdated: false,
-        body: "**Drop-ins sport dropdown can now list one sport twice**".into(),
+        body: "**Day-slip dock dropdown can now list one dock twice**".into(),
         replies: vec![],
         resolved,
         resolved_by_person: resolved,

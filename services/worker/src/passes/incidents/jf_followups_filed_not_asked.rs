@@ -1,7 +1,7 @@
-//! jf. A run on a Jira audit ticket finished the audit, wrote eight
-//! follow-up ticket drafts into proposal.md and stopped with "this run has
-//! no Jira access to file them. Can you connect Jira so CoderHelm files
-//! them, or would you rather file the 8 yourself?", marked as needing a
+//! jf. A run on a Jira audit ticket finished the audit, wrote several
+//! follow-up ticket drafts into proposal.md and stopped with a question
+//! saying the run had no Jira access to file them, asking a person to
+//! connect Jira or file them by hand, marked as needing a
 //! person with no default. The team's Jira was connected: the run had been
 //! started from that Jira ticket and had commented on it. The planner's
 //! capability list never named the ticket tracker (only "Connected apps:
@@ -15,7 +15,7 @@
 //! search), linked and labelled, with one comment listing the keys
 //! (`followups::prepare`, `followups::file`); a plan written before that field files the list
 //! under proposal.md's follow-up heading, so Retry on the stuck run files
-//! its eight; a run that codes nothing and leaves nothing for a person ends
+//! its drafts; a run that codes nothing and leaves nothing for a person ends
 //! delivered (`followups::nothing_left`, `finish_delivered`); and no ask,
 //! hold or plan step may ask a person to connect a system the run reaches
 //! (`connected_access`, in the stop judge's rules and its last pass).
@@ -45,19 +45,18 @@ The ticket asks for an audit that sorts each component into (a), (b) or (c). Fol
 ## Follow-up tickets to file (additive only: no deletes, no replacements)
 1. Record in the ticket that `Hero.tsx`, `FeatureSection.tsx` and `ContactCard.tsx` are not rendered. There is no code change; any future wiring takes a required alt.
 2. Add alt-required validation to `imageWithAlt` (when an asset is set). Then run typegen and take a before-count per dataset.
-3. Add alt-required validation to coach images. Fill in the missing alt on the 3 production coaches with `setIfMissing`.
-4. Replace the placeholder fallbacks (`richtext`, `add-on-block`, `camp-promo`) with schema-required alt.
-5. Replace the whitespace alts (`CoachesCarousel.tsx:40` with the coach name, `SubNavigationMenu.tsx:79` with `\"\"`).
-6. `league-sport-navigation-client.tsx:41`: drop the generic \"Sport icon\".
-7. Classify the eight `?? \"\"` content-image fallbacks per card, and confirm the four decorative `alt=\"\"`.
-8. Promotion alt quality: replace \"soccer\" on `cdc0f16c` with a real description.
+3. Add alt-required validation to skipper images. Fill in the missing alt on the production skippers with `setIfMissing`.
+4. Replace the placeholder fallbacks (`richtext`, `add-on-block`, `slip-promo`) with schema-required alt.
+5. Replace the whitespace alts (`SkippersCarousel.tsx:40` with the skipper name, `SubNavigationMenu.tsx:79` with `\"\"`).
+6. `dock-navigation-client.tsx:41`: drop the generic \"Dock icon\".
+7. Promotion alt quality: replace \"sailboat\" on `a1b2c3d4` with a real description.
 
 ## Scope
 An audit only.
 ";
 
 const TASKS: &str =
-    "NO_CODE_CHANGE: the full classification and 8 additive follow-up tickets are in proposal.md.";
+    "NO_CODE_CHANGE: the full classification and 7 additive follow-up tickets are in proposal.md.";
 
 /// The plan's decision as the run wrote it.
 fn plan() -> FixDecision {
@@ -67,7 +66,7 @@ fn plan() -> FixDecision {
         cause: "The three named components are unused; the real gaps are the optional alt in the shared schema.".into(),
         outside_change: Some(OutsideChange {
             system: "Jira".into(),
-            change: "File the 8 additive follow-up tickets listed in proposal.md".into(),
+            change: "File the 7 additive follow-up tickets listed in proposal.md".into(),
             where_: "Jira ABC project".into(),
             steps: vec![
                 NoteStep {
@@ -77,7 +76,7 @@ fn plan() -> FixDecision {
                     ..Default::default()
                 },
                 NoteStep {
-                    step: "File the 8 follow-up tickets".into(),
+                    step: "File the 7 follow-up tickets".into(),
                     by: "person".into(),
                     owner: "the ticket's reporter".into(),
                     how: "Jira, from proposal.md 'Follow-up tickets to file'".into(),
@@ -103,7 +102,7 @@ fn plan() -> FixDecision {
             },
         ],
         next_step: Some(NextStep {
-            action: "File the 8 follow-up tickets from proposal.md in the Jira ABC project, or connect Jira so CoderHelm can file them".into(),
+            action: "File the 7 follow-up tickets from proposal.md in the Jira ABC project, or connect Jira so CoderHelm can file them".into(),
             why_person: "this run has no Jira access".into(),
             ..Default::default()
         }),
@@ -138,12 +137,12 @@ fn the_planner_reads_the_connected_tracker_and_its_tool() {
 }
 
 #[test]
-fn the_stuck_run_s_eight_drafts_come_from_its_proposal() {
+fn the_stuck_run_s_seven_drafts_come_from_its_proposal() {
     let d = plan();
     assert!(d.followup_tickets.is_empty(), "written before the field");
     assert!(followups::asks_to_file(&d));
     let drafts = ft::drafts(&d.followup_tickets, PROPOSAL);
-    assert_eq!(drafts.len(), 8, "{drafts:?}");
+    assert_eq!(drafts.len(), 7, "{drafts:?}");
     assert_eq!(
         drafts[1].summary,
         "Add alt-required validation to imageWithAlt (when an asset is set)"
@@ -151,22 +150,22 @@ fn the_stuck_run_s_eight_drafts_come_from_its_proposal() {
     assert!(drafts[1].description.contains("before-count per dataset"));
     assert_eq!(
         drafts[5].summary,
-        "league-sport-navigation-client.tsx:41: drop the generic \"Sport icon\""
+        "dock-navigation-client.tsx:41: drop the generic \"Dock icon\""
     );
     // Filed once per draft for this source, whichever run files it.
-    let ids: Vec<String> = drafts.iter().map(|x| ft::draft_id("ABC-8989", x)).collect();
+    let ids: Vec<String> = drafts.iter().map(|x| ft::draft_id("ABC-123", x)).collect();
     let again: Vec<String> = ft::drafts(&[], PROPOSAL)
         .iter()
-        .map(|x| ft::draft_id("ABC-8989", x))
+        .map(|x| ft::draft_id("ABC-123", x))
         .collect();
     assert_eq!(ids, again);
     assert_eq!(
-        followups::record_sk("abc-8989", &ids[0]),
-        format!("FOLLOWUP#ABC-8989#{}", ids[0])
+        followups::record_sk("abc-123", &ids[0]),
+        format!("FOLLOWUP#ABC-123#{}", ids[0])
     );
     // In the source ticket's project, labelled like every CoderHelm ticket.
     assert_eq!(
-        ft::tracker("ABC-8989", true, SITE, "acme/web", Some(true)),
+        ft::tracker("ABC-123", true, SITE, "acme/web", Some(true)),
         Tracker::Jira {
             project: "ABC".into(),
             site: SITE.into()
@@ -174,8 +173,8 @@ fn the_stuck_run_s_eight_drafts_come_from_its_proposal() {
     );
     assert_eq!(
         // Never the trigger label (see `jh_followups_never_cascade`).
-        ft::labels("ABC-8989", "coderhelm"),
-        vec!["coderhelm-followup", "coderhelm:followup:ABC-8989"]
+        ft::labels("ABC-123", "coderhelm"),
+        vec!["coderhelm-followup", "coderhelm:followup:ABC-123"]
     );
 }
 
@@ -188,10 +187,10 @@ fn once_filed_the_run_ends_delivered_and_asks_no_one() {
     );
     let reach = [connected_access::jira(SITE, true)];
     followups::drop_connect_asks(&mut d, &reach);
-    let keys: Vec<String> = (1..=8).map(|n| format!("ABC-9{n:02}")).collect();
+    let keys: Vec<String> = (1..=7).map(|n| format!("ABC-9{n:02}")).collect();
     followups::mark_filed(
         &mut d,
-        &format!("Filed 8 of 8 follow-up tickets: {}", keys.join(", ")),
+        &format!("Filed 7 of 7 follow-up tickets: {}", keys.join(", ")),
         true,
     );
     assert!(followups::nothing_left(&d, TASKS, &[]));
@@ -225,7 +224,7 @@ fn once_filed_the_run_ends_delivered_and_asks_no_one() {
             site: SITE.into(),
         },
     );
-    assert!(comment.starts_with("Filed 8 follow-up tickets from this ticket's findings:"));
+    assert!(comment.starts_with("Filed 7 follow-up tickets from this ticket's findings:"));
     for k in &keys {
         assert!(comment.contains(&format!("{k}: ")), "{k}: {comment}");
     }
@@ -256,11 +255,11 @@ fn asking_to_connect_a_connected_jira_never_reaches_a_person() {
     p.connected = vec![connected_access::jira(SITE, true)];
     let ask = json!({
         "verdict": "ask",
-        "question": "The audit is done and proposal.md holds 8 follow-up ticket drafts, but this run has no Jira access to file them in ABC. Can you connect Jira so CoderHelm files them (recommended), or would you rather file the 8 from proposal.md yourself?",
+        "question": "The audit is done and proposal.md holds 7 follow-up ticket drafts, but this run has no Jira access to file them in ABC. Can you connect Jira so CoderHelm files them (recommended), or would you rather file the 7 from proposal.md yourself?",
         "person_only": "access",
         "tried": ["Found no Jira connection in this run to file the tickets in ABC"],
-        "options": ["Connect Jira to CoderHelm so it files the 8 tickets", "You file the 8 tickets yourself"],
-        "default": "Connect Jira to CoderHelm so it files the 8 tickets",
+        "options": ["Connect Jira to CoderHelm so it files the 7 tickets", "You file the 7 tickets yourself"],
+        "default": "Connect Jira to CoderHelm so it files the 7 tickets",
         "deadline_hours": 0
     });
     let err = common::stop_judge::validate(&p, &ask).expect_err("refused");
@@ -326,6 +325,6 @@ fn without_jira_the_drafts_go_to_issues_or_the_comment_and_the_run_completes() {
     let drafts = ft::drafts(&[], PROPOSAL);
     let c = ft::comment(&drafts, &[], &t);
     assert!(c.contains("They weren't filed because"), "{c}");
-    assert!(c.contains("8. Promotion alt quality"), "{c}");
+    assert!(c.contains("7. Promotion alt quality"), "{c}");
     assert!(!c.to_lowercase().contains("connect"), "{c}");
 }

@@ -1,5 +1,5 @@
-//! p. A small ticket finished all 11 tasks, then spent 2.5 hours and $41.96
-//! with no pull request. Each 15-minute step resumed at the checks before the
+//! p. A small ticket finished all its tasks, then spent hours and tens of
+//! dollars with no pull request. Each 15-minute step resumed at the checks before the
 //! pull request and re-ran them from nothing. Their round counters were locals,
 //! so every step got new rounds; every fix was a commit, so the stall detector
 //! saw progress; and the pull request came last, with whatever time was left.
@@ -14,8 +14,8 @@ use crate::passes::proof::{self, Finding, Next};
 use crate::passes::run_guard::*;
 use crate::passes::steps::Gate;
 
-/// What that run cost, and the steps it took.
-const INCIDENT_USD: f64 = 41.96;
+/// What a run of that shape costs, and the steps it takes.
+const INCIDENT_USD: f64 = 44.0;
 const INCIDENT_CONTINUATIONS: usize = 11;
 
 fn gaps(n: usize) -> Vec<Finding> {
@@ -45,7 +45,7 @@ fn replay(work_done: bool) -> Replayed {
     let counts = [2, 4, 3, 1];
     let mut g = GuardState::default();
     if work_done {
-        g.apply(&Progress::TasksDone(11));
+        g.apply(&Progress::TasksDone(12));
         g.apply(&Progress::WorkDone);
     }
     let (mut passes, mut usd) = (0, 0.0);
@@ -120,10 +120,10 @@ fn the_recorded_run_stops_without_any_word_that_its_tasks_are_done() {
     let r = replay(false);
     assert!(r.trip.is_some());
     // The count of 1 is a new low and counts once. The spend since then stops it
-    // at $20, in the ninth step, at about $33.57 in all.
+    // at $20, in the ninth step, at about $34.40 in all.
     assert_eq!(r.trip, Some(Trip::Spend));
     assert_eq!(r.continuations, 8);
-    assert!((r.usd - 33.57).abs() < 0.01, "{}", r.usd);
+    assert!((r.usd - 34.40).abs() < 0.01, "{}", r.usd);
     assert!(r.usd < INCIDENT_USD, "{}", r.usd);
 }
 
@@ -547,7 +547,7 @@ fn run_forever(c: &Checker) -> End {
         }
     };
     if !c.before_pr {
-        g.apply(&Progress::TasksDone(11));
+        g.apply(&Progress::TasksDone(12));
         g.apply(&Progress::WorkDone);
         open(&mut end, &mut ledger);
         g.apply(&Progress::PrOpen);

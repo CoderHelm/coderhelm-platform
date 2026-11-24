@@ -101,7 +101,7 @@ fn file_stem(t: &str) -> Option<String> {
 
 /// The key files and components a text names: file names (their stems),
 /// code identifiers in mixed case, and names in backticks that read as
-/// code (`camp-promo`, `image_with_alt`), all lowercased. Two drafts about the same component share these whatever
+/// code (`slip-promo`, `image_with_alt`), all lowercased. Two drafts about the same component share these whatever
 /// their wording.
 pub fn marks(text: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
@@ -1223,7 +1223,7 @@ mod tests {
             Near::New
         );
         assert_eq!(
-            near(&draft("Add a sitemap entry for the camps page"), &earlier),
+            near(&draft("Add a sitemap entry for the slips page"), &earlier),
             Near::New
         );
         // An exact summary is always the same, case and dots aside.

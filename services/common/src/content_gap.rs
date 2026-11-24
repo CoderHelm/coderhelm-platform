@@ -416,8 +416,8 @@ pub fn throw_instruction(found: &[String]) -> String {
 mod tests {
     use super::*;
 
-    const ADDR: &str = "Error: fitnessClub /club-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-club-addresses";
-    const FIX: &str = "Error: Camp date \"e2e-callout-expired\" is missing from the Camp Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
+    const ADDR: &str = "Error: marinaClub /marina-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-marina-addresses";
+    const FIX: &str = "Error: Charter date \"e2e-callout-expired\" is missing from the Charter Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
 
     fn step(text: &str, blocked: bool) -> Step {
         Step {
@@ -433,7 +433,7 @@ mod tests {
         let g = names_gap(ADDR).unwrap();
         assert_eq!(
             g.run.as_deref(),
-            Some("apps/studio/migrations/fill-club-addresses")
+            Some("apps/studio/migrations/fill-marina-addresses")
         );
         let g = names_gap(FIX).unwrap();
         assert_eq!(g.run.as_deref(), Some("add-callout-e2e-fixtures"));
@@ -446,11 +446,11 @@ mod tests {
     #[test]
     fn a_test_waiting_on_a_blocked_step_awaits_it() {
         let steps = [
-            step("Dry run, then run the migration on staging apps/studio/migrations/fill-club-addresses/index.ts", true),
+            step("Dry run, then run the migration on staging apps/studio/migrations/fill-marina-addresses/index.ts", true),
             step("Tag the release", false),
         ];
         match classify(ADDR, true, &steps) {
-            Verdict::AwaitsStep { step, .. } => assert!(step.contains("fill-club-addresses")),
+            Verdict::AwaitsStep { step, .. } => assert!(step.contains("fill-marina-addresses")),
             v => panic!("{v:?}"),
         }
         let steps = [step(
@@ -465,14 +465,17 @@ mod tests {
 
     #[test]
     fn a_build_on_missing_content_is_the_codes_to_tolerate() {
-        let steps = [step("run apps/studio/migrations/fill-club-addresses", true)];
+        let steps = [step(
+            "run apps/studio/migrations/fill-marina-addresses",
+            true,
+        )];
         assert!(matches!(
             classify(ADDR, false, &steps),
             Verdict::TolerateFirst(_)
         ));
         // A step CoderHelm can still do, or one already done, is not waited on.
         let open = [step(
-            "run apps/studio/migrations/fill-club-addresses",
+            "run apps/studio/migrations/fill-marina-addresses",
             false,
         )];
         assert!(matches!(

@@ -1,10 +1,10 @@
 //! ds. A made-up marina's Insights line of deploys CoderHelm started went
-//! flat on the 6th and stayed flat for seventeen days. Its install reached
+//! flat and stayed flat for weeks. Its install reached
 //! GitHub through CoderHelm's token broker, so its gateway had no GitHub App
 //! key of its own: asking GitHub for the app's slug failed, and every
 //! completed workflow run was dropped before it reached the worker, without
 //! a line in any log. The one-time backfill had read the history up to the
-//! 6th and was marked done, so nothing ever read the hole back, and nothing
+//! day the line stopped and was marked done, so nothing ever read the hole back, and nothing
 //! said the line had stopped.
 //!
 //! Guarantee: a gateway that can't name the app's bot still sends every
@@ -23,13 +23,13 @@ use serde_json::json;
 const BOT: &str = "coderhelm[bot]";
 
 fn at(d: u32, h: u32, m: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap()
+    Utc.with_ymd_and_hms(2030, 3, d, h, m, 0).unwrap()
 }
 
 /// A preview deploy of the bot's push, as the webhook brings it.
 fn preview_run() -> serde_json::Value {
     json!({
-        "id": 42294703511u64,
+        "id": 12345678901u64,
         "name": "Deploy Preview",
         "event": "pull_request",
         "status": "completed",
@@ -40,7 +40,8 @@ fn preview_run() -> serde_json::Value {
 }
 
 /// Thirty to seventy deploys a day across the marina's repositories, every
-/// day for the three weeks to the 6th at 21:26.
+/// day for the three weeks to the last record (the 6th at 21:26 in this
+/// made-up month).
 fn records() -> Vec<(DateTime<Utc>, String)> {
     let last = at(6, 21, 26);
     let mut out = Vec::new();
@@ -101,8 +102,8 @@ fn seventeen_quiet_days_read_as_stalled_and_the_hole_is_read_back() {
     }
     let l = health::loop_of(
         "stalled",
-        "2026-11-06T21:26:00Z",
-        "2026-11-23T18:00:00Z",
+        "2030-03-06T21:26:00Z",
+        "2030-03-23T18:00:00Z",
         220,
         None,
     );

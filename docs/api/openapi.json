@@ -4260,7 +4260,7 @@
           "github_wait": {
             "description": "While the run waits for GitHub (its hourly limit, or a moment GitHub\nfailed to answer): when it goes on, in plain words. The run continues\nby itself; nothing is needed from anyone.",
             "examples": [
-              "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"
+              "Waiting for GitHub's hourly limit; continues by itself at 14:05 UTC"
             ],
             "type": [
               "string",
@@ -6106,14 +6106,14 @@
           "criterion": {
             "description": "The criterion, as written.",
             "examples": [
-              "Only one sport filter chip shows on /camps"
+              "Only one dock filter chip shows on /slips"
             ],
             "type": "string"
           },
           "page": {
             "description": "The site path it is about, when it names one.",
             "examples": [
-              "/camps"
+              "/slips"
             ],
             "type": "string"
           },
@@ -6132,7 +6132,7 @@
             "description": "The tests that cover it (`file` or `file › title`).",
             "examples": [
               [
-                "e2e/camps.spec.ts › shows one chip"
+                "e2e/slips.spec.ts › shows one chip"
               ]
             ],
             "items": {

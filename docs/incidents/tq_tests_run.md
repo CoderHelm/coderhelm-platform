@@ -1,11 +1,11 @@
 # tq. `tq_tests_run`
 
-**What happened:** Across the 53 most recent runs, 17 had new or changed tests to run with and without the change. Not one of them ran both ways:
+**What happened:** Across a batch of recent runs, many had new or changed tests to run with and without the change. Not one of them ran both ways:
 
-- **6 runs: the install failed in the sandbox.** All six were in one pnpm workspace. The test files sat in a workspace member (`apps/web`) whose lockfile is the workspace root's, and the sandbox installed the member on its own: `cd 'apps/web' && pnpm install --ignore-workspace --frozen-lockfile`. That folder has no lockfile, so pnpm stopped with `ERR_PNPM_NO_LOCKFILE` before any test ran, on every run. The run's CI install (cached per manifest blob) was never used for these runs, and the failure didn't say why. One of the runs also listed a Playwright spec as a unit test.
-- **7 runs: no step had the time.** The check asked once for a step of its own. The fresh step ran every other check first (the proof, the link checks, the new-feature rules, the live probes, the scope ledger), so it reached the sandbox runs with less than their 760 seconds left, and its one request was already spent. One run resumed for the runs at 16:00:42 and only reached them at 16:05:42.
-- **2 runs: CI's test command wasn't read.** A data pipeline's CI runs a `python "$t"` loop over its tests. Its fixture JSON files were also listed as tests, and one file without a command stopped every file from running.
-- **2 runs: no test to run.** One change was only tests; the other changed no test file.
+- **Several runs: the install failed in the sandbox.** All of them were in one pnpm workspace. The test files sat in a workspace member (`apps/web`) whose lockfile is the workspace root's, and the sandbox installed the member on its own: `cd 'apps/web' && pnpm install --ignore-workspace --frozen-lockfile`. That folder has no lockfile, so pnpm stopped with `ERR_PNPM_NO_LOCKFILE` before any test ran, on every run. The run's CI install (cached per manifest blob) was never used for these runs, and the failure didn't say why. One of the runs also listed a Playwright spec as a unit test.
+- **Several runs: no step had the time.** The check asked once for a step of its own. The fresh step ran every other check first (the proof, the link checks, the new-feature rules, the live probes, the scope ledger), so it reached the sandbox runs with less than their 760 seconds left, and its one request was already spent. One run resumed for the runs and only reached them minutes later.
+- **A few runs: CI's test command wasn't read.** A data pipeline's CI runs a `python "$t"` loop over its tests. Its fixture JSON files were also listed as tests, and one file without a command stopped every file from running.
+- **A few runs: no test to run.** One change was only tests; the other changed no test file.
 
 **The guarantee:**
 - **Install the way CI does.** The sandbox runs use CI's job for the changed files: its install lines in order, its Node and pnpm versions, through the cached environment. Without one, a workspace member installs from the workspace root, falling back to the member and what it depends on. A failed install says why, with its error lines.

@@ -7314,7 +7314,7 @@ mod tests {
             json!({"package": {"name": "lodash", "ecosystem": "npm"}, "version": "4.17.20"})
         );
         assert!(
-            exact_version("npm", "1.4.4-lts.1")
+            exact_version("npm", "1.6.2-lts.1")
                 && !exact_version("npm", "3")
                 && !exact_version("npm", "main")
         );

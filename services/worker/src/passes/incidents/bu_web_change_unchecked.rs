@@ -5,8 +5,8 @@
 //! deploy and end-to-end check on the head read "skipped (its conditions
 //! left this PR out)", next to passing unit tests. It said "No screenshot:
 //! CoderHelm had no runnable preview", gave `npm test` as the way to check
-//! it, and the tests check passed on "0 of 6 changed test files fail
-//! without the change". The run page only said `needs_person_approval`.
+//! it, and the tests check passed with none of the changed test files
+//! failing without the change. The run page only said `needs_person_approval`.
 //!
 //! Guarantee, all read from the repository and the run's records:
 //! - the preview and end-to-end jobs that cover the change, and the labels
@@ -66,7 +66,7 @@ fn s(v: &[&str]) -> Vec<String> {
 
 fn changed() -> Vec<String> {
     s(&[
-        "apps/web/src/components/signup/use-signup-form.ts",
+        "apps/web/src/components/booking/use-booking-form.ts",
         "apps/web/src/lib/validation.ts",
         "apps/web/src/test/lib/validation.test.ts",
     ])
@@ -83,8 +83,8 @@ fn the_workflows_say_which_labels_start_the_preview_and_its_e2e() {
         "CI:PREVIEW",
         "CI:E2E",
         "CI:STAGING",
-        "E2E:signup",
-        "E2E:billing",
+        "E2E:booking",
+        "E2E:payments",
     ]);
     let p = pv::plan(&pv::PlanInput {
         workflows: &w,
@@ -97,12 +97,12 @@ fn the_workflows_say_which_labels_start_the_preview_and_its_e2e() {
     });
     assert_eq!(
         p.add,
-        s(&["E2E:signup"]),
+        s(&["E2E:booking"]),
         "the change's own area, never staging"
     );
     assert_eq!(p.draft_gated, s(&["Deploy Preview App", "E2E on preview"]));
     // The test map names the area when the repository keeps one.
-    let areas = s(&["signup"]);
+    let areas = s(&["booking"]);
     let mapped = pv::plan(&pv::PlanInput {
         workflows: &w,
         changed: &c,
@@ -112,7 +112,7 @@ fn the_workflows_say_which_labels_start_the_preview_and_its_e2e() {
         preferred: &[],
         areas: &areas,
     });
-    assert_eq!(mapped.add, s(&["E2E:signup"]));
+    assert_eq!(mapped.add, s(&["E2E:booking"]));
 }
 
 fn facts(preview: Option<pv::State>) -> Facts {
@@ -185,15 +185,16 @@ fn the_pages_are_shown_at_both_widths_once_the_preview_is_checked() {
         url: "https://pr-1.preview-web.example.com".into(),
         shots: vec![
             pv::Shot {
-                page: "/signup".into(),
+                page: "/booking".into(),
                 width: "desktop".into(),
-                src: "https://github.com/org/web/blob/c1/pr-1/abc/signup-desktop.png?raw=true"
+                src: "https://github.com/org/web/blob/c1/pr-1/abc/booking-desktop.png?raw=true"
                     .into(),
             },
             pv::Shot {
-                page: "/signup".into(),
+                page: "/booking".into(),
                 width: "phone".into(),
-                src: "https://github.com/org/web/blob/c1/pr-1/abc/signup-phone.png?raw=true".into(),
+                src: "https://github.com/org/web/blob/c1/pr-1/abc/booking-phone.png?raw=true"
+                    .into(),
             },
         ],
         ..Default::default()
@@ -202,8 +203,8 @@ fn the_pages_are_shown_at_both_widths_once_the_preview_is_checked() {
     match b.screens {
         Some(common::pr_body::Screens::Pages(p)) => {
             assert_eq!(p.len(), 1);
-            assert!(p[0].1.ends_with("signup-desktop.png?raw=true"));
-            assert!(p[0].2.ends_with("signup-phone.png?raw=true"));
+            assert!(p[0].1.ends_with("booking-desktop.png?raw=true"));
+            assert!(p[0].2.ends_with("booking-phone.png?raw=true"));
         }
         other => panic!("pages expected, got {other:?}"),
     }
@@ -230,10 +231,10 @@ fn how_to_check_is_the_changed_specs_and_tests() {
         runner: "playwright".into(),
     };
     let mut c = changed();
-    c.push("apps/web/e2e/tests/signup.spec.ts".into());
+    c.push("apps/web/e2e/tests/booking.spec.ts".into());
     let how = pv::how_to_check(&c, Some(&suite), "npx vitest run");
     assert!(
-        how.contains("npx playwright test tests/signup.spec.ts"),
+        how.contains("npx playwright test tests/booking.spec.ts"),
         "{how}"
     );
     assert!(how.contains("apps/web/src/test/lib/validation.test.ts"));
@@ -289,7 +290,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
     let mut failure = fr::read(
         "E2E on preview",
         &fr::Sources {
-            comment: "1 failed\n  1) [chromium] › tests/signup.spec.ts:9:3 › Signup › shows the age error\n    Error: expect(locator).toBeVisible() failed".into(),
+            comment: "1 failed\n  1) [chromium] › tests/booking.spec.ts:9:3 › Booking › shows the boat length error\n    Error: expect(locator).toBeVisible() failed".into(),
             ..Default::default()
         },
     )
@@ -305,7 +306,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
     let mut f = facts(None);
     f.open = vec![
         OpenItem {
-            text: "Run `cd services/uploader-fn && npm test` before merge".into(),
+            text: "Run `cd services/image-resizer-fn && npm test` before merge".into(),
             closer: Closer::CoderHelm,
         },
         OpenItem {
@@ -317,7 +318,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
             closer: Closer::CoderHelm,
         },
     ];
-    f.how_to_check = "`cd services/uploader-fn && npm test`".into();
+    f.how_to_check = "`cd services/image-resizer-fn && npm test`".into();
     crate::passes::description_facts::with_preview(&mut f, Some(&st));
     let texts: Vec<&str> = f.open.iter().map(|o| o.text.as_str()).collect();
     assert_eq!(texts, vec!["Run `cd apps/web && npm test`"]);
@@ -332,7 +333,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
         .find(|e| e.starts_with("`E2E on preview` failed"))
         .expect("the failure, read");
     assert!(
-        read.contains("tests/signup.spec.ts › shows the age error"),
+        read.contains("tests/booking.spec.ts › shows the boat length error"),
         "{read}"
     );
     assert!(read.contains("This change caused it"), "{read}");

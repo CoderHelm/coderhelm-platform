@@ -100,7 +100,7 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
     // What people merged in that repository.
     let merged: Vec<Sample> = (400..424)
         .map(|n| Sample {
-            text: format!("OPS-{n}: Change number {n}"),
+            text: format!("HARBOR-{n}: Change number {n}"),
             bot: false,
         })
         .chain((0..6).map(|n| Sample {
@@ -130,24 +130,27 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
     );
     // A key is real only as the run's ticket or in the tracker.
     assert!(!pr_conventions::real_key("KEY-1", None, Some(true)));
-    assert!(!pr_conventions::real_key("OPS-431", None, None));
+    assert!(!pr_conventions::real_key("HARBOR-431", None, None));
     // Written now: the repository's form with a real key, or the closest
     // valid form with one sentence saying why, and never an invented key.
     let run = conventions::ForRun {
         title: c.clone(),
         commit: c.clone(),
-        key: Key::Real("OPS-431".into()),
+        key: Key::Real("HARBOR-431".into()),
     };
     let now = run.title(OLD_TITLE);
     assert_eq!(
         now.text,
-        "OPS-431: Update 3 packages to fix 4 security advisories"
+        "HARBOR-431: Update 3 packages to fix 4 security advisories"
     );
     assert_eq!(
-        pr_conventions::violation(&c, &now.text, &["OPS-431".to_string()]),
+        pr_conventions::violation(&c, &now.text, &["HARBOR-431".to_string()]),
         None
     );
-    assert_eq!(run.commit(OLD_COMMIT), "OPS-431: Glob-walk 2.1.0 to 2.1.4");
+    assert_eq!(
+        run.commit(OLD_COMMIT),
+        "HARBOR-431: Glob-walk 2.1.0 to 2.1.4"
+    );
     let keyless = conventions::ForRun {
         key: Key::None(
             "creating a ticket for a run that has none is off in the team's settings".into(),
@@ -184,10 +187,16 @@ fn the_lesson_check_catches_the_sample_key() {
     // Where it came from: the line a fix round writes into the description
     // no longer holds a sample key.
     let style = commit_style::learn(
-        &["OPS-1: a", "OPS-2: b", "OPS-3: c", "OPS-4: d", "OPS-5: e"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
+        &[
+            "HARBOR-1: a",
+            "HARBOR-2: b",
+            "HARBOR-3: c",
+            "HARBOR-4: d",
+            "HARBOR-5: e",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
     );
     let how = commit_style::describe(&style);
     assert!(common::placeholders::found(&how, &[]).is_empty(), "{how}");

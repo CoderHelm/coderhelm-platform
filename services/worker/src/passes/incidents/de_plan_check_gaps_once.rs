@@ -9,7 +9,7 @@
 //! added the same gap: "A task names `FAQPage`, which `## Out of scope`
 //! leaves out (\"Looked up\")". The run note and the decision's open gaps
 //! carried that line five times, and the run told itself to take the
-//! ticket's own ask out of its tasks. The same day a second plan for the
+//! ticket's own ask out of its tasks. A second plan for the
 //! same ticket was told an item about one script per page was asked for
 //! by the criterion "No layout shift when the page loads or when items
 //! toggle": the two share only "when" (counted twice) and "page".
@@ -31,7 +31,7 @@ use common::scope_ledger::Ledger;
 
 const TICKET: &str = "Make the FAQ block work without JavaScript\n\nEvery question and answer of the FAQ block is in the server HTML, and the block's `FAQPage` structured data is rendered on the server.\n\nAcceptance criteria:\n- Answers are readable with JavaScript off\n- No layout shift when the page loads or when items toggle\n";
 
-const DESIGN: &str = "## Out of scope\n- **Merging the structured data of several blocks on one page**: decided with the default: one script per block\n  - Looked up: `https://example.test/parking?cb=1` returned 200 with two blocks, and `FAQPage` was not in the server HTML\n  - No lookup settles which is better for search: today's script is added only in the browser\n- `apps/web/src/components/ui/accordion.tsx`: other blocks use it\n- One FAQPage script per page when a page has two FAQ blocks: decided with the default: one per block\n";
+const DESIGN: &str = "## Out of scope\n- **Merging the structured data of several blocks on one page**: decided with the default: one script per block\n  - Looked up: `https://example.test/moorings?cb=1` returned 200 with two blocks, and `FAQPage` was not in the server HTML\n  - No lookup settles which is better for search: today's script is added only in the browser\n- `apps/web/src/components/ui/accordion.tsx`: other blocks use it\n- One FAQPage script per page when a page has two FAQ blocks: decided with the default: one per block\n";
 
 const TASKS: &str = "- [ ] apps/web/src/components/blocks/faq.tsx: [modify] Render each answer in `<details>`, and the `FAQPage` script on the server\n- [ ] apps/web/src/test/components/faq.test.tsx: [create] The `FAQPage` script is in the server HTML\n- [ ] e2e/pages/faq.ts: [create] Read the `FAQPage` script from the raw HTML\n- [ ] e2e/tests/site/faq.spec.ts: [create] With JavaScript off, every answer and the `FAQPage` script are there\n- [ ] e2e/specs/site.md: [modify] Document the `FAQPage` check\n";
 

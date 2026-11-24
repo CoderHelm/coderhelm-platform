@@ -1017,7 +1017,7 @@ pub(crate) fn failure_excerpt(logs: &str) -> String {
         "panicked",
     ];
     let clean = |l: &str| -> String {
-        // GitHub's timestamp prefix (`2026-11-11T19:52:01.1234567Z `).
+        // GitHub's timestamp prefix (`2030-03-11T19:52:01.1234567Z `).
         let t = l.trim();
         // A step's command echoed back (`\u{1b}[36;1m...`) is the script,
         // never what failed: a pull request once quoted a comment line of
@@ -1470,8 +1470,8 @@ mod ci_triage_tests {
     /// "fixed"; on a head already re-run, the attempt is spent.
     #[test]
     fn an_infrastructure_failure_is_rerun_once() {
-        let logs = "2026-11-11T19:50:01.0000000Z  FAIL  src/test/integration/real-server.test.ts\n\
-                    2026-11-11T19:50:01.0000000Z Error: getaddrinfo ENOTFOUND search-staging.example.internal";
+        let logs = "2030-03-11T19:50:01.0000000Z  FAIL  src/test/integration/real-server.test.ts\n\
+                    2030-03-11T19:50:01.0000000Z Error: getaddrinfo ENOTFOUND search-staging.example.internal";
         let infra = looks_infra(logs);
         assert!(
             infra.as_deref().unwrap_or("").contains("ENOTFOUND"),
@@ -1501,12 +1501,12 @@ mod ci_triage_tests {
 
     #[test]
     fn the_failure_excerpt_is_the_error_not_the_upload_step() {
-        let logs = "2026-11-11T19:50:00.1234567Z ##[group]Upload report\n\
-                    2026-11-11T19:50:00.1234567Z Uploaded 14 files\n\
-                    2026-11-11T19:49:58.1234567Z   1) [chromium] venues.spec.ts:131 the Info heading lines up\n\
-                    2026-11-11T19:49:58.1234567Z     Error: expect(received).toBeLessThanOrEqual(expected)\n\
-                    2026-11-11T19:49:58.1234567Z     Expected: <= 1\n\
-                    2026-11-11T19:49:58.1234567Z     Received:    32";
+        let logs = "2030-03-11T19:50:00.1234567Z ##[group]Upload report\n\
+                    2030-03-11T19:50:00.1234567Z Uploaded 14 files\n\
+                    2030-03-11T19:49:58.1234567Z   1) [chromium] marinas.spec.ts:131 the Info heading lines up\n\
+                    2030-03-11T19:49:58.1234567Z     Error: expect(received).toBeLessThanOrEqual(expected)\n\
+                    2030-03-11T19:49:58.1234567Z     Expected: <= 1\n\
+                    2030-03-11T19:49:58.1234567Z     Received:    32";
         let e = failure_excerpt(logs);
         assert!(
             e.starts_with("Error: expect(received).toBeLessThanOrEqual(expected)"),
@@ -1534,12 +1534,12 @@ mod ci_triage_tests {
             2,
             3,
             &["changed nothing: the log only showed the report upload".into()],
-            "--- comment by e2e-reporter[bot] ---\n1 failed: venues.spec.ts:131",
+            "--- comment by e2e-reporter[bot] ---\n1 failed: marinas.spec.ts:131",
         );
         assert!(fb.contains("CI fix attempt 2 of 3"));
         assert!(fb.contains("Reproduce first: call run_checks"));
         assert!(fb.contains("- Attempt 1: changed nothing"));
-        assert!(fb.contains("venues.spec.ts:131"));
+        assert!(fb.contains("marinas.spec.ts:131"));
         let checks = vec!["Deploy Preview".to_string()];
         let excerpt = "Error: expect(received).toBeLessThanOrEqual(expected) / Expected: <= 1";
         let section = ci_failing_section(

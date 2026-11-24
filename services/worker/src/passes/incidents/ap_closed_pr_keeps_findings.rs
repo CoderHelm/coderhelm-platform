@@ -1,10 +1,10 @@
 //! ap. An admin closed CoderHelm's dependency fix pull request for one
 //! repository on GitHub to start again, and cancelled its fix run. On the
 //! Security page, filtered to that repository, every checkbox was off,
-//! the header's too, with nothing to say why: 274 of the repository's
-//! findings still read "in a pull request" a day after it was closed (3
-//! were open, with no fix yet), and a finding in a pull request cannot be
-//! picked. Nothing told the findings: the pull request webhook recorded
+//! the header's too, with nothing to say why: hundreds of the
+//! repository's findings still read "in a pull request" a day after it was
+//! closed (a few were open, with no fix yet), and a finding in a pull
+//! request cannot be picked. Nothing told the findings: the pull request webhook recorded
 //! the close on the run and stopped there, cancelling a run wrote only the
 //! run, and the one place that compared a finding with GitHub was the last
 //! step of the scheduled sweep, behind the time every team's sources and
@@ -34,7 +34,7 @@ use crate::passes::security_fixes::{mark_retry, release};
 
 const REPO: &str = "acme/site";
 const TICKET: &str = "SEC-0A1B2C3D4E5F";
-const PR: u64 = 412;
+const PR: u64 = 42;
 
 fn day_after() -> DateTime<Utc> {
     at("2026-11-13T10:00:00Z")
@@ -47,10 +47,10 @@ fn cfg() -> SecurityConfig {
     }
 }
 
-/// The repository as it stood: 274 findings in the bundle pull request,
+/// The repository as it stood: 180 findings in the bundle pull request,
 /// last written when it opened the day before, and 3 open with no fix yet.
 fn the_repository() -> Vec<(Finding, FindingState)> {
-    let mut all: Vec<(Finding, FindingState)> = (0..274)
+    let mut all: Vec<(Finding, FindingState)> = (0..180)
         .map(|i| {
             let (mut f, st) = in_pr(&format!("f{i:03}"), REPO, PR, TICKET);
             f.tier = Some(if i < 4 { Tier::P1 } else { Tier::P2 });
@@ -95,7 +95,7 @@ async fn before_the_sweep_nothing_could_be_asked_for() {
             .iter()
             .filter(|r| *r == "already has an open PR")
             .count(),
-        274
+        180
     );
 }
 
@@ -108,7 +108,7 @@ async fn the_sweep_puts_yesterdays_stale_records_right_with_no_step_by_a_person(
     let now = day_after();
 
     let r = reconcile(&github, &mut all, &Scope::All, now).await;
-    assert_eq!((r.prs_read, r.released), (1, 274), "one read of GitHub");
+    assert_eq!((r.prs_read, r.released), (1, 180), "one read of GitHub");
     assert!(all.iter().all(|(f, _)| f.status != Status::PrOpen));
 
     // Each finding keeps who closed its pull request, when, and which.
@@ -127,14 +127,14 @@ async fn the_sweep_puts_yesterdays_stale_records_right_with_no_step_by_a_person(
     assert_eq!(st.ticket, None);
     let line = &github.event_texts()[0];
     assert!(
-        line.contains("PR #412 was closed without merging by octo-admin"),
+        line.contains("PR #42 was closed without merging by octo-admin"),
         "{line}"
     );
 
     // A person asks: every finding with a fix gets one. The 3 with no
     // fixed version are skipped for that reason, never for the pull request.
     let (fixes, reasons) = asked(&all, now);
-    assert_eq!(fixes, 274);
+    assert_eq!(fixes, 180);
     assert_eq!(reasons, vec!["no fixed version"; 3]);
 
     // Automatic fixes do not open the same bundle again against the
@@ -144,7 +144,7 @@ async fn the_sweep_puts_yesterdays_stale_records_right_with_no_step_by_a_person(
     let later = sec::plan_units(&all, &cfg(), now + Duration::days(8));
     assert_eq!(
         later.iter().map(|u| u.finding_ids.len()).sum::<usize>(),
-        274
+        180
     );
 
     // The same sweep again: one read, nothing written.
@@ -164,7 +164,7 @@ async fn the_webhook_and_the_cancel_release_at_once_and_agree_with_the_sweep() {
         number: PR,
     };
     let r = reconcile(&github, &mut by_webhook, &scope, day_after()).await;
-    assert_eq!(r.released, 274);
+    assert_eq!(r.released, 180);
     // The sweep, had the webhook never arrived, ends in the same place.
     let mut by_sweep = the_repository();
     reconcile(&github, &mut by_sweep, &Scope::All, day_after()).await;
@@ -219,7 +219,7 @@ async fn github_not_answering_releases_nothing_and_the_next_sweep_heals() {
         day_after() + Duration::minutes(20),
     )
     .await;
-    assert_eq!(r.released, 274);
+    assert_eq!(r.released, 180);
 }
 
 #[tokio::test]
@@ -229,7 +229,7 @@ async fn retry_on_the_run_is_a_new_request_from_the_findings_as_they_are_now() {
         repo: REPO.into(),
         bundle: true,
         ticket: TICKET.into(),
-        finding_ids: ids(&all)[..274].to_vec(),
+        finding_ids: ids(&all)[..180].to_vec(),
         ..Default::default()
     };
     let now = day_after();
@@ -248,7 +248,7 @@ async fn retry_on_the_run_is_a_new_request_from_the_findings_as_they_are_now() {
     // One was fixed another way since the plan was made.
     all[7].0.status = Status::Fixed;
     let asked = mark_retry(&mut all, &unit, "admin@example.com", now);
-    assert_eq!(asked.len(), 273);
+    assert_eq!(asked.len(), 179);
     assert!(!asked.contains(&all[7].0.id));
 
     // The request starts as any a person made: one pull request for the
@@ -256,7 +256,7 @@ async fn retry_on_the_run_is_a_new_request_from_the_findings_as_they_are_now() {
     let units = sec::requested_units(&all, &cfg(), now);
     assert_eq!(units.len(), 1);
     let new = &units[0];
-    assert_eq!(new.finding_ids.len(), 273);
+    assert_eq!(new.finding_ids.len(), 179);
     assert!(new.bundle);
     assert_ne!(new.ticket, TICKET, "a new run, not the old plan");
     assert_ne!(new.branch, "", "on a branch of its own");

@@ -7,7 +7,7 @@
 //! the head, but the line stayed, so the pull request stayed a draft: first
 //! when CI passed ("The PR stays a draft: a check the change didn't pass is
 //! listed in the description"), and again when the ready sweep decided
-//! a day and a half later. Nothing about the change had failed; the hold's
+//! later. Nothing about the change had failed; the hold's
 //! reason was CoderHelm's own environment.
 //!
 //! Guarantee: a check CoderHelm's own tools couldn't run is never a hold. Its
@@ -115,7 +115,7 @@ fn a_check_the_change_really_failed_still_holds_with_ci_green() {
 }
 
 /// The same pull request, decided again by the sweep after the fix above
-/// shipped: still held, every 75 minutes, for a day. The decision only read
+/// shipped: still held, on every sweep. The decision only read
 /// the repository's CI when CoderHelm's own feature checks had findings;
 /// this pull request had none, so CI stayed "not green" without being asked
 /// and the tooling line kept holding although CI had passed on the head.

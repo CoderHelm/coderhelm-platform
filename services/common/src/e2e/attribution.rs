@@ -518,17 +518,17 @@ mod tests {
     #[test]
     fn a_test_the_change_adds_or_edits_is_the_changes_failure() {
         let diff = vec![
-            "e2e/pages/venue-subnav.ts".to_string(),
-            "e2e/tests/site/venue-subnav-more-menu.spec.ts".to_string(),
+            "e2e/pages/marina-subnav.ts".to_string(),
+            "e2e/tests/site/marina-subnav-more-menu.spec.ts".to_string(),
             "web/src/components/subnav.tsx".to_string(),
         ];
         let test_files = vec![
-            "./e2e/tests/site/venue-subnav-more-menu.spec.ts".to_string(),
-            "e2e/pages/venue-subnav.ts".to_string(),
+            "./e2e/tests/site/marina-subnav-more-menu.spec.ts".to_string(),
+            "e2e/pages/marina-subnav.ts".to_string(),
         ];
         let changed = test_changed(&diff, &test_files);
         assert_eq!(changed.len(), 2);
-        assert!(test_changed_reason(&changed).contains("`e2e/pages/venue-subnav.ts`"));
+        assert!(test_changed_reason(&changed).contains("`e2e/pages/marina-subnav.ts`"));
         assert!(test_changed(&diff, &["e2e/tests/site/home.spec.ts".to_string()]).is_empty());
     }
 
@@ -538,10 +538,10 @@ mod tests {
     fn a_saved_unrelated_verdict_settles_under_the_current_rules() {
         let mut a = Attribution {
             test: "More menu on a phone".into(),
-            file: "e2e/tests/site/venue-subnav-more-menu.spec.ts".into(),
+            file: "e2e/tests/site/marina-subnav-more-menu.spec.ts".into(),
             diff: vec![
-                "e2e/pages/venue-subnav.ts".into(),
-                "e2e/tests/site/venue-subnav-more-menu.spec.ts".into(),
+                "e2e/pages/marina-subnav.ts".into(),
+                "e2e/tests/site/marina-subnav-more-menu.spec.ts".into(),
             ],
             verdict: Verdict::Unrelated,
             ..Default::default()

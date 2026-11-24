@@ -35,12 +35,12 @@ use common::log_repo::{
 };
 use common::repo_read::{RepoInfo, SearchHit};
 
-const GROUP: &str = "/ecs/prod-ledger-api";
-const APP: &str = "acme/ledger-api";
+const GROUP: &str = "/ecs/prod-bookings-api";
+const APP: &str = "acme/bookings-api";
 const INFRA: &str = "acme/terraform-infra";
 const CLI: &str = "acme/ops-cli";
 const SHA: &str = "4c1e9a07b2d85f6e3a90c71d2b48e5f60a1c3d97";
-const NOW: &str = "2026-11-12T10:19:20Z";
+const NOW: &str = "2030-03-12T10:19:20Z";
 /// What the card said.
 const OLD_WORDS: [&str; 4] = [
     "Which repo should this fix go to?",
@@ -58,23 +58,23 @@ fn now() -> chrono::DateTime<chrono::Utc> {
 /// The team's account as the read-only role sees it: the service's task
 /// definition logs to the group and runs the image built from `SHA`.
 fn account() -> AwsFacts {
-    let image = format!("111122223333.dkr.ecr.us-east-1.amazonaws.com/prod-ledger-api:sha-{SHA}");
+    let image = format!("111122223333.dkr.ecr.us-east-1.amazonaws.com/prod-bookings-api:sha-{SHA}");
     AwsFacts {
         connected: true,
         ecs: vec![EcsFact {
-            cluster: "arn:aws:ecs:us-east-1:111122223333:cluster/prod-ledger-api-ecs-cluster"
+            cluster: "arn:aws:ecs:us-east-1:111122223333:cluster/prod-bookings-api-ecs-cluster"
                 .into(),
-            service: "prod-ledger-api-ecs-service".into(),
+            service: "prod-bookings-api-ecs-service".into(),
             task_definition:
-                "arn:aws:ecs:us-east-1:111122223333:task-definition/prod-ledger-api:270".into(),
-            family: "prod-ledger-api".into(),
+                "arn:aws:ecs:us-east-1:111122223333:task-definition/prod-bookings-api:12".into(),
+            family: "prod-bookings-api".into(),
             images: vec![image.clone()],
             ..Default::default()
         }],
         images: vec![ImageFact {
             image,
-            ecr_repo: "prod-ledger-api".into(),
-            tags: [("App", "ledger-api"), ("Environment", "prod")]
+            ecr_repo: "prod-bookings-api".into(),
+            tags: [("App", "bookings-api"), ("Environment", "prod")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
@@ -106,30 +106,30 @@ impl Team {
         // The image repository's name: Terraform defines it, the app's
         // workflow pushes to it.
         hits.insert(
-            "prod-ledger-api".to_string(),
+            "prod-bookings-api".to_string(),
             vec![
-                hit(INFRA, "modules/ecs/main.tf", "name = \"prod-ledger-api\""),
+                hit(INFRA, "modules/ecs/main.tf", "name = \"prod-bookings-api\""),
                 hit(
                     APP,
                     ".github/workflows/deploy.yml",
-                    "ECR_REPOSITORY: prod-ledger-api",
+                    "ECR_REPOSITORY: prod-bookings-api",
                 ),
             ],
         );
         hits.insert(
-            "/ecs/prod-ledger-api".to_string(),
+            "/ecs/prod-bookings-api".to_string(),
             vec![hit(
                 INFRA,
                 "modules/ecs/logs.tf",
-                "name = \"/ecs/prod-ledger-api\"",
+                "name = \"/ecs/prod-bookings-api\"",
             )],
         );
         hits.insert(
-            "class SearchIndexService".to_string(),
+            "class AvailabilityService".to_string(),
             vec![hit(
                 APP,
-                "src/search/search-index.service.ts",
-                "export class SearchIndexService {",
+                "src/availability/availability.service.ts",
+                "export class AvailabilityService {",
             )],
         );
         Team {
@@ -204,12 +204,12 @@ fn input() -> Input {
             about: "Secrets detected in CloudWatch Logs (2 instances)".into(),
             samples: vec![LogLine {
                 log_group: GROUP.into(),
-                message: "[Nest] 1  - 11/12/2026, 10:19:20 AM   ERROR [SearchIndexService] Failed to reach the search cluster with password=[REDACTED_PASSWORD]".into(),
+                message: "[Nest] 1  - 3/12/2030, 10:19:20 AM   ERROR [AvailabilityService] Failed to reach the availability cache with password=[REDACTED_PASSWORD]".into(),
             }],
             ..Default::default()
         },
         repos: vec![repo(APP, "backend"), repo(INFRA, "infra"), repo(CLI, "tools")],
-        related: vec![("/ecs/prod-ledger-api-worker".into(), APP.into())],
+        related: vec![("/ecs/prod-bookings-api-worker".into(), APP.into())],
         ..Default::default()
     }
 }
@@ -284,7 +284,7 @@ async fn the_card_that_asked_now_starts_the_fix_in_the_traced_repo() {
     let said = action.sentence(&inc.diagnosis);
     assert_eq!(
         said,
-        "Started a fix in acme/ledger-api (from the running image's commit and the build and deploy files that ship it). The pull request follows here when it opens."
+        "Started a fix in acme/bookings-api (from the running image's commit and the build and deploy files that ship it). The pull request follows here when it opens."
     );
     for old in OLD_WORDS {
         assert!(!said.contains(old), "{said}");
@@ -300,14 +300,14 @@ async fn a_split_call_starts_on_the_guess_and_says_so_never_only_asks() {
     team.commits.clear();
     team.hits.clear();
     team.hits.insert(
-        "class SearchIndexService".to_string(),
+        "class AvailabilityService".to_string(),
         vec![
             hit(
                 APP,
-                "src/search/search-index.service.ts",
-                "export class SearchIndexService {",
+                "src/availability/availability.service.ts",
+                "export class AvailabilityService {",
             ),
-            hit(CLI, "src/search.ts", "class SearchIndexService {"),
+            hit(CLI, "src/availability.ts", "class AvailabilityService {"),
         ],
     );
     let mut inp = input();
@@ -331,9 +331,9 @@ async fn a_split_call_starts_on_the_guess_and_says_so_never_only_asks() {
         "https://app.example/logs?incident=inc1",
     );
     let text = format!("{card:?}");
-    assert!(text.contains("Fixing in acme/ledger-api"), "{text}");
+    assert!(text.contains("Fixing in acme/bookings-api"), "{text}");
     assert!(
-        text.contains("Started a fix in acme/ledger-api, the best guess"),
+        text.contains("Started a fix in acme/bookings-api, the best guess"),
         "{text}"
     );
     assert!(text.contains("Wrong repo? Move it"), "{text}");

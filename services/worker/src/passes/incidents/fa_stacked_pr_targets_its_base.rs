@@ -10,7 +10,7 @@
 //! open pull request (#40) "under new hashes", and stopped before the pull
 //! request step: first "rebasing onto that branch didn't apply cleanly",
 //! then "too many commits to replay", then "neither did merging #40's
-//! branch in". Five runs over three days stopped the same way, each on the
+//! branch in". Several runs stopped the same way, each on the
 //! same kept branch with the same four commits, until a person stepped in.
 //!
 //! Today the branch's own change is rebuilt on #40's branch and the run

@@ -1,5 +1,5 @@
-//! dh. A ticket listed two acceptance criteria: one filter chip per sport
-//! on a camps page, and the page view tracked there. The pull request
+//! dh. A ticket listed two acceptance criteria: one filter chip per dock
+//! on a slips page, and the page view tracked there. The pull request
 //! changed the chip code, added an end-to-end spec for the chip, and its
 //! two-way proof passed. Its description listed the files and the checks,
 //! and nothing tied either to the criteria: the tracking criterion had
@@ -25,16 +25,16 @@ use common::trace::{self, Inputs, State};
 
 const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
 
-const TICKET: &str = "On /club/summer-camps the sport filter shows two Multi-Sport chips.\n\nAcceptance Criteria\n- Only one multi-sport filter chip shows on /club/summer-camps\n- Page views of the camps page are tracked";
+const TICKET: &str = "On /club/slips the dock filter shows two Guest-Dock chips.\n\nAcceptance Criteria\n- Only one guest-dock filter chip shows on /club/slips\n- Page views of the slips page are tracked";
 
-const DESIGN: &str = "## Criteria map\n- Only one multi-sport filter chip shows | page: /club/summer-camps | e2e: e2e/camps.spec.ts › shows one multi-sport filter chip | asserts: one Multi-Sport chip | code: filterMaps.ts, dedupeSportsBySlug\n- Page views of the camps page are tracked | page: /club/summer-camps | e2e: none: an analytics call | asserts: a page view event\n";
+const DESIGN: &str = "## Criteria map\n- Only one guest-dock filter chip shows | page: /club/slips | e2e: e2e/slips.spec.ts › shows one guest-dock filter chip | asserts: one Guest-Dock chip | code: filterMaps.ts, dedupeDocksBySlug\n- Page views of the slips page are tracked | page: /club/slips | e2e: none: an analytics call | asserts: a page view event\n";
 
 fn diff() -> Vec<(String, String, String)> {
     vec![
         (
             "apps/web/src/utils/filterMaps.ts".into(),
             "modified".into(),
-            "@@ -1 +1,4 @@\n+export function dedupeSportsBySlug(rows: Row[]) {\n+  return uniqBy(rows, (r) => r.slug);\n+}\n".into(),
+            "@@ -1 +1,4 @@\n+export function dedupeDocksBySlug(rows: Row[]) {\n+  return uniqBy(rows, (r) => r.slug);\n+}\n".into(),
         ),
         (
             "apps/web/src/lib/analytics.ts".into(),
@@ -42,18 +42,18 @@ fn diff() -> Vec<(String, String, String)> {
             "@@ -1 +1,2 @@\n+export function trackPageView(page: string) {}\n".into(),
         ),
         (
-            "e2e/camps.spec.ts".into(),
+            "e2e/slips.spec.ts".into(),
             "added".into(),
-            "@@ -0,0 +1,3 @@\n+test('shows one multi-sport filter chip', async ({ page }) => {\n+  await page.goto('/club/summer-camps');\n+});\n".into(),
+            "@@ -0,0 +1,3 @@\n+test('shows one guest-dock filter chip', async ({ page }) => {\n+  await page.goto('/club/slips');\n+});\n".into(),
         ),
     ]
 }
 
 fn proven_chip() -> Proof {
     Proof {
-        criterion: "Only one multi-sport filter chip shows on /club/summer-camps".into(),
-        page: "/club/summer-camps".into(),
-        test: "e2e/camps.spec.ts › shows one multi-sport filter chip".into(),
+        criterion: "Only one guest-dock filter chip shows on /club/slips".into(),
+        page: "/club/slips".into(),
+        test: "e2e/slips.spec.ts › shows one guest-dock filter chip".into(),
         record: Record {
             head: HEAD.into(),
             base: Leg {
@@ -95,7 +95,7 @@ fn each_criterion_is_traced_and_the_unproven_one_is_open() {
     let t = the_trace();
     let chip = &t.rows[0];
     assert_eq!(chip.code[0].path, "apps/web/src/utils/filterMaps.ts");
-    assert_eq!(chip.code[0].symbols, vec!["dedupeSportsBySlug"]);
+    assert_eq!(chip.code[0].symbols, vec!["dedupeDocksBySlug"]);
     assert_eq!(chip.proof.state, State::Proven);
     let views = &t.rows[1];
     assert_eq!(views.code[0].path, "apps/web/src/lib/analytics.ts");
@@ -128,7 +128,7 @@ fn each_criterion_is_traced_and_the_unproven_one_is_open() {
     assert!(open[0].why.contains("no test"));
 
     // The table is in the description, in its checks, from the facts.
-    let shaped = description_facts::shape("", "fix: one Multi-Sport chip", f, None);
+    let shaped = description_facts::shape("", "fix: one Guest-Dock chip", f, None);
     let body = &shaped.body;
     assert!(
         body.contains("| Criterion | Code | Tests | Proof |"),
@@ -141,12 +141,8 @@ fn each_criterion_is_traced_and_the_unproven_one_is_open() {
         .expect("the checks fold");
     assert!(body.find("Acceptance criteria, traced").unwrap() > fold);
     // Built again from the same facts, the same table: nothing piles up.
-    let again = description_facts::shape(
-        body,
-        "fix: one Multi-Sport chip",
-        shaped.facts.clone(),
-        None,
-    );
+    let again =
+        description_facts::shape(body, "fix: one Guest-Dock chip", shaped.facts.clone(), None);
     assert_eq!(again.body.matches("Acceptance criteria, traced").count(), 1);
 }
 
@@ -194,7 +190,7 @@ fn an_open_criterion_drives_a_fix_round_like_any_open_gap() {
     assert_eq!(proof_items.len(), 1);
     let trace_items = trace::coder_items(&not_the_ticket);
     assert!(
-        !trace_items.iter().any(|i| i.contains("multi-sport")),
+        !trace_items.iter().any(|i| i.contains("guest-dock")),
         "{trace_items:?}"
     );
     let merged =

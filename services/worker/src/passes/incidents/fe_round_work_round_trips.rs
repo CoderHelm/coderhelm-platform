@@ -9,11 +9,11 @@
 //!   nothing": the branch holding the work was deleted, twice, and the
 //!   coder tried `%255F` paths that wrote new files.
 //! - A CI fix round and a review fix round each ran out of their time
-//!   budget three steps in a row (each command a sandbox build of one to
+//!   budget several steps in a row (each command a sandbox build of one to
 //!   two minutes, the checks two to six). The run page said "Resume
 //!   continues from there", but the next round reset the WIP branch to the
 //!   pull request's head and did the same work again in the same budget:
-//!   20, then 17, then 4 checkpoint commits thrown away on one run.
+//!   dozens of checkpoint commits thrown away on one run.
 //!
 //! Guarantee: every contents URL percent-encodes each path segment and the
 //! ref, so a path holding `%`, `#`, `?`, a space or brackets reads and
@@ -50,7 +50,7 @@ fn served(url: &str) -> (String, Option<String>) {
 fn a_path_with_special_characters_is_the_file_github_serves() {
     for path in [
         "apps/web/src/app/%5Fmarkdown/[[...slug]]/route.ts",
-        "apps/web/src/app/(site)/[venue]/page.tsx",
+        "apps/web/src/app/(site)/[marina]/page.tsx",
         "docs/notes on #3?.md",
         "data/100%.json",
         "plain/path.ts",

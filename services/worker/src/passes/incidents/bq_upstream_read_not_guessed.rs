@@ -26,10 +26,10 @@ use common::log_incident::{
     Look, Lookup, Plan,
 };
 
-const GROUP: &str = "/ecs/prod-shop-api";
-const REPO: &str = "acme/shop-api";
-const NOW: &str = "2026-11-14T15:10:00Z";
-const LINE: &str = "[Nest] 1  - 11/14/2026, 2:26:14 PM   ERROR [AuthGuard] AxiosError: Request failed with status code 503";
+const GROUP: &str = "/ecs/prod-harbor-api";
+const REPO: &str = "acme/harbor-api";
+const NOW: &str = "2030-03-14T15:10:00Z";
+const LINE: &str = "[Nest] 1  - 3/14/2030, 2:26:14 PM   ERROR [AuthGuard] AxiosError: Request failed with status code 503";
 /// What the card said.
 const OLD_WORDS: [&str; 3] = [
     "The evidence does not show",
@@ -49,7 +49,7 @@ const GUARD: &str = r#"import { Injectable, CanActivate } from '@nestjs/common';
 export class AuthGuard implements CanActivate {
   constructor(private http: HttpService, private config: ConfigService) {}
   async canActivate(ctx) {
-    const base = this.config.get<string>('IDENTITY_URL') ?? 'http://identity.shop.internal';
+    const base = this.config.get<string>('IDENTITY_URL') ?? 'http://identity.harbor.internal';
     const res = await this.http.axiosRef.get(`${base}/v1/session`, { timeout: 5000 });
     return res.data.valid;
   }
@@ -111,8 +111,8 @@ fn finding(today: u64, per_day: u64) -> Finding {
         source_log_group: GROUP.into(),
         source_account_id: "111122223333".into(),
         error_pattern: "Request failed with status code 503".into(),
-        first_seen_at: "2026-11-09T09:00:00Z".into(),
-        last_seen_at: "2026-11-14T14:26:14Z".into(),
+        first_seen_at: "2030-03-09T09:00:00Z".into(),
+        last_seen_at: "2030-03-14T14:26:14Z".into(),
         reopen_count: 3,
         daily_lines: daily,
         log_streams: vec![
@@ -170,10 +170,10 @@ async fn a_rise_names_the_upstream_from_the_code_with_the_numbers() {
         "{}",
         d.decision
     );
-    assert_eq!(d.upstream, "identity.shop.internal");
+    assert_eq!(d.upstream, "identity.harbor.internal");
     assert_eq!(
         d.facts[0],
-        "AuthGuard (src/auth/auth.guard.ts in acme/shop-api) calls identity.shop.internal (IDENTITY_URL), with a 5000 timeout, and no retry."
+        "AuthGuard (src/auth/auth.guard.ts in acme/harbor-api) calls identity.harbor.internal (IDENTITY_URL), with a 5000 timeout, and no retry."
     );
     assert!(
         d.facts.contains(
@@ -184,7 +184,7 @@ async fn a_rise_names_the_upstream_from_the_code_with_the_numbers() {
         d.facts
     );
     assert!(
-        d.steps[0].starts_with("Retry AuthGuard's call to identity.shop.internal once"),
+        d.steps[0].starts_with("Retry AuthGuard's call to identity.harbor.internal once"),
         "{:?}",
         d.steps
     );
@@ -212,11 +212,11 @@ async fn a_rise_names_the_upstream_from_the_code_with_the_numbers() {
         "{text}"
     );
     assert!(
-        text.contains("(\"Upstream\", \"identity.shop.internal\")"),
+        text.contains("(\"Upstream\", \"identity.harbor.internal\")"),
         "{text}"
     );
     assert!(
-        text.contains("AuthGuard call to identity.shop.internal answered 503"),
+        text.contains("AuthGuard call to identity.harbor.internal answered 503"),
         "{text}"
     );
     for old in OLD_WORDS {

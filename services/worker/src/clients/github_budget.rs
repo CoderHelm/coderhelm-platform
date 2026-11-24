@@ -734,7 +734,7 @@ mod tests {
             ),
             (
                 "GET",
-                "https://api.github.com/repos/acme/site/git/ref/heads/coderhelm/cpm-1",
+                "https://api.github.com/repos/acme/site/git/ref/heads/coderhelm/abc-1",
                 "GET /repos/:o/:r/git/ref/:name",
             ),
             (
