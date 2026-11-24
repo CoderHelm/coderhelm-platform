@@ -3363,6 +3363,28 @@ fn token_error(code: &str, desc: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// The broker's answer when the provider's sign-in can't give a token now.
+/// Only a sign-in that is gone (`invalid_grant`, HTTP 400) tells the install
+/// to reconnect; anything passing (the provider's sign-in server down,
+/// overloaded or rate limiting) is `temporarily_unavailable` with HTTP 503,
+/// so the install keeps its grant and asks again on the next sync. The
+/// words are the reason's own, never a debug dump of it.
+pub fn broker_refusal(e: &common::mcp_remote::runtime::ConnError) -> (StatusCode, Json<Value>) {
+    use common::mcp_remote::runtime::ConnError;
+    match e {
+        ConnError::NotConnected => {
+            token_error("invalid_grant", "No sign-in for this provider. Reconnect.")
+        }
+        ConnError::NeedsReconnect(why) | ConnError::Failed(why) => {
+            token_error("invalid_grant", why)
+        }
+        ConnError::Temporary(why) | ConnError::Busy { why, .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "temporarily_unavailable", "error_description": why })),
+        ),
+    }
+}
+
 /// The install's client credentials at the token endpoint (constant time).
 pub fn client_ok(master: &str, install_id: &str, secret: &str) -> bool {
     if !sign::is_install_id(install_id) {
@@ -3504,7 +3526,10 @@ pub async fn oauth_token(State(state): State<Arc<AppState>>, body: Bytes) -> Rep
     let header = rt
         .auth_header(&rec, &common::mcp_remote::store::Owner::Team, false)
         .await
-        .map_err(|e| token_error("invalid_grant", &format!("{e:?}")))?
+        .map_err(|e| {
+            warn!(install = %install.id, kind = %kind, error = %e, "hybrid: no token to hand out");
+            broker_refusal(&e)
+        })?
         .ok_or_else(|| token_error("invalid_grant", "No sign-in for this provider. Reconnect."))?;
     let access = header
         .1
@@ -3670,6 +3695,57 @@ pub async fn admin_revoke(
 
 #[cfg(test)]
 mod tests {
+
+    /// The broker's token endpoint never turns a passing failure into
+    /// `invalid_grant`: the install would mark its sign-in revoked and ask
+    /// a person to reconnect over a provider's brief outage.
+    #[test]
+    fn the_broker_answers_a_passing_failure_as_temporarily_unavailable() {
+        use axum::http::StatusCode;
+        use common::mcp_remote::runtime::ConnError;
+        let busy = ConnError::Busy {
+            why: "Atlassian's sign-in server was briefly unavailable (HTTP 503); retrying.".into(),
+            retry_after: None,
+            rate_limited: false,
+        };
+        for e in [
+            busy,
+            ConnError::Temporary("The sign-in server refused (503).".into()),
+        ] {
+            let (status, body) = super::broker_refusal(&e);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body.0["error"], "temporarily_unavailable");
+            let desc = body.0["error_description"].as_str().unwrap();
+            assert!(
+                !desc.contains("Temporary(") && !desc.contains("Busy {"),
+                "{desc}"
+            );
+            // What the install makes of it: passing, never a reconnect.
+            let r = common::mcp_remote::http::HttpResponse {
+                status: status.as_u16(),
+                headers: vec![],
+                body: body.0.to_string().into_bytes(),
+            };
+            let t = common::mcp_remote::oauth::parse_token_response(&r, 0, None).unwrap_err();
+            assert!(t.is_passing() && !t.needs_reconnect());
+        }
+        for e in [
+            ConnError::NeedsReconnect(
+                "The sign-in server refused (invalid_grant). Reconnect to sign in again.".into(),
+            ),
+            ConnError::NotConnected,
+        ] {
+            let (status, body) = super::broker_refusal(&e);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.0["error"], "invalid_grant");
+        }
+        // The token endpoint answers through it, not a debug dump.
+        let src = include_str!("hybrid.rs");
+        let handler = &src[src.find("pub async fn oauth_token(").unwrap()
+            ..src.find("pub async fn oauth_revoke(").unwrap()];
+        assert!(handler.contains("broker_refusal(&e)"));
+        assert!(!handler.contains(concat!("{e", ":?}")));
+    }
 
     #[test]
     fn drive_is_offered_to_installs_only_with_its_own_app() {

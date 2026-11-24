@@ -329,12 +329,13 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
             None => {
                 s.status = Status::Ready;
                 s.error = None;
+                super::note_finished(&mut s);
                 s.last_success_at = rfc3339(now);
                 s.next_sync_at = next_sync(&s, now, false);
             }
             Some(e) => {
-                s.status = Status::Error;
-                s.error = Some(super::source_error(&s, e));
+                let error = super::source_error(&s, e);
+                super::note_stop(&mut s, error, now);
                 s.next_sync_at = next_sync(&s, now, true);
             }
         }
@@ -389,8 +390,7 @@ pub async fn fail_with(
     if let Err(e) = store.put_run(team, &run).await {
         tracing::warn!(error = %e, "Knowledge sync run not recorded");
     }
-    s.status = Status::Error;
-    s.error = Some(error);
+    super::note_stop(&mut s, error, now);
     s.progress = None;
     s.continuing = false;
     s.last_sync_at = rfc3339(now);
@@ -1840,6 +1840,73 @@ mod tests {
             s.next_sync_at - r.clock.load(Ordering::SeqCst)
                 < super::super::DEFAULT_INTERVAL_MINS * 60
         );
+    }
+
+    #[tokio::test]
+    async fn a_passing_stop_retries_says_so_once_and_asks_nobody() {
+        let r = rig();
+        r.provider.set("a", "1", "Text.");
+        sync(&r).await;
+        let busy = || {
+            ConnectorError::unavailable(
+                "Atlassian's sign-in server was briefly unavailable (HTTP 503); retrying.",
+                None,
+            )
+        };
+        for _ in 0..3 {
+            *r.provider.fail_list.lock().unwrap() = Some(busy());
+            sync(&r).await;
+        }
+        let s = r.store.sources.lock().unwrap()["s1"].clone();
+        // The source stays as it was: nothing for a person to fix.
+        assert_eq!(s.status, Status::Ready);
+        assert!(s.error.is_none());
+        let why = s.retrying.clone().unwrap();
+        assert_eq!(why.action, "retry");
+        assert!(why.message.contains("briefly unavailable"));
+        assert!(!why.fix.contains("Reconnect") && !why.message.contains("Reconnect"));
+        // Three stops in a row, said once, with when they began.
+        assert_eq!(s.stops, 3);
+        assert!(!s.stopped_since.is_empty());
+        assert!(
+            s.next_sync_at - r.clock.load(Ordering::SeqCst)
+                < super::super::DEFAULT_INTERVAL_MINS * 60
+        );
+        // A sync that finishes ends the run of stops.
+        *r.provider.fail_list.lock().unwrap() = None;
+        sync(&r).await;
+        let s = r.store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!(
+            (s.stops, s.retrying.is_none(), s.stopped_since.as_str()),
+            (0, true, "")
+        );
+    }
+
+    #[test]
+    fn a_stop_only_turns_the_source_to_error_when_a_person_must_fix_it() {
+        let mut s = super::super::Source {
+            last_success_at: "2026-11-23T13:18:54Z".into(),
+            status: Status::Ready,
+            kind: Some(super::super::Kind::Confluence),
+            ..Default::default()
+        };
+        let passing =
+            ConnectorError::unavailable("down", None).for_source(super::super::Kind::Confluence);
+        super::super::note_stop(&mut s, passing, 1_000);
+        assert_eq!((s.status, s.stops), (Status::Ready, 1));
+        let gone =
+            ConnectorError::Reconnect("revoked".into()).for_source(super::super::Kind::Confluence);
+        super::super::note_stop(&mut s, gone, 2_000);
+        assert_eq!((s.status, s.stops), (Status::Error, 2));
+        assert!(s.retrying.is_none() && s.error.is_some());
+        // Before its first sync a passing stop leaves it queued.
+        let mut new = super::super::Source::default();
+        super::super::note_stop(
+            &mut new,
+            ConnectorError::Temporary("x".into()).for_source(super::super::Kind::Notion),
+            1,
+        );
+        assert_eq!(new.status, Status::Queued);
     }
 
     #[tokio::test]

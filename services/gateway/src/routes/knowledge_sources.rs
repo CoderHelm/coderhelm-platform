@@ -150,6 +150,23 @@ fn ts(secs: i64) -> String {
 /// A source as the page shows it.
 pub fn source_json(s: &Source, now: i64) -> Value {
     let status = shown_status(s, now);
+    let mut v = source_fields(s, status);
+    if let Some(m) = v.as_object_mut() {
+        // The last sync stopped for a passing reason: said once, with how
+        // many in a row and since when; nothing for a person to do.
+        let retrying = if status == Status::Error {
+            Value::Null
+        } else {
+            serde_json::to_value(&s.retrying).unwrap_or(Value::Null)
+        };
+        m.insert("retrying".into(), retrying);
+        m.insert("stops".into(), json!(s.stops));
+        m.insert("stopped_since".into(), json!(s.stopped_since));
+    }
+    v
+}
+
+fn source_fields(s: &Source, status: Status) -> Value {
     json!({
         "id": s.id,
         "kind": s.kind_key(),

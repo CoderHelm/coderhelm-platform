@@ -793,6 +793,31 @@ pub trait Store: Send + Sync {
         t: &TokenRecord,
         expected: Option<i64>,
     ) -> Result<bool, String>;
+    /// Takes the right to refresh one token record until `until`: only one
+    /// refresher at a time sends the refresh token, so a provider that
+    /// rotates refresh tokens (Atlassian) never sees the same one twice.
+    /// `Ok(false)` when someone else holds it, or the record moved past
+    /// `version`. Writing the refreshed tokens ([`Store::put_token`])
+    /// releases it; a refresher that dies loses it at `until`.
+    async fn claim_refresh(
+        &self,
+        team: &str,
+        id: &str,
+        owner: &Owner,
+        version: i64,
+        now: i64,
+        until: i64,
+    ) -> Result<bool, String>;
+    /// Gives back a refresh claimed until `until` that didn't write tokens
+    /// (the sign-in server was down, or refused), so the next refresher
+    /// doesn't wait for it. A claim someone else took since is left alone.
+    async fn release_refresh(
+        &self,
+        team: &str,
+        id: &str,
+        owner: &Owner,
+        until: i64,
+    ) -> Result<(), String>;
     async fn set_token_status(
         &self,
         team: &str,
@@ -1012,6 +1037,66 @@ impl Store for DynamoStore {
                 }
             }
         }
+    }
+
+    async fn claim_refresh(
+        &self,
+        team: &str,
+        id: &str,
+        owner: &Owner,
+        version: i64,
+        now: i64,
+        until: i64,
+    ) -> Result<bool, String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", av(team))
+            .key("sk", av(token_sk(id, owner)))
+            .update_expression("SET refresh_lease = :u")
+            .condition_expression(
+                "version = :v AND (attribute_not_exists(refresh_lease) OR refresh_lease < :n)",
+            )
+            .expression_attribute_values(":u", num(until))
+            .expression_attribute_values(":v", num(version))
+            .expression_attribute_values(":n", num(now))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!(
+                "claim mcp token refresh: {}",
+                e.into_service_error()
+            )),
+        }
+    }
+
+    async fn release_refresh(
+        &self,
+        team: &str,
+        id: &str,
+        owner: &Owner,
+        until: i64,
+    ) -> Result<(), String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", av(team))
+            .key("sk", av(token_sk(id, owner)))
+            .update_expression("REMOVE refresh_lease")
+            .condition_expression("refresh_lease = :u")
+            .expression_attribute_values(":u", num(until))
+            .send()
+            .await;
+        ignore_missing(r.map(|_| ()))
     }
 
     async fn set_token_status(
@@ -1273,6 +1358,40 @@ pub mod fake {
             }
             self.put(team, t.to_item(team, id));
             Ok(true)
+        }
+        async fn claim_refresh(
+            &self,
+            team: &str,
+            id: &str,
+            owner: &Owner,
+            version: i64,
+            now: i64,
+            until: i64,
+        ) -> Result<bool, String> {
+            let mut items = self.items.lock().unwrap();
+            let Some(i) = items.get_mut(&(team.to_string(), token_sk(id, owner))) else {
+                return Ok(false);
+            };
+            let free = n(i, "refresh_lease").is_none_or(|l| l < now);
+            if n(i, "version") != Some(version) || !free {
+                return Ok(false);
+            }
+            i.insert("refresh_lease".into(), num(until));
+            Ok(true)
+        }
+        async fn release_refresh(
+            &self,
+            team: &str,
+            id: &str,
+            owner: &Owner,
+            until: i64,
+        ) -> Result<(), String> {
+            self.update(team, &token_sk(id, owner), |i| {
+                if n(i, "refresh_lease") == Some(until) {
+                    i.remove("refresh_lease");
+                }
+            });
+            Ok(())
         }
         async fn set_token_status(
             &self,

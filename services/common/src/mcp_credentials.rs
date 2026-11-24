@@ -124,7 +124,14 @@ impl crate::envelope::Keys for Kms<'_> {
             .ciphertext_blob(Blob::new(blob))
             .send()
             .await
-            .map_err(|e| format!("kms decrypt: {e}"))?;
+            // The whole chain ("ThrottlingException", "dispatch failure"),
+            // so a caller can tell a passing failure from a refused blob.
+            .map_err(|e| {
+                format!(
+                    "kms decrypt: {}",
+                    aws_sdk_kms::error::DisplayErrorContext(&e)
+                )
+            })?;
         let plain = out.plaintext().ok_or("kms returned no plaintext")?;
         Ok(plain.as_ref().to_vec())
     }

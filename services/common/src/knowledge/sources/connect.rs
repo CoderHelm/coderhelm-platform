@@ -148,6 +148,25 @@ impl Via {
     }
 }
 
+/// A sign-in that can't give a token right now for a passing reason, as the
+/// connector error a sync waits out: its own words (they already name who
+/// was unavailable), never a debug dump, and never "reconnect".
+pub fn passing_sign_in(e: ConnError) -> ConnectorError {
+    match e {
+        ConnError::Busy {
+            why,
+            retry_after,
+            rate_limited: true,
+        } => ConnectorError::rate_limited(why, retry_after),
+        ConnError::Busy {
+            why, retry_after, ..
+        } => ConnectorError::unavailable(why, retry_after),
+        ConnError::Temporary(why) => ConnectorError::Temporary(why),
+        ConnError::NotConnected => ConnectorError::Reconnect("Nobody is signed in.".into()),
+        ConnError::NeedsReconnect(why) | ConnError::Failed(why) => ConnectorError::Reconnect(why),
+    }
+}
+
 /// A connector ready to call, and the settings it worked out on the way
 /// (Confluence: which site a sign-in reaches).
 pub struct Opened<'a> {
@@ -189,7 +208,7 @@ impl Env {
             Ok(None) | Err(ConnError::NotConnected) => Ok(None),
             Err(ConnError::NeedsReconnect(why)) => Err(ConnectorError::Reconnect(why)),
             Err(ConnError::Failed(why)) => Err(ConnectorError::Reconnect(why)),
-            Err(e) => Err(ConnectorError::Temporary(format!("{e:?}"))),
+            Err(e) => Err(passing_sign_in(e)),
         }
     }
 
