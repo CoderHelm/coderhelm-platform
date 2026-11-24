@@ -52,9 +52,12 @@ class Rules(unittest.TestCase):
         self.assertIn("AWS account id", rules("arn:aws:lambda:us-east-1:418273645091:function:w"))
         self.assertIn("AWS account id", rules("pushed to 418273645091.dkr.ecr.us-east-1.amazonaws.com"))
         self.assertIn("AWS account id", rules("the install's account 4182-7364-5091"))
+        self.assertEqual(rules("account 111122223333"), set())
         self.assertIn("AWS account id", rules("AWS_ACCOUNT_ID=418273645091"))
         self.assertEqual(rules("arn:aws:iam::111122223333:root, account id 123456789012"), set())
-        self.assertEqual(rules("processed 418273645091 bytes"), set())
+        self.assertEqual(rules("processed 418273645091 bytes"), {"12-digit number"})
+        self.assertEqual(rules("ids 4182-7364-5091 and 111122223333"), {"12-digit number"})
+        self.assertEqual(rules("ALAS2023-2025-1234, v1.418273645091, 4182736450912"), set())
 
     def test_team_ids(self):
         self.assertEqual(rules("pk TEAM#9f3a21"), {"TEAM# id"})
@@ -85,6 +88,62 @@ class Rules(unittest.TestCase):
         self.assertEqual(hits("ok\nok\nmail a@zorbmail.io\nQXZ-11", DENY), [(3, "email address"), (4, "Jira-style key")])
 
 
+class Hashes(unittest.TestCase):
+    # Synthetic terms, hashed here: only their digests reach the rule.
+    TERMS = ["Zorb Corp", "frobnitz", "acme-widget-sales-floor", "418273645091"]
+
+    def setUp(self):
+        self.hashes = set(g.hash_terms(io.StringIO("\n".join(self.TERMS) + "\n")))
+
+    def rules(self, text):
+        return {rule for _, rule in g.scan_lines(g.numbered(text), g.rules_for([], self.hashes))}
+
+    def test_normalize(self):
+        self.assertEqual(g.normalize("  Zorb_Corp's  API.v2! "), "zorb corp s api v2")
+        self.assertEqual(g.term_hash("ZORB--corp"), g.term_hash("zorb corp"))
+
+    def test_one_to_four_word_runs_match(self):
+        self.assertEqual(self.rules("Fixed for zorb-corp today"), {"denylisted term"})
+        self.assertEqual(self.rules("calls FROBNITZ.example.com"), {"denylisted term"})
+        self.assertEqual(self.rules("the Acme widget, sales floor"), {"denylisted term"})
+
+    def test_parts_and_neighbours_do_not_match(self):
+        self.assertEqual(self.rules("zorb alone, corp alone, frobnitzer, acme widget sales"), set())
+
+    def test_twelve_digit_numbers_match(self):
+        self.assertIn("denylisted term", self.rules("id 4182-7364-5091 in a table"))
+        self.assertEqual(self.rules("x418273645091y"), {"denylisted term"})
+        self.assertEqual(self.rules("4182736450912"), set())
+
+    def test_hash_file_parsing(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".sha256", delete=False) as f:
+            f.write("# header\n\n" + g.term_hash("frobnitz") + "  # one\nnot-a-digest\n")
+        try:
+            hashes, problems = g.load_hashes(f.name)
+        finally:
+            os.unlink(f.name)
+        self.assertEqual(hashes, {g.term_hash("frobnitz")})
+        self.assertEqual(problems, [f"{f.name} line 4 is not a SHA-256 hex digest"])
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(g.load_hashes("/nonexistent/text-guard.sha256"), (set(), []))
+
+    def test_failure_prints_no_term(self):
+        with tempfile.TemporaryDirectory() as d:
+            hf, tf = os.path.join(d, "h.sha256"), os.path.join(d, "t.md")
+            with open(hf, "w") as f:
+                f.write("\n".join(sorted(self.hashes)) + "\n")
+            with open(tf, "w") as f:
+                f.write("ok\nShipped for Zorb Corp\n")
+            out = io.StringIO()
+            env = {"GUARD_DENYLIST": "", "GUARD_HASH_FILE": hf}
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
+                code = g.main(["text_guard.py", "--text", tf])
+        self.assertEqual(code, 1)
+        self.assertIn("line 2: denylisted term", out.getvalue())
+        self.assertNotIn("zorb", out.getvalue().lower())
+
+
 class Diffs(unittest.TestCase):
     DIFF = (
         "diff --git a/docs/a.md b/docs/a.md\n"
@@ -113,7 +172,8 @@ class Output(unittest.TestCase):
             f.write(text)
         out = io.StringIO()
         try:
-            with mock.patch.dict(os.environ, {"GUARD_DENYLIST": deny}), contextlib.redirect_stdout(out):
+            env = {"GUARD_DENYLIST": deny, "GUARD_HASH_FILE": "/nonexistent/text-guard.sha256"}
+            with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out):
                 code = g.main(["text_guard.py", "--text", f.name])
         finally:
             os.unlink(f.name)
@@ -138,7 +198,7 @@ class Output(unittest.TestCase):
     def test_clean_text_passes_and_missing_denylist_warns(self):
         code, out = self.run_main("Retries a failed check once.\n", "")
         self.assertEqual(code, 0)
-        self.assertIn("GUARD_DENYLIST is not available", out)
+        self.assertIn("no denylist hashes or GUARD_DENYLIST", out)
 
 
 if __name__ == "__main__":
