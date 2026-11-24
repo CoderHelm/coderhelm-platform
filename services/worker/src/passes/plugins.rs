@@ -65,7 +65,7 @@ fn cipher(state: &WorkerState) -> common::mcp_credentials::Kms<'_> {
 
 /// The team's remote MCP servers (Connections page, OAuth or a key) for a
 /// plugin run, publish or results check.
-fn remote(
+pub(crate) fn remote(
     state: &WorkerState,
     team: &str,
     user: Option<&str>,
@@ -378,8 +378,8 @@ pub async fn sweep(state: &WorkerState) -> Res {
 /// The team's catalog MCP servers (the Connections page), through the MCP
 /// proxy. Remote OAuth servers join through `common::mcp_remote` once it is
 /// deployed.
-struct CatalogConnections<'a> {
-    state: &'a WorkerState,
+pub(crate) struct CatalogConnections<'a> {
+    pub(crate) state: &'a WorkerState,
 }
 
 impl CatalogConnections<'_> {

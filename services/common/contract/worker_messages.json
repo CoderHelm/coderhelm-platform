@@ -54,6 +54,7 @@
     "hybrid_name_check": {"type":"hybrid_name_check"},
     "support_sync": {"type":"support_sync"},
     "plugin_trigger": {"type":"plugin_trigger","team_id":"TEAM#team-a","plugin_id":"marketing","trigger":1},
-    "plugin_results": {"type":"plugin_results","team_id":"TEAM#team-a","artifact_id":"01hzzart"}
+    "plugin_results": {"type":"plugin_results","team_id":"TEAM#team-a","artifact_id":"01hzzart"},
+    "skill_run": {"type":"skill_run","team_id":"TEAM#team-a","schedule_id":"01hzzsched","trigger":"schedule","requested_by":"schedule"}
   }
 }

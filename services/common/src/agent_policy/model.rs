@@ -89,10 +89,12 @@ pub enum Agent {
     LogAutofix,
     /// A plugin's run.
     Plugin,
+    /// A scheduled run of a team skill (`skill_runs`).
+    SkillRun,
 }
 
 impl Agent {
-    pub const ALL: [Agent; 8] = [
+    pub const ALL: [Agent; 9] = [
         Agent::Planner,
         Agent::Coder,
         Agent::Reviewer,
@@ -101,6 +103,7 @@ impl Agent {
         Agent::AlertFixer,
         Agent::LogAutofix,
         Agent::Plugin,
+        Agent::SkillRun,
     ];
 
     pub fn key(self) -> &'static str {
@@ -113,6 +116,7 @@ impl Agent {
             Agent::AlertFixer => "alert_fixer",
             Agent::LogAutofix => "log_autofix",
             Agent::Plugin => "plugin",
+            Agent::SkillRun => "skill_run",
         }
     }
 
@@ -126,6 +130,7 @@ impl Agent {
             Agent::AlertFixer => "Alert fixer",
             Agent::LogAutofix => "Log auto-fix",
             Agent::Plugin => "Plugin runs",
+            Agent::SkillRun => "Skill runs",
         }
     }
 
@@ -139,6 +144,9 @@ impl Agent {
             Agent::AlertFixer => "Looks into alerts and proposes fixes.",
             Agent::LogAutofix => "Fixes log findings on its own when turned on.",
             Agent::Plugin => "Runs the team's installed plugins.",
+            Agent::SkillRun => {
+                "Runs the team's scheduled skills, read-only unless a schedule allows writes."
+            }
         }
     }
 

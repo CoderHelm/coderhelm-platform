@@ -412,6 +412,7 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
         | M::PluginSync(_)
         | M::PluginTrigger(_)
         | M::PluginResults(_)
+        | M::SkillRun(_)
         | M::SkillSync(_)
         | M::SkillAsk(_)
         | M::ToolProposals(_)
@@ -852,6 +853,12 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             info!(team_id = %msg.team_id, artifact = %msg.artifact_id, "Plugin results");
             if let Err(e) = passes::plugins::results(&state, msg).await {
                 error!("Plugin results failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::SkillRun(msg) => {
+            info!(team_id = %msg.team_id, schedule = %msg.schedule_id, trigger = %msg.trigger, "Skill run");
+            if let Err(e) = passes::skill_schedule::run(&state, msg).await {
+                error!("Skill run failed: {e:?}");
             }
         }
         models::WorkerMessage::SkillSync(msg) => {

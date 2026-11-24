@@ -91,6 +91,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "plugin_sync",
     "plugin_sweep",
     "plugin_trigger",
+    "skill_run",
     "plugin_results",
     // Hybrid names: the 15 minute check (hosted side only).
     "hybrid_name_check",
