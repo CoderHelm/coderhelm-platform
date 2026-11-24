@@ -101,6 +101,10 @@ async fn main() -> Result<(), Error> {
         secrets,
     });
 
+    // The first start of a new release runs the self-heal sweep once:
+    // failed runs this release now gets past resume right after the deploy.
+    passes::recover::on_new_release(&state).await;
+
     lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
         // Boxed: the event's future lives on the heap, never on the main
         // thread's stack (see `future_sizes` below).
@@ -1037,6 +1041,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 error!("Usage reconciliation failed: {e}");
             }
         }
+        models::WorkerMessage::SelfHealSweep => {
+            passes::recover::self_heal_sweep(&state).await;
+        }
         models::WorkerMessage::AgentResumeSweep => {
             let store = agent::policy::store(&state);
             let sent = common::agent_policy::pause::sweep(&*store, &SqsResender(&state)).await;
@@ -1044,6 +1051,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         models::WorkerMessage::RunWaiting(msg) => {
             passes::webhooks::run_waiting(&state, &msg).await;
+        }
+        models::WorkerMessage::ChangeWaitCheck(msg) => {
+            passes::change_wait::check_all(&state, Some(&msg.team_id)).await;
         }
         models::WorkerMessage::RoleReadsWait(msg) => {
             passes::role_wait::check(&state, &msg).await;

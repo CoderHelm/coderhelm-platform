@@ -73,10 +73,14 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "aws_permissions_sweep",
     // Resumes agent work kept while a team's agents were paused.
     "agent_resume_sweep",
+    // Resumes failed runs CoderHelm now gets past by itself.
+    "self_heal_sweep",
     // A run waiting on a person: its reminder (from the stuck-run sweep).
     "run_waiting",
     // A run waiting for the AWS role's reads: its re-check (`role_wait`).
     "role_reads_wait",
+    // A team's runs waiting for another change read it again.
+    "change_wait_check",
     // A model call's usage, held because its counters couldn't be written.
     "usage_record",
     // Knowledge sources: the scheduled sweep, and one source's sync.
@@ -111,6 +115,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "log_autofix",
     "aws_permissions_sweep",
     "agent_resume_sweep",
+    "self_heal_sweep",
     "knowledge_sync_sweep",
     "plugin_sweep",
     "hybrid_name_check",

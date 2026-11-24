@@ -210,18 +210,26 @@ pub trait NeedsInput {
 
 impl NeedsInput for UpdateItemFluentBuilder {
     fn needs_input(self, run_id: &str, wait: &WaitingOn, why: &HandBack) -> Self {
-        let mut wait = wait.clone();
-        wait.handback = why.why().code().to_string();
-        if wait.detail.trim().is_empty() {
-            wait.detail = bounded(why.need(), MAX_DETAIL_CHARS);
-        }
-        self.expression_attribute_values(":s", AttributeValue::S(NEEDS_INPUT.into()))
-            .expression_attribute_values(
-                ":sri",
-                AttributeValue::S(format!("{NEEDS_INPUT}#{run_id}")),
-            )
-            .expression_attribute_values(":wo", wait.to_attr())
+        let [s, sri, wo] = needs_input_values(run_id, wait, why);
+        self.expression_attribute_values(":s", s)
+            .expression_attribute_values(":sri", sri)
+            .expression_attribute_values(":wo", wo)
     }
+}
+
+/// The values [`NeedsInput::needs_input`] sets, in order `:s`, `:sri` and
+/// `:wo`: for a write built without a client (`run_fail::update`).
+pub fn needs_input_values(run_id: &str, wait: &WaitingOn, why: &HandBack) -> [AttributeValue; 3] {
+    let mut wait = wait.clone();
+    wait.handback = why.why().code().to_string();
+    if wait.detail.trim().is_empty() {
+        wait.detail = bounded(why.need(), MAX_DETAIL_CHARS);
+    }
+    [
+        AttributeValue::S(NEEDS_INPUT.into()),
+        AttributeValue::S(format!("{NEEDS_INPUT}#{run_id}")),
+        wait.to_attr(),
+    ]
 }
 
 /// Whether a run waiting since `since` is due its one reminder at `now`:

@@ -55,6 +55,7 @@ impl Group {
             rs::NEEDS_INPUT,
             rs::NEEDS_OUTSIDE_CHANGE,
             rs::AWAITING_SETUP,
+            rs::AWAITING_CHANGE,
         ];
         match self {
             // Archived runs show only when asked for by run id.

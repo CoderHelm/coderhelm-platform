@@ -432,7 +432,7 @@ async fn try_auto_continue(
         .send_message()
         .queue_url(&state.config.ticket_queue_url)
         .message_body(body)
-        .delay_seconds(steps::STEP_DELAY_SECS)
+        .delay_seconds(steps::STEP_DELAY_SECS.max(msg.retry_after_secs.min(900) as i32))
         .send()
         .await
     {
@@ -455,6 +455,23 @@ async fn try_auto_continue(
             Handoff::Stopped(format!("the next step couldn't be queued ({e})"))
         }
     }
+}
+
+/// Sends the run's next step (the same run, its own triage, plan and
+/// checkpoint) after `delay_secs`, from wherever the run stands, within
+/// [`try_auto_continue`]'s ceilings: the team's usage, the step ceiling and
+/// the run guard.
+pub(crate) async fn send_next_step(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    why: &str,
+    owed: bool,
+    delay_secs: i32,
+) -> Handoff {
+    let mut m = msg.clone();
+    m.retry_after_secs = delay_secs.max(0) as u32;
+    try_auto_continue(state, &m, run_id, &None, &[], true, why, owed).await
 }
 
 /// The cap on how many times the automated post-PR loops (CI-fix,
@@ -1269,6 +1286,8 @@ pub mod aws_permissions;
 pub mod base_images;
 pub mod bedrock_sync;
 mod branch_update;
+/// A run waiting for another change to merge (`common::change_wait`).
+pub mod change_wait;
 mod checks;
 pub(crate) mod ci_repro;
 pub mod code_graph;
@@ -1386,6 +1405,9 @@ pub mod quarantine_work;
 /// Whether a finished run's pull request leaves draft, decided in one place.
 pub mod ready;
 pub mod recheck;
+/// One recovery path for every pass error: retry, repair and resume, or
+/// hand to a person in plain words (`common::run_recovery`).
+pub mod recover;
 pub mod related;
 pub mod relay_retry;
 pub mod release_notes;
@@ -1707,29 +1729,6 @@ pub async fn orchestrate_ticket(
                     )
                     .await
                     .continued();
-                // An error after the work started that names nothing only a
-                // person has gets one fresh step first (`supervisor`): most
-                // are passing (a GitHub refusal, a check that errored once).
-                // A step after it that made no progress ships what is done.
-                let continued = continued
-                    || !guard_ended
-                        && paused.is_none()
-                        && supervisor::human_only_in(&err_msg).is_none()
-                        && e.downcast_ref::<stack::Refused>().is_none()
-                        && crate::agent::policy::claim_stop(&run_id).is_none()
-                        && steps::load(state, &msg.team_id, &run_id).await.stalled == 0
-                        && try_auto_continue(
-                            state,
-                            &msg,
-                            &run_id,
-                            &checkpoint,
-                            &["implement", "implement_started", "security"],
-                            false,
-                            "A step after the work stopped on an error; the next one tries again",
-                            false,
-                        )
-                        .await
-                        .continued();
                 // A transient model failure (5xx incl. 520-524, 429, 529, no
                 // response) that outlasted the client's own retries is not the
                 // ticket's fault: the run is sent again later (same run_id), by
@@ -1742,6 +1741,28 @@ pub async fn orchestrate_ticket(
                         common::model_retry::is_transient_model_error(err)
                             && requeue_after_model_error(state, &msg, &run_id).await
                     };
+                // Every other pass error takes the one recovery path before
+                // anything is marked failed (`recover`): transient errors try
+                // again after a backoff, a state CoderHelm can repair is
+                // repaired and the same pass resumes from its checkpoint,
+                // the same error again with no progress takes another
+                // strategy, and only what a person must do stops the run, as
+                // "needs you" in plain words. An unclassified error is tried
+                // again once.
+                let mut needs_you: Option<common::run_recovery::NeedsYou> = None;
+                let continued = continued
+                    || !guard_ended
+                        && e.downcast_ref::<stack::Refused>().is_none()
+                        && crate::agent::policy::claim_stop(&run_id).is_none()
+                        && match recover::after_error(state, &msg, &run_id, &*e, &checkpoint).await
+                        {
+                            recover::AfterError::Continued => true,
+                            recover::AfterError::NeedsYou(n) => {
+                                needs_you = Some(n);
+                                false
+                            }
+                            recover::AfterError::NotHandled => false,
+                        };
                 // A run stopped after its work started (mid-implement or by a
                 // check after it) with work on its branch gets the standard
                 // held draft (`stop_pr`): its ticket line, what is done and
@@ -1755,9 +1776,11 @@ pub async fn orchestrate_ticket(
                         && e.downcast_ref::<stack::Refused>().is_none()
                         && crate::agent::policy::claim_stop(&run_id).is_none()
                     {
-                        match stop_pr::open(state, &msg, &run_id, branch, &sanitize_error(&err_msg))
-                            .await
-                        {
+                        let why = needs_you
+                            .as_ref()
+                            .map(|n| format!("{} {}.", n.detail, n.action))
+                            .unwrap_or_else(|| sanitize_error(&err_msg));
+                        match stop_pr::open(state, &msg, &run_id, branch, &why).await {
                             // Named only when GitHub gave it a number: a
                             // refused pull request waits on a person with
                             // GitHub's reason, and is never logged as opened.
@@ -1788,8 +1811,16 @@ pub async fn orchestrate_ticket(
                     false
                 };
                 if !continued && !salvaged && !guard_ended {
-                    let sanitized = sanitize_error(&err_msg);
-                    fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
+                    match &needs_you {
+                        Some(n) => {
+                            recover::stop_for_person(state, &msg, &run_id, n, &usage, duration)
+                                .await
+                        }
+                        None => {
+                            let sanitized = sanitize_error(&err_msg);
+                            fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
+                        }
+                    }
                 }
                 // A wait that couldn't be taken still names GitHub, never the
                 // coder.
@@ -2727,6 +2758,31 @@ async fn run_passes(
     let checkpoint = match checkpoint {
         Some(c) => Some(c),
         None => inherited_checkpoint(state, msg, run_id, &github, usage).await,
+    };
+    // A checkpoint's branch is this run's work only when it is in the run's
+    // repository. One that isn't (another repository's branch from a
+    // multi-repo step, or a branch never pushed) goes back to the plan: the
+    // pass starts again on this repository's own branch, created before
+    // any compare, and is never planned again.
+    let checkpoint = match checkpoint {
+        Some((pass, branch, cycle))
+            if !branch.is_empty()
+                && recover::branch_missing(&github, &msg.repo_owner, &msg.repo_name, &branch)
+                    .await =>
+        {
+            warn!(run_id, branch = %branch, "The checkpoint's branch isn't in the run's repository: back to the plan");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &recover::stale_checkpoint_note(&branch, &msg.repo_owner, &msg.repo_name),
+            )
+            .await;
+            checkpoint_back_to_plan(state, &msg.team_id, run_id).await;
+            let _ = pass;
+            Some(("plan".to_string(), String::new(), cycle))
+        }
+        other => other,
     };
     let can_skip_implement = checkpoint.as_ref().is_some_and(|(last_pass, branch, _)| {
         !branch.is_empty()
@@ -5416,6 +5472,27 @@ false,
             }
 
             for (repo_task, repo_branch) in plan_result.repo_tasks.iter().zip(repo_branches) {
+                // Each repository's coder starts with a step's full time, as
+                // the single-repository coder does: planning (or the
+                // repositories before this one) can use most of a step, and
+                // a coder started with a minute left writes nothing. The
+                // next step resumes here from each repository's own
+                // checkpoint, never planning again.
+                if remaining_secs(start) < MIN_TIME_FOR_IMPLEMENT_SECS {
+                    let handoff = send_next_step(
+                        state,
+                        msg,
+                        run_id,
+                        "This step has too little time left for the next repository's coder; it starts in a fresh one",
+                        false,
+                        steps::STEP_DELAY_SECS,
+                    )
+                    .await;
+                    if handoff.continued() {
+                        close_memory(state, agent_memory.take()).await;
+                        return Ok(());
+                    }
+                }
                 // A pull request in a repository other than the ticket's asks
                 // the team's agent permissions first.
                 let full = format!("{}/{}", repo_task.owner, repo_task.name);
@@ -5514,17 +5591,15 @@ false,
                 .collect();
             pr::link_siblings(&github, &siblings).await;
 
-            // Save checkpoint + set awaiting_ci with all PRs
-            save_checkpoint(
-                state,
-                &msg.team_id,
-                run_id,
-                "pr",
-                &pr_results[0].branch,
-                0,
-                usage,
-            )
-            .await;
+            // Save checkpoint + set awaiting_ci with all PRs. The run's own
+            // checkpoint names a branch of the run's repository only: the
+            // others' are on their own checkpoints.
+            if let Some(own) = pr_results.iter().find(|p| {
+                format!("{}/{}", p.repo.0, p.repo.1)
+                    .eq_ignore_ascii_case(&format!("{}/{}", msg.repo_owner, msg.repo_name))
+            }) {
+                save_checkpoint(state, &msg.team_id, run_id, "pr", &own.branch, 0, usage).await;
+            }
 
             let duration = start.elapsed().as_secs();
             let now = chrono::Utc::now().to_rfc3339();
@@ -8115,8 +8190,44 @@ async fn run_repo_pipeline(
     let repo_owner = &msg.repo_owner;
     let repo_name = &msg.repo_name;
 
+    // This repository's own checkpoint (never the run's: that one is the
+    // run repository's). A repository whose pull request is open already is
+    // done; one whose work is on its branch goes on from it.
+    let own = load_repo_checkpoint(state, &msg.team_id, run_id, repo_owner, repo_name)
+        .await
+        .filter(|(_, b, _)| b == branch_name);
+    if let Some((pass, _, _)) = &own {
+        if pass == "pr" {
+            if let Ok(Some(pr)) = github
+                .find_open_pr_for_branch(repo_owner, repo_name, branch_name)
+                .await
+            {
+                let number = pr["number"].as_u64().unwrap_or(0);
+                if number > 0 {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!("{repo_owner}/{repo_name}: pull request #{number} is open already; nothing to redo"),
+                    )
+                    .await;
+                    return Ok(RepoPrResult {
+                        repo: (repo_owner.to_string(), repo_name.to_string()),
+                        branch: branch_name.to_string(),
+                        base: base_branch.to_string(),
+                        pr_number: number,
+                        pr_url: pr["html_url"].as_str().unwrap_or("").to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let implemented_before = own
+        .as_ref()
+        .is_some_and(|(pass, _, _)| matches!(pass.as_str(), "implement" | "security" | "pr"));
+
     // Create working branch (a branch with an open pull request keeps its
-    // head; the note says which).
+    // head; the note says which). It is made before anything compares it.
     let (_, started) = github
         .start_branch(repo_owner, repo_name, branch_name, base_branch)
         .await?;
@@ -8148,24 +8259,56 @@ async fn run_repo_pipeline(
 
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let impl_result = implement::run(
-        state,
-        msg,
-        github,
-        &repo_plan,
-        branch_name,
-        rules,
-        repo_instructions,
-        None,
-        complexity,
-        provider,
-        usage,
-        file_cache,
-        Some(run_id),
-        implement_deadline,
-        write_guard::RoundFor::PlanTasks,
-    )
-    .await?;
+    let impl_result = if implemented_before {
+        // Its work is on its branch from an earlier step: what the branch
+        // holds is the work (a compare of a branch not pushed yet is no
+        // diff, never an error).
+        let diff = github
+            .get_diff(repo_owner, repo_name, base_branch, branch_name)
+            .await?;
+        let files_modified: Vec<String> = diff["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ci_commands = checks::detect_ci(github, repo_owner, repo_name, base_branch).await;
+        implement::ImplementResult {
+            files_modified,
+            timed_out: false,
+            conversation_log: vec![],
+            writes: Default::default(),
+            outside_plan: Vec::new(),
+            refused: Vec::new(),
+            owed: Vec::new(),
+            evidence: proof::RunEvidence {
+                ci_gates: checks::kinds_from(&ci_commands),
+                ci_commands,
+                ..Default::default()
+            },
+        }
+    } else {
+        implement::run(
+            state,
+            msg,
+            github,
+            &repo_plan,
+            branch_name,
+            rules,
+            repo_instructions,
+            None,
+            complexity,
+            provider,
+            usage,
+            file_cache,
+            Some(run_id),
+            implement_deadline,
+            write_guard::RoundFor::PlanTasks,
+        )
+        .await?
+    };
     write_pass_trace(
         state,
         &msg.team_id,
@@ -8183,16 +8326,6 @@ async fn run_repo_pipeline(
         run_id,
         &format!("implement_{repo_owner}_{repo_name}"),
         &impl_result.conversation_log,
-    )
-    .await;
-    save_checkpoint(
-        state,
-        &msg.team_id,
-        run_id,
-        "implement",
-        branch_name,
-        0,
-        usage,
     )
     .await;
 
@@ -8255,6 +8388,20 @@ async fn run_repo_pipeline(
             }
         }
     }
+    // Only work that is on the branch is a checkpoint, and only this
+    // repository's: a coder that wrote nothing leaves none, so the next
+    // step builds it again instead of resuming from an empty branch.
+    save_repo_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        repo_owner,
+        repo_name,
+        "implement",
+        branch_name,
+        usage,
+    )
+    .await;
     let mut plan_optional: Vec<proof::Finding> = Vec::new();
     if let Some(cov) = plan_coverage::close_gaps(
         &plan_coverage::Work {
@@ -8405,13 +8552,14 @@ async fn run_repo_pipeline(
         None,
     )
     .await;
-    save_checkpoint(
+    save_repo_checkpoint(
         state,
         &msg.team_id,
         run_id,
+        repo_owner,
+        repo_name,
         "security",
         branch_name,
-        0,
         usage,
     )
     .await;
@@ -8835,6 +8983,19 @@ async fn run_repo_pipeline(
         }
     }
 
+    // This repository is done: a later step finds its pull request open
+    // and redoes nothing.
+    save_repo_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        repo_owner,
+        repo_name,
+        "pr",
+        branch_name,
+        usage,
+    )
+    .await;
     Ok(RepoPrResult {
         repo: (repo_owner.to_string(), repo_name.to_string()),
         branch: branch_name.to_string(),
@@ -9286,6 +9447,18 @@ async fn finish_without_code(
     // final check leaves them; with none, the run waits for the role's
     // reads it was refused, or plans again.
     let mut waiting: Option<common::role_wait::Waiting> = None;
+    // What the ticket changes may not exist yet because another ticket's
+    // change makes it: that is something to wait for, never "waits for
+    // nothing". The run waits for that change (one note on the ticket) and
+    // goes on by itself once it merges (`change_wait`).
+    if outside {
+        if let Some(dep) =
+            change_wait::dependency_for(state, msg, run_id, decision.cause.trim()).await
+        {
+            change_wait::begin(state, msg, run_id, dep, usage).await;
+            return NoCodeEnd::Ended;
+        }
+    }
     if outside {
         let report = fix_location::outside_report(decision, false);
         let left =
@@ -10695,7 +10868,24 @@ pub(crate) async fn fail_run(
         only_from: None,
         extra,
         add: usage_adds(&delta),
+        needs: None,
     };
+    // The stop is read first (`common::run_recovery::ending`): only an
+    // error the self-heal sweep resumes is parked as `failed`; anything
+    // else waits on a person, saying what to do. The ticket hears the plain
+    // words, never the raw error.
+    let ended_as = common::run_fail::status_for(error_msg);
+    let said = match common::run_recovery::ending(error_msg) {
+        common::run_recovery::Ending::Parked(c) => {
+            format!("{} CoderHelm resumes the run by itself.", c.plain)
+        }
+        common::run_recovery::Ending::NeedsYou(_, n) => format!("{} {}.", n.detail, n.action),
+    };
+    if ended_as == common::run_fail::STATUS {
+        // The continuation the self-heal sweep sends: the same run, from
+        // its checkpoint and its own plan.
+        recover::keep_resume_message(state, msg, run_id).await;
+    }
     match common::run_fail::fail_run(
         &state.dynamo,
         &state.config.runs_table_name,
@@ -10707,7 +10897,11 @@ pub(crate) async fn fail_run(
     {
         Ok(true) => {
             usage.mark_recorded(&delta);
-            self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await;
+            if ended_as == common::run_fail::STATUS {
+                self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await;
+            } else {
+                self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+            }
             release_blocked_pr(state, msg).await
         }
         // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
@@ -10716,24 +10910,26 @@ pub(crate) async fn fail_run(
     }
 
     // Update analytics counters (include tokens so billing stays accurate)
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        let _ = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("period", attr_s(period))
-            .update_expression("ADD failed :one")
-            .expression_attribute_values(":one", attr_n(1))
-            .send()
-            .await;
+    if ended_as == common::run_fail::STATUS {
+        let month = chrono::Utc::now().format("%Y-%m").to_string();
+        for period in &[month.as_str(), "ALL_TIME"] {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.analytics_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("period", attr_s(period))
+                .update_expression("ADD failed :one")
+                .expression_attribute_values(":one", attr_n(1))
+                .send()
+                .await;
+        }
     }
 
     // Check token usage against limit and send warning if needed
     check_token_usage_warning(state, &msg.team_id, usage).await;
 
-    notify_ticket_failed(state, msg, run_id, error_msg).await;
+    notify_ticket_failed(state, msg, run_id, &said).await;
 }
 
 /// Tells the ticket the run failed and why: a GitHub issue comment or a Jira
@@ -13285,11 +13481,108 @@ mod trace_name_tests {
     }
 }
 
+/// The run's own checkpoint item.
+fn run_checkpoint_key(run_id: &str) -> String {
+    format!("RUN#{run_id}")
+}
+
+/// The checkpoint of one repository's pipeline in a multi-repo run: kept
+/// apart from the run's own, so the run's resume never takes another
+/// repository's branch for its own (a compare of that branch in the run's
+/// repository is a 404: the branch was only ever made in the other one).
+pub(crate) fn repo_checkpoint_key(run_id: &str, owner: &str, repo: &str) -> String {
+    format!(
+        "RUN#{run_id}#REPO#{}/{}",
+        owner.to_lowercase(),
+        repo.to_lowercase()
+    )
+}
+
 /// Save a checkpoint after a pass completes so runs can resume on Lambda timeout.
 pub(crate) async fn save_checkpoint(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
+    last_pass: &str,
+    branch: &str,
+    review_cycle: u8,
+    usage: &TokenUsage,
+) {
+    save_checkpoint_at(
+        state,
+        team_id,
+        &run_checkpoint_key(run_id),
+        last_pass,
+        branch,
+        review_cycle,
+        usage,
+    )
+    .await
+}
+
+/// One repository's pipeline checkpoint in a multi-repo run
+/// ([`repo_checkpoint_key`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_repo_checkpoint(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    last_pass: &str,
+    branch: &str,
+    usage: &TokenUsage,
+) {
+    save_checkpoint_at(
+        state,
+        team_id,
+        &repo_checkpoint_key(run_id, owner, repo),
+        last_pass,
+        branch,
+        0,
+        usage,
+    )
+    .await
+}
+
+/// [`save_repo_checkpoint`]'s checkpoint, when there is one.
+pub(crate) async fn load_repo_checkpoint(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<(String, String, u8)> {
+    load_checkpoint_at(state, team_id, &repo_checkpoint_key(run_id, owner, repo)).await
+}
+
+/// The run's checkpoint goes back to its plan (recovery): the next step
+/// starts the pass again from the plan it already has, never planning
+/// again. Its token counts and step marks are kept.
+pub(crate) async fn checkpoint_back_to_plan(state: &WorkerState, team_id: &str, run_id: &str) {
+    if state.config.checkpoints_table_name.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.checkpoints_table_name)
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(run_checkpoint_key(run_id)))
+        .update_expression("SET last_pass = :lp, branch = :b REMOVE gate, gate_carry")
+        .expression_attribute_values(":lp", AttributeValue::S("plan".into()))
+        .expression_attribute_values(":b", AttributeValue::S(String::new()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not move the checkpoint back to the plan");
+    }
+}
+
+async fn save_checkpoint_at(
+    state: &WorkerState,
+    team_id: &str,
+    sk: &str,
     last_pass: &str,
     branch: &str,
     review_cycle: u8,
@@ -13321,7 +13614,7 @@ pub(crate) async fn save_checkpoint(
         .update_item()
         .table_name(&state.config.checkpoints_table_name)
         .key("team_id", AttributeValue::S(team_id.to_string()))
-        .key("sk", AttributeValue::S(format!("RUN#{run_id}")))
+        .key("sk", AttributeValue::S(sk.to_string()))
         .update_expression(expr)
         .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_names("#tin", "tokens_in")
@@ -13394,10 +13687,18 @@ async fn inherited_checkpoint(
     Some((last, branch, cycle))
 }
 
-async fn load_checkpoint(
+pub(crate) async fn load_checkpoint(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
+) -> Option<(String, String, u8)> {
+    load_checkpoint_at(state, team_id, &run_checkpoint_key(run_id)).await
+}
+
+async fn load_checkpoint_at(
+    state: &WorkerState,
+    team_id: &str,
+    sk: &str,
 ) -> Option<(String, String, u8)> {
     if state.config.checkpoints_table_name.is_empty() {
         return None;
@@ -13407,7 +13708,7 @@ async fn load_checkpoint(
         .get_item()
         .table_name(&state.config.checkpoints_table_name)
         .key("team_id", AttributeValue::S(team_id.to_string()))
-        .key("sk", AttributeValue::S(format!("RUN#{run_id}")))
+        .key("sk", AttributeValue::S(sk.to_string()))
         .send()
         .await
         .ok()?;

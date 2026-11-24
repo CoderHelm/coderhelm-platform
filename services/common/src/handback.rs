@@ -37,6 +37,11 @@ pub enum HumanOnly {
     /// A person stopped, reopened, redirected the run, or put its pull
     /// request back to draft.
     PersonAction,
+    /// An error CoderHelm tried to get past by itself (a retry for one it
+    /// doesn't know, each repair strategy for one it does) and met again
+    /// every time: a person looks at what the run names
+    /// (`run_recovery`). Never for a stall, a red check or a budget.
+    Unrepaired,
 }
 
 /// Every reason on the list.
@@ -49,6 +54,7 @@ pub const HUMAN_ONLY: &[HumanOnly] = &[
     HumanOnly::UsageLimit,
     HumanOnly::Approval,
     HumanOnly::PersonAction,
+    HumanOnly::Unrepaired,
 ];
 
 impl HumanOnly {
@@ -63,6 +69,7 @@ impl HumanOnly {
             HumanOnly::UsageLimit => "usage_limit",
             HumanOnly::Approval => "approval",
             HumanOnly::PersonAction => "person_action",
+            HumanOnly::Unrepaired => "unrepaired_error",
         }
     }
 
@@ -81,6 +88,7 @@ impl HumanOnly {
             HumanOnly::UsageLimit => "the team's usage limit",
             HumanOnly::Approval => "an approval",
             HumanOnly::PersonAction => "a person's action on the run",
+            HumanOnly::Unrepaired => "an error CoderHelm couldn't get past by itself",
         }
     }
 }

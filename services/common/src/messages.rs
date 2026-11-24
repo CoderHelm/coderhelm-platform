@@ -210,6 +210,12 @@ pub enum WorkerMessage {
     /// passing needs nobody to click anything).
     #[serde(rename = "agent_resume_sweep")]
     AgentResumeSweep,
+    /// On deploy and every 15 minutes (EventBridge, then SQS): runs left
+    /// failed on an error CoderHelm now gets past by itself (transient, or a
+    /// state it repairs) are resumed from their checkpoint, at most once per
+    /// run per deploy (the worker's `passes::recover`).
+    #[serde(rename = "self_heal_sweep")]
+    SelfHealSweep,
     /// A run waiting on a person, from the stuck-run sweep: its one
     /// reminder, or the notice for a wait the sweep just named (a run left
     /// `needs_input` with nothing asked). Sent as the usual
@@ -222,6 +228,11 @@ pub enum WorkerMessage {
     /// sends one too).
     #[serde(rename = "role_reads_wait")]
     RoleReadsWait(RoleReadsWaitMessage),
+    /// A pull request of the team merged or closed: its runs waiting for
+    /// another change (`awaiting_change`, `crate::change_wait`) read their
+    /// dependency again (the self-heal sweep checks every 15 minutes too).
+    #[serde(rename = "change_wait_check")]
+    ChangeWaitCheck(ChangeWaitCheckMessage),
     /// One plugin run: a brief, a schedule or a release (see
     /// `plugins::run`).
     #[serde(rename = "plugin_run")]
@@ -477,8 +488,10 @@ impl WorkerMessage {
             | WorkerMessage::DlqCleanup
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::SelfHealSweep
             | WorkerMessage::RunWaiting(_)
             | WorkerMessage::RoleReadsWait(_)
+            | WorkerMessage::ChangeWaitCheck(_)
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
             | WorkerMessage::HybridNameCheck
@@ -555,8 +568,10 @@ impl WorkerMessage {
             | WorkerMessage::RewardOutcome(_)
             | WorkerMessage::JiraComment(_)
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::SelfHealSweep
             | WorkerMessage::RunWaiting(_)
             | WorkerMessage::RoleReadsWait(_)
+            | WorkerMessage::ChangeWaitCheck(_)
             | WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
@@ -852,6 +867,12 @@ pub struct RunWaitingMessage {
     /// worker goes ahead with its recommended default.
     #[serde(default)]
     pub why: String,
+}
+
+/// Read again the dependency of a team's runs waiting for another change.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeWaitCheckMessage {
+    pub team_id: String,
 }
 
 /// Re-check the role of a run waiting for the install's "AWS role reads"
@@ -1154,6 +1175,11 @@ pub struct TicketMessage {
     /// How many times this ticket has already been auto-continued. Hard cap.
     #[serde(default)]
     pub continuation: u32,
+    /// Seconds the next step waits before it starts: a recovery's backoff
+    /// (the worker's `passes::recover`). Read once when the next step is
+    /// sent, never carried past it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retry_after_secs: u32,
     /// Reuse this run_id across continuations so it's ONE run, not duplicates.
     #[serde(default)]
     pub continuation_run_id: Option<String>,
@@ -1343,6 +1369,7 @@ impl Default for TicketMessage {
             base_branch: default_branch(),
             image_attachments: Vec::new(),
             continuation: 0,
+            retry_after_secs: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
             resume_from: None,
