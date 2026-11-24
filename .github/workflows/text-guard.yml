@@ -1,15 +1,16 @@
 name: Public text guard
 
 # The words a pull request publishes (title, body, commit messages, added
-# lines under docs/) carry no details from a customer install: no names or
-# hosts from GUARD_DENYLIST, AWS account ids, TEAM# ids, ULID run ids, Jira
-# keys or email addresses (.github/scripts/text_guard.py). It runs on its own,
-# not in CI, so editing a PR's text reruns only this check and never cancels
-# or skips the build.
+# lines under docs/) carry no details from a customer install: no denylisted
+# terms (.github/text-guard.sha256, and GUARD_DENYLIST when it is set), AWS
+# account ids, TEAM# ids, ULID run ids, Jira keys or email addresses
+# (.github/scripts/text_guard.py). CI's first job runs the same guard on
+# every push; this workflow reruns it when the PR's title or body is edited,
+# on its own so an edit never cancels or skips the build.
 on:
   pull_request:
     branches: [main]
-    types: [opened, edited, synchronize, reopened]
+    types: [edited]
 
 permissions:
   contents: read
