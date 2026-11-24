@@ -28,7 +28,7 @@ const OLD_FIX: &str = "CI failed — attempting fix";
 const WORKFLOW: &str = "E2E";
 
 fn now() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 2, 12, 9, 0, 0).unwrap()
+    Utc.with_ymd_and_hms(2030, 2, 14, 9, 0, 0).unwrap()
 }
 
 /// What the repository saw that week: two other pull requests whose E2E

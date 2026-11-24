@@ -1,12 +1,12 @@
 //! au. An outside reviewer checked a dependency security pull request of
-//! about fifty packages, four of them across a major version. The code was
+//! dozens of packages, several of them across a major version. The code was
 //! sound. The account of it was not:
 //!
-//! 1. "three high advisories left" was counted from CoderHelm's own
+//! 1. the number of high advisories left was counted from CoderHelm's own
 //!    findings; the package manager's production audit of the same head
-//!    showed one, in a package the pull request does not touch;
-//! 2. one package of a framework was raised to 10.4.22 while its siblings
-//!    from the same source repository stayed at 10.4.15;
+//!    showed fewer, in a package the pull request does not touch;
+//! 2. one package of a framework was raised while its siblings from the
+//!    same source repository stayed at the older version;
 //! 3. no type check was recorded, because the repository's CI has none and
 //!    CoderHelm's checks mirrored CI; the reviewer ran it themselves, and
 //!    a frozen-lockfile install with the package manager version the
@@ -67,9 +67,9 @@ fn lockfile(versions: &[(&str, &str)]) -> String {
 /// an upload middleware about to cross a major, a development tool, and
 /// two packages the change never touches.
 const BASE: &[(&str, &str)] = &[
-    ("@lattice/common", "10.4.15"),
-    ("@lattice/core", "10.4.15"),
-    ("@lattice/platform-http", "10.4.15"),
+    ("@lattice/common", "10.6.1"),
+    ("@lattice/core", "10.6.1"),
+    ("@lattice/platform-http", "10.6.1"),
     ("shape-check", "3.2.0"),
     ("upload-kit", "1.4.5"),
     ("lint-kit", "8.0.0"),
@@ -79,9 +79,9 @@ const BASE: &[(&str, &str)] = &[
 
 /// The head the reviewed pull request had: one member of the family raised.
 const SPLIT_HEAD: &[(&str, &str)] = &[
-    ("@lattice/common", "10.4.22"),
-    ("@lattice/core", "10.4.15"),
-    ("@lattice/platform-http", "10.4.15"),
+    ("@lattice/common", "10.6.3"),
+    ("@lattice/core", "10.6.1"),
+    ("@lattice/platform-http", "10.6.1"),
     ("shape-check", "4.0.1"),
     ("upload-kit", "2.0.2"),
     ("lint-kit", "8.0.0"),
@@ -91,9 +91,9 @@ const SPLIT_HEAD: &[(&str, &str)] = &[
 
 /// The head the pipeline makes: the family moved as one.
 const WHOLE_HEAD: &[(&str, &str)] = &[
-    ("@lattice/common", "10.4.22"),
-    ("@lattice/core", "10.4.22"),
-    ("@lattice/platform-http", "10.4.22"),
+    ("@lattice/common", "10.6.3"),
+    ("@lattice/core", "10.6.3"),
+    ("@lattice/platform-http", "10.6.3"),
     ("shape-check", "4.0.1"),
     ("upload-kit", "2.0.2"),
     ("lint-kit", "8.0.0"),
@@ -135,16 +135,16 @@ fn registry() -> Vec<fam::Known> {
 /// The family, found the way the run finds it at its start.
 fn family() -> fam::Family {
     let base = copies(BASE);
-    let candidates = fam::candidates("@lattice/common", "10.4.15", &base);
+    let candidates = fam::candidates("@lattice/common", "10.6.1", &base);
     assert_eq!(candidates, vec!["@lattice/core", "@lattice/platform-http"]);
     let mut f =
-        fam::detect("@lattice/common", "10.4.15", LOCK, &base, &registry(), &[]).expect("a family");
+        fam::detect("@lattice/common", "10.6.1", LOCK, &base, &registry(), &[]).expect("a family");
     let published = f
         .members
         .iter()
-        .map(|m| (m.clone(), vec!["10.4.22".to_string()]))
+        .map(|m| (m.clone(), vec!["10.6.3".to_string()]))
         .collect();
-    f.target = fam::target(&f, &["10.4.22".to_string()], &published).unwrap();
+    f.target = fam::target(&f, &["10.6.3".to_string()], &published).unwrap();
     f
 }
 
@@ -155,9 +155,9 @@ fn family() -> fam::Family {
 fn a_family_moves_together_and_a_split_one_fails_the_set() {
     let f = family();
     assert_eq!(f.key, "lattice-js/lattice");
-    assert_eq!(f.target, "10.4.22");
+    assert_eq!(f.target, "10.6.3");
     let mut plan = df::DepPlan {
-        bumps: vec![bump("@lattice/common", "10.4.15", "10.4.22", "f-common")],
+        bumps: vec![bump("@lattice/common", "10.6.1", "10.6.3", "f-common")],
         deferred: vec![],
     };
     let mut families = vec![f];
@@ -170,9 +170,9 @@ fn a_family_moves_together_and_a_split_one_fails_the_set() {
     assert_eq!(
         told,
         vec![
-            "@lattice/common@10.4.22",
-            "@lattice/core@10.4.22",
-            "@lattice/platform-http@10.4.22"
+            "@lattice/common@10.6.3",
+            "@lattice/core@10.6.3",
+            "@lattice/platform-http@10.6.3"
         ]
     );
     // The reviewed head: found by the probe's own check of the lockfile it
@@ -184,7 +184,7 @@ fn a_family_moves_together_and_a_split_one_fails_the_set() {
         &[(LOCK.to_string(), lockfile(SPLIT_HEAD))],
     );
     assert_eq!(split.len(), 1, "{split:?}");
-    assert!(split[0].contains("`@lattice/core` at 10.4.15"));
+    assert!(split[0].contains("`@lattice/core` at 10.6.1"));
     let (whole, _) = df::lockfile_violations(
         &families,
         &bumps,
@@ -224,7 +224,7 @@ fn a_family_moves_together_and_a_split_one_fails_the_set() {
     // The pull request states it.
     let text = fam::section(&families, &[], &[]);
     assert!(
-        text.contains("move together from 10.4.15 to 10.4.22"),
+        text.contains("move together from 10.6.1 to 10.6.3"),
         "{text}"
     );
     assert!(
@@ -590,7 +590,7 @@ fn notes() -> Vec<PackageNotes> {
         PackageNotes {
             parents: vec![ParentSupport {
                 parent: "@lattice/platform-http".into(),
-                version: "10.4.22".into(),
+                version: "10.6.3".into(),
                 declares: "^1.4.0".into(),
                 admits: Some(false),
                 ..Default::default()
@@ -862,7 +862,7 @@ fn each_major_says_where_it_runs_how_it_is_fixed_and_whether_it_is_probed() {
     assert!(end.says("Use in this repository: `src/files.controller.ts:12`."));
     assert!(end.says("That is not proof of safety"));
     assert!(end.says("Fixed by an override scoped to its version line (`upload-kit@1`)"));
-    assert!(end.says("Outside a declared range: `@lattice/platform-http` 10.4.22 declares `^1.4.0` for it, and the override installs 2.0.2, outside that range."));
+    assert!(end.says("Outside a declared range: `@lattice/platform-http` 10.6.3 declares `^1.4.0` for it, and the override installs 2.0.2, outside that range."));
     assert!(end.says("Needs a functional probe: it runs in production and the repository uses it"));
     assert!(end.says("- `glob-walk` 2.4.0 to 4.0.4 (major): runs in development only."));
     // A production major with no probe behind it never lets the word

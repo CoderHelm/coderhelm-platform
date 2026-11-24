@@ -1,11 +1,11 @@
 //! uj. A run's planned-work round finished and its check found "no planned
-//! work left". Twenty-eight minutes later, on the same head, the proof
+//! work left". Later, on the same head, the proof
 //! check judged the branch again and found "1 planned task(s) still not
 //! done", held the pull request as a draft, and sent the run back to work.
 //! The two checks each asked the judge on their own and kept their own
 //! result, so they disagreed, and the run went round until its
-//! continuation ceiling stopped it and handed it to a person. Three more
-//! runs on the install did the same.
+//! continuation ceiling stopped it and handed it to a person. Other runs
+//! did the same.
 //!
 //! Guarantee: there is one verdict on planned work per head
 //! (`proof::PLANNED_FIELD`). Whichever check judges a head first keeps its

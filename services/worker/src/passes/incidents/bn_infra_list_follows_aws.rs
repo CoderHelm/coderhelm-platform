@@ -1,13 +1,13 @@
-//! bn. Security, Infrastructure kept ten rows for one account while AWS had
-//! moved on. An RDS instance deleted two days before still showed an
+//! bn. Security, Infrastructure kept rows for one account while AWS had
+//! moved on. An RDS instance deleted days before still showed an
 //! operating system update and an engine upgrade pending. A Lambda function
 //! on a retired runtime was listed from a Terraform module nothing called,
 //! so it never ran anywhere. Both Aurora clusters already ran the new engine
-//! version, so five rows were fixed, yet they kept their Runbook and Fix PR
+//! version, so several rows were fixed, yet they kept their Runbook and Fix PR
 //! buttons beside "Fixed", and an older CVE row and the engine patch to the
 //! same version stood as two rows. Meanwhile AWS listed a serverless
 //! platform update on both clusters and an operating system update on each
-//! of their three instances, and the page showed neither. The operating
+//! of their instances, and the page showed neither. The operating
 //! system updates it did show were handed over as runbooks, and a person
 //! asking "this should refresh, right?" had no way to know when the list
 //! was last read. The read kept every resource it had seen for three days,
@@ -41,13 +41,13 @@ use crate::passes::infra_findings;
 
 const ACCOUNT: &str = "111122223333";
 const REGION: &str = "us-east-1";
-const CVE: &str = "CVE-2026-98432";
+const CVE: &str = "CVE-2030-10017";
 const INFRA: &str = "acme/platform-infra";
-const GONE: &str = "legacy-db-0002";
-const STAGING: &str = "staging-orders-db";
-const PROD: &str = "prod-orders-db";
-const BEFORE: &str = "2026-11-13T00:20:00Z";
-const NOW: &str = "2026-11-15T00:20:00Z";
+const GONE: &str = "old-bookings-db";
+const STAGING: &str = "staging-bookings-db";
+const PROD: &str = "prod-bookings-db";
+const BEFORE: &str = "2030-03-13T00:20:00Z";
+const NOW: &str = "2030-03-15T00:20:00Z";
 
 fn arn(kind: &str, name: &str) -> String {
     format!("arn:aws:rds:{REGION}:{ACCOUNT}:{kind}:{name}")
@@ -78,7 +78,7 @@ fn members(version: &str) -> Vec<RawDatabase> {
     vec![
         db(
             "db",
-            "prod-orders-db-1",
+            "prod-bookings-db-1",
             "aurora-postgresql",
             version,
             PROD,
@@ -86,7 +86,7 @@ fn members(version: &str) -> Vec<RawDatabase> {
         ),
         db(
             "db",
-            "prod-orders-db-2",
+            "prod-bookings-db-2",
             "aurora-postgresql",
             version,
             PROD,
@@ -94,7 +94,7 @@ fn members(version: &str) -> Vec<RawDatabase> {
         ),
         db(
             "db",
-            "staging-orders-db-1",
+            "staging-bookings-db-1",
             "aurora-postgresql",
             version,
             STAGING,
@@ -169,9 +169,9 @@ fn now_read() -> RawAccount {
         ));
     }
     for i in [
-        "prod-orders-db-1",
-        "prod-orders-db-2",
-        "staging-orders-db-1",
+        "prod-bookings-db-1",
+        "prod-bookings-db-2",
+        "staging-bookings-db-1",
     ] {
         pend.push(pending(
             &arn("db", i),
@@ -196,8 +196,8 @@ fn now_read() -> RawAccount {
 /// The Terraform: the clusters through a module each environment calls,
 /// and a redirect module with a Lambda function that nothing calls.
 const MODULE: &str = "variable \"engine_version\" {}\nresource \"aws_rds_cluster\" \"this\" {\n  engine_version = var.engine_version\n}\n";
-const ENV: &str = "terraform {\n  backend \"s3\" {}\n}\nmodule \"orders\" {\n  source         = \"../../modules/aurora\"\n  engine_version = \"16.11\"\n}\n";
-const REDIRECT: &str = "resource \"aws_lambda_function\" \"redirect_function\" {\n  function_name = \"redirect-function\"\n  handler       = \"index.handler\"\n  runtime       = \"python3.9\"\n}\n";
+const ENV: &str = "terraform {\n  backend \"s3\" {}\n}\nmodule \"bookings\" {\n  source         = \"../../modules/aurora\"\n  engine_version = \"16.11\"\n}\n";
+const REDIRECT: &str = "resource \"aws_lambda_function\" \"edge_redirect\" {\n  function_name = \"edge-redirect\"\n  handler       = \"index.handler\"\n  runtime       = \"python3.9\"\n}\n";
 
 fn code() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -233,7 +233,7 @@ fn placed(mut rs: Vec<Resource>) -> Vec<Resource> {
         r.defined_in = Some(Location {
             repo: INFRA.into(),
             file: "modules/aurora/main.tf".into(),
-            address: "module.orders.aws_rds_cluster.this".into(),
+            address: "module.bookings.aws_rds_cluster.this".into(),
             how: "terraform_module".into(),
             tool: "terraform".into(),
             confidence: Confidence::High,
@@ -258,12 +258,12 @@ fn placed(mut rs: Vec<Resource>) -> Vec<Resource> {
 
 fn bulletin() -> Bulletin {
     Bulletin {
-        id: "2026-160-AWS".into(),
+        id: "2026-901-AWS".into(),
         title: "Issue with Aurora PostgreSQL".into(),
-        url: "https://aws.amazon.com/security/security-bulletins/2026-160-AWS/".into(),
+        url: "https://aws.amazon.com/security/security-bulletins/2026-901-AWS/".into(),
         severity: "important".into(),
-        published: "2026-11-02".into(),
-        updated: "2026-11-02".into(),
+        published: "2030-03-02".into(),
+        updated: "2030-03-02".into(),
         cves: vec![CVE.into()],
         services: vec![ServiceStatus {
             service: "rds".into(),
@@ -349,7 +349,7 @@ fn legacy_cve_row(cluster: &str) -> Record {
 fn stored() -> (Vec<Resource>, Vec<Record>) {
     let mut res = placed(before().resources());
     res.push(lambda());
-    let mut recs = records::reconcile(&[], find(&res, "2026-11-13"), at(BEFORE));
+    let mut recs = records::reconcile(&[], find(&res, "2030-03-13"), at(BEFORE));
     recs.push(legacy_cve_row(STAGING));
     recs.push(legacy_cve_row(PROD));
     (res, recs)
@@ -387,7 +387,7 @@ fn before_the_gone_instance_and_the_uncalled_function_stay_open() {
     res.extend(fresh);
     let after = apply_changes(
         &recs,
-        records::reconcile(&recs, find(&res, "2026-11-15"), at(NOW)),
+        records::reconcile(&recs, find(&res, "2030-03-15"), at(NOW)),
     );
     let open = open_titles(&after);
     assert!(
@@ -402,7 +402,7 @@ fn before_the_gone_instance_and_the_uncalled_function_stay_open() {
     );
     assert!(
         open.iter()
-            .any(|t| t.contains("redirect-function") && t.contains("python3.9")),
+            .any(|t| t.contains("edge-redirect") && t.contains("python3.9")),
         "{open:#?}"
     );
 }
@@ -438,7 +438,7 @@ fn after_a_full_read_the_list_is_what_aws_says_now() {
     assert!(gone.iter().any(|sk| sk.ends_with(&format!(":db:{GONE}"))));
     assert!(gone
         .iter()
-        .any(|sk| sk.contains("aws_lambda_function.redirect_function")));
+        .any(|sk| sk.contains("aws_lambda_function.edge_redirect")));
 
     let present: BTreeSet<String> = fresh.iter().map(|r| r.id.clone()).collect();
     let coverage = Coverage {
@@ -451,7 +451,7 @@ fn after_a_full_read_the_list_is_what_aws_says_now() {
     };
     let changed = records::reconcile_with(
         &recs,
-        find(&fresh, "2026-11-15"),
+        find(&fresh, "2030-03-15"),
         Seen::Read {
             coverage: &coverage,
             present: &present,
@@ -569,7 +569,7 @@ fn a_partial_read_never_closes_or_drops() {
     }
     let changed = records::reconcile_with(
         &recs,
-        find(&quiet, "2026-11-15"),
+        find(&quiet, "2030-03-15"),
         Seen::Read {
             coverage: &coverage,
             present: &present,
@@ -607,7 +607,7 @@ fn a_partial_read_never_closes_or_drops() {
 #[test]
 fn the_cve_is_a_pull_request_and_os_upgrade_is_an_approved_apply() {
     let res = placed(before().resources());
-    let found = find(&res, "2026-11-13");
+    let found = find(&res, "2030-03-13");
     let on = |name: &str, m: Meaning| {
         found
             .iter()
@@ -663,7 +663,7 @@ fn production_waits_for_staging_and_a_refusal_names_the_permission() {
         .position(|r| r.finding.name == PROD && r.finding.fix.meaning == Some(Meaning::OsUpdate))
         .unwrap();
     approve(&mut recs[prod]);
-    let why = infra_findings::not_due(&recs[prod], &recs, "2026-11-15");
+    let why = infra_findings::not_due(&recs[prod], &recs, "2030-03-15");
     assert!(
         why.as_deref().is_some_and(|w| w.contains(STAGING)),
         "{why:?}"
@@ -673,7 +673,7 @@ fn production_waits_for_staging_and_a_refusal_names_the_permission() {
         r.status = Status::Fixed;
     }
     assert_eq!(
-        infra_findings::not_due(&recs[prod], &recs, "2026-11-15"),
+        infra_findings::not_due(&recs[prod], &recs, "2030-03-15"),
         None
     );
     let (perm, note) = infra_findings::refusal(

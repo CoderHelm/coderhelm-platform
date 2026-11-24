@@ -1,14 +1,14 @@
 //! ax. An installation used up GitHub's hourly request budget. Sweeps on
-//! timers had been added the same day (a look at every finished run's pull
-//! request every 15 minutes, a read of every pull request a security
+//! timers (a look at every finished run's pull request on a short
+//! interval, a read of every pull request a security
 //! finding records, a description rebuilt after each push) and spent it
-//! beside the runs. A review fix round that had worked for two hours then
+//! beside the runs. A review fix round that had worked for hours then
 //! met the limit: "The review fix round didn't land: GitHub didn't answer
 //! (its changes couldn't be read (403 Forbidden) ... /compare/...)", the
 //! next step read the branch, got the same 403 and logged `Resume failed:
-//! RateLimited { wait_secs: 731 }`, the run read "Pull request open; the
+//! RateLimited { .. }`, the run read "Pull request open; the
 //! last fix round didn't finish: the review fix round hit an error (403
-//! Forbidden ... git/ref/heads/...)", and fourteen minutes later the sweep
+//! Forbidden ... git/ref/heads/...)", and minutes later the sweep
 //! deferred the review's findings to a person. The security reconcile, the
 //! outcomes reconcile and the review reminders failed on the same limit,
 //! one warning per item.
@@ -34,9 +34,9 @@ use common::run_round::{self, Kind};
 
 const OLD_END: &str = "the last fix round didn't finish";
 const OLD_DEFER: &str = "fix rounds on its own review's findings ended";
-/// GitHub's reset, and when the round met the limit (731 seconds before).
-const RESET: u64 = 1_793_999_100;
-const HIT: u64 = RESET - 731;
+/// GitHub's reset, and when the round met the limit (655 seconds before).
+const RESET: u64 = 1_899_728_400;
+const HIT: u64 = RESET - 655;
 
 /// The 403 as the client reports it for a read during the limit.
 fn refused(path: &str) -> String {
@@ -79,15 +79,15 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
     );
     assert_eq!(round::fault_of(&unread), Fault::GitHubBusy);
     let (cause, wait) =
-        round::github_wait_of(&unread, Some((Cause::RateLimit, 731))).expect("a wait");
-    assert_eq!((cause, wait), (Cause::RateLimit, 731));
+        round::github_wait_of(&unread, Some((Cause::RateLimit, 655))).expect("a wait");
+    assert_eq!((cause, wait), (Cause::RateLimit, 655));
     let parked = working.parked(false);
     assert_eq!(parked.attempt, working.attempt, "no attempt is spent");
     assert_eq!(parked.wip_branch, working.wip_branch, "its work is kept");
 
     // 2. The step after it reads the branch and gets the same 403, typed.
     //    It used to be `Resume failed: RateLimited` and "didn't finish".
-    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(RateLimited::for_test(731));
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(RateLimited::for_test(655));
     let paused = crate::passes::github_pause_of(&*err, 0).expect("GitHub's limit is a pause");
     assert_eq!(paused.cause, Cause::RateLimit);
     // The same error with its type lost (a step that words its own error)
@@ -99,11 +99,11 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
     .into();
     assert!(crate::passes::github_pause_of(&*worded, 0).is_some());
     assert!(gw::may_wait(Cause::RateLimit, 1));
-    let until = gw::until(HIT, gw::paced(Cause::RateLimit, 731, 1));
+    let until = gw::until(HIT, gw::paced(Cause::RateLimit, 655, 1));
     end.said(gw::waiting_text(Cause::RateLimit, until));
     assert_eq!(
         gw::waiting_text(Cause::RateLimit, RESET),
-        "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"
+        "Waiting for GitHub's hourly limit; continues by itself at 14:20 UTC"
     );
 
     // 3. The resume rides to the reset in hops and runs the parked round.
@@ -113,7 +113,7 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
         t += h;
         hops += 1;
     }
-    assert_eq!(hops, 1, "731 seconds is one delayed message");
+    assert_eq!(hops, 1, "655 seconds is one delayed message");
     assert!(t >= RESET);
     let again = parked.resumed(chrono::Utc::now());
     assert_eq!(
@@ -179,7 +179,7 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
     assert!(include_str!("../mod.rs")
         .contains("common::github_wait::may_wait(paused.cause, msg.github_wait.waits)"));
 
-    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"));
+    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 14:20 UTC"));
     end.never_says(OLD_END);
     end.never_says(OLD_DEFER);
     end.never_says("Resume");
@@ -190,7 +190,7 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
 /// stop at the share kept for runs and at their own caps.
 #[tokio::test]
 async fn one_budget_runs_first_sweeps_last() {
-    let (id, now) = (930_001, 1_794_000_000);
+    let (id, now) = (930_001, 1_899_729_300);
     let left = |remaining| {
         github::record_budget(
             id,
@@ -250,17 +250,17 @@ async fn one_budget_runs_first_sweeps_last() {
     let all: u64 = who::BACKGROUND.iter().map(|(_, c)| c).sum();
     assert!(all <= budget::SMALLEST_LIMIT / 2);
     // The limit met: nothing leaves for anyone until the reset.
-    ledger::limit_spent(id, now + 731, now);
+    ledger::limit_spent(id, now + 655, now);
     for anyone in [who::FIX_ROUND, who::RUN, who::SWEEP_PR_WATCH] {
         assert_eq!(
             ledger::standing(id, anyone, now),
             Spend::Hold {
                 why: Hold::LimitSpent,
-                wait_secs: 731
+                wait_secs: 655
             }
         );
     }
-    assert_eq!(ledger::standing(id, who::FIX_ROUND, now + 732), Spend::Go);
+    assert_eq!(ledger::standing(id, who::FIX_ROUND, now + 656), Spend::Go);
     ledger::drain_of(id);
 
     // A run waiting on CI polls every ten minutes, not two, while the
@@ -371,7 +371,7 @@ fn the_watch_costs_nothing_while_nothing_changed_and_picks_the_round_back_up() {
     // The run the limit ended: "didn't finish", for a 403 on a read.
     let reason = run_round::errored(Kind::ReviewFix, &refused("git/ref/heads/coderhelm/gh-41"));
     assert!(round::ended_by_limit(&reason));
-    let at = "2026-11-06T20:52:49+00:00";
+    let at = "2030-03-14T14:09:05+00:00";
     let none = Marks::default();
     assert_eq!(
         pr_watch::resume_after_limit("completed", &seen, &none, at),

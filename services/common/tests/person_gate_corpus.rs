@@ -95,7 +95,7 @@ fn corpus() -> Vec<Case> {
             ..case(Question, "Where should the new helper live?", Decided)
         },
         case(Question, "Use the existing `title_size` field instead of creating a new one?", Decided),
-        case(Question, "What H1 and intro copy should each of the four venue pages use? (Default: '{Venue} Summer Camp Registration' plus one sentence.)", Decided),
+        case(Question, "What H1 and intro copy should each of the four marina pages use? (Default: '{Marina} Seasonal Slip Booking' plus one sentence.)", Decided),
         case(Question, "Should the card link open in a new tab?", Decided),
         Case {
             options: &["refund them in full", "offer a credit"],

@@ -1654,15 +1654,15 @@ mod tests {
         };
         let g = gate(
             vec![
-                q("What H1 and intro copy should each of the four venue pages use? (Default: '{Venue} Summer Camp Registration' plus one sentence.)"),
-                q("Which heading and intro sentence should the four venue pages show? (Default: '{Venue} Summer Camp Registration' plus one sentence.)"),
+                q("What H1 and intro copy should each of the four marina pages use? (Default: '{Marina} Seasonal Slip Booking' plus one sentence.)"),
+                q("Which heading and intro sentence should the four marina pages show? (Default: '{Marina} Seasonal Slip Booking' plus one sentence.)"),
             ],
             &Context::default(),
         );
         assert_eq!(g.items.len(), 1, "the same question twice is one");
         match &g.items[0].1 {
             Outcome::Decided(d) => {
-                assert!(d.chose.contains("Summer Camp Registration"), "{d:?}");
+                assert!(d.chose.contains("Seasonal Slip Booking"), "{d:?}");
             }
             o => panic!("{o:?}"),
         }
@@ -1672,7 +1672,7 @@ mod tests {
     fn an_irreversible_customer_facing_choice_is_one_yes_no_on_the_recommendation() {
         let a = Ask {
             kind: Kind::Question,
-            text: "Should the migration email customers whose bookings move to the new venue?"
+            text: "Should the migration email customers whose bookings move to the new marina?"
                 .into(),
             options: vec!["email them once".into(), "send nothing".into()],
             ..Default::default()

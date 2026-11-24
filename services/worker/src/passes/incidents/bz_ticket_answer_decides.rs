@@ -1,10 +1,9 @@
 //! bz. A run asked on its ticket for a page's heading and intro copy, with
-//! a proposed default. The product owner answered on the ticket: "Skip the
-//! heading and intro copy. Just use the title." That run took the answer
-//! as a round on its own pull request. Two days later a new run on the
-//! same ticket opened a new pull request: the comment was already marked
-//! handled, so the new run never read it, built the intro anyway and
-//! listed it under "Decisions pending product input".
+//! a proposed default. The product owner answered on the ticket to skip
+//! both and use the page title. That run took the answer as a round on
+//! its own pull request. Later a new run on the same ticket opened a new
+//! pull request: the comment was already marked handled, so the new run
+//! never read it, built the intro anyway and listed it under "Decisions pending product input".
 //!
 //! Guarantee: every answer and instruction people wrote on the ticket is
 //! a decision for every run on it, whichever run handled it: merged into
@@ -21,19 +20,20 @@ use common::ticket_decisions::{
     from_comments, remember, settle, settle_known, Known, DECIDED_HEADING,
 };
 
-const QUESTION: &str = "Final heading and intro copy per venue? Proposed default: '{Venue} \
-    Camp Registration' plus one portal sentence. I am building the default now; a different \
-    answer changes it in src/utils/camp-portal-copy.ts.";
+const QUESTION: &str = "Final heading and intro copy per marina? Proposed default: '{Marina} \
+    Slip Booking' plus one portal sentence. I am building the default now; a different \
+    answer changes it in src/utils/slip-portal-copy.ts.";
 
 /// The answer as it was kept: handled by the earlier run.
 fn handled_answer() -> Comment {
     Comment {
         ticket_id: "ABC-76".into(),
-        comment_id: "98054".into(),
+        comment_id: "10001".into(),
         author: "a-product-owner".into(),
-        text: "Skip the H1 and intro copy. Just use the title\n Register for Camps | Example Site"
-            .into(),
-        at: "2026-01-14T16:16:36Z".into(),
+        text:
+            "Skip the H1 and intro copy; the page title alone is fine\n Book a Slip | Example Site"
+                .into(),
+        at: "2030-03-14T16:16:36Z".into(),
         run_id: "an-earlier-run".into(),
         state: State::Handled,
         class: Some(Class::Answer),
@@ -47,10 +47,10 @@ fn handled_answer() -> Comment {
 const DESCRIPTION: &str = "Ticket: [ABC-76](https://example.atlassian.net/browse/ABC-76)
 
 ## Summary
-Embeds the camp portal on the four registration pages.
+Embeds the booking portal on the four slip booking pages.
 
 ### Decisions pending product input
-- Final H1 and intro copy per venue: built with the default '{Venue} Camp Registration' and one portal sentence until product confirms.
+- Final H1 and intro copy per marina: built with the default '{Marina} Slip Booking' and one portal sentence until product confirms.
 - Whether the portal opens in a new tab on phones
 
 ## Testing

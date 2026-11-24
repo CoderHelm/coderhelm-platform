@@ -5,8 +5,8 @@
 //! base branch. The reviewer was told only "this check fails on the base
 //! branch too" by the check's name, and wrote that an unrelated
 //! phone-pricing test was "broken on main". The test that failed was the
-//! camp-selection test in the spec the pull request changed, and it failed
-//! because the vendor had opened next year's registration: an outside
+//! slip-selection test in the spec the pull request changed, and it failed
+//! because the vendor had opened next season's booking: an outside
 //! change, this branch's to fix.
 //!
 //! The rules:
@@ -528,7 +528,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const HEAD: &str = "\n--- Playwright e2e (all tests) ---\nfailure: e2e/tests/browse/portal.spec.ts:120: 1) [chromium] › browse/portal.spec.ts:120:7 › Portal › choosing a camp adds it to the cart while registration is open ──\n\n    Error: Choosing a camp did not add it to the order summary\n    expect(locator).not.toHaveText(expected) failed\n";
+    const HEAD: &str = "\n--- Playwright e2e (all tests) ---\nfailure: e2e/tests/browse/portal.spec.ts:120: 1) [chromium] › browse/portal.spec.ts:120:7 › Portal › choosing a slip adds it to the cart while booking is open ──\n\n    Error: Choosing a slip did not add it to the booking total\n    expect(locator).not.toHaveText(expected) failed\n";
 
     #[test]
     fn annotations_give_each_failing_test_with_its_own_error() {
@@ -536,10 +536,10 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(
             t[0].name,
-            "Portal › choosing a camp adds it to the cart while registration is open"
+            "Portal › choosing a slip adds it to the cart while booking is open"
         );
         assert_eq!(t[0].spec, "e2e/tests/browse/portal.spec.ts");
-        assert!(t[0].error.starts_with("Error: Choosing a camp"));
+        assert!(t[0].error.starts_with("Error: Choosing a slip"));
         assert_eq!(t[0].check, "Playwright e2e (all tests)");
     }
 
@@ -564,7 +564,7 @@ mod tests {
         let mut c = "Playwright e2e fails on main too, so it's pre-existing.".to_string();
         assert_eq!(hold_text(&mut c, &cmp), 1);
         // A revert of the change the failing test passes without is backed.
-        let mut r = "Revert the cart step: choosing a camp adds it to the cart while registration is open fails only here.".to_string();
+        let mut r = "Revert the cart step: choosing a slip adds it to the cart while booking is open fails only here.".to_string();
         assert_eq!(hold_text(&mut r, &cmp), 0);
         // Code words alone are no blame.
         let mut code = "This guards a pre-existing hole in the parser.".to_string();

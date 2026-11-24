@@ -1,13 +1,13 @@
-//! lw. A person closed four of CoderHelm's pull requests within ten
+//! lw. A person closed several of CoderHelm's pull requests within
 //! seconds. Each close reached its run (`pr_outcome = closed`) and queued
-//! its scoring. The installation had 2353 of 5000 GitHub requests left,
-//! under the half kept for runs, so CoderHelm's own budget gate held the
+//! its scoring. The installation had less than half of its GitHub requests
+//! left, under the half kept for runs, so CoderHelm's own budget gate held the
 //! scoring's first read: "Reward outcome failed: ... 403 ... not sent, what
 //! is left of GitHub's hourly budget is kept for runs". The handler only
 //! logged it and the message was consumed; the lesson job lost its
 //! question the same way. Nothing tried again: the sweep only looks at
 //! runs with no outcome, and these had one. For days the learning page
-//! read "Not learning: 4 closed pull request(s) were never scored" and
+//! read "Not learning: N closed pull request(s) were never scored" and
 //! told a person to check the GitHub App's pull request events, which had
 //! arrived.
 //!
@@ -38,7 +38,7 @@ use serde_json::json;
 const OLD: &str = "were never scored";
 const OLD_CHECK: &str = "GitHub App";
 const TEAM: &str = "TEAM#team-a";
-const INSTALL: u64 = 940_017;
+const INSTALL: u64 = 1_000_002;
 const PRS: [u64; 4] = [41, 42, 43, 44];
 
 fn at(t: &str) -> chrono::DateTime<chrono::Utc> {
@@ -64,7 +64,7 @@ fn closes() -> Vec<ClosedPr> {
         .map(|(i, pr)| ClosedPr {
             repo: format!("{OWNER}/{REPO}"),
             pr: *pr,
-            closed_at: format!("2026-11-16T16:55:0{}Z", i * 3),
+            closed_at: format!("2030-03-12T16:55:0{}Z", i * 3),
             run_id: format!("01RUN{pr}"),
             installation_id: INSTALL,
             ..Default::default()
@@ -106,19 +106,19 @@ fn closed_events(p: &ClosedPr) -> Vec<common::rewards::RewardEvent> {
     };
     let pr = json!({
         "number": p.pr, "state": "closed", "merged_at": null,
-        "closed_at": p.closed_at, "created_at": "2026-11-16T15:00:00Z",
+        "closed_at": p.closed_at, "created_at": "2030-03-12T15:00:00Z",
     });
     mapping::pr_closed_events(&ctx, &pr, Some(0), None, Default::default())
 }
 
 #[tokio::test]
 async fn held_scorings_wait_are_swept_and_score_once() {
-    let held_at = epoch("2026-11-16T16:55:10Z");
-    let reset = epoch("2026-11-16T18:25:00Z");
+    let held_at = epoch("2030-03-12T16:55:10Z");
+    let reset = epoch("2030-03-12T18:25:00Z");
     github::record_budget(
         INSTALL,
         Budget {
-            remaining: 2_353,
+            remaining: 2_400,
             limit: 5_000,
             reset,
         },
@@ -209,7 +209,7 @@ async fn held_scorings_wait_are_swept_and_score_once() {
     for (p, m) in recorded.iter_mut().zip(&waiting) {
         p.retry.retry_at = rfc(m.github_wait.until);
     }
-    let page_at = at("2026-11-16T18:00:00Z");
+    let page_at = at("2030-03-12T18:00:00Z");
     let l = health::loops(
         &health::Inputs {
             closed_prs: &recorded,
@@ -249,7 +249,7 @@ async fn held_scorings_wait_are_swept_and_score_once() {
 
     // 5. Had the messages been lost anyway, the sweep finds all four by the
     // page's own rule, after deploy, inside the week.
-    let after_deploy = at("2026-11-21T12:00:00Z");
+    let after_deploy = at("2030-03-17T12:00:00Z");
     let missing = unscored::missing(&closes, std::iter::empty(), after_deploy);
     assert_eq!(missing.iter().map(|p| p.pr).collect::<Vec<_>>(), PRS);
     let mut report = SweepReport::default();

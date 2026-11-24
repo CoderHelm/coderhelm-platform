@@ -1,7 +1,7 @@
 //! br. The description writer was upgraded (a final review in the one save,
 //! the repository's template as the structure, a running check never a
 //! result), and a pull request opened the day before kept its old text:
-//! six check rows "Not run: still running when this was written", "Look
+//! several check rows "Not run: still running when this was written", "Look
 //! first" and "Roll back" said twice, filler and a raw page id. Its head had
 //! not moved, its checked text was what CoderHelm wrote, and no check showed
 //! as running in the new form, so its stamp said it was current and nothing
@@ -40,12 +40,12 @@ const PAGE_ID: &str = "7e1d2c3b-4a59-4687-b0a1-c2d3e4f5a6b7";
 fn written_before() -> String {
     format!(
         "<!-- coderhelm:lead -->
-<!-- coderhelm:body v1 ticket=OPS-12 head=5ab6c7d -->
-Adds a length warning to the banner block's caption in the Studio (OPS-12).<!-- ch:summary-end -->
+<!-- coderhelm:body v1 ticket=HARBOR-12 head=5ab6c7d -->
+Adds a length warning to the banner block's caption in the Studio (HARBOR-12).<!-- ch:summary-end -->
 
 ### Review focus
 
-- Approach: decide whether this does what OPS-12 asks. CoderHelm's conclusion: nothing is out of the ordinary.
+- Approach: decide whether this does what HARBOR-12 asks. CoderHelm's conclusion: nothing is out of the ordinary.
 - Read first: `apps/studio/blocks/banner-validation.ts` (the largest change to code).
 - See it: Studio: Home page ({PAGE_ID}), banner caption field.
 
@@ -61,7 +61,6 @@ On 5ab6c7d (head of this PR):
 | Unit tests (CI) | Not run: still running when this was written |
 | Type check (CI) | Not run: still running when this was written |
 | Build (CI) | Not run: still running when this was written |
-| Studio build (CI) | Not run: still running when this was written |
 | Test Coverage Report (CI) | Not run: still running when this was written |
 
 <!-- /coderhelm:lead -->
@@ -189,11 +188,11 @@ fn an_old_layout_description_on_an_unchanged_head_is_rebuilt_once() {
 #[test]
 fn an_old_description_without_markers_keeps_no_old_line() {
     let unmarked = format!(
-        "Adds a length warning to the banner block's caption in the Studio (OPS-12).
+        "Adds a length warning to the banner block's caption in the Studio (HARBOR-12).
 
 ### Review focus
 
-- Approach: decide whether this does what OPS-12 asks. CoderHelm's conclusion: nothing is out of the ordinary.
+- Approach: decide whether this does what HARBOR-12 asks. CoderHelm's conclusion: nothing is out of the ordinary.
 - Read first: `apps/studio/blocks/banner-validation.ts` (the largest change to code).
 - See it: Studio: Home page ({PAGE_ID}), banner caption field.
 
@@ -212,7 +211,6 @@ fn an_old_description_without_markers_keeps_no_old_line() {
 | Unit tests (CI) | Not run: still running when this was written |
 | Type check (CI) | Not run: still running when this was written |
 | Build (CI) | Not run: still running when this was written |
-| Studio build (CI) | Not run: still running when this was written |
 | Test Coverage Report (CI) | Not run: still running when this was written |
 
 Closes #12

@@ -32,7 +32,7 @@ use crate::passes::security_fixes::release::{fake::*, reconcile, Scope};
 
 const REPO: &str = "acme/infra";
 const TICKET: &str = "SEC-0A1B2C3D4E5F";
-const PR: u64 = 58;
+const PR: u64 = 42;
 const REFUSED: &str =
     "db/main.tf, line 2: `aws_db_instance.orders` changes `identifier`, which replaces the resource";
 
@@ -102,7 +102,7 @@ async fn a_closed_pull_request_gives_the_record_back_with_who_closed_it() {
     assert_eq!(v["pr"]["state"], "closed");
     assert_eq!(v["pr"]["closed_by"], "octo-admin");
     assert_eq!(v["pr"]["closed_at"], "2026-11-13T09:30:00Z");
-    assert!(github.event_texts()[0].contains("PR #58 was closed without merging by octo-admin"));
+    assert!(github.event_texts()[0].contains("PR #42 was closed without merging by octo-admin"));
     // No run starts by itself for a week; a person asking never waits
     // (`start_fixes` skips the hold only for the finding asked for).
     assert!(rec.on_hold(now() + Duration::days(6)));
@@ -231,7 +231,7 @@ async fn a_fix_round_that_dies_becomes_the_guards_second_step_never_a_ready_pull
     assert_eq!(newly_drafted(r), Some((REPO.to_string(), PR)));
     let line = github.event_texts().pop().unwrap();
     assert!(
-        line.contains("PR #58 is now a draft") && !line.contains("closed"),
+        line.contains("PR #42 is now a draft") && !line.contains("closed"),
         "{line}"
     );
 }

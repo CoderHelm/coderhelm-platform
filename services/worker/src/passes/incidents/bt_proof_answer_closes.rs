@@ -10,7 +10,7 @@
 //! the draft was held "for a person": "1 finding from CoderHelm's review is
 //! still open. Fix them on the branch, or remove a finding". The merge
 //! standing beside it said no person was needed. It stayed that way for
-//! thirteen hours.
+//! hours.
 //!
 //! Guarantee: a round that pushed nothing is read by a review of the same
 //! head, with the round's account in the reviewer's context, and a finding
@@ -28,7 +28,7 @@ use crate::passes::own_review_ledger::{
 };
 
 const OLD: &str = "Fix them on the branch, or remove a finding";
-const HEAD: &str = "4b1d0c9e2f7a";
+const HEAD: &str = "abc1234e2f7a";
 
 /// The finding, as the review listed it.
 const PROOF: &str =
@@ -37,9 +37,9 @@ const PROOF: &str =
 /// What the second round wrote: every check on the head passing, one
 /// runtime check cut short by the step's time.
 const ACCOUNT: &str = "I re-ran the build, lint, type-check and unit tests on the head commit \
-4b1d0c9, and all four pass. There were no code changes this round; the finding was about the \
+abc1234, and all four pass. There were no code changes this round; the finding was about the \
 proof, not the code.\n- Build: passed (`pnpm run build`, exit 0).\n- Unit tests: passed \
-(`jest --ci`, 188 suites passed).\nEvidence:\n- Confirmed: the sandbox checked out 4b1d0c9.\n- \
+(`jest --ci`, 42 suites passed).\nEvidence:\n- Confirmed: the sandbox checked out abc1234.\n- \
 Unconfirmed [external:native module at runtime]: whether the module loads and runs a query. It \
 didn't run because the sandbox ran out of time this step.";
 

@@ -1,5 +1,5 @@
 //! sg. A Confluence knowledge source on a hybrid install stopped syncing
-//! for fourteen and a half hours and told its team to reconnect, though
+//! for hours and told its team to reconnect, though
 //! nothing about its sign-in was wrong. One scheduled sync asked the
 //! hosted broker for a token while Atlassian's sign-in server answered
 //! `503`. The broker's runtime called that passing, as it is, and the
@@ -8,7 +8,7 @@
 //! server refused (503).\")". The install read `invalid_grant` as a revoked
 //! grant, marked its connection as needing a reconnect, and every
 //! scheduled sync after it stopped in no time at all on that stored mark,
-//! 38 in a row, each one "Stopped" with "Reconnect Confluence to sign in
+//! many in a row, each one "Stopped" with "Reconnect Confluence to sign in
 //! again." A person signed in again and the next check worked at once.
 //!
 //! Guarantee: only a definitive refusal (HTTP 400 or 401 with
@@ -51,7 +51,7 @@ fn confluence() -> Source {
         kind: Some(Kind::Confluence),
         name: "Engineering wiki".into(),
         status: Status::Ready,
-        last_success_at: "2026-11-23T13:18:54+00:00".into(),
+        last_success_at: "2030-03-23T08:18:54+00:00".into(),
         ..Default::default()
     }
 }
@@ -114,16 +114,16 @@ fn stops_in_a_row_are_retrying_said_once_and_cleared_by_a_sync_that_works() {
         rate_limited: false,
     })
     .for_source(Kind::Confluence);
-    // 14:33 UTC, then every half hour: the incident's 38 stops.
-    for i in 0..38 {
-        let run = stopped(&s, "schedule", 1_795_444_434 + i * 1_800, passing.clone());
+    // 09:33 UTC, then every half hour: 30 stops in a row.
+    for i in 0..30 {
+        let run = stopped(&s, "schedule", 1_900_488_834 + i * 1_800, passing.clone());
         assert_eq!(run.result, "retrying");
-        note_stop(&mut s, passing.clone(), 1_795_444_434 + i * 1_800);
+        note_stop(&mut s, passing.clone(), 1_900_488_834 + i * 1_800);
     }
     assert_eq!(s.status, Status::Ready, "nothing for a person to fix");
     assert!(s.error.is_none());
-    assert_eq!(s.stops, 38);
-    assert_eq!(s.stopped_since, "2026-11-23T14:33:54+00:00");
+    assert_eq!(s.stops, 30);
+    assert_eq!(s.stopped_since, "2030-03-23T09:33:54+00:00");
     assert_eq!(stop_result(s.retrying.as_ref().unwrap()), "retrying");
     note_finished(&mut s);
     assert_eq!((s.stops, s.retrying.is_none()), (0, true));

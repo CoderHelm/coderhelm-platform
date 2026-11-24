@@ -1,14 +1,14 @@
-//! cv. A camp registration page embeds a vendor's portal in a frame. The
+//! cv. A slip booking page embeds a booking vendor's portal in a frame. The
 //! run that added it wrote an end-to-end page object with two branches on
-//! the portal's state: registration closed (the camp's button disabled, it
-//! must say so) and registration open (choosing the camp must fill the
+//! the portal's state: booking closed (the slip's button disabled, it
+//! must say so) and booking open (choosing the slip must fill the
 //! cart). Its coder tried to load the portal with Playwright; the shell
 //! refused the command, and it wrote the open branch from test-id strings
 //! it found in the vendor's script bundle. Only the closed branch ever ran.
 //! The next ticket's run edited the same file, kept the branch untouched,
 //! and re-wrapped a test's lines nobody's formatter checks. The day the
-//! vendor opened registration the open branch failed on every branch: a
-//! signed-out visitor who picks a camp gets the vendor's sign-in drawer,
+//! vendor opened booking the open branch failed on every branch: a
+//! signed-out visitor who picks a slip gets the vendor's sign-in drawer,
 //! and the cart stays at $0. The review's probe gate saw none of it: it
 //! read only added lines, and only `getByTestId('…')` written on one line,
 //! so the page object's wrapped and pattern ids were invisible to it.
@@ -36,55 +36,55 @@ const PORTAL: &str = "portal.vendor.test";
 const PAGE_OBJECT: &str = r#"import { expect, type FrameLocator, type Locator, type Page } from "@playwright/test";
 
 export const PORTAL_URL =
-  "https://portal.vendor.test/program-portals/organization/1/portal/2";
+  "https://portal.vendor.test/booking/marina/1/portal/2";
 
-export class CampRegistration {
+export class SlipBooking {
   readonly portalFrame: FrameLocator;
 
   constructor(readonly page: Page) {
-    this.portalFrame = page.frameLocator(`iframe[title="Camp registration"]`);
+    this.portalFrame = page.frameLocator(`iframe[title="Slip booking"]`);
   }
 
-  registrationSection(): Locator {
-    return this.portalFrame.getByTestId("portal-registration");
+  bookingSection(): Locator {
+    return this.portalFrame.getByTestId("portal-booking");
   }
 
   weeks(): Locator {
     return this.portalFrame.getByTestId(
-      /^portal-segment-tag-guest-\d+$/,
+      /^portal-week-tag-guest-\d+$/,
     );
   }
 
   sessions(): Locator {
     return this.portalFrame.getByTestId(
-      /^portal-segment-option-guest-\d+$/,
+      /^portal-slot-option-guest-\d+$/,
     );
   }
 
-  cartSubtotal(): Locator {
+  cartTotal(): Locator {
     return this.portalFrame.getByTestId(
-      "portal-cart-preview-subtotal",
+      "portal-cart-preview-total",
     );
   }
 
-  async selectFirstCamp(): Promise<{ camp: string; registrationOpen: boolean }> {
+  async selectFirstSlip(): Promise<{ slip: string; bookingOpen: boolean }> {
     const session = this.sessions().first();
-    const camp = (await session.innerText()).split("\n")[0]?.trim() ?? "";
-    const registrationOpen = await session.isEnabled();
+    const slip = (await session.innerText()).split("\n")[0]?.trim() ?? "";
+    const bookingOpen = await session.isEnabled();
 
-    if (registrationOpen) {
+    if (bookingOpen) {
       await session.click();
       await expect(
-        this.cartSubtotal(),
-        `Choosing "${camp}" did not add it to the portal's Order Summary`,
+        this.cartTotal(),
+        `Choosing "${slip}" did not add it to the portal's booking total`,
       ).not.toHaveText(/\$0(\.00)?\s*$/, { timeout: 60_000 });
     } else {
       await expect(
         session,
-        `"${camp}" is disabled but doesn't say registration is closed`,
-      ).toContainText(/registration is not open/i);
+        `"${slip}" is disabled but doesn't say booking is closed`,
+      ).toContainText(/booking is not open/i);
     }
-    return { camp, registrationOpen };
+    return { slip, bookingOpen };
   }
 }
 "#;
@@ -98,37 +98,37 @@ fn state(id: &str, enabled: bool) -> ProbeState {
     }
 }
 
-/// A probe of the portal clicking the first week, then the first camp.
+/// A probe of the portal clicking the first week, then the first slip.
 fn probe_of(open: bool) -> ProbeRecord {
-    let mut after_camp = vec![state("portal-cart-preview-subtotal", true)];
+    let mut after_slip = vec![state("portal-cart-preview-total", true)];
     if open {
-        after_camp.push(state("portal-authentication-drawer", true));
+        after_slip.push(state("portal-sign-in-drawer", true));
     }
     ProbeRecord {
         origin: PORTAL.into(),
-        url: "https://portal.vendor.test/program-portals/organization/1/portal/2".into(),
-        at: "2026-11-17T15:40:00Z".into(),
+        url: "https://portal.vendor.test/booking/marina/1/portal/2".into(),
+        at: "2030-03-17T15:40:00Z".into(),
         testids: vec![
-            "portal-registration".into(),
-            "portal-segment-tag-guest-0".into(),
-            "portal-segment-option-guest-0".into(),
-            "portal-cart-preview-subtotal".into(),
+            "portal-booking".into(),
+            "portal-week-tag-guest-0".into(),
+            "portal-slot-option-guest-0".into(),
+            "portal-cart-preview-total".into(),
         ],
         states: vec![
-            state("portal-registration", true),
-            state("portal-segment-tag-guest-0", true),
-            state("portal-cart-preview-subtotal", true),
+            state("portal-booking", true),
+            state("portal-week-tag-guest-0", true),
+            state("portal-cart-preview-total", true),
         ],
         steps: vec![
             ProbeStep {
-                click: "portal-segment-tag-guest-0".into(),
+                click: "portal-week-tag-guest-0".into(),
                 clicked: true,
-                states: vec![state("portal-segment-option-guest-0", open)],
+                states: vec![state("portal-slot-option-guest-0", open)],
             },
             ProbeStep {
-                click: "/^portal-segment-option-guest-\\d+$/".into(),
+                click: "/^portal-slot-option-guest-\\d+$/".into(),
                 clicked: open,
-                states: after_camp,
+                states: after_slip,
             },
         ],
         ..Default::default()
@@ -136,7 +136,7 @@ fn probe_of(open: bool) -> ProbeRecord {
 }
 
 fn own() -> Vec<String> {
-    vec!["acme-camps.test".into()]
+    vec!["acme-harbor.test".into()]
 }
 
 #[test]
@@ -145,16 +145,16 @@ fn every_portal_id_is_held_to_a_probe_even_wrapped_or_kept() {
     assert_eq!(
         probe::selectors_in(PAGE_OBJECT),
         vec![
-            "/^portal-segment-option-guest-\\d+$/",
-            "/^portal-segment-tag-guest-\\d+$/",
-            "portal-cart-preview-subtotal",
-            "portal-registration",
+            "/^portal-slot-option-guest-\\d+$/",
+            "/^portal-week-tag-guest-\\d+$/",
+            "portal-booking",
+            "portal-cart-preview-total",
         ]
     );
     // The second run's change added no selector line; the kept ones are
     // still the gate's.
     let files = vec![(
-        "e2e/pages/camp-registration.ts".to_string(),
+        "e2e/pages/slip-booking.ts".to_string(),
         PAGE_OBJECT.to_string(),
         "    // the page header now scrolls away".to_string(),
     )];
@@ -169,10 +169,10 @@ fn every_portal_id_is_held_to_a_probe_even_wrapped_or_kept() {
 fn the_write_waits_for_a_probe_and_the_round_records_it() {
     let g = LiveGuard::new(vec![], own(), vec![]);
     let refusal = g
-        .check_e2e("e2e/pages/camp-registration.ts", PAGE_OBJECT)
+        .check_e2e("e2e/pages/slip-booking.ts", PAGE_OBJECT)
         .unwrap_err();
     assert!(refusal.starts_with("Not written:"));
-    assert!(refusal.contains("`portal-cart-preview-subtotal`"));
+    assert!(refusal.contains("`portal-cart-preview-total`"));
     assert!(refusal.contains("`clicks`"));
     // The probe tool's answer carries its record; the round keeps it (and
     // commits it at its path) and the write goes through.
@@ -189,24 +189,24 @@ fn the_write_waits_for_a_probe_and_the_round_records_it() {
         ".coderhelm/probes/portal.vendor.test.json"
     );
     assert!(g
-        .check_e2e("e2e/pages/camp-registration.ts", PAGE_OBJECT)
+        .check_e2e("e2e/pages/slip-booking.ts", PAGE_OBJECT)
         .is_ok());
 }
 
 #[test]
 fn the_open_branch_is_unverified_until_a_run_takes_it() {
-    let b = state_branches("e2e/pages/camp-registration.ts", PAGE_OBJECT);
+    let b = state_branches("e2e/pages/slip-booking.ts", PAGE_OBJECT);
     assert_eq!(b.len(), 1);
     assert_eq!(
         b[0].subject.as_deref(),
-        Some("/^portal-segment-option-guest-\\d+$/")
+        Some("/^portal-slot-option-guest-\\d+$/")
     );
     let files = vec![(
-        "e2e/pages/camp-registration.ts".to_string(),
+        "e2e/pages/slip-booking.ts".to_string(),
         Some(PAGE_OBJECT.to_string()),
         PAGE_OBJECT.to_string(),
     )];
-    // Registration closed, as on the day the branch was written: the open
+    // Booking closed, as when the branch was written: the open
     // arm is unverified in the pull request and nothing asks the coder to
     // run what can't run; the closed arm, which the page shows, is the one
     // it runs and records.
@@ -221,7 +221,7 @@ fn the_open_branch_is_unverified_until_a_run_takes_it() {
     let lines = closed.blocking();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains(" when false: <the command"));
-    // The vendor opened registration: the fresh probe shows the camp
+    // The vendor opened booking: the fresh probe shows the slip
     // enabled and, after choosing it, the sign-in drawer. The coder is
     // sent to run the open arm against the live page.
     let opened = assess(&files, &[probe_of(false)], &[probe_of(true)], &own(), "");
@@ -229,13 +229,14 @@ fn the_open_branch_is_unverified_until_a_run_takes_it() {
     let lines = opened.blocking();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("has never run in a recorded run"));
-    assert!(lines[0].contains("Branch ran: e2e/pages/camp-registration.ts:"));
-    assert!(probe::quote(&probe_of(true))
-        .contains("newly visible: `portal-authentication-drawer` (visible)"));
+    assert!(lines[0].contains("Branch ran: e2e/pages/slip-booking.ts:"));
+    assert!(
+        probe::quote(&probe_of(true)).contains("newly visible: `portal-sign-in-drawer` (visible)")
+    );
     // Once the coder ran it and said so, the arm reads as run.
     let line = b[0].line;
     let notes = format!(
-        "{RAN_LINE} e2e/pages/camp-registration.ts:{line} when true: playwright test against staging, 1 passed"
+        "{RAN_LINE} e2e/pages/slip-booking.ts:{line} when true: playwright test against staging, 1 passed"
     );
     let ran = assess(&files, &[probe_of(true)], &[], &own(), &notes);
     assert_eq!(ran.arms.iter().find(|a| a.when).unwrap().state, "ran");
@@ -247,8 +248,8 @@ fn a_reformat_is_never_written_and_formatting_goes_back() {
     let g = LiveGuard::new(vec![], own(), vec![]);
     // The unit test the second run touched: the fix dropped two
     // assertions, and a call the fix didn't need was re-wrapped.
-    let old = "    expect((iframe as HTMLIFrameElement).style.width).toBe(\"100%\");\n    expect(iframe).toHaveClass(\"h-svh!\");\n  });\n  it(\"has no link\", () => {\n    expect(\n      screen.queryByText(\"Open registration in a new tab\")\n    ).toBeNull();\n  });\n";
-    let new = "    expect((iframe as HTMLIFrameElement).style.width).toBe(\"100%\");\n  });\n  it(\"has no link\", () => {\n    expect(screen.queryByText(\"Open registration in a new tab\")).toBeNull();\n  });\n";
+    let old = "    expect((iframe as HTMLIFrameElement).style.width).toBe(\"100%\");\n    expect(iframe).toHaveClass(\"h-svh!\");\n  });\n  it(\"has no link\", () => {\n    expect(\n      screen.queryByText(\"Open booking in a new tab\")\n    ).toBeNull();\n  });\n";
+    let new = "    expect((iframe as HTMLIFrameElement).style.width).toBe(\"100%\");\n  });\n  it(\"has no link\", () => {\n    expect(screen.queryByText(\"Open booking in a new tab\")).toBeNull();\n  });\n";
     let Shaped::Write(kept, n) = g.shape("web/src/test/portal-embed.test.tsx", old, new, true)
     else {
         panic!("the fix's lines are written");
@@ -260,13 +261,13 @@ fn a_reformat_is_never_written_and_formatting_goes_back() {
     let e2e_old = "await expect(\n  page.getByRole(\"heading\")\n).toBeVisible();\n";
     let e2e_new = "await expect(page.getByRole('heading')).toBeVisible();\n";
     assert!(matches!(
-        g.shape("e2e/tests/browse/camps.spec.ts", e2e_old, e2e_new, false),
+        g.shape("e2e/tests/browse/slips.spec.ts", e2e_old, e2e_new, false),
         Shaped::Refused(m) if m.contains("only reformats")
     ));
     // A file only reformatted on the branch goes back after the build.
     let facts = assess(
         &[(
-            "e2e/tests/browse/camps.spec.ts".to_string(),
+            "e2e/tests/browse/slips.spec.ts".to_string(),
             Some(e2e_old.to_string()),
             e2e_new.to_string(),
         )],
@@ -275,7 +276,7 @@ fn a_reformat_is_never_written_and_formatting_goes_back() {
         &own(),
         "",
     );
-    assert_eq!(facts.reformatted, vec!["e2e/tests/browse/camps.spec.ts"]);
+    assert_eq!(facts.reformatted, vec!["e2e/tests/browse/slips.spec.ts"]);
     assert!(facts.blocking()[0].contains("restore_file"));
 }
 

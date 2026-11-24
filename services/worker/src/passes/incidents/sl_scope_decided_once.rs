@@ -1,18 +1,18 @@
-//! sl. A ticket said a summer camps page showed two Multi-Sport filter
+//! sl. A ticket said a guest slips page showed two Multi-Berth filter
 //! chips (two rows of the schedule API share one slug). The plan fixed the
-//! chips and wrote, in its proposal, "Out: `/classes/<sport>` path pages
+//! chips and wrote, in its proposal, "Out: `/charters/<berth>` path pages
 //! ... Both are open product questions", with an "Open product questions"
 //! section that already answered each with "Meanwhile". Its task list
-//! then said "switch any other slugToId caller ... to slugToIds". Three days
-//! later a round built the path pages (three service files and two tests);
+//! then said "switch any other slugToId caller ... to slugToIds". Days
+//! later a round built the path pages (service files and their tests);
 //! the tests and scope check took the code out again as "no task of the
 //! plan" but left the tests, which that check exempts; the run's automatic
 //! revert put the path-page tests back for code that was no longer there;
 //! a person deleted them by hand. The description kept saying the path
 //! pages were out of scope while the diff changed them, and asked the team
-//! the questions the plan had answered. Across the 53 runs audited, 19 of
-//! 38 plans with a recorded conversation left product questions open, and
-//! 8 branches had a file go in, come out and come back.
+//! the questions the plan had answered. An audit of recent runs found many
+//! recorded plans that left product questions open, and several branches
+//! where a file went in, came out and came back.
 //!
 //! Guarantee: scope is decided once, from the ticket's acceptance criteria
 //! (`stop_judge::acceptance`) and the plan, before any code
@@ -31,16 +31,16 @@ use crate::passes::{description_facts, scope_ledger as store};
 use common::pr_facts::{Facts, FileChange};
 use common::scope_ledger::{self, Ledger};
 
-const TICKET: &str = "Steps to reproduce\nGo to /club/summer-camps\nScroll to the sports filter\nObserved\nTwo Multi-Sport filters show\nAcceptance Criteria\nOnly one multi-sport filter to show";
+const TICKET: &str = "Steps to reproduce\nGo to /harbor/guest-slips\nScroll to the berths filter\nObserved\nTwo Multi-Berth filters show\nAcceptance Criteria\nOnly one multi-berth filter to show";
 
 /// The proposal as the planner wrote it.
-const PROPOSAL: &str = "## Problem\nTwo Multi-Sport chips.\n\n## Scope\n- In: shared sport chips and `?sports=` resolution on every page using them.\n- Out:\n  - Merging the two schedule API rows.\n  - `/classes/<sport>` path pages, which resolve one sport through `findNormalizedSport` and `selectedSport`. Both are open product questions.\n\n## Open product questions\n- Should the schedule API merge the two Multi-Sport rows? Meanwhile the rows stay as they are.\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/classes/<sport>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
+const PROPOSAL: &str = "## Problem\nTwo Multi-Berth chips.\n\n## Scope\n- In: shared berth chips and `?berths=` resolution on every page using them.\n- Out:\n  - Merging the two schedule API rows.\n  - `/charters/<berth>` path pages, which resolve one berth through `findNormalizedBerth` and `selectedBerth`. Both are open product questions.\n\n## Open product questions\n- Should the schedule API merge the two Multi-Berth rows? Meanwhile the rows stay as they are.\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/charters/<berth>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
 
-const TASKS: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeSportsBySlug; switch any other slugToId caller in apps/web/src that builds a sport-id variable to slugToIds\n- [ ] apps/web/src/components/blocks/SportsFilter.tsx: [modify] One chip per slug\n";
+const TASKS: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeBerthsBySlug; switch any other slugToId caller in apps/web/src that builds a berth-id variable to slugToIds\n- [ ] apps/web/src/components/blocks/BerthsFilter.tsx: [modify] One chip per slug\n";
 
 /// The plan after the send-back: scope decided once.
-const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/classes/<sport>` path pages (`selectedSport`, `findNormalizedSport`): decided with the default: one id, as today\n- The chip's spelling: decided with the default: whichever row comes first\n";
-const TASKS_AFTER: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeSportsBySlug\n- [ ] apps/web/src/components/blocks/SportsFilter.tsx: [modify] One chip per slug\n";
+const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/charters/<berth>` path pages (`selectedBerth`, `findNormalizedBerth`): decided with the default: one id, as today\n- The chip's spelling: decided with the default: whichever row comes first\n";
+const TASKS_AFTER: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeBerthsBySlug\n- [ ] apps/web/src/components/blocks/BerthsFilter.tsx: [modify] One chip per slug\n";
 
 fn patch(lines: &[&str]) -> String {
     lines
@@ -50,28 +50,28 @@ fn patch(lines: &[&str]) -> String {
         .join("\n")
 }
 
-/// The round that built the path pages, three days later.
+/// The round that built the path pages, days later.
 fn path_page_round() -> Vec<(String, String, String)> {
     vec![
         (
-            "apps/web/src/components/sanity-blocks/classes-block.tsx".into(),
+            "apps/web/src/components/cms-blocks/charters-block.tsx".into(),
             "modified".into(),
             patch(&[
-                "  // A /classes/<sport> path page filters by every sport sharing the path",
-                "  const selectedSportsIdList = selectedSport",
+                "  // A /charters/<berth> path page filters by every berth sharing the path",
+                "  const selectedBerthsIdList = selectedBerth",
             ]),
         ),
         (
-            "apps/web/src/services/classService.ts".into(),
+            "apps/web/src/services/charterService.ts".into(),
             "modified".into(),
-            patch(&["    : selectedSport", "      ? [selectedSport.id]"]),
+            patch(&["    : selectedBerth", "      ? [selectedBerth.id]"]),
         ),
         (
-            "apps/web/src/test/components/classes-block-dedup.test.tsx".into(),
+            "apps/web/src/test/components/charters-block-dedup.test.tsx".into(),
             "modified".into(),
             patch(&[
-                "  it(\"sends every sport id sharing a /classes/<sport> path slug\", () => {",
-                "    expect(args.selectedSport?.id).toBe(\"s-b\");",
+                "  it(\"sends every berth id sharing a /charters/<berth> path slug\", () => {",
+                "    expect(args.selectedBerth?.id).toBe(\"s-b\");",
             ]),
         ),
     ]
@@ -117,14 +117,14 @@ fn the_plan_decides_scope_once_and_asks_nothing() {
     let l = ledger();
     assert_eq!(
         l.criteria,
-        vec!["Only one multi-sport filter to show".to_string()]
+        vec!["Only one multi-berth filter to show".to_string()]
     );
     let path = l
         .outs()
-        .find(|e| e.item.contains("/classes/<sport>"))
+        .find(|e| e.item.contains("/charters/<berth>"))
         .expect("path pages out");
     assert!(
-        path.marks.contains(&"selectedSport".to_string()),
+        path.marks.contains(&"selectedBerth".to_string()),
         "{:?}",
         path.marks
     );
@@ -155,7 +155,7 @@ fn every_round_is_held_to_it_tests_included() {
     assert!(
         lines
             .iter()
-            .any(|x| x.contains("classes-block-dedup.test.tsx")
+            .any(|x| x.contains("charters-block-dedup.test.tsx")
                 && x.contains("decided is out of scope")),
         "{lines:?}"
     );
@@ -165,8 +165,8 @@ fn every_round_is_held_to_it_tests_included() {
     let (keep, gone) = store::drop_covered(
         &l,
         vec![
-            "apps/web/src/services/classService.ts: prefer the resolved id list over `selectedSport`".into(),
-            "apps/web/src/components/blocks/SportsFilter.tsx: one chip per slug".into(),
+            "apps/web/src/services/charterService.ts: prefer the resolved id list over `selectedBerth`".into(),
+            "apps/web/src/components/blocks/BerthsFilter.tsx: one chip per slug".into(),
         ],
     );
     assert_eq!((keep.len(), gone.len()), (1, 1));
@@ -175,15 +175,15 @@ fn every_round_is_held_to_it_tests_included() {
 #[test]
 fn scope_changes_only_with_a_cited_reason() {
     let mut l = ledger();
-    let sources = vec!["Please also make the /classes/<sport> path pages list classes from every row sharing the slug".to_string()];
+    let sources = vec!["Please also make the /charters/<berth> path pages list charters from every row sharing the slug".to_string()];
     let (ok, no) = l.apply_changes(
-        "Scope change: /classes/<sport> path pages: it seemed incomplete without them",
+        "Scope change: /charters/<berth> path pages: it seemed incomplete without them",
         &sources,
     );
     assert!(ok.is_empty() && no.len() == 1);
     assert_eq!(scope_ledger::breaches(&l, &path_page_round()).len(), 3);
     let (ok, _) = l.apply_changes(
-        "Scope change: /classes/<sport> path pages: the comment asks that path pages list classes from every row sharing the slug",
+        "Scope change: /charters/<berth> path pages: the comment asks that path pages list charters from every row sharing the slug",
         &sources,
     );
     assert_eq!(ok.len(), 1);
@@ -195,7 +195,7 @@ fn the_description_says_what_the_ledger_says() {
     let l = ledger();
     let files = path_page_round();
     let mut facts = Facts {
-        head: "6bbf7be3fdc0347b699f05e89d2438e518194327".into(),
+        head: "abc1234def5678901234567890abcdef12345678".into(),
         files: files
             .iter()
             .map(|(p, s, _)| FileChange {
@@ -214,7 +214,7 @@ fn the_description_says_what_the_ledger_says() {
         !facts
             .out_of_scope
             .iter()
-            .any(|x| x.contains("/classes/<sport>")),
+            .any(|x| x.contains("/charters/<berth>")),
         "{:?}",
         facts.out_of_scope
     );
@@ -226,9 +226,9 @@ fn the_description_says_what_the_ledger_says() {
         .unverified
         .iter()
         .any(|u| u.what.contains("decided out of scope at plan time")));
-    let written = "## Changes\nOne chip per slug.\n\nRedirect helpers are untouched. Out of scope: merging the two rows, and `/classes/<sport>` pages, which still resolve one sport.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n";
+    let written = "## Changes\nOne chip per slug.\n\nRedirect helpers are untouched. Out of scope: merging the two rows, and `/charters/<berth>` pages, which still resolve one berth.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n";
     let (text, corrections) = description_facts::hold_scope(written, &mut facts);
-    assert!(!text.contains("still resolve one sport"), "{text}");
+    assert!(!text.contains("still resolve one berth"), "{text}");
     assert!(text.contains("Redirect helpers are untouched."));
     assert!(!text.to_lowercase().contains("question"), "{text}");
     assert_eq!(corrections.len(), 1);
@@ -240,7 +240,7 @@ fn the_description_says_what_the_ledger_says() {
         "{:?}",
         facts.out_of_scope
     );
-    let shaped = description_facts::shape(written, "ABC-1: One Multi-Sport chip", facts, None);
+    let shaped = description_facts::shape(written, "ABC-1: One Multi-Berth chip", facts, None);
     let low = shaped.body.to_lowercase();
     assert!(
         !low.contains("open product question") && !low.contains("please answer"),
@@ -252,7 +252,7 @@ fn the_description_says_what_the_ledger_says() {
         "{}",
         shaped.body
     );
-    assert!(!common::pr_body::defects(&shaped.body, "6bbf7be")
+    assert!(!common::pr_body::defects(&shaped.body, "abc1234")
         .iter()
         .any(|d| d.contains("question")));
 }

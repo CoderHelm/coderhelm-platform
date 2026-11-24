@@ -1,17 +1,16 @@
-//! co. A ticket asked two things of a vendor portal page: remove the
-//! "Open registration in a new tab" link, and "Don't freeze the header,
-//! allow the user to scroll". The build removed the link and sized the
+//! co. A ticket asked two things of a booking vendor's portal page: remove
+//! the link that opens booking in a new tab, and let the user scroll past
+//! the header instead of freezing it. The build removed the link and sized the
 //! frame one window tall (`className="h-svh!"`) so the header scrolls
 //! away. CoderHelm's own review asked to take the sizing out; the review
 //! round did. The check before the pull request then listed the sizing as
 //! planned work not done, and a planned-work round put it back. The review
 //! asked again, and the next review round took it out again: build, take
 //! out, build, take out, in four commits, and the pull request ended up
-//! saying "the PR now only removes the link" while the ticket's second
-//! criterion was gone. Seven branches that week had a review round and a
-//! planned-work round undoing each other (diagnostics added, removed,
-//! added and removed again on three flaky-test fixes; a listener moved and
-//! moved back).
+//! saying it only removed the link while the ticket's second criterion was
+//! gone. Several other branches had a review round and a planned-work
+//! round undoing each other (diagnostics added, removed, added and removed
+//! again on flaky-test fixes; a listener moved and moved back).
 //!
 //! Guarantee: planned work a review commit on the pull request took out is
 //! not built again (`round_agree::taken_out`, `round_agree::sort`); the run
@@ -33,7 +32,7 @@ const BUILD: &str = "@@ -5,32 +5,24 @@\n-  linkLabel: string;\n }\n /**\n- * Ven
 /// The review round: the sizing and its comment go, the link stays gone.
 const REVIEW: &str = "@@ -8,9 +8,8 @@\n- * Vendor portal embed. The iframe is exactly one small viewport\n- * tall: the `h-svh!` stylesheet rule is `!important`, so it beats the inline\n- * height the vendor's script writes. The page above the frame scrolls away.\n+ * Vendor portal embed. The vendor's script sets the iframe's height.\n         src={src}\n-        className=\"h-svh!\"\n         style={{ width: \"100%\", border: 0 }}\n";
 
-const TICKET: &str = "Acceptance Criteria\nRemove \u{201c}Open registration in a new tab\u{201d} text and link\nDon\u{2019}t freeze the \u{201c}Register for Camps\u{201d} header, allow the user to scroll down the iframe.\nexample page: https://www.example.com/venue/summer-camps/register";
+const TICKET: &str = "Acceptance Criteria\nRemove \u{201c}Open booking in a new tab\u{201d} text and link\nDon\u{2019}t freeze the \u{201c}Book a Slip\u{201d} header, allow the user to scroll down the iframe.\nexample page: https://www.example.com/marina/slips/book";
 
 const ITEM: &str = "`apps/web/src/components/blocks/portal-embed.tsx` drops the link but never adds `className=\"h-svh!\"` to the iframe and never rewrites the doc comment, so the frame is still sized by the vendor's script and the page never scrolls.";
 
@@ -47,10 +46,10 @@ fn taken() -> Vec<round_agree::TakenOut> {
 
 #[test]
 fn the_review_commit_is_known_and_what_it_took_out_is_read() {
-    assert!(answers_review("CPM-1: Address the review"));
+    assert!(answers_review("ABC-1: Address the review"));
     assert!(answers_review("Address the review comments\n\nbody"));
     assert!(!answers_review(
-        "CPM-1: Finish the planned work still not done"
+        "ABC-1: Finish the planned work still not done"
     ));
     let t = taken();
     assert_eq!(t.len(), 1);

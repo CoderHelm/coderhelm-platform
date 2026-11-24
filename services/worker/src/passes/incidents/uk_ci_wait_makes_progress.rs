@@ -2,7 +2,7 @@
 //! One workflow passed; another never left `queued`. Every two minutes the
 //! run asked GitHub again and armed another check, and webhook resumes in
 //! between armed a second chain, so it checked about once a minute. After
-//! eight hours and almost 500 checks nothing had changed, and nothing said
+//! hours and hundreds of checks nothing had changed, and nothing said
 //! which check it was waiting on. The 24-hour cap measured from the run's
 //! last write, which every check refreshed.
 //!
@@ -20,7 +20,7 @@ use serde_json::json;
 #[test]
 fn a_wait_with_no_progress_reruns_once_then_stops_and_names_the_check() {
     let checks = json!({"total_count": 4, "check_runs": [
-        {"name": "Web App Lint", "status": "completed", "conclusion": "success"},
+        {"name": "Lint", "status": "completed", "conclusion": "success"},
         {"name": "Unit Tests", "status": "completed", "conclusion": "success"},
         {"name": "E2E on preview", "status": "queued",
          "details_url": "https://github.com/o/web/actions/runs/9001/job/3"},
@@ -28,7 +28,7 @@ fn a_wait_with_no_progress_reruns_once_then_stops_and_names_the_check() {
     ]});
     let pending = ci_watch::pending_of(&checks);
     assert_eq!(ci_watch::pending_run_ids(&checks), vec![9001]);
-    // The real run: a check every ~60 s for eight hours, nothing moving.
+    // A check every ~60 s for hours, nothing moving.
     let mut w = None;
     let mut steps = Vec::new();
     for i in 0..480i64 {

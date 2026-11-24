@@ -1,15 +1,15 @@
 # rp. `rp_reproduce_before_planning`
 
-**What happened:** A data-pipeline ticket named four camps that were filed under the wrong sport. The pipeline already had an overrides table for exactly this case, with entries for those camps. Its lookup matched exact names, though, and the vendor appends "-Half Day" or "-Full Day", so the entries never matched: the lookup returned nothing for each of the ticket's names on the base.
+**What happened:** A data-pipeline ticket named a few charters that were filed under the wrong activity. The pipeline already had an overrides table for exactly this case, with entries for those charters. Its lookup matched exact names, though, and the booking vendor appends a "-Half Day" or "-Full Day" suffix, so the entries never matched: the lookup returned nothing for each of the ticket's names on the base.
 
-The run's notes said so, then planned a keyword step beside the table. The diff was +595/-186 across the pipeline: a moved extractor, keyword matching, new logging and a fixture. It also moved other programs to another lookup, which its own reviewer flagged as out of scope, and it asked two questions on the pull request that one page load answered.
+The run's notes said so, then planned a keyword step beside the table. The diff was hundreds of lines across the pipeline: a moved extractor, keyword matching, new logging and a fixture. It also moved other programs to another lookup, which its own reviewer flagged as out of scope, and it asked two questions on the pull request that one page load answered.
 
-The new test was never run on the base. The repository's CI runs each test file in a `python "$t"` loop, which CoderHelm couldn't narrow to one file, so the test was recorded as not run and the description said nothing about it. The right change stripped the suffix in the lookup and added two entries (+49/-1, mostly a test of the exact stored names), and that test fails on the base.
+The new test was never run on the base. The repository's CI runs each test file in a `python "$t"` loop, which CoderHelm couldn't narrow to one file, so the test was recorded as not run and the description said nothing about it. The right change stripped the suffix in the lookup and added two entries (a small diff, mostly a test of the exact stored names), and that test fails on the base.
 
-Across the 53 runs audited:
-- 8 of the 10 bug tickets that wrote code ran nothing before their first edit;
-- 6 diffs of 300 lines or more answered a ticket that named 1 to 10 records;
-- none of the 17 runs whose tests were checked had a test shown to fail on the base.
+An audit of recent runs found the same shape often:
+- most bug tickets that wrote code ran nothing before their first edit;
+- several diffs of hundreds of lines answered a ticket that named a few records;
+- none of the runs whose tests were checked had a test shown to fail on the base.
 
 **The guarantee:**
 - **Reproduce first.** A bug plan has a `## Reproduce` section with:

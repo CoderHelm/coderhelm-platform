@@ -1,5 +1,5 @@
-//! k. A ticket about a wrong class time (a schedule data fix) failed in the
-//! plan pass after about 14 minutes: "The step reached its time limit and
+//! k. A ticket about a wrong charter time (a schedule data fix) failed in
+//! the plan pass at its time limit: "The step reached its time limit and
 //! the run couldn't continue in a fresh step: no work is committed to
 //! continue from." It planned (with two reviewers and a revision), switched
 //! repository and planned again there, was told by the release check that
@@ -33,19 +33,19 @@ const OLD: &str = "no work is committed to continue from";
 /// check pushed it to write, and both environments listed as unchecked.
 fn schedule_fix() -> PlanResult {
     PlanResult {
-        proposal: "Correct the Saturday Speed and Agility class from 9am to 8am.".into(),
-        design: "A data migration runs UPDATE class_schedule SET start_time = '08:00', \
-                 updated_at = now() WHERE class_id = 42. No schema change."
+        proposal: "Correct the Saturday sunset charter from 9am to 8am.".into(),
+        design: "A data migration runs UPDATE charter_schedule SET start_time = '08:00', \
+                 updated_at = now() WHERE charter_id = 42. No schema change."
             .into(),
-        tasks: "- [ ] src/database/migrations/1783400000000-FixClassTime.ts: [create] Set the \
-                class's start time to 08:00 and bump updated_at\n"
+        tasks: "- [ ] src/database/migrations/1900000000000-FixCharterTime.ts: [create] Set the \
+                charter's start time to 08:00 and bump updated_at\n"
             .into(),
-        spec: "Given the class page, the Saturday time reads 8am.".into(),
+        spec: "Given the charter page, the Saturday time reads 8am.".into(),
         repo_tasks: vec![],
         fix: Some(FixDecision {
-            cause: "The class is stored with a 9am start; the ticket says 8am.".into(),
+            cause: "The charter is stored with a 9am start; the ticket says 8am.".into(),
             evidence: FixEvidence {
-                data_shows: "class_schedule row 42 has start_time 09:00".into(),
+                data_shows: "charter_schedule row 42 has start_time 09:00".into(),
                 environments: vec![
                     EnvCheck {
                         env: "production".into(),
@@ -64,7 +64,7 @@ fn schedule_fix() -> PlanResult {
                 fields: vec![FieldChange {
                     old: vec!["updated_at".into()],
                     new: String::new(),
-                    types: vec!["class_schedule".into()],
+                    types: vec!["charter_schedule".into()],
                 }],
                 ..Default::default()
             }),

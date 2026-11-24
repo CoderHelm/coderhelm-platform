@@ -1,5 +1,6 @@
 //! ae. Two loops of fix rounds still stopped on their own budget and waited
-//! on a person after #635 moved every other ending onto the supervisor:
+//! on a person after an earlier change moved every other ending onto the
+//! supervisor:
 //!
 //! - the CI-only fix rounds on a finished run's pull request: at eight
 //!   automatic pushes CoderHelm marked the pull request ready, completed the

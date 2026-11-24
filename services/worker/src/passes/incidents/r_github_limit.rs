@@ -1,6 +1,5 @@
 //! r. A fix round after red sandbox checks hit the installation's hourly
-//! GitHub limit around 20:05 UTC: fifteen `batch_write` and fourteen
-//! `edit_file` calls came back "403 ... API rate limit exceeded", the diff
+//! GitHub limit: dozens of `batch_write` and `edit_file` calls came back "403 ... API rate limit exceeded", the diff
 //! and the plan check's compare failed the same way, and the run ended
 //! "Orchestration failed": "Stopped without a pull request: the coder wrote
 //! no file (and GitHub couldn't show the branch's diff) ... That is
@@ -23,9 +22,9 @@ use common::github_wait::{self as gw, Cause};
 const OLD: &str = "That is CoderHelm's miss";
 const RUN: &str = "01RUNLIMIT";
 
-/// The reset the 403s named: 2026-11-06 21:05:00 UTC.
-const RESET: u64 = 1_793_999_100;
-/// When the round hit the limit: 20:05:00.
+/// The reset the 403s named: 2030-03-06 14:05:00 UTC.
+const RESET: u64 = 1_899_036_300;
+/// When the round hit the limit: 13:05:00.
 const HIT: u64 = RESET - 3_600;
 
 fn refused_write() -> Box<dyn std::error::Error + Send + Sync> {
@@ -48,10 +47,10 @@ fn a_rate_limited_round_waits_for_the_reset_and_goes_on_as_itself() {
     assert!(told.contains("Do not retry"));
     assert!(!told.contains("403"));
 
-    // Had the pass gone on to the empty-step check anyway: 29 refused
+    // Had the pass gone on to the empty-step check anyway: 24 refused
     // writes and an unreadable diff are a wait, not "no file".
     let mut writes = Writes::default();
-    for _ in 0..29 {
+    for _ in 0..24 {
         writes.refuse(Cause::RateLimit, RESET);
     }
     let tasks = plan_coverage::plan_tasks(&plan_tasks_md());
@@ -103,7 +102,7 @@ fn a_rate_limited_round_waits_for_the_reset_and_goes_on_as_itself() {
         "only once"
     );
 
-    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"));
+    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 14:05 UTC"));
     end.never_says(OLD);
     end.never_says("the coder wrote no file");
     end.never_says("Orchestration failed");

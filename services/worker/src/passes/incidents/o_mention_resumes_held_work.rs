@@ -40,7 +40,7 @@ fn held_record() -> Incomplete {
     let mut r = Round::start(
         Kind::Feedback,
         0,
-        "3cb5799",
+        "ccc3333",
         FIVE,
         false,
         chrono::Utc::now(),
@@ -49,7 +49,7 @@ fn held_record() -> Incomplete {
     Incomplete::held(
         &r,
         "Full test suite FAILED (exit 2) in CoderHelm's own setup",
-        "2026-10-29T21:34:45Z",
+        "2030-03-12T21:34:45Z",
     )
 }
 
@@ -87,13 +87,13 @@ fn a_bare_mention_resumes_the_held_round_never_a_review() {
     assert!(back.status_line().contains("held, not landed"));
     let work = Outstanding::from_incomplete(&back).unwrap();
     assert_eq!(work.wip_branch, wip());
-    assert_eq!(work.base_sha, "3cb5799");
+    assert_eq!(work.base_sha, "ccc3333");
 
     let route = held_work::mention_route(true, false, true);
     assert_eq!(route, MentionRoute::ResumeWork);
     let end = ending_for(route, Some(&work), false);
     assert!(end.says(
-        "on the run and the ticket: Picking up the held changes from 2026-10-29 21:34 UTC: \
+        "on the run and the ticket: Picking up the held changes from 2030-03-12 21:34 UTC: \
          re-running the checks with the current setup, then landing them."
     ));
     end.never_says(OLD);
@@ -115,17 +115,17 @@ fn a_round_held_before_the_record_kept_it_is_found_on_its_wip_branch() {
     // GitHub's compare of the pull request's branch with the WIP.
     let mut compare = gh.compare(&wip());
     compare["ahead_by"] = 2.into();
-    compare["merge_base_commit"] = serde_json::json!({"sha": "3cb5799"});
+    compare["merge_base_commit"] = serde_json::json!({"sha": "ccc3333"});
     compare["commits"] = serde_json::json!([
-        {"commit": {"committer": {"date": "2026-10-29T21:34:40Z"}}}
+        {"commit": {"committer": {"date": "2030-03-12T21:34:40Z"}}}
     ]);
     let mut work = Outstanding::from_wip_compare(&wip(), &compare).unwrap();
     assert!(work.held);
-    assert_eq!(work.base_sha, "3cb5799");
+    assert_eq!(work.base_sha, "ccc3333");
     // What it was asked: the person's last review before it stopped.
     let reviews = serde_json::json!([
-        {"user": {"login": "lead", "type": "User"}, "body": FIVE, "submitted_at": "2026-10-29T21:26:30Z"},
-        {"user": {"login": "coderhelm[bot]", "type": "Bot"}, "body": "APPROVE", "submitted_at": "2026-10-30T00:20:14Z"}
+        {"user": {"login": "lead", "type": "User"}, "body": FIVE, "submitted_at": "2030-03-12T21:26:30Z"},
+        {"user": {"login": "coderhelm[bot]", "type": "Bot"}, "body": "APPROVE", "submitted_at": "2030-03-13T00:20:14Z"}
     ]);
     work.requests = held_work::requests_from_reviews(&reviews, &work.since);
     assert_eq!(work.requests, FIVE);
@@ -157,7 +157,7 @@ fn words_are_read_for_meaning_and_only_a_review_ask_reviews() {
     assert_eq!(review_agent::route_ask(fix, true), AskRoute::FixLoop);
     // The model is told about the held work.
     let work = Outstanding::from_incomplete(&held_record()).unwrap();
-    let prompt = review_agent::ask_prompt("do it", "APPROVE on 3cb5799.", None, Some(&work.note()));
+    let prompt = review_agent::ask_prompt("do it", "APPROVE on ccc3333.", None, Some(&work.note()));
     assert!(prompt.contains("## Outstanding work on the PR"));
     assert!(prompt.contains("held the changes from landing"));
     // A review happens when asked for, or with no work outstanding.

@@ -32,16 +32,16 @@ const TOKEN: &str = "ghs_madeUpTokenForTheIncident0123";
 fn item() -> SkillMeta {
     SkillMeta {
         repo: "acme/team-playbook".into(),
-        path: "skills/report-rate/SKILL.md".into(),
+        path: "skills/merge-report/SKILL.md".into(),
         kind: Kind::Skill,
-        name: "report-rate".into(),
+        name: "merge-report".into(),
         description: "Merge rate by contributor".into(),
         sha: "s".into(),
         hash: "h2".into(),
         enabled: true,
         files: vec![
-            "skills/report-rate/report_rate.py".into(),
-            "skills/report-rate/test_report_rate.py".into(),
+            "skills/merge-report/merge_report.py".into(),
+            "skills/merge-report/test_merge_report.py".into(),
         ],
         missing_tools: vec![],
         uses: 0,
@@ -59,11 +59,11 @@ fn item() -> SkillMeta {
     }
 }
 
-const BODY: &str = "---\nname: report-rate\ndescription: Merge rate by contributor\n---\n\
+const BODY: &str = "---\nname: merge-report\ndescription: Merge rate by contributor\n---\n\
 1. Parse the arguments: repos, since, until, --verify.\n\
 2. Choose an output directory, ./reports/<date>.\n\
 3. Check access with `gh auth status`; if it fails, tell the user to log in.\n\
-4. Run `python3 report_rate.py --repos <repos> --out <dir>`: it fetches every pull request \
+4. Run `python3 merge_report.py --repos <repos> --out <dir>`: it fetches every pull request \
 through GitHub GraphQL, saves a snapshot and writes CSVs, summary.json, tables.md and \
 report.html.\n\
 5. Read tables.md and summary.json.\n\
@@ -91,7 +91,7 @@ fn before() -> Value {
             s("Choose an output directory", false, vec![q("./reports/<date>", "path", "missing", &[], "repo")]),
             s("Check access", true, vec![q("gh auth status", "command", "missing", &[], "none")]),
             s("Run the bundled script", false, vec![
-                q("python3 report_rate.py", "command", "missing", &[], "none"),
+                q("python3 merge_report.py", "command", "missing", &[], "none"),
                 q("Pull request history", "data", "translated", &["github_history"], "none")]),
             s("Read the tables", false, vec![q("tables.md and summary.json", "path", "missing", &[], "none")]),
             s("Write the narrative report", false, vec![]),
@@ -110,13 +110,13 @@ fn after() -> Value {
             s("Choose an output directory", true, vec![q("./reports/<date>", "path", "missing", &[], "repo")]),
             s("Check access", true, vec![q("gh auth status", "command", "missing", &[], "none")]),
             s("Run the bundled script", false, vec![
-                q("python3 report_rate.py", "command", "translated", &["run_skill_script"], "none"),
+                q("python3 merge_report.py", "command", "translated", &["run_skill_script"], "none"),
                 q("Pull request history through GitHub GraphQL", "data", "translated", &["run_skill_script"], "none")]),
             s("Read the tables", false, vec![q("tables.md and summary.json", "path", "translated", &["read_output"], "none")]),
             s("Write the narrative report", false, vec![q("report.md", "path", "translated", &["save_output"], "none")]),
             s("Tell the user where everything is", false, vec![q("Tell the user", "person", "available", &[], "none")]),
         ],
-        "translated": "1. Read the arguments.\n2. Run `run_skill_script` with skill:report-rate, report_rate.py, `--repos <repos> --out {out}`, and the repositories for its token.\n3. Read tables.md and summary.json with `read_output`.\n4. Write the narrative and keep it with `save_output`, linking report.html.\n5. Give the links to the outputs.",
+        "translated": "1. Read the arguments.\n2. Run `run_skill_script` with skill:merge-report, merge_report.py, `--repos <repos> --out {out}`, and the repositories for its token.\n3. Read tables.md and summary.json with `read_output`.\n4. Write the narrative and keep it with `save_output`, linking report.html.\n5. Give the links to the outputs.",
         "reviews": []
     })
 }
@@ -256,7 +256,7 @@ fn the_script_run_keeps_its_files_as_outputs_and_never_its_token() {
     // The command the translated step runs: the skill's own script, its
     // output folder as the sandbox's.
     let cmd = skill_run::script_command(
-        "report_rate.py",
+        "merge_report.py",
         &[
             "--repos".into(),
             "acme/web,acme/api".into(),
@@ -265,7 +265,7 @@ fn the_script_run_keeps_its_files_as_outputs_and_never_its_token() {
         ],
     )
     .unwrap();
-    assert!(cmd.starts_with("python3 'report_rate.py'") && cmd.contains("\"$CODERHELM_OUT\""));
+    assert!(cmd.starts_with("python3 'merge_report.py'") && cmd.contains("\"$CODERHELM_OUT\""));
     // The token covers only the team's repositories it names.
     let team = vec!["acme/web".to_string(), "acme/api".to_string()];
     assert_eq!(
@@ -276,7 +276,7 @@ fn the_script_run_keeps_its_files_as_outputs_and_never_its_token() {
     // A script that printed its token: the log and every file come back
     // without it.
     let log = format!(
-        "Running command bash -c \"$SCRIPT_CMD\"\n===CODERHELM_SCRIPT_START===\nusing token {TOKEN}\nfetched 412 pull requests\n===CODERHELM_SCRIPT_END exit=0===\n===CODERHELM_SCRIPT_UPLOADED===\n"
+        "Running command bash -c \"$SCRIPT_CMD\"\n===CODERHELM_SCRIPT_START===\nusing token {TOKEN}\nfetched 128 pull requests\n===CODERHELM_SCRIPT_END exit=0===\n===CODERHELM_SCRIPT_UPLOADED===\n"
     );
     let out = script_outcome(
         &log,
@@ -284,7 +284,7 @@ fn the_script_run_keeps_its_files_as_outputs_and_never_its_token() {
             files: vec![
                 (
                     "summary.json".into(),
-                    format!("{{\"merged\": 301, \"debug\": \"{TOKEN}\"}}"),
+                    format!("{{\"merged\": 97, \"debug\": \"{TOKEN}\"}}"),
                 ),
                 ("tables.md".into(), "| author | merged |\n".into()),
                 ("report.html".into(), "<html></html>".into()),
@@ -293,7 +293,7 @@ fn the_script_run_keeps_its_files_as_outputs_and_never_its_token() {
         },
     );
     assert!(out.ran && out.exit_code == Some(0));
-    assert!(out.output.contains("fetched 412 pull requests"));
+    assert!(out.output.contains("fetched 128 pull requests"));
     assert!(!out.output.contains("CODERHELM_SCRIPT_END"));
     let shown = skill_run::redact(&out.output, Some(TOKEN));
     assert!(!shown.contains(TOKEN) && shown.contains(skill_run::REDACTED));

@@ -5,18 +5,18 @@
 //! Executable doesn't exist"). Playwright's CDN redirects the browser build
 //! to a shared storage host the network allowlist didn't list, and the
 //! `--with-deps` install failed first on the OS package mirrors with its
-//! error hidden. Those runs were still counted: 0 of 480 passed, so the
+//! error hidden. Those runs were still counted and none passed, so the
 //! test was called "not flaky, failing every run".
 //!
-//! CoderHelm's own review then asked for 20 repeat runs. The fix round ran
+//! CoderHelm's own review then asked for more repeat runs. The fix round ran
 //! them against the team's staging site and against the pull request's
-//! preview: 20 of 20 failed with `net::ERR_TUNNEL_CONNECTION_FAILED`, the
+//! preview: every one failed with `net::ERR_TUNNEL_CONNECTION_FAILED`, the
 //! proxy printing `CODERHELM_EGRESS_BLOCKED` for both hosts, while
 //! `check_url` read both pages (they are under the domain the team lists as
 //! its own). The round ended "NEEDS A PERSON ... outside_reach: add the
 //! hosts to CoderHelm's sandbox network allowlist", the review kept asking
-//! for changes and the pull request was held: 2.7 hours, $6.84. In two
-//! weeks eleven more runs on the same install met the same environment.
+//! for changes and the pull request was held for hours. Other runs met
+//! the same environment.
 //!
 //! Guarantee: the sandbox reaches the team's own hosts from its settings
 //! and gets Playwright's browsers (through the proxy's mirror, never by
@@ -32,7 +32,7 @@ use crate::passes::own_review_ledger::{self as ledger, Approach, Blocker, Ledger
 use common::agent_policy::sandbox::{domain_allowed, own_hosts, run_allowlist};
 
 const STAGING: &str = "staging-web.example.com";
-const PREVIEW: &str = "pr-1562.preview-web.example.com";
+const PREVIEW: &str = "pr-12.preview-web.example.com";
 const FINDING: &str =
     "Fix is unproven: no repeat run shows the test passes (`e2e/pages/browse-pages.ts:352`)";
 
@@ -57,7 +57,7 @@ fn blocked_log() -> Vec<serde_json::Value> {
             "type": "tool_result",
             "tool_use_id": "t1",
             "content": format!(
-                "exit 1\n  1) [chromium] > tests/browse/venues.spec.ts:111:3\n    Error: page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{STAGING}/all/drop-ins\n  20 failed\nCODERHELM_EGRESS_BLOCKED {STAGING}\n"
+                "exit 1\n  1) [chromium] > tests/browse/marinas.spec.ts:111:3\n    Error: page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{STAGING}/marinas/guest-slips\n  20 failed\nCODERHELM_EGRESS_BLOCKED {STAGING}\n"
             )
         }]
     })]
@@ -144,7 +144,7 @@ fn playwrights_browsers_come_through_the_proxys_mirror_and_are_kept() {
 
 #[test]
 fn tests_that_never_started_are_never_counted_as_failures() {
-    let out = "Error: Failed to download Chrome for Testing 153.0.8010.12 (playwright chromium v1243), caused by\nError: Download failure, code=1\n  Error: browserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome\n  480 failed\n";
+    let out = "Error: Failed to download Chrome for Testing 153.0.8010.12 (playwright chromium v1243), caused by\nError: Download failure, code=1\n  Error: browserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome\n  120 failed\n";
     let r = crate::passes::test_bug::counts_of(out);
     assert!(r.is_err(), "{r:?}");
     assert!(r.unwrap_err().contains("never started"));

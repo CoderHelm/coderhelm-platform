@@ -1,16 +1,16 @@
 //! bu. A release fixed how a finished run's held draft is finished (a round
 //! that answered a review finding with proof is read by a review of the
 //! same head). The run it was for never got there. Its hold had been
-//! decided 22 minutes before the release, and the draft sweep re-decides a
+//! decided shortly before the release, and the draft sweep re-decides a
 //! held draft only once its hold is an hour old: the first sweep after the
-//! release came six seconds early and only peeked. The next one, a quarter
-//! hour later, found less than half of GitHub's hourly budget left and
+//! release came seconds early and only peeked. The next one, a while
+//! later, found less than half of GitHub's hourly budget left and
 //! skipped the installation, logging "it looks again in about 1 min"; the
-//! budget refilled ten seconds later, but nothing ran until the next
+//! budget refilled seconds later, but nothing ran until the next
 //! scheduled sweep. The pull request watch, which also finishes held
-//! drafts, looked at none of its candidates for three sweeps: its hourly
+//! drafts, looked at none of its candidates for several sweeps: its hourly
 //! cap went to merged pull requests looked at less recently. A person reset
-//! the run 67 minutes after the release.
+//! the run over an hour after the release.
 //!
 //! Guarantee: a hold carries the version of the code that decided it, and
 //! the sweep decides a hold other code wrote on its first pass after a
@@ -56,14 +56,14 @@ fn candidate(status: &str, hold: Option<DraftHold>) -> ready::Candidate {
 #[test]
 fn a_hold_older_code_decided_is_decided_again_on_the_first_sweep() {
     let now = chrono::Utc::now();
-    // Decided 59 minutes 54 seconds ago, by the code before the release.
-    let stuck = candidate("completed", Some(held_by(OLD, 3594)));
+    // Decided 59 minutes 50 seconds ago, by the code before the release.
+    let stuck = candidate("completed", Some(held_by(OLD, 3590)));
     assert_eq!(
         ready::sweep_step(&stuck, now, NEW),
         ready::SweepStep::Decide
     );
     // The same hold decided by this code is only peeked at until it is old.
-    let current = candidate("completed", Some(held_by(NEW, 3594)));
+    let current = candidate("completed", Some(held_by(NEW, 3590)));
     assert_eq!(
         ready::sweep_step(&current, now, NEW),
         ready::SweepStep::Peek
@@ -121,7 +121,7 @@ fn a_sweep_the_budget_skipped_runs_again_once_it_refills() {
     crate::clients::github::record_budget(
         id,
         Budget {
-            remaining: 2_268,
+            remaining: 2_100,
             limit: 5_000,
             reset: now + 10,
         },

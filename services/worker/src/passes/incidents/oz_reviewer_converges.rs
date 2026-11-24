@@ -1,6 +1,6 @@
 //! oz. The pull request of `ow` and `ox`, its whole review history. The
 //! fix was right by its third commit; CI and the preview's end-to-end run
-//! (71 of 71) were green, and a person's product answers were built. The
+//! were green, and a person's product answers were built. The
 //! review still requested changes for six more rounds on two generic
 //! findings. "A parallel structure next to an existing one" never named the
 //! function it duplicated across three rewrites of the file. "A test out of
@@ -8,7 +8,7 @@
 //! was trimmed, and landed on a test whose selected-chip and row-order
 //! cases the review had asked to restore. CoderHelm's own fix rounds
 //! deferred both as making no progress, and the review kept blocking. A
-//! person had answered that the `/classes/<sport>` path pages should cover
+//! person had answered that the `/charters/<berth>` path pages should cover
 //! both rows; the run reverted that work as out of scope, and a later
 //! review called it missing.
 //!
@@ -30,16 +30,16 @@ use serde_json::json;
 
 const MAPS: &str = "apps/web/src/utils/filterMaps.ts";
 const MAPS_TEST: &str = "apps/web/src/test/utils/filterMaps.test.ts";
-const GRID_TEST: &str = "apps/web/src/test/components/filter-nav-sport-grid.test.tsx";
-const DEDUPE_TEST: &str = "apps/web/src/test/components/sports-filter-dedupe.test.tsx";
+const GRID_TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
+const DEDUPE_TEST: &str = "apps/web/src/test/components/docks-filter-dedupe.test.tsx";
 const VALIDATION_TEST: &str =
-    "apps/web/src/test/components/classes-block-filter-validation.test.tsx";
+    "apps/web/src/test/components/charters-block-filter-validation.test.tsx";
 const PARALLEL: &str = "A parallel structure next to an existing one";
 const TEST_SIZE: &str = "A test out of proportion to the change";
 
 /// The person's answer on the ticket, the day before.
-const ANSWER: &str = "Yes: the /classes/<sport> path pages should cover both rows too, the \
-     sport chip and the class list.";
+const ANSWER: &str = "Yes: the /charters/<berth> path pages should cover both rows too, the \
+     berth chip and the charter list.";
 
 fn finding(v: serde_json::Value) -> Finding {
     let mut base = json!({"line": 1, "severity": "blocking", "evidence": "verified-defect",
@@ -53,7 +53,7 @@ fn finding(v: serde_json::Value) -> Finding {
 fn size(file: &str) -> Finding {
     finding(
         json!({"file": file, "line": 4, "category": "tests", "title": TEST_SIZE,
-        "body": "The tests are 236 added lines against 41 lines of changed code for this change. Cut them to the cases the ticket names."}),
+        "body": "The tests are 240 added lines against 40 lines of changed code for this change. Cut them to the cases the ticket names."}),
     )
 }
 
@@ -79,16 +79,16 @@ fn the_parallel_structure_that_names_nothing_never_blocks() {
     assert!(!fs[0].holds_merge());
     // Named and anchored, the same check blocks in a first review.
     let mut named = vec![finding(
-        json!({"file": MAPS, "line": 640, "title": PARALLEL,
-        "body": "`apps/web/src/utils/filterMaps.ts` adds `dedupeSportOptionsBySlug` next to the existing `dedupeSportsBySlug`."}),
+        json!({"file": MAPS, "line": 120, "title": PARALLEL,
+        "body": "`apps/web/src/utils/filterMaps.ts` adds `dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`."}),
     )];
     assert!(d::judge(&mut named, &facts(&[], &[], &[])).is_empty());
     assert!(named[0].note_only.is_none());
     // The check anchors it on the new definition's line.
-    let patch = "@@ -630,3 +630,9 @@ export const x = 1;\n context\n+export function dedupeSportOptionsBySlug(o) {\n+  return o;\n+}\n";
+    let patch = "@@ -110,3 +110,9 @@ export const x = 1;\n context\n+export function dedupeDockOptionsBySlug(o) {\n+  return o;\n+}\n";
     assert_eq!(
         crate::passes::review_rules::anchor_line(patch, &named[0].body),
-        631
+        111
     );
 }
 
@@ -123,7 +123,7 @@ fn a_finding_the_rounds_deferred_holds_no_more_without_new_code() {
         format!("{TEST_SIZE} (`{VALIDATION_TEST}`)"),
     ];
     let mut fs = vec![
-        finding(json!({"file": MAPS, "line": 640, "title": PARALLEL,
+        finding(json!({"file": MAPS, "line": 120, "title": PARALLEL,
             "body": "`x` next to the existing `y`."})),
         size(VALIDATION_TEST),
     ];
@@ -132,9 +132,9 @@ fn a_finding_the_rounds_deferred_holds_no_more_without_new_code() {
     assert!(made.iter().all(|m| m.why.contains("deferred")));
     // New code on the line is new evidence: it may hold again.
     let changed: std::collections::HashMap<String, std::collections::HashSet<u64>> =
-        [(MAPS.to_string(), std::collections::HashSet::from([641u64]))].into();
+        [(MAPS.to_string(), std::collections::HashSet::from([121u64]))].into();
     let mut again = vec![finding(
-        json!({"file": MAPS, "line": 640, "title": PARALLEL,
+        json!({"file": MAPS, "line": 120, "title": PARALLEL,
         "body": "`x` next to the existing `y`."}),
     )];
     let f = Facts {
@@ -152,19 +152,19 @@ fn a_finding_the_rounds_deferred_holds_no_more_without_new_code() {
 fn a_persons_answer_decides_scope() {
     let people = vec![ANSWER.to_string()];
     let mut out = vec![finding(
-        json!({"file": "apps/web/src/components/sanity-blocks/classes-block.tsx", "line": 30,
+        json!({"file": "apps/web/src/components/sanity-blocks/charters-block.tsx", "line": 30,
         "title": "Path-page changes are outside the ticket",
-        "body": "The /classes/<sport> path pages changes are out of scope for a summer camps chip fix; revert them."}),
+        "body": "The /charters/<berth> path pages changes are out of scope for a day slips chip fix; revert them."}),
     )];
     let made = d::judge(&mut out, &facts(&[], &[], &people));
     assert_eq!(made.len(), 1);
     assert!(made[0].why.contains("a person asked for this"));
     // Called missing after the revert: it says whose answer it was.
     let mut missing = vec![finding(
-        json!({"file": "apps/web/src/components/sanity-blocks/classes-block.tsx", "line": 30,
+        json!({"file": "apps/web/src/components/sanity-blocks/charters-block.tsx", "line": 30,
         "category": "correctness", "defeats_goal": true,
         "title": "Path pages no longer cover both rows",
-        "body": "The /classes/<sport> path pages are missing the sport chip dedupe."}),
+        "body": "The /charters/<berth> path pages are missing the berth chip dedupe."}),
     )];
     d::judge(&mut missing, &facts(&[], &[], &people));
     assert!(missing[0].body.contains("A person asked for this"));
@@ -176,23 +176,23 @@ fn a_persons_answer_decides_scope() {
 #[test]
 fn the_last_round_approves_with_follow_up_notes_once_the_criteria_pass() {
     let proofs = json!([
-        {"criterion": "One Multi-Sport chip on the summer camps page", "test": "e2e/camps.spec.ts › one chip",
-         "record": {"head": "e4599595a1", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 1, "failed": 0}}},
-        {"criterion": "Path pages cover both rows", "test": "e2e/classes.spec.ts › both rows",
-         "record": {"head": "e4599595a1", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 3, "failed": 0}}}
+        {"criterion": "One Multi-Dock chip on the day slips page", "test": "e2e/slips.spec.ts › one chip",
+         "record": {"head": "abcdef0123", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 1, "failed": 0}}},
+        {"criterion": "Path pages cover both rows", "test": "e2e/charters.spec.ts › both rows",
+         "record": {"head": "abcdef0123", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 3, "failed": 0}}}
     ])
     .to_string();
-    let proven = d::criteria_met(&proofs, "e4599595a1").unwrap();
+    let proven = d::criteria_met(&proofs, "abcdef0123").unwrap();
     assert!(proven);
     // What the last review still raised: the two generic findings, anchored
     // and named this time, and a concern it couldn't show.
     let mut fs = vec![
-        finding(json!({"file": MAPS, "line": 640, "title": PARALLEL,
+        finding(json!({"file": MAPS, "line": 120, "title": PARALLEL,
             "body": "`a.ts` adds `x` next to the existing `y`."})),
         size(VALIDATION_TEST),
         finding(json!({"file": MAPS, "line": 12, "category": "correctness",
-            "evidence": "unverified-concern", "title": "Inactive sports may still show",
-            "body": "Could a hidden sport still render?"})),
+            "evidence": "unverified-concern", "title": "Inactive docks may still show",
+            "body": "Could a hidden dock still render?"})),
     ];
     let f = Facts {
         criteria_proven: proven,
@@ -214,7 +214,7 @@ fn the_last_round_approves_with_follow_up_notes_once_the_criteria_pass() {
     assert!(one::check(&body).is_empty());
     // A shown defect still holds, criteria or not.
     let mut defect = vec![finding(json!({"file": MAPS, "line": 12, "category": "bug",
-        "title": "Crash on an empty sport list", "body": "`sports[0].id` throws on []."}))];
+        "title": "Crash on an empty dock list", "body": "`docks[0].id` throws on []."}))];
     assert!(d::judge(&mut defect, &f).is_empty());
     assert!(defect[0].holds_merge());
 }

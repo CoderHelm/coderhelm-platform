@@ -1,4 +1,4 @@
-//! uh. A feature put structured data on club pages from addresses in the
+//! uh. A feature put structured data on marina pages from addresses in the
 //! CMS. Staging had none, so the change carried a migration to fill them,
 //! and its own end-to-end test failed by name until the migration ran
 //! ("... is incomplete in this dataset; run apps/studio/migrations/...").
@@ -6,10 +6,10 @@
 //! person "Needed from you: nothing", but the repository had no staging
 //! CMS write connection, which CoderHelm only found after the pull request
 //! opened. The code was right (it left the block out when the address was
-//! missing), so each CI fix round changed nothing; four rounds met the
+//! missing), so each CI fix round changed nothing; every round met the
 //! same failure, spent the run's fix budget and ended the run "failed".
-//! A second feature on the same install met the same shape with test
-//! fixtures a migration adds ($20, four rounds).
+//! A second feature met the same shape with test fixtures a migration
+//! adds.
 //!
 //! Guarantee: a failing test that waits only on the change's own content
 //! step CoderHelm can't run ends the CI loop before any fix round
@@ -27,8 +27,8 @@ use crate::passes::{feature::checklist, outside_work, resume, review_rules};
 use common::content_gap::{self, Verdict};
 
 /// The failing check's error, as the report gave it (names made generic).
-const CAUSE: &str = "Error: venueClub /club-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-club-addresses";
-const FIXTURES: &str = "Error: Camp date \"e2e-callout-expired\" is missing from the Camp Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
+const CAUSE: &str = "Error: marinaPage /marina-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-marina-addresses";
+const FIXTURES: &str = "Error: Slip date \"e2e-callout-expired\" is missing from the Slip Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
 
 fn decision(migration: &str, how: &str) -> crate::passes::fix_location::FixDecision {
     serde_json::from_value(serde_json::json!({
@@ -54,8 +54,8 @@ fn decision(migration: &str, how: &str) -> crate::passes::fix_location::FixDecis
 #[test]
 fn a_test_waiting_on_the_changes_own_blocked_migration_ends_the_loop() {
     let d = decision(
-        "apps/studio/migrations/fill-club-addresses/index.ts",
-        "cd apps/studio && npx sanity migration run fill-club-addresses --dataset staging",
+        "apps/studio/migrations/fill-marina-addresses/index.ts",
+        "cd apps/studio && npx sanity migration run fill-marina-addresses --dataset staging",
     );
     let steps = resume::content_steps(&d);
     // The change's own `this_pr` task is not an outside step.
@@ -63,7 +63,7 @@ fn a_test_waiting_on_the_changes_own_blocked_migration_ends_the_loop() {
     assert!(steps[0].blocked && steps[0].writes_content && !steps[0].done);
     match content_gap::classify(CAUSE, true, &steps) {
         Verdict::AwaitsStep { gap, step } => {
-            assert!(step.contains("fill-club-addresses"), "{step}");
+            assert!(step.contains("fill-marina-addresses"), "{step}");
             let sec = content_gap::section(&gap, &step, "Deploy Staging");
             assert!(sec.contains("Before merge"));
             assert!(sec.contains("spent no CI fix round"));
@@ -92,7 +92,7 @@ fn a_test_waiting_on_the_changes_own_blocked_migration_ends_the_loop() {
 
 #[test]
 fn a_build_that_fails_on_missing_content_is_made_tolerant_never_retried() {
-    let d = decision("apps/studio/migrations/fill-club-addresses/index.ts", "");
+    let d = decision("apps/studio/migrations/fill-marina-addresses/index.ts", "");
     // No failing test: the build or deploy failed on the content.
     match content_gap::classify(CAUSE, false, &resume::content_steps(&d)) {
         Verdict::TolerateFirst(g) => {
@@ -126,7 +126,7 @@ fn the_ci_loop_reads_the_gap_before_it_claims_a_fix_round() {
 
 #[test]
 fn the_plan_makes_a_staging_content_step_with_no_connection_a_persons() {
-    let d = decision("apps/studio/migrations/fill-club-addresses/index.ts", "");
+    let d = decision("apps/studio/migrations/fill-marina-addresses/index.ts", "");
     let c = d.outside_change.unwrap();
     let a = outside_work::Abilities::default();
     assert!(!a.staging_write);
@@ -149,9 +149,9 @@ fn the_plan_makes_a_staging_content_step_with_no_connection_a_persons() {
 
 #[test]
 fn code_that_throws_on_missing_content_is_flagged_by_the_checklist_and_the_review() {
-    let patch = "@@ -0,0 +1,6 @@\n+export async function clubJsonLd(slug: string) {\n+  const club = await client.fetch(queryClub, { slug });\n+  if (!club?.metadata?.address) {\n+    throw new Error(`club ${slug} address is missing; run the migration`);\n+  }\n+}\n";
+    let patch = "@@ -0,0 +1,6 @@\n+export async function marinaJsonLd(slug: string) {\n+  const marina = await client.fetch(queryMarina, { slug });\n+  if (!marina?.metadata?.address) {\n+    throw new Error(`marina ${slug} address is missing; run the migration`);\n+  }\n+}\n";
     let files = vec![(
-        "apps/web/src/lib/club-jsonld.ts".to_string(),
+        "apps/web/src/lib/marina-jsonld.ts".to_string(),
         "added".to_string(),
         patch.to_string(),
     )];

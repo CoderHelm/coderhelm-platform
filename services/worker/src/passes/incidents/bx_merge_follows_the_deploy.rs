@@ -33,13 +33,13 @@ const MERGE: &str = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b";
 /// Another service's deploy: a job per environment on merge to `main`,
 /// limited to its folder.
 const SERVICE_DEPLOY: &str = r#"
-name: Deploy Thumbnail Service
+name: Deploy Image Resizer
 on:
   push:
     branches: [main]
     paths:
-      - 'services/thumbnail/**'
-      - '.github/workflows/deploy-thumbnail.yml'
+      - 'services/image-resizer/**'
+      - '.github/workflows/deploy-image-resizer.yml'
   workflow_dispatch:
 jobs:
   deploy-staging:
@@ -98,7 +98,7 @@ fn repo() -> release_plan::Mechanics {
     release_plan::mechanics(
         &[
             (
-                ".github/workflows/deploy-thumbnail.yml".into(),
+                ".github/workflows/deploy-image-resizer.yml".into(),
                 SERVICE_DEPLOY.into(),
             ),
             (
@@ -118,7 +118,7 @@ fn repo() -> release_plan::Mechanics {
 /// The web change the pull request made.
 fn changed() -> Vec<String> {
     vec![
-        "apps/web/src/components/blocks/portal-embed.tsx".into(),
+        "apps/web/src/components/blocks/booking-embed.tsx".into(),
         "apps/web/src/lib/csp.ts".into(),
     ]
 }
@@ -128,13 +128,13 @@ fn changed() -> Vec<String> {
 fn armed_before_the_fix() -> Vec<Step> {
     let json = r#"[{"id":"deploy_production","kind":"deploy","env":"production",
         "what":"Deploy the change to production",
-        "how":"wait for `Deploy Thumbnail Service` (.github/workflows/deploy-thumbnail.yml), which runs on merge to `main`",
+        "how":"wait for `Deploy Image Resizer` (.github/workflows/deploy-image-resizer.yml), which runs on merge to `main`",
         "tool":"","after":[],"after_merge":true,"verify":"","status":"running",
-        "detail":"waiting for `.github/workflows/deploy-thumbnail.yml` on the merge commit",
+        "detail":"waiting for `.github/workflows/deploy-image-resizer.yml` on the merge commit",
         "before":"","after_count":"","approval_id":"","run_id":0,"tag":"",
-        "workflow":".github/workflows/deploy-thumbnail.yml","inputs":[],
+        "workflow":".github/workflows/deploy-image-resizer.yml","inputs":[],
         "trigger":{"on":"merge","value":"main"},"project_id":"p1","dataset":"production",
-        "started_at":1794879648}]"#;
+        "started_at":1899942048}]"#;
     serde_json::from_str(json).unwrap()
 }
 
@@ -234,7 +234,7 @@ fn the_deploy_is_the_one_that_runs_for_the_change() {
     assert!(!web
         .deploys
         .iter()
-        .any(|d| d.file.ends_with("deploy-thumbnail.yml") && matches!(d.on, On::Merge(_))));
+        .any(|d| d.file.ends_with("deploy-image-resizer.yml") && matches!(d.on, On::Merge(_))));
     assert_eq!(
         web.deploy(Env::Production).unwrap().name,
         "Deploy Production"
@@ -242,11 +242,11 @@ fn the_deploy_is_the_one_that_runs_for_the_change() {
     assert_eq!(web.deploy(Env::Staging).unwrap().name, "Deploy Staging");
 
     // A change to the service runs it: it stays a deploy of the change.
-    let svc = m.for_change(&["services/thumbnail/src/index.ts".to_string()]);
+    let svc = m.for_change(&["services/image-resizer/src/index.ts".to_string()]);
     assert!(svc
         .deploys
         .iter()
-        .any(|d| d.file.ends_with("deploy-thumbnail.yml") && matches!(d.on, On::Merge(_))));
+        .any(|d| d.file.ends_with("deploy-image-resizer.yml") && matches!(d.on, On::Merge(_))));
 }
 
 #[test]
@@ -296,12 +296,12 @@ fn the_release_armed_on_the_wrong_deploy_is_pointed_at_the_right_one() {
 fn a_step_already_done_is_kept() {
     let mut old = armed_before_the_fix();
     old[0].status = Status::Done;
-    old[0].detail = "`Deploy Thumbnail Service` succeeded".into();
+    old[0].detail = "`Deploy Image Resizer` succeeded".into();
     let fresh = release_plan::follow_steps(&repo().for_change(&changed()));
     let now = refollow(&old, &fresh).unwrap();
     let prod = now.iter().find(|s| s.id == "deploy_production").unwrap();
     assert_eq!(prod.status, Status::Done);
-    assert_eq!(prod.workflow, ".github/workflows/deploy-thumbnail.yml");
+    assert_eq!(prod.workflow, ".github/workflows/deploy-image-resizer.yml");
 }
 
 #[test]

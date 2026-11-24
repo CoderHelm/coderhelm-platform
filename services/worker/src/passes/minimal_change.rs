@@ -1,11 +1,11 @@
 //! The change is the smallest one that does what the ticket asks.
 //!
-//! A ticket asked to link four camps to a second sport. The pull request
+//! A ticket asked to link four charters to a second activity. The pull request
 //! added a second map and helpers beside the existing overrides map, turned
 //! an insert-only link sync into a replacing upsert that deleted links
 //! nobody asked to delete, added warnings, three summary counters and a log
-//! level change in code other pipelines share, and a 432-line test with
-//! fake hooks and a payload nobody had seen. The right change was four map
+//! level change in code other pipelines share, and a test of several
+//! hundred lines with fake hooks and a payload nobody had seen. The right change was four map
 //! entries, an insert that does nothing on conflict in the three write
 //! branches, and one small test.
 //!
@@ -1148,7 +1148,7 @@ fn payload_key(line: &str) -> bool {
         && rest[end + 1..].trim_start().starts_with(':')
 }
 
-/// Test fixtures with invented ids (`sport-a`, `id-1`) while the run's
+/// Test fixtures with invented ids (`berth-a`, `id-1`) while the run's
 /// lookups (`lookups`: their recorded lines) returned real ones
 /// (`common::fixture_ids`).
 pub fn made_up_ids(diff: &Diff, lookups: &[String]) -> Vec<Widening> {
@@ -1244,8 +1244,8 @@ fn entry_line(line: &str) -> bool {
 /// A change that rewrites a code path while its ticket names a few records
 /// (`common::repro_first::ticket_ids`): more than [`WHOLE_PATH_LINES`]
 /// changed code lines that are no entries of a map or list. A ticket that
-/// named four camps filed under the wrong sport got 900 changed lines
-/// across the pipeline that loads every camp; the fix was a suffix
+/// named four charters filed under the wrong activity got hundreds of changed
+/// lines across the pipeline that loads every charter; the fix was a suffix
 /// stripped in the existing lookup and two entries. A `Wider than the
 /// ticket:` line keeps it, with the reason the narrower change can't work.
 pub fn whole_path(diff: &Diff, ticket: &str) -> Vec<Widening> {
@@ -1466,16 +1466,16 @@ mod tests {
     #[test]
     fn definitions_by_language() {
         let py =
-            "CAMP_MULTI_SPORT_OVERRIDES = {\ndef get_camp_multi_sport_names(name):\n    X = {}";
-        let got = defs(py, "dags/camps.py");
+            "CHARTER_MULTI_ACTIVITY_OVERRIDES = {\ndef get_charter_multi_activity_names(name):\n    X = {}";
+        let got = defs(py, "dags/charters.py");
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, DefKind::Table);
         assert_eq!(got[1].kind, DefKind::Function);
-        let ts = "export const SPORT_MAP: Record<string, string> = {\nexport function sportFor(x) {\nconst handler = async (e) => {\nexport const firstBy = <T extends { value: string }>(";
+        let ts = "export const ACTIVITY_MAP: Record<string, string> = {\nexport function activityFor(x) {\nconst handler = async (e) => {\nexport const firstBy = <T extends { value: string }>(";
         let got = defs(ts, "src/a.ts");
         assert_eq!(
             got.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            vec!["SPORT_MAP", "sportFor", "handler", "firstBy"]
+            vec!["ACTIVITY_MAP", "activityFor", "handler", "firstBy"]
         );
         assert_eq!(got[3].kind, DefKind::Function);
         let rs = "pub const RULES: &[&str] = &[\npub(crate) fn rules_for() {}";
@@ -1485,36 +1485,38 @@ mod tests {
     #[test]
     fn a_second_map_next_to_the_first_is_a_parallel_structure() {
         let base = vec![(
-            "dags/camps.py".to_string(),
-            "CAMP_MULTI_SPORT_OVERRIDES = {\n    \"a\": [\"Soccer\"],\n}\n\ndef get_camp_multi_sport_names(name):\n    return CAMP_MULTI_SPORT_OVERRIDES.get(name, [])\n".to_string(),
+            "dags/charters.py".to_string(),
+            "CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n    \"a\": [\"Sailing\"],\n}\n\ndef get_charter_multi_activity_names(name):\n    return CHARTER_MULTI_ACTIVITY_OVERRIDES.get(name, [])\n".to_string(),
         )];
-        let patch = "@@ -1,3 +1,9 @@\n CAMP_MULTI_SPORT_OVERRIDES = {\n+CAMP_SWIMMING_OVERRIDES = {\n+    \"b\": [\"Swimming\"],\n+}\n+def get_camp_swimming_names(name):\n+    return CAMP_SWIMMING_OVERRIDES.get(name, [])\n";
-        let w = parallel_structures(&[d("dags/camps.py", "modified", patch)], &base);
+        let patch = "@@ -1,3 +1,9 @@\n CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+CHARTER_FISHING_OVERRIDES = {\n+    \"b\": [\"Fishing\"],\n+}\n+def get_charter_fishing_names(name):\n+    return CHARTER_FISHING_OVERRIDES.get(name, [])\n";
+        let w = parallel_structures(&[d("dags/charters.py", "modified", patch)], &base);
         assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w[0].what.contains("CAMP_SWIMMING_OVERRIDES"));
-        assert!(w[0].what.contains("CAMP_MULTI_SPORT_OVERRIDES"));
-        assert!(w[1].what.contains("get_camp_multi_sport_names"));
+        assert!(w[0].what.contains("CHARTER_FISHING_OVERRIDES"));
+        assert!(w[0].what.contains("CHARTER_MULTI_ACTIVITY_OVERRIDES"));
+        assert!(w[1].what.contains("get_charter_multi_activity_names"));
         // Four new entries in the existing map are no new structure.
-        let small = "@@ -1,3 +1,7 @@\n CAMP_MULTI_SPORT_OVERRIDES = {\n+    \"c\": [\"Swimming\", \"Tennis\"],\n";
-        assert!(parallel_structures(&[d("dags/camps.py", "modified", small)], &base).is_empty());
+        let small = "@@ -1,3 +1,7 @@\n CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+    \"c\": [\"Fishing\", \"Kayaking\"],\n";
+        assert!(parallel_structures(&[d("dags/charters.py", "modified", small)], &base).is_empty());
         // A rename is not a parallel.
-        let rename = "-CAMP_MULTI_SPORT_OVERRIDES = {\n+CAMP_SPORT_OVERRIDES = {\n";
-        assert!(parallel_structures(&[d("dags/camps.py", "modified", rename)], &base).is_empty());
+        let rename = "-CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+CHARTER_ACTIVITY_OVERRIDES = {\n";
+        assert!(
+            parallel_structures(&[d("dags/charters.py", "modified", rename)], &base).is_empty()
+        );
     }
 
     #[test]
     fn insert_only_made_replacing_blocks_unless_asked() {
-        let patch = "-    ON CONFLICT (camp_id, sport_id) DO NOTHING\n+    ON CONFLICT (camp_id, sport_id) DO UPDATE SET sport_id = EXCLUDED.sport_id\n+DELETE FROM camp_sports WHERE camp_id = %s AND sport_id <> ALL(%s)\n";
+        let patch = "-    ON CONFLICT (charter_id, activity_id) DO NOTHING\n+    ON CONFLICT (charter_id, activity_id) DO UPDATE SET activity_id = EXCLUDED.activity_id\n+DELETE FROM charter_activities WHERE charter_id = %s AND activity_id <> ALL(%s)\n";
         let base = vec![(
             "dags/sync.py".to_string(),
-            "INSERT INTO camp_sports VALUES (%s, %s) ON CONFLICT (camp_id, sport_id) DO NOTHING"
+            "INSERT INTO charter_activities VALUES (%s, %s) ON CONFLICT (charter_id, activity_id) DO NOTHING"
                 .to_string(),
         )];
         let diff = [d("dags/sync.py", "modified", patch)];
         let w = check(
             &diff,
             &base,
-            "Link these four camps to Swimming as well",
+            "Link these four charters to Fishing as well",
             false,
         );
         let r: Vec<&Widening> = w.iter().filter(|w| w.kind == Kind::Replacing).collect();
@@ -1529,7 +1531,7 @@ mod tests {
                 .all(|w| w.kind != Kind::Replacing)
         );
         // An additive insert is fine.
-        let add = "+    INSERT INTO camp_sports VALUES (%s, %s) ON CONFLICT DO NOTHING\n";
+        let add = "+    INSERT INTO charter_activities VALUES (%s, %s) ON CONFLICT DO NOTHING\n";
         assert!(replacing(&[d("dags/sync.py", "modified", add)], &base).is_empty());
     }
 
@@ -1537,7 +1539,7 @@ mod tests {
     fn log_levels_and_new_reporting() {
         let patch = "-logger.setLevel(logging.INFO)\n+logger.setLevel(logging.DEBUG)\n+    skipped += 1\n+    linked += 1\n+    log.warning(\"skipped %s\", ids)\n";
         let diff = [d("dags/common/log.py", "modified", patch)];
-        let w = check(&diff, &[], "Link four camps to Swimming", false);
+        let w = check(&diff, &[], "Link four charters to Fishing", false);
         assert!(w.iter().any(|w| w.kind == Kind::LogLevel), "{w:?}");
         assert!(w.iter().any(|w| w.kind == Kind::Reporting), "{w:?}");
         // A reason keeps an excusable item.
@@ -1547,7 +1549,7 @@ mod tests {
         );
         assert!(kept.is_empty());
         // A ticket that asks for logging gets it.
-        assert!(check(&diff, &[], "Log how many camps were skipped", false).is_empty());
+        assert!(check(&diff, &[], "Log how many charters were skipped", false).is_empty());
         // One new log line in a change is ordinary.
         let one = [d("a.py", "modified", "+    log.info(\"done\")\n")];
         assert!(reporting(&one).is_empty());
@@ -1597,16 +1599,16 @@ mod tests {
 
     #[test]
     fn what_a_helper_does_to_existing_rows() {
-        let text = "def upsert_multi_sport_links(cur, group_id, sport_ids):\n    cur.execute(\"DELETE FROM group_sport WHERE group_id = %s AND NOT (sport_id = ANY(%s))\", (group_id, sport_ids))\n    for s in sport_ids:\n        cur.execute(\"INSERT INTO group_sport VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, s))\n\n\ndef upsert_group_sport_link(cur, group_id, sport_id):\n    cur.execute(\"INSERT INTO group_sport VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, sport_id))\n\n\ndef sport_names(name):\n    return OVERRIDES.get(name, [])\n";
-        let replacing = body_of(text, "a.py", "upsert_multi_sport_links").unwrap();
-        assert!(!replacing.contains("def upsert_group_sport_link"));
+        let text = "def upsert_multi_activity_links(cur, group_id, activity_ids):\n    cur.execute(\"DELETE FROM group_activity WHERE group_id = %s AND NOT (activity_id = ANY(%s))\", (group_id, activity_ids))\n    for s in activity_ids:\n        cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, s))\n\n\ndef upsert_group_activity_link(cur, group_id, activity_id):\n    cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, activity_id))\n\n\ndef activity_names(name):\n    return OVERRIDES.get(name, [])\n";
+        let replacing = body_of(text, "a.py", "upsert_multi_activity_links").unwrap();
+        assert!(!replacing.contains("def upsert_group_activity_link"));
         assert_eq!(
             write_semantics(&replacing),
             Writes::Replacing(vec!["`DELETE FROM`".to_string()])
         );
-        let insert = body_of(text, "a.py", "upsert_group_sport_link").unwrap();
+        let insert = body_of(text, "a.py", "upsert_group_activity_link").unwrap();
         assert_eq!(write_semantics(&insert), Writes::InsertOnly);
-        let read = body_of(text, "a.py", "sport_names").unwrap();
+        let read = body_of(text, "a.py", "activity_names").unwrap();
         assert_eq!(write_semantics(&read), Writes::None);
         assert!(inserts_only(&[&insert]));
         assert!(!inserts_only(&[&insert, &replacing]));
@@ -1616,7 +1618,7 @@ mod tests {
             Writes::Replacing(_)
         ));
         assert!(matches!(
-            write_semantics("group.sports.set(ids)\ngroup.save()"),
+            write_semantics("group.activities.set(ids)\ngroup.save()"),
             Writes::Replacing(_)
         ));
         assert_eq!(write_semantics("cache.set(k, v)"), Writes::None);
@@ -1661,11 +1663,11 @@ mod tests {
 
     #[test]
     fn an_edit_that_adds_a_parallel_helper() {
-        let old = "SPORT_OVERRIDES = {\n}\ndef sport_overrides_for(n):\n    pass\n";
-        let new = format!("{old}SWIM_SPORT_OVERRIDES = {{\n}}\n");
+        let old = "ACTIVITY_OVERRIDES = {\n}\ndef activity_overrides_for(n):\n    pass\n";
+        let new = format!("{old}FISH_ACTIVITY_OVERRIDES = {{\n}}\n");
         let p = parallel_in_edit("a.py", old, &new);
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].1.name, "SPORT_OVERRIDES");
+        assert_eq!(p[0].1.name, "ACTIVITY_OVERRIDES");
         assert!(parallel_in_edit("a.py", old, old).is_empty());
     }
 }

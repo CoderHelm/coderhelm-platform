@@ -71,11 +71,11 @@ into the same loop as the run's other open gaps:
   "head": "c0ffee1…",
   "rows": [
     {
-      "criterion": "Only one sport filter chip shows on /camps",
+      "criterion": "Only one dock filter chip shows on /slips",
       "source": "ticket",
-      "page": "/camps",
-      "code": [{ "path": "src/utils/filters.ts", "symbols": ["dedupeSportsBySlug"] }],
-      "tests": ["e2e/camps.spec.ts › shows one chip"],
+      "page": "/slips",
+      "code": [{ "path": "src/utils/filters.ts", "symbols": ["dedupeDocksBySlug"] }],
+      "tests": ["e2e/slips.spec.ts › shows one chip"],
       "proof": { "state": "proven", "by": "end to end on staging and the preview", "detail": "…" }
     }
   ]

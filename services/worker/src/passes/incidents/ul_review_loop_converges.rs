@@ -1,9 +1,9 @@
 //! ul. Review and fix rounds didn't converge. On one run the review raised
-//! "A parallel structure next to an existing one" four times: each fix
+//! "A parallel structure next to an existing one" round after round: each fix
 //! round moved the duplicate (a flag, then a merged helper, then a moved
 //! function), the next review found it in the new place, and the ledger
 //! counted it as a new finding each time. The rounds ran out only when the
-//! pull request merged, at $39. On another run two rounds undid each
+//! pull request merged, after a costly string of rounds. On another run two rounds undid each
 //! other: a review fix moved a listener to a capture listener on the window, a
 //! later pass put the document listener back, and the review raised the
 //! same finding again.
@@ -19,9 +19,9 @@ use super::fixture::fn_src;
 use crate::passes::own_review_ledger::{self, Ledger, Settled};
 use crate::passes::round_agree;
 
-const P1: &str = "A parallel structure next to an existing one (`dags/utils/schedule_common.py`)";
+const P1: &str = "A parallel structure next to an existing one (`dags/utils/booking_common.py`)";
 const P2: &str = "A parallel structure next to an existing one (`dags/pipeline.py`)";
-const P3: &str = "A parallel structure next to an existing one (`dags/utils/sport_map.py`)";
+const P3: &str = "A parallel structure next to an existing one (`dags/utils/activity_map.py`)";
 
 #[test]
 fn a_style_finding_that_moves_is_one_item_and_then_a_note() {
@@ -40,8 +40,8 @@ fn a_style_finding_that_moves_is_one_item_and_then_a_note() {
     assert!(l.settled_item(P3).is_some());
     // A finding about behaviour still needs the same file.
     assert!(!own_review_ledger::same_finding(
-        "Live impact on camps is not measured (`dags/pipeline.py:1046`)",
-        "Live impact on camps is not measured (`dags/other.py:10`)"
+        "Live impact on charters is not measured (`dags/pipeline.py:1046`)",
+        "Live impact on charters is not measured (`dags/other.py:10`)"
     ));
     // The review demotes the noted style finding: never a block.
     let src = include_str!("../review_pr.rs");
@@ -52,7 +52,7 @@ fn a_style_finding_that_moves_is_one_item_and_then_a_note() {
 #[test]
 fn a_later_round_never_undoes_a_review_fix_without_saying_why() {
     let fix = vec![(
-        "a7185a8000".to_string(),
+        "abcdef1000".to_string(),
         vec![(
             "src/drawer-client.tsx".to_string(),
             "@@\n-document.addEventListener('visibilitychange', onHide);\n-return () => document.removeEventListener('visibilitychange', onHide);\n-sendDrawerLeft(state);\n+window.addEventListener('visibilitychange', onHide, true);\n+return () => window.removeEventListener('visibilitychange', onHide, true);\n+queueDrawerLeft(state);\n".to_string(),

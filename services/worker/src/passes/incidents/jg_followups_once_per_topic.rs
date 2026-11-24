@@ -1,12 +1,12 @@
-//! jg. A Retry of a Jira audit ticket (whose earlier run had written eight
-//! follow-up drafts) planned again instead of taking up that plan, filed six
+//! jg. A Retry of a Jira audit ticket (whose earlier run had written
+//! follow-up drafts) planned again instead of taking up that plan, filed
 //! follow-up tickets from its first plan, then had that plan sent back by a
 //! later check ("the plan stopped on a change outside the code that leaves
-//! nothing for a person and waits for nothing"), planned again, filed four
-//! more tickets in other words (three of them the same work as three of the
-//! six), and then failed with the same message. Ten tickets, three pairs of
-//! duplicates, and a failed run whose deliverable (the audit and its
-//! follow-ups) was done.
+//! nothing for a person and waits for nothing"), planned again, filed more
+//! tickets in other words (several of them the same work as tickets it had
+//! just filed), and then failed with the same message. Duplicate tickets,
+//! and a failed run whose deliverable (the audit and its follow-ups) was
+//! done.
 //!
 //! The causes: the follow-ups were filed right after each plan was written,
 //! before the plan's last check; a draft counted as filed only under the
@@ -50,11 +50,11 @@ const FIRST: [(&str, &str); 6] = [
     ),
     (
         "ABC-95",
-        "Coach images: fall back to the coach name for alt; empty when the name is adjacent",
+        "Skipper images: fall back to the skipper name for alt; empty when the name is adjacent",
     ),
     (
         "ABC-96",
-        "Fix alt on the unused Hero, ContactCard, FeatureSection and CoachesCarousel components",
+        "Fix alt on the unused Hero, ContactCard, FeatureSection and SkippersCarousel components",
     ),
     ("ABC-97", "Confirm hardcoded alt=\"\" images are decorative"),
 ];
@@ -63,7 +63,7 @@ const FIRST: [(&str, &str); 6] = [
 const SECOND: [&str; 4] = [
     "Remove unused Hero, FeatureSection and ContactCard prototype components",
     "Replace placeholder and whitespace alt text with data-derived or decorative alt",
-    "Studio: warn when image alt is missing on imageWithAlt and coach image",
+    "Studio: warn when image alt is missing on imageWithAlt and skipper image",
     "Content-image alt: apply the same missing-alt warning to block alt fields and title fallbacks on the web",
 ];
 
@@ -93,23 +93,23 @@ fn second_plan() -> FixDecision {
                 ..Default::default()
             },
             EndToEndStep {
-                step: "Fill alt text on the 3 production records".into(),
+                step: "Fill alt text on the production records that have none".into(),
                 by: "person".into(),
                 owner: "Content editor".into(),
                 ..Default::default()
             },
         ],
         next_step: Some(NextStep {
-            action: "A content editor sets the alt text on the 3 records that have none".into(),
+            action: "A content editor sets the alt text on the records that have none".into(),
             why_person: "the run has no write connection to the content store".into(),
             outcomes: vec![
                 Outcome {
-                    if_: "all 3 are set".into(),
+                    if_: "all are set".into(),
                     means: "the schema warning flags nothing".into(),
                 },
                 Outcome {
                     if_: "they stay empty".into(),
-                    means: "the warning shows on those 3".into(),
+                    means: "the warning shows on those records".into(),
                 },
             ],
         }),
@@ -260,7 +260,7 @@ fn findings_are_the_deliverable_never_a_plan_that_stopped_short() {
 fn a_new_run_takes_up_the_findings_plan_instead_of_planning_again() {
     // The earlier run's plan: findings, drafts in proposal.md, no spec.
     let plan = PlanResult {
-        proposal: "# Audit\n\n## Follow-up tickets to file\n1. Add alt validation to `imageWithAlt`.\n2. Fall back to the coach name.\n".into(),
+        proposal: "# Audit\n\n## Follow-up tickets to file\n1. Add alt validation to `imageWithAlt`.\n2. Fall back to the skipper name.\n".into(),
         design: String::new(),
         tasks: "NO_CODE_CHANGE: the audit and 2 follow-up tickets are in proposal.md.".into(),
         spec: String::new(),

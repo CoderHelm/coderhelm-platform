@@ -1,5 +1,5 @@
 //! s. A new-feature run checked its rules on the pull request: one checklist
-//! item failing, then after a fix round none, but four of CoderHelm's own
+//! item failing, then after a fix round none, but several of CoderHelm's own
 //! sandbox checks failing on the new head. The repository's CI passed, the
 //! review ran and approved, and the run logged "Review passed — completing
 //! run", "Run completed" and "Run handed its PR over — review queued". No
@@ -7,7 +7,7 @@
 //! mark-ready step had returned on the sandbox failures without a word. The
 //! pull request stayed a draft, the run page said completed, and nobody was
 //! told why. The same day, mark-ready messages that hit GitHub's rate limit
-//! were logged as "Mark PR ready failed" and dropped, leaving five more pull
+//! were logged as "Mark PR ready failed" and dropped, leaving more pull
 //! requests drafts.
 //!
 //! Guarantee: one decision (`ready::decide`) settles every pull request a
@@ -53,11 +53,11 @@ fn the_pull_request_at_completion() -> Facts {
         ci: ready::ci_standing(
             &[
                 serde_json::json!({"name": "build", "status": "completed", "conclusion": "success",
-                    "started_at": "2026-11-06T22:15:00Z", "app": {"slug": "github-actions"}}),
+                    "started_at": "2030-03-06T22:15:00Z", "app": {"slug": "github-actions"}}),
                 serde_json::json!({"name": "test", "status": "completed", "conclusion": "success",
-                    "started_at": "2026-11-06T22:15:00Z", "app": {"slug": "github-actions"}}),
+                    "started_at": "2030-03-06T22:15:00Z", "app": {"slug": "github-actions"}}),
                 serde_json::json!({"name": common::review_check::CHECK_NAME, "status": "completed",
-                    "conclusion": "success", "started_at": "2026-11-06T22:17:00Z",
+                    "conclusion": "success", "started_at": "2030-03-06T22:17:00Z",
                     "app": {"slug": "coderhelm"}}),
             ],
             &[],
@@ -196,12 +196,12 @@ fn every_path_goes_through_the_one_decision_and_no_hold_returns_silently() {
 fn a_refused_mark_ready_is_tried_again_and_the_last_refusal_is_recorded() {
     let mut end = Ending {
         status: "completed".into(),
-        pr: Some(1387),
+        pr: Some(1234),
         draft: true,
         ..Default::default()
     };
     // The message that was dropped, as the webhook sent it: it still parses.
-    let old = r#"{"type":"mark_ready","team_id":"TEAM#1","installation_id":41,"repo_owner":"acme","repo_name":"web","pr_number":1387}"#;
+    let old = r#"{"type":"mark_ready","team_id":"TEAM#1","installation_id":41,"repo_owner":"acme","repo_name":"web","pr_number":1234}"#;
     let WorkerMessage::MarkReady(m) = serde_json::from_str::<WorkerMessage>(old).unwrap() else {
         panic!()
     };
@@ -230,7 +230,7 @@ fn a_refused_mark_ready_is_tried_again_and_the_last_refusal_is_recorded() {
             "Mark it ready for review on GitHub yourself; CoderHelm also tries again within the \
              hour.",
         )],
-        1387,
+        1234,
         "",
     )
     .unwrap();

@@ -1,14 +1,14 @@
 //! ug. A small web fix's preview check failed on an end-to-end test of
 //! another page. CoderHelm's CI fix round showed it wasn't the change's:
-//! the staging data the test reads changed three minutes before it ran,
+//! the staging data the test reads changed minutes before it ran,
 //! staging (the base branch's build) showed the same mismatch, and the
 //! change touched nothing on that page. It changed no code, which was
 //! right. The run still ended "failed" with "CoderHelm made 1 fix
-//! attempt(s) without getting it green" (its record said two rounds), and
+//! attempt(s) without getting it green" (its record counted more rounds), and
 //! the pull request stayed a draft. The check runs only on pull requests,
 //! so its comparison with the base branch's head never ran and the round's
 //! proof counted for nothing. Earlier, a review fix round on the same run
-//! ran out of time three steps in a row: each step read the same files
+//! ran out of time several steps in a row: each step read the same files
 //! again and edited a file the step before had put back on purpose.
 //!
 //! Guarantee: a round that changes no code and shows, with evidence, that
@@ -27,10 +27,10 @@ use crate::passes::resume;
 use common::ci_repro::{self, Verdict};
 use common::ci_unrelated::{self, Rerun};
 
-const HEAD: &str = "c6da43eae6ee1bb8";
+const HEAD: &str = "d00dfeed12345678";
 
 /// The round's own conclusion, as it wrote it (names made generic).
-const ROUND: &str = "I made no code change. The failing e2e test (`Classes › sport filter shows only that sport's sessions and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the camps block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows session 113154.\n- Confirmed: the session went inactive at 17:01:59; the e2e run went from 17:05 to 17:08.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
+const ROUND: &str = "I made no code change. The failing e2e test (`Charters › dock filter shows only that dock's sailings and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the slips block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows sailing 4242.\n- Confirmed: the sailing went inactive minutes before the e2e run started.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
 
 #[test]
 fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
@@ -40,12 +40,12 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
         HEAD,
         &["Deploy Preview".into()],
         &[],
-        &["apps/web/src/components/camps-block.tsx".into()],
+        &["apps/web/src/components/slips-block.tsx".into()],
     )
     .expect("the round's proof is read");
     assert_eq!(
         s.tests,
-        vec!["Classes › sport filter shows only that sport's sessions and clears".to_string()]
+        vec!["Charters › dock filter shows only that dock's sailings and clears".to_string()]
     );
     assert_eq!(s.proof.len(), 2);
     // The standing reads "not this change's" everywhere: the run's ending,
@@ -66,8 +66,8 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
     let mut s = s;
     s.rerun = Rerun::Started;
     let sec = ci_unrelated::section(&s);
-    assert!(sec.contains("`Deploy Preview` fails on `Classes › sport filter"));
-    assert!(sec.contains("ran again once on c6da43e and failed the same way"));
+    assert!(sec.contains("`Deploy Preview` fails on `Charters › dock filter"));
+    assert!(sec.contains("ran again once on d00dfee and failed the same way"));
     assert!(sec.contains("ready for review"));
     assert!(!sec.contains("without getting it green") && !sec.contains("stays a draft"));
 }
@@ -106,9 +106,9 @@ fn a_check_that_never_runs_on_the_base_finds_its_base() {
     let r = ci_repro::from_history(
         HEAD,
         "Deploy Preview",
-        "Classes › sport filter",
+        "Charters › dock filter",
         "main",
-        ("9a7cb49aaaa", true, "2026-11-23T17:30:00Z"),
+        ("0badc0ffee1", true, "2030-03-23T17:30:00Z"),
     );
     assert!(matches!(r.verdict(), Verdict::NotThisChange(_)), "{r:?}");
     let s = ci_unrelated::classify(ROUND, &[r], HEAD, &[], &[], &[]).unwrap();
@@ -150,13 +150,13 @@ fn a_continuing_step_goes_on_from_what_the_steps_before_settled() {
     let call = |name: &str, path: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": {"path": path}}]});
     let step = vec![
         call("write_file", "e2e/tests/browse/callouts.spec.ts"),
-        call("edit_file", "e2e/data/venues.ts"),
-        call("restore_file", "e2e/data/venues.ts"),
+        call("edit_file", "e2e/data/marinas.ts"),
+        call("restore_file", "e2e/data/marinas.ts"),
     ];
     let fb = common::run_round::settled_first("Fix the review finding.", &step);
     assert!(fb.contains("`e2e/tests/browse/callouts.spec.ts`"), "{fb}");
     assert!(
-        fb.contains("on purpose (leave them as they are): `e2e/data/venues.ts`"),
+        fb.contains("on purpose (leave them as they are): `e2e/data/marinas.ts`"),
         "{fb}"
     );
     let src = include_str!("../resume.rs");

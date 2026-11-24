@@ -1,24 +1,22 @@
-//! rp. A data-pipeline ticket named four camps of a vendor's booking
-//! system filed under the wrong sport ("Squash Camp-Half Day" listed under
-//! volleyball, "Total Skills Hockey Camp-Full Day" missing from hockey).
-//! The pipeline already had a table for exactly this, `CAMP_SPORT_OVERRIDES`,
-//! with entries for "squash camp" and "total skills hockey camp". Its lookup
-//! matched exact names, and the vendor appends "-Half Day" / "-Full Day", so
-//! the entries never matched: the lookup returned `None` for every one of
-//! the ticket's names on the base. The run's own notes said so, then
-//! planned "a keyword step after the override": +595/-186 across the
-//! pipeline, a moved extractor, keyword matching, new logging, a fixture,
-//! other programs moved to another lookup (its own reviewer flagged that),
-//! and two questions on the pull request that one page load answered. The
-//! new test was never run on the base: the repository's CI runs each test
-//! file with a `python "$t"` loop, which CoderHelm couldn't narrow, so the
-//! test was recorded as not run and the description said nothing of it.
-//! The right change stripped the suffix in the lookup and added two
-//! entries, +49/-1, mostly a test of the exact names stored on staging that
-//! fails on the base. Across the 53 runs audited, 8 of 10 bug tickets that
-//! wrote code ran nothing before their first edit, 6 diffs of 300+ lines
-//! answered a ticket naming 1 to 10 records, and none of the 17 runs whose
-//! tests were checked had a test shown to fail on the base.
+//! rp. A data-pipeline ticket named a few charters of a booking vendor's
+//! system filed under the wrong activity. The pipeline already had an
+//! overrides table for exactly this, with entries for those charters. Its
+//! lookup matched exact names, and the vendor appends a "-Half Day" /
+//! "-Full Day" suffix, so the entries never matched: the lookup returned
+//! `None` for every one of the ticket's names on the base. The run's own
+//! notes said so, then planned "a keyword step after the override": a large
+//! diff across the pipeline, a moved extractor, keyword matching, new
+//! logging, a fixture, other programs moved to another lookup (its own
+//! reviewer flagged that), and two questions on the pull request that one
+//! page load answered. The new test was never run on the base: the
+//! repository's CI runs each test file with a `python "$t"` loop, which
+//! CoderHelm couldn't narrow, so the test was recorded as not run and the
+//! description said nothing of it. The right change stripped the suffix in
+//! the lookup and added two entries, a small diff that was mostly a test of
+//! the exact names as stored, and that test fails on the base. An audit of
+//! recent runs found the same shape often: bug runs that ran nothing before
+//! their first edit, diffs of hundreds of lines for a ticket naming a few
+//! records, and no test shown to fail on the base.
 //!
 //! Guarantee: a bug plan reproduces before it plans (`## Reproduce`: the
 //! ticket's exact inputs and their stored variants, a command this run ran
@@ -38,11 +36,11 @@ use crate::passes::reproduce;
 use common::repro_first::{self, Attempt};
 use common::test_env;
 
-const TICKET: &str = "Update sport categorization for summer camps\nObserved\nThe hockey filter only catches the preschool hockey class, not the Total Skills Hockey Camp-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Volleyball, Squash Camp-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nSquash Camp-Half Day (a0000002-0000-4000-8000-000000000002)\nSquash Camp- Full Day (a0000003-0000-4000-8000-000000000003)\nSquash High-Performance Camp (a0000004-0000-4000-8000-000000000004)";
+const TICKET: &str = "Update activity categorization for summer charters\nObserved\nThe fishing filter only catches the kids fishing lesson, not the Deep Sea Fishing Charter-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Sailing, Kayak Charter-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nKayak Charter-Half Day (a0000002-0000-4000-8000-000000000002)\nKayak Charter- Full Day (a0000003-0000-4000-8000-000000000003)\nKayak Sunrise Paddle Charter (a0000004-0000-4000-8000-000000000004)";
 
 /// The call that reproduces it on the base, and what it printed.
-const CALL: &str = "cd dags && python -c \"from utils.schedule_common import get_camp_sport_override as g; [print(n, g(n)) for n in ['Squash Camp-Half Day', 'Squash Camp-Full Day', 'Squash Camp- Full Day', 'Total Skills Hockey Camp-Full Day']]\"";
-const PRINTED: &str = "Squash Camp-Half Day None\nSquash Camp-Full Day None\nSquash Camp- Full Day None\nTotal Skills Hockey Camp-Full Day None";
+const CALL: &str = "cd dags && python -c \"from utils.booking_common import get_charter_activity_override as g; [print(n, g(n)) for n in ['Kayak Charter-Half Day', 'Kayak Charter-Full Day', 'Kayak Charter- Full Day', 'Deep Sea Fishing Charter-Full Day']]\"";
+const PRINTED: &str = "Kayak Charter-Half Day None\nKayak Charter-Full Day None\nKayak Charter- Full Day None\nDeep Sea Fishing Charter-Full Day None";
 
 fn ran() -> Vec<Attempt> {
     vec![Attempt {
@@ -53,14 +51,14 @@ fn ran() -> Vec<Attempt> {
     }]
 }
 
-const REUSE: &str = "## Reuse\n- `CAMP_SPORT_OVERRIDES` and `get_camp_sport_override` in dags/utils/schedule_common.py\n\n## Must not change\nOther programs' sport lookups; logging.\n\n## Measure first\nNone: the change stays inside this repository.\n";
+const REUSE: &str = "## Reuse\n- `CHARTER_ACTIVITY_OVERRIDES` and `get_charter_activity_override` in dags/utils/booking_common.py\n\n## Must not change\nOther programs' activity lookups; logging.\n\n## Measure first\nNone: the change stays inside this repository.\n";
 
 /// The plan as the run wrote it.
 fn plan_as_run() -> PlanResult {
     PlanResult {
-        proposal: "## Problem\nCamps sit on the wrong sport.\n\n## Approach\nExact keys miss suffixed names, so a keyword step is added after the override, and booking programs move to the active-only sport map.".into(),
-        design: format!("{REUSE}\n## Smallest change\nAdd `resolve_camp_sport_id` and `build_sport_name_map`: the override first, then a keyword match on the camp name, for every camp the activities path loads.\n\n## Proof\n`tests/test_camp_sport.py` over 116 live camp names.\n\n## Out of scope\n- Inactive Squash camps: decided with the default: they show under the squash filter as today\n"),
-        tasks: "- [ ] dags/utils/schedule_common.py: [modify] add resolve_camp_sport_id\n- [ ] dags/camp_pipeline.py: [modify] use it for every camp\n- [ ] tests/test_camp_sport.py: [create] the test\n".into(),
+        proposal: "## Problem\nCharters sit on the wrong activity.\n\n## Approach\nExact keys miss suffixed names, so a keyword step is added after the override, and booking programs move to the active-only activity map.".into(),
+        design: format!("{REUSE}\n## Smallest change\nAdd `resolve_charter_activity_id` and `build_activity_name_map`: the override first, then a keyword match on the charter name, for every charter the activities path loads.\n\n## Proof\n`tests/test_charter_activity.py` over 100 live charter names.\n\n## Out of scope\n- Inactive kayak charters: decided with the default: they show under the kayak filter as today\n"),
+        tasks: "- [ ] dags/utils/booking_common.py: [modify] add resolve_charter_activity_id\n- [ ] dags/charter_pipeline.py: [modify] use it for every charter\n- [ ] tests/test_charter_activity.py: [create] the test\n".into(),
         ..Default::default()
     }
 }
@@ -68,9 +66,9 @@ fn plan_as_run() -> PlanResult {
 /// The plan the gates ask for.
 fn plan_right() -> PlanResult {
     PlanResult {
-        proposal: "## Problem\nCamps sit on the wrong sport.\n".into(),
-        design: format!("{REUSE}\n## Reproduce\nInputs: a0000001-0000-4000-8000-000000000001, a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003, a0000004-0000-4000-8000-000000000004; staging lookup L2 (name LIKE '%squash camp%'): `Squash Camp- Full Day`, `Squash Camp-Full Day`, `Squash Camp-Half Day`, `Summer Squash Camp Plus`\nRan on base: `{CALL}`\nOutput:\n```\n{PRINTED}\n```\nWrong line: dags/utils/schedule_common.py:99 `return CAMP_SPORT_OVERRIDES.get(normalized)` matches the whole name, suffix included.\n\n## Smallest change\nStrip a trailing `-Half Day` / `-Full Day` before `CAMP_SPORT_OVERRIDES.get` in `get_camp_sport_override`; add 2 entries.\n\n## Proof\nOne test of the four stored names; it fails on the base.\n\n## Out of scope\n- Inactive Squash camps: decided with the default: they show as today. Looked up: the summer camps page already shows a squash chip\n"),
-        tasks: "- [ ] tests/test_camp_sport.py: [create] the stored names map to squash\n- [ ] dags/utils/schedule_common.py: [modify] strip the suffix in get_camp_sport_override\n".into(),
+        proposal: "## Problem\nCharters sit on the wrong activity.\n".into(),
+        design: format!("{REUSE}\n## Reproduce\nInputs: a0000001-0000-4000-8000-000000000001, a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003, a0000004-0000-4000-8000-000000000004; staging lookup L2 (name LIKE '%kayak charter%'): `Kayak Charter- Full Day`, `Kayak Charter-Full Day`, `Kayak Charter-Half Day`, `Summer Kayak Charter Plus`\nRan on base: `{CALL}`\nOutput:\n```\n{PRINTED}\n```\nWrong line: dags/utils/booking_common.py:99 `return CHARTER_ACTIVITY_OVERRIDES.get(normalized)` matches the whole name, suffix included.\n\n## Smallest change\nStrip a trailing `-Half Day` / `-Full Day` before `CHARTER_ACTIVITY_OVERRIDES.get` in `get_charter_activity_override`; add 2 entries.\n\n## Proof\nOne test of the four stored names; it fails on the base.\n\n## Out of scope\n- Inactive kayak charters: decided with the default: they show as today. Looked up: the summer charters page already shows a kayak chip\n"),
+        tasks: "- [ ] tests/test_charter_activity.py: [create] the stored names map to kayaking\n- [ ] dags/utils/booking_common.py: [modify] strip the suffix in get_charter_activity_override\n".into(),
         ..Default::default()
     }
 }
@@ -82,7 +80,7 @@ fn the_plan_reproduces_on_the_base_and_fixes_the_lookup_it_lands_in() {
     assert!(all.contains("lacks `## Reproduce`"), "{all}");
     // The question one page load answers is looked up first.
     assert!(
-        all.contains("Inactive Squash camps") && all.contains("check_url"),
+        all.contains("Inactive kayak charters") && all.contains("check_url"),
         "{all}"
     );
 
@@ -100,13 +98,13 @@ fn the_plan_reproduces_on_the_base_and_fixes_the_lookup_it_lands_in() {
     // step planned beside it, goes back.
     let mut beside = plan_right();
     beside.design = beside.design.replace(
-        "Strip a trailing `-Half Day` / `-Full Day` before `CAMP_SPORT_OVERRIDES.get` in `get_camp_sport_override`; add 2 entries.",
-        "Add `resolve_camp_sport_id`: the override first, then a keyword match on the name.",
+        "Strip a trailing `-Half Day` / `-Full Day` before `CHARTER_ACTIVITY_OVERRIDES.get` in `get_charter_activity_override`; add 2 entries.",
+        "Add `resolve_charter_activity_id`: the override first, then a keyword match on the name.",
     );
     let g = reproduce::plan_gaps(&beside, true, TICKET, &ran(), true, true);
     assert!(
         g.iter()
-            .any(|l| l.contains("`CAMP_SPORT_OVERRIDES`") && l.contains("doesn't change it")),
+            .any(|l| l.contains("`CHARTER_ACTIVITY_OVERRIDES`") && l.contains("doesn't change it")),
         "{g:?}"
     );
     assert!(g.iter().any(|l| l.contains("keyword match")), "{g:?}");
@@ -128,16 +126,18 @@ fn patch(sign: char, lines: &[String]) -> String {
 }
 
 #[test]
-fn a_whole_path_rewrite_for_four_camps_goes_back_and_the_lookup_fix_does_not() {
-    // The run's diff, in shape: the pipeline that loads every camp rewritten.
+fn a_whole_path_rewrite_for_four_charters_goes_back_and_the_lookup_fix_does_not() {
+    // The run's diff, in shape: the pipeline that loads every charter rewritten.
     let added: Vec<String> = (0..300)
-        .map(|i| format!("    sport_id = resolve_camp_sport_id(row, names_{i}, sport_map)"))
+        .map(|i| {
+            format!("    activity_id = resolve_charter_activity_id(row, names_{i}, activity_map)")
+        })
         .collect();
     let removed: Vec<String> = (0..90)
-        .map(|i| format!("    sport_id = group_sport.get(row['group_{i}'])"))
+        .map(|i| format!("    activity_id = group_activity.get(row['group_{i}'])"))
         .collect();
     let wide = vec![(
-        "dags/camp_pipeline.py".to_string(),
+        "dags/charter_pipeline.py".to_string(),
         "modified".to_string(),
         format!("{}\n{}", patch('+', &added), patch('-', &removed)),
     )];
@@ -156,12 +156,12 @@ fn a_whole_path_rewrite_for_four_camps_goes_back_and_the_lookup_fix_does_not() {
     // The right change: the suffix stripped in the lookup, two entries.
     let narrow = vec![
         (
-            "dags/utils/schedule_common.py".to_string(),
+            "dags/utils/booking_common.py".to_string(),
             "modified".to_string(),
-            "-    normalized = re.sub(r\"\\s+\", \" \", str(name).strip().lower())\n+    normalized = re.sub(r\"\\s*-\\s*(half|full) day$\", \"\", re.sub(r\"\\s+\", \" \", str(name).strip().lower()))\n+    'summer squash camp plus': 'b0000001-0000-4000-8000-00000000000a',\n+    'squash high-performance camp': 'b0000001-0000-4000-8000-00000000000a',".to_string(),
+            "-    normalized = re.sub(r\"\\s+\", \" \", str(name).strip().lower())\n+    normalized = re.sub(r\"\\s*-\\s*(half|full) day$\", \"\", re.sub(r\"\\s+\", \" \", str(name).strip().lower()))\n+    'summer kayak charter plus': 'b0000001-0000-4000-8000-00000000000a',\n+    'kayak sunrise paddle charter': 'b0000001-0000-4000-8000-00000000000a',".to_string(),
         ),
         (
-            "tests/test_camp_sport.py".to_string(),
+            "tests/test_charter_activity.py".to_string(),
             "added".to_string(),
             patch('+', &(0..45).map(|i| format!("    assert_case({i})")).collect::<Vec<_>>()),
         ),
@@ -171,7 +171,7 @@ fn a_whole_path_rewrite_for_four_camps_goes_back_and_the_lookup_fix_does_not() {
     // A reason the narrower change can't work keeps a wide one.
     assert!(minimal_change::standing(
         &minimal_change::check(&wide, &[], TICKET, false),
-        "Wider than the ticket: dags/camp_pipeline.py: the vendor gives no name for these camps"
+        "Wider than the ticket: dags/charter_pipeline.py: the vendor gives no name for these charters"
     )
     .is_empty());
 }
@@ -204,18 +204,18 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
         .expect("the test job");
     // CoderHelm's runner list knows no command here; the loop runs the file.
     assert_eq!(
-        habits_check::file_cmd(None, Some(&env), "tests/test_camp_sport.py").as_deref(),
-        Ok("python tests/test_camp_sport.py")
+        habits_check::file_cmd(None, Some(&env), "tests/test_charter_activity.py").as_deref(),
+        Ok("python tests/test_charter_activity.py")
     );
     assert!(
-        habits_check::file_cmd(None, None, "tests/test_camp_sport.py")
+        habits_check::file_cmd(None, None, "tests/test_charter_activity.py")
             .unwrap_err()
             .contains("no unit test command")
     );
     // Fails on the base with the reported names, passes on the head.
     let base = FileRun {
         code: Some(1),
-        output: "AssertionError: 'Squash Camp-Half Day' maps to None, expected squash".into(),
+        output: "AssertionError: 'Kayak Charter-Half Day' maps to None, expected kayaking".into(),
     };
     let head = FileRun {
         code: Some(0),
@@ -224,13 +224,13 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     assert_eq!(habits_check::verdict(&head, &base).0, Verdict::Proven);
     // A test that passes on the base goes back to the coder.
     let plan = PlanResult {
-        tasks: "- [ ] tests/test_camp_sport.py: [create] x\n".into(),
+        tasks: "- [ ] tests/test_charter_activity.py: [create] x\n".into(),
         ..Default::default()
     };
     let either = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_camp_sport.py".into(),
+            path: "tests/test_charter_activity.py".into(),
             verdict: habits_check::verdict(&head, &head).0,
             detail: String::new(),
             why: None,
@@ -244,7 +244,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     let not_run = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_camp_sport.py".into(),
+            path: "tests/test_charter_activity.py".into(),
             verdict: Verdict::NotRun,
             detail: "the sandbox gave no result for it".into(),
             why: None,
@@ -255,7 +255,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     let proven = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_camp_sport.py".into(),
+            path: "tests/test_charter_activity.py".into(),
             verdict: Verdict::Proven,
             detail: "AssertionError".into(),
             why: None,

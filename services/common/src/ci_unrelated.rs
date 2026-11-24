@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::ci_repro::Leg;
 
-    const ROUND: &str = "I made no code change. The failing e2e test (`Drop-ins › sport filter shows only that sport's sessions and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows session 113154.\n- Confirmed: the session went inactive just before the run.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
+    const ROUND: &str = "I made no code change. The failing e2e test (`Day passes › dock filter shows only that dock's slips and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows slip 900154.\n- Confirmed: the slip went inactive just before the run.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
 
     #[test]
     fn a_round_with_confirmed_evidence_is_classified() {
@@ -378,7 +378,7 @@ mod tests {
         .expect("classified");
         assert_eq!(
             s.tests,
-            vec!["Drop-ins › sport filter shows only that sport's sessions and clears".to_string()]
+            vec!["Day passes › dock filter shows only that dock's slips and clears".to_string()]
         );
         assert_eq!(s.proof.len(), 2, "{:?}", s.proof);
         assert!(s.proof[0].starts_with("on the base branch's build"));
@@ -396,8 +396,8 @@ mod tests {
 
     #[test]
     fn a_test_the_change_edits_is_the_changes() {
-        let tests = vec!["e2e/tests/browse/venues.spec.ts › Drop-ins › filter".to_string()];
-        let changed = vec!["e2e/tests/browse/venues.spec.ts".to_string()];
+        let tests = vec!["e2e/tests/browse/docks.spec.ts › Day passes › filter".to_string()];
+        let changed = vec!["e2e/tests/browse/docks.spec.ts".to_string()];
         assert!(classify(ROUND, &[], "abc1234", &[], &tests, &changed).is_none());
         // Unless a comparison shows it fails on the base too.
         let red = |ran| Leg {
@@ -459,7 +459,7 @@ mod tests {
             sec.starts_with("## CI failure outside this change"),
             "{sec}"
         );
-        assert!(sec.contains("`Deploy Preview` fails on `Drop-ins › sport filter"));
+        assert!(sec.contains("`Deploy Preview` fails on `Day passes › dock filter"));
         assert!(sec.contains("ran again once on c6da43e and failed the same way"));
         assert!(sec.contains("Fix for the test: flaky-test fix started"));
         assert!(!sec.contains("fix attempt"));
@@ -470,19 +470,19 @@ mod tests {
 
     #[test]
     fn a_named_test_finds_its_record() {
-        let t = "Drop-ins › sport filter shows only that sport's sessions and clears";
-        assert!(same_test(t, t, "browse/venues.spec.ts"));
+        let t = "Day passes › dock filter shows only that dock's slips and clears";
+        assert!(same_test(t, t, "browse/docks.spec.ts"));
         assert!(same_test(
-            &format!("browse/venues.spec.ts › {t}"),
+            &format!("browse/docks.spec.ts › {t}"),
             t,
-            "browse/venues.spec.ts"
+            "browse/docks.spec.ts"
         ));
         assert!(!same_test(
-            &format!("browse/camps.spec.ts › {t}"),
+            &format!("browse/slips.spec.ts › {t}"),
             t,
-            "browse/venues.spec.ts"
+            "browse/docks.spec.ts"
         ));
-        assert!(!same_test("Drop-ins › other", t, ""));
+        assert!(!same_test("Day passes › other", t, ""));
         assert!(!same_test("", t, ""));
     }
 

@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn blame_needs_a_record_and_a_count_is_evidence() {
-        let text = "The fix is in.\n- `summer camp pricing` is broken on main since #12. Nothing else changed.";
+        let text = "The fix is in.\n- `seasonal slip pricing` is broken on main since #12. Nothing else changed.";
         let (held, changed) = hold_blame(text, &[], "abc1234");
         assert!(changed);
         assert!(!held.contains("broken on main"), "{held}");
@@ -967,10 +967,8 @@ mod tests {
     #[test]
     fn read_evidence_is_never_unconfirmed() {
         let text = "I couldn't confirm why the e2e test fails. The link is gone.";
-        let (held, changed) = hold_unread(
-            text,
-            Some("`E2E` failed in `a.spec.ts › adds it`: Subtotal$0"),
-        );
+        let (held, changed) =
+            hold_unread(text, Some("`E2E` failed in `a.spec.ts › adds it`: Total$0"));
         assert!(changed);
         assert!(
             held.starts_with("The failure's report says: `E2E` failed"),
@@ -1003,7 +1001,7 @@ mod tests {
     fn the_comparison_command_and_targets() {
         let c = leg_cmd(
             "e2e",
-            "tests/browse/camp.spec.ts",
+            "tests/browse/slip.spec.ts",
             "adds it (AM)",
             "https://staging.example.com",
         )

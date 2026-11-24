@@ -99,13 +99,13 @@ impl Fake {
             ]),
             changes: Ok(vec![
                 Change {
-                    at: "2026-11-12T05:04:32Z".into(),
+                    at: "2030-03-12T05:04:32Z".into(),
                     action: "CreateDomain".into(),
                     resource: "ledger-os-opt".into(),
                     by: "deploy-bot".into(),
                 },
                 Change {
-                    at: "2026-11-12T05:18:20Z".into(),
+                    at: "2030-03-12T05:18:20Z".into(),
                     action: "DeleteDomain".into(),
                     resource: "ledger-os-opt2".into(),
                     by: "deploy-bot".into(),
@@ -117,7 +117,7 @@ impl Fake {
                 path: "modules/search/main.tf".into(),
                 sha: "4f1c2d3e9a".into(),
                 message: "Move the search domain into the VPC".into(),
-                at: "2026-11-12T04:58:00Z".into(),
+                at: "2030-03-12T04:58:00Z".into(),
             }],
             since: Some(0),
             asked: Mutex::new(vec![]),
@@ -162,7 +162,7 @@ fn finding(id: &str, group: &str, title: &str, pattern: &str, first: &str, last:
         source_account_id: ACCOUNT.into(),
         first_seen_at: first.into(),
         last_seen_at: last.into(),
-        created_at: "2026-11-12T09:27:15Z".into(),
+        created_at: "2030-03-12T09:27:15Z".into(),
         ..Default::default()
     }
 }
@@ -173,8 +173,8 @@ fn dns_finding() -> Finding {
         "/ecs/prod-ledger-api",
         "OpenSearch endpoint DNS ENOTFOUND in /ecs/prod-ledger-api",
         &format!("ConnectionError: getaddrinfo ENOTFOUND {OLD_HOST}"),
-        "2026-11-12T05:19:17.975Z",
-        "2026-11-12T05:25:18.153Z",
+        "2030-03-12T05:19:17.975Z",
+        "2030-03-12T05:25:18.153Z",
     )
 }
 
@@ -184,8 +184,8 @@ fn index_finding() -> Finding {
         "/ecs/prod-ledger-api",
         "OpenSearch class_index index missing (404) in /ecs/prod-ledger-api",
         "search on class_index failed (attempt 1/4, status=404, error=ResponseError):",
-        "2026-11-12T05:24:23.261Z",
-        "2026-11-12T05:26:38.950Z",
+        "2030-03-12T05:24:23.261Z",
+        "2030-03-12T05:26:38.950Z",
     )
 }
 
@@ -195,14 +195,14 @@ fn web_finding() -> Finding {
         "/ecs/prod-storefront",
         "Facets failing on OpenSearch errors in /ecs/prod-storefront",
         "errors: [Array],",
-        "2026-11-12T05:19:07.249Z",
-        "2026-11-12T05:26:39.069Z",
+        "2030-03-12T05:19:07.249Z",
+        "2030-03-12T05:26:39.069Z",
     );
     f.severity = Severity::Warning;
     f
 }
 
-const NOW: &str = "2026-11-12T09:30:00Z";
+const NOW: &str = "2030-03-12T09:30:00Z";
 
 async fn diag(look: &Fake, f: &Finding) -> Diagnosis {
     diagnose(
@@ -288,7 +288,7 @@ async fn a_dns_failure_on_a_replaced_domain_is_a_setting_with_the_new_endpoint_n
     assert!(fix.change.contains("OPENSEARCH_NODE"), "{}", fix.change);
     assert!(
         d.summary.starts_with(
-            "The OpenSearch domain ledger-os-opt2 was replaced by ledger-os-opt (VPC only) at Nov 12 05:18 UTC; /ecs/prod-ledger-api still reads the old hostname from envs/prod/ledger-api.tf in acme/infra-live"
+            "The OpenSearch domain ledger-os-opt2 was replaced by ledger-os-opt (VPC only) at Mar 12 05:18 UTC; /ecs/prod-ledger-api still reads the old hostname from envs/prod/ledger-api.tf in acme/infra-live"
         ),
         "{}",
         d.summary
@@ -305,7 +305,7 @@ async fn a_dns_failure_on_a_replaced_domain_is_a_setting_with_the_new_endpoint_n
         "reads its endpoint from OPENSEARCH_NODE (src/config/search.config.ts in acme/ledger-api)"
     )));
     // It stopped hours ago and nothing came since.
-    assert_eq!(d.recovered_at, "2026-11-12T05:25:18.153Z");
+    assert_eq!(d.recovered_at, "2030-03-12T05:25:18.153Z");
 }
 
 #[tokio::test]
@@ -385,7 +385,7 @@ async fn one_cause_across_findings_and_services_is_one_incident() {
         inc.log_groups,
         vec!["/ecs/prod-ledger-api", "/ecs/prod-storefront"]
     );
-    assert_eq!(inc.first_seen, "2026-11-12T05:19:07.249Z");
+    assert_eq!(inc.first_seen, "2030-03-12T05:19:07.249Z");
     assert!(inc.diagnosis.summary.contains("replaced by ledger-os-opt"));
     assert!(inc
         .diagnosis
@@ -414,16 +414,16 @@ async fn different_causes_or_windows_stay_apart() {
         "/ecs/prod-ledger-api",
         "TypeError in the invoice export",
         "TypeError: cannot read properties of undefined (reading 'total')",
-        "2026-11-12T05:20:00Z",
-        "2026-11-12T05:21:00Z",
+        "2030-03-12T05:20:00Z",
+        "2030-03-12T05:21:00Z",
     );
     let later = finding(
         "later",
         "/ecs/prod-ledger-api",
         "OpenSearch class_index index missing (404) in /ecs/prod-ledger-api",
         "search on class_index failed (attempt 1/4, status=404, error=ResponseError):",
-        "2026-11-12T09:00:00Z",
-        "2026-11-12T09:05:00Z",
+        "2030-03-12T09:00:00Z",
+        "2030-03-12T09:05:00Z",
     );
     let mut items = Vec::new();
     for f in [dns_finding(), code_bug, later] {
@@ -468,7 +468,7 @@ async fn two_findings_with_one_cause_make_one_card_that_says_what_was_done() {
     );
     assert!(text.contains("2 findings, one cause"));
     assert!(
-        text.contains("stopped on its own at Nov 12 05:26 UTC"),
+        text.contains("stopped on its own at Mar 12 05:26 UTC"),
         "{text}"
     );
     assert!(text.contains("If it comes back, the change is ready"));
@@ -539,7 +539,7 @@ fn what_is_left_for_a_person_is_a_listed_reason() {
     // Code that stopped erroring is still the code's: the fix goes ahead.
     let d = Diagnosis {
         place: Place::Code,
-        recovered_at: "2026-11-12T05:26:00Z".into(),
+        recovered_at: "2030-03-12T05:26:00Z".into(),
         ..Default::default()
     };
     assert_eq!(plan(&d), Plan::Code);

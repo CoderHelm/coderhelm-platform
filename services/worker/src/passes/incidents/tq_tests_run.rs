@@ -1,8 +1,8 @@
-//! tq. Across the 53 most recent runs, 17 had new or changed tests to run
+//! tq. Across a batch of recent runs, many had new or changed tests to run
 //! with and without the change, and not one ran both ways:
 //!
-//! - 6 recorded "the package's install failed in the sandbox", all in one
-//!   pnpm workspace. The test files sat in a member (`apps/web`) whose
+//! - several recorded "the package's install failed in the sandbox", all in
+//!   one pnpm workspace. The test files sat in a member (`apps/web`) whose
 //!   lockfile is the workspace root's, and the sandbox installed the member
 //!   on its own: `cd 'apps/web' && pnpm install --ignore-workspace
 //!   --frozen-lockfile`. With no lockfile in that folder pnpm stops with
@@ -11,17 +11,17 @@
 //!   manifest blob) was never used for these runs, and the failure said
 //!   nothing of why. One of them also listed a Playwright spec as a unit
 //!   test.
-//! - 7 recorded "no step of the run had the time for the two sandbox
+//! - several recorded "no step of the run had the time for the two sandbox
 //!   runs". The check asked once for a step of its own; the fresh step ran
 //!   every other check first (the proof, the link checks, the new-feature
 //!   rules, live probes, the scope ledger) and came to the runs with less
 //!   than their 760 seconds left, and the one request was spent: one run
-//!   resumed for the runs at 16:00:42 and reached them at 16:05:42.
-//! - 2 recorded "the repository's CI runs no unit test command CoderHelm
+//!   resumed for the runs and only reached them minutes later.
+//! - a few recorded "the repository's CI runs no unit test command CoderHelm
 //!   can read" for a data pipeline whose CI loops `python "$t"` over its
 //!   tests, and listed fixture JSON files as tests too; one file without a
 //!   command stopped every file from running.
-//! - 2 had no test to run (a change of only tests, or no test file).
+//! - a few had no test to run (a change of only tests, or no test file).
 //!
 //! Guarantee: the runs install the way CI does (its job for the files, its
 //! install lines in order, its Node and pnpm versions, through the cached
@@ -49,7 +49,7 @@ fn tree(paths: &[&str]) -> Vec<String> {
     paths.iter().map(|p| p.to_string()).collect()
 }
 
-/// A web workspace like the six runs': `apps/web` a member, the lockfile at
+/// A web workspace like those runs': `apps/web` a member, the lockfile at
 /// the root, an end-to-end package with its own lockfile.
 fn workspace() -> Vec<String> {
     tree(&[
@@ -61,7 +61,7 @@ fn workspace() -> Vec<String> {
         "apps/web/src/test/components/drawer-reopen.test.tsx",
         "e2e/package.json",
         "e2e/pnpm-lock.yaml",
-        "e2e/tests/browse/registration.spec.ts",
+        "e2e/tests/browse/booking.spec.ts",
     ])
 }
 
@@ -81,7 +81,7 @@ fn manifests(p: &str) -> Option<String> {
 fn a_workspace_member_installs_from_the_root_and_says_why_when_it_fails() {
     let t = workspace();
     let test = "apps/web/src/test/components/drawer-reopen.test.tsx".to_string();
-    // What the six runs ran: the member on its own, where pnpm finds no
+    // What those runs ran: the member on its own, where pnpm finds no
     // lockfile.
     let web = test_package::package_of(&t, &test, &manifests).unwrap();
     let install = &test_package::check_steps(&web).unwrap()[0].cmd;
@@ -120,7 +120,7 @@ fn a_workspace_member_installs_from_the_root_and_says_why_when_it_fails() {
         .cmd
         .contains("pnpm install --frozen-lockfile"));
     // The Playwright spec one run listed is never a unit test.
-    let spec = "e2e/tests/browse/registration.spec.ts".to_string();
+    let spec = "e2e/tests/browse/booking.spec.ts".to_string();
     let plan = bench_plan(&[spec], &t, None, None, &manifests);
     assert!(matches!(&plan.per_file[0], Err(w) if w == habits_check::E2E_SPEC));
     assert_eq!(NotRunWhy::of(habits_check::E2E_SPEC), NotRunWhy::EndToEnd);
@@ -151,7 +151,7 @@ fn the_runs_have_a_step_of_their_own_and_run_first_in_it() {
     let files = vec!["apps/web/src/test/a.test.ts".to_string()];
     // The coding step ends with 300 seconds left: the runs are owed.
     assert_eq!(proof_time(None, "h1", &files, 300, 0, true), ProofTime::Owe);
-    // What the seven runs did next: the fresh step reached them after its
+    // What those runs did next: the fresh step reached them after its
     // other checks, short again, with its one request spent. Now the owed
     // runs go first, with the step's whole time, and are recorded.
     assert_eq!(proof_time(None, "h1", &files, 880, 1, true), ProofTime::Run);
@@ -223,25 +223,28 @@ fn a_loop_ci_runs_the_test_and_its_fixtures_are_not_tests() {
         ..Default::default()
     };
     let diff: Vec<(String, String, String)> = [
-        "dags/utils/schedule_common.py",
-        "tests/fixtures/camp_activities.json",
-        "tests/fixtures/camp_live_names.json",
-        "tests/test_camp_sport.py",
+        "dags/utils/booking_common.py",
+        "tests/fixtures/charter_activities.json",
+        "tests/fixtures/charter_live_names.json",
+        "tests/test_charter_activity.py",
     ]
     .iter()
     .map(|p| (p.to_string(), "modified".to_string(), String::new()))
     .collect();
     let files = bench_files(&diff);
-    assert_eq!(files, vec!["tests/test_camp_sport.py"]);
-    let t = tree(&["tests/test_camp_sport.py", "requirement.txt"]);
+    assert_eq!(files, vec!["tests/test_charter_activity.py"]);
+    let t = tree(&["tests/test_charter_activity.py", "requirement.txt"]);
     let plan = bench_plan(&files, &t, None, Some(&ci), &|_| None);
     assert_eq!(
         plan.per_file,
-        vec![Ok("python tests/test_camp_sport.py".to_string())]
+        vec![Ok("python tests/test_charter_activity.py".to_string())]
     );
     // A file no command runs is not run, with why; the others still run.
     let plan = bench_plan(
-        &["tests/test_camp_sport.py".into(), "scripts/check.sh".into()],
+        &[
+            "tests/test_charter_activity.py".into(),
+            "scripts/check.sh".into(),
+        ],
         &t,
         None,
         Some(&ci),
@@ -258,8 +261,9 @@ fn a_loop_ci_runs_the_test_and_its_fixtures_are_not_tests() {
     };
     make.resolve_scripts(&tree(&["Makefile"]), &read);
     assert_eq!(
-        make.file_command("tests/test_camp_sport.py").as_deref(),
-        Some("python -m pytest tests/test_camp_sport.py")
+        make.file_command("tests/test_charter_activity.py")
+            .as_deref(),
+        Some("python -m pytest tests/test_charter_activity.py")
     );
 }
 

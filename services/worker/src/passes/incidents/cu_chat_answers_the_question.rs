@@ -1,9 +1,9 @@
-//! cu. A team's CTO opened chat for the first time and asked what could be
-//! useful to someone in his role. Chat answered a different question: it
-//! led with "what's waiting on you" (24 items, one ticket's details first),
-//! in the fixed shape that list's lookup imposes on every answer, and said
-//! Jira wasn't connected, a claim it hadn't checked. His next message had to
-//! correct it ("what do you mean that jira isn't connected?"). Earlier, a
+//! cu. A person opened chat for the first time, named their role, and asked
+//! what could be useful to someone in it. Chat answered a different
+//! question: it led with "what's waiting on you" (a long list, one ticket's
+//! details first), in the fixed shape that list's lookup imposes on every
+//! answer, and said Jira wasn't connected, a claim it hadn't checked. Their
+//! next message had to question that claim. Earlier, a
 //! question that linked a pull request comment got the canned "found
 //! nothing" line, because any answer that cited nothing was replaced by it.
 //!
@@ -20,14 +20,14 @@
 use common::chat_intent::{read, Intent, Signals};
 use common::knowledge::answer::{finalize_reply, Registry, NO_SOURCE_ANSWER};
 
-const FIRST: &str = "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me";
+const FIRST: &str = "first time here with coderhelm. i'm the cto at my company. what are a few things that could be useful to me?";
 
 /// The answer as it was given (shortened): the list first, then a claim
 /// no check made in that answer supported.
-const GIVEN: &str = "Welcome. Here are the things I think will matter most to you, starting with something already waiting on you.\n## 1. Questions only you can answer\nI checked what's waiting on your GitHub account: 24 items: 14 need you now, 8 today, 2 when you can. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list.";
+const GIVEN: &str = "Welcome. Here are the things I think will matter most to you, starting with something already waiting on you.\n## 1. Questions only you can answer\nI checked what's waiting on your GitHub account: 9 items: 5 need you now, 3 today, 1 when you can. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list.";
 
 const NEXT: &str =
-    "what do you mean that jira isn't connected? i see atlassian in the integrations";
+    "what do you mean jira isn't connected? atlassian shows up on my integrations page";
 
 #[test]
 fn the_first_question_is_an_orientation_for_a_cto_and_never_the_list() {

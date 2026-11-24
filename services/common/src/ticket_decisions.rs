@@ -472,14 +472,14 @@ mod tests {
 
     #[test]
     fn an_answered_item_leaves_the_pending_list() {
-        let body = "## Summary\nAdds the page.\n\n### Decisions pending product input\n- Final heading and intro copy per venue: built with the default for now.\n- Analytics event names\n\n## Testing\n- unit tests\n";
+        let body = "## Summary\nAdds the page.\n\n### Decisions pending product input\n- Final heading and intro copy per marina: built with the default for now.\n- Analytics event names\n\n## Testing\n- unit tests\n";
         let a = answer(
-            "Final heading and intro copy per venue? Proposed default: '{Venue} Camp Registration'.",
+            "Final heading and intro copy per marina? Proposed default: '{Marina} Slip Booking'.",
             "Skip the heading and intro copy. Just use the title",
         );
         let s = settle(body, &[a], &[]);
         assert!(
-            !s.body.contains("intro copy per venue: built"),
+            !s.body.contains("intro copy per marina: built"),
             "{}",
             s.body
         );
@@ -491,9 +491,9 @@ mod tests {
 
     #[test]
     fn an_emptied_pending_section_goes() {
-        let body = "## Summary\nx\n\n**Open questions**\n- Heading and intro copy for each venue\n\n## Testing\n- ok\n";
+        let body = "## Summary\nx\n\n**Open questions**\n- Heading and intro copy for each marina\n\n## Testing\n- ok\n";
         let a = answer(
-            "Heading and intro copy per venue?",
+            "Heading and intro copy per marina?",
             "Skip both, use the title",
         );
         let s = settle(body, &[a], &[]);
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn an_unrelated_answer_changes_nothing() {
         let body = "### Pending\n- Analytics event names\n";
-        let s = settle(body, &[answer("Which venue goes first?", "Venue A")], &[]);
+        let s = settle(body, &[answer("Which marina goes first?", "Marina A")], &[]);
         assert_eq!(s.body, body);
     }
 

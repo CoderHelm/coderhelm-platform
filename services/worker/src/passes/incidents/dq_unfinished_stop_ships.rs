@@ -1,8 +1,8 @@
-//! dq. A run on a large ticket finished 23 of its 38 planned tasks and then
-//! spent nine steps reading the same files: each step searched, read, ran
+//! dq. A run on a large ticket finished part of its planned tasks and then
+//! spent several steps reading the same files: each step searched, read, ran
 //! the checks and wrote nothing, because the files it was told were missing
 //! were already in their planned form. The guard ended it with "CoderHelm
-//! stopped this run and handed it to you: it continued 7 times without
+//! stopped this run and handed it to you: it continued N times without
 //! finishing another task ... Push to the branch or comment on the pull
 //! request". A later run on another ticket did the same on one README line:
 //! every step re-read the file, thought to the output limit and wrote
@@ -31,7 +31,7 @@ use crate::passes::steps;
 use crate::passes::supervisor::{self, Rung};
 
 /// What a recorded implement step cost, in USD (the README run's steps
-/// spent 2.3 to 2.9 each).
+/// spent a few dollars each).
 const STEP_USD: f64 = 2.6;
 
 /// The recorded shape: the last task finished in the step before the first
@@ -41,11 +41,11 @@ const STEP_USD: f64 = 2.6;
 /// ladder's rungs in order, and the guard's stop when it fired.
 fn replay() -> (Vec<Rung>, Option<Trip>, GuardState) {
     let at = "implement_started";
-    let head = "4f0c2aa";
+    let head = "a1b2c3d";
     let mut g = GuardState::default();
-    assert!(g.apply(&Progress::TasksDone(23)));
+    assert!(g.apply(&Progress::TasksDone(17)));
     // The mark the last productive step started at: its head moved since.
-    let mut prev = Some(steps::progress_mark("19be3d0", at));
+    let mut prev = Some(steps::progress_mark("d3c2b1a", at));
     let mut stalled = 0;
     let mut rungs = Vec::new();
     for _ in 0..20 {
@@ -66,8 +66,8 @@ fn replay() -> (Vec<Rung>, Option<Trip>, GuardState) {
             _ => {}
         }
         prev = Some(now);
-        // Its plan check: the same 23 done, the next stuck task first.
-        assert!(!g.apply(&Progress::TasksDone(23)));
+        // Its plan check: the same 17 done, the next stuck task first.
+        assert!(!g.apply(&Progress::TasksDone(17)));
     }
     (rungs, None, g)
 }

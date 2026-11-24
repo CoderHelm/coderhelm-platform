@@ -24,7 +24,7 @@ use crate::passes::ready::{self, Ci, Decision, Facts};
 use common::draft_hold::{DraftHold, Kind, Reason};
 use common::handback::HumanOnly;
 
-const HEAD: &str = "9c1e0d2b7a44";
+const HEAD: &str = "abc9876d7a44";
 
 fn draft(body: &str) -> Facts {
     Facts {

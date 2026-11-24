@@ -1050,7 +1050,7 @@ mod intent_tests {
         // The live case: a complaint, then what to add, with a Story type
         // or with none at all.
         let title = "Editors can't choose a block's title size: add a Title Size setting \
-                     (Section / Page) to the venue page blocks";
+                     (Section / Page) to the marina page blocks";
         let body = "Part 4 of 4.\n\nAcceptance criteria:\n- Editors can choose Section or Page \
                     for each block's title\n- The site renders the chosen size";
         assert!(asks_for_new_work(title, body));
@@ -1068,7 +1068,7 @@ mod intent_tests {
         for (title, body) in [
             ("Allow admins to set a default timezone", ""),
             ("Support a dark mode option in settings", ""),
-            ("Create a new page for venue events", ""),
+            ("Create a new page for marina events", ""),
             ("Add an export button to the reports view", ""),
             ("Users have no way to filter orders by date: add a date filter", ""),
             (
@@ -1090,7 +1090,7 @@ mod intent_tests {
             ("Add a null check so checkout stops crashing", "", None),
             ("Login button doesn't work on Safari", "", None),
             ("Price field shows the wrong currency", "", None),
-            ("Venue hours are missing on the venue page", "", None),
+            ("Marina hours are missing on the marina page", "", None),
             (
                 "The new settings page throws an error on save",
                 "## Acceptance criteria\n- Saving works without an error",

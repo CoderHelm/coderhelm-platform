@@ -1,17 +1,17 @@
 //! bf. A security update's run page and pull request handed its reader a
 //! pile of CoderHelm's own work. Under Open items: "Run `npm view
 //! <package>@<version> maintainers dist.integrity` and compare the result to
-//! the lockfile hash"; then nine near-identical lines, "Assumed instead of
+//! the lockfile hash"; then many near-identical lines, "Assumed instead of
 //! asking: fix location: The ticket is an explicit, self-contained
 //! security-update request, so CoderHelm opens a new pull request ...
 //! Settle: Correct it in a comment on this pull request if it's wrong;
 //! otherwise delete this line. Only a person can settle this: a product
 //! decision", each cut off with an ellipsis. "Needed from you" repeated
-//! six of them, "and 3 more", then "Review: decide whether to merge 48
-//! dependency updates. Feedback wanted: does the evidence beside each
-//! major version jump cover how this code uses those packages". The owner:
-//! "it is a senior developer ... it has more access than I do; it should be
-//! able to do it itself".
+//! several of them, "and N more", then a review line asking the reviewer
+//! to decide whether to merge dozens of dependency updates and to judge
+//! whether the evidence beside each major version jump covered how the
+//! code uses those packages. The team's owner pointed out that CoderHelm
+//! has more access than they do and should have done that work itself.
 //!
 //! The causes: the settle stage classed every judge assumption as a
 //! product decision for a person (`settle::classify`); each proceed the
@@ -268,7 +268,7 @@ fn the_second_pull_requests_three_items() {
     assert_eq!(person_gate::decide(&deploy.ask(), &ctx).class(), Class::Do);
     // A look at a field: the reviewer's sign-off, folded into the review.
     let look = Step {
-        what: "Look at Studio: the landing document, hero Sub Title field".into(),
+        what: "Look at Studio: the slip page document, hero Tagline field".into(),
         how: String::new(),
         when: When::Any,
         owner: "the reviewer".into(),
@@ -289,7 +289,7 @@ fn the_second_pull_requests_three_items() {
     // The look is part of the review: shown in Verification, never a
     // chore under "Needed from you".
     assert!(
-        lead.contains("See it: Studio: the landing document, hero Sub Title field."),
+        lead.contains("See it: Studio: the slip page document, hero Tagline field."),
         "{lead}"
     );
     assert!(!lead.contains("judgement only a person"), "{lead}");
@@ -298,9 +298,9 @@ fn the_second_pull_requests_three_items() {
     // A checklist step owned by CoderHelm is CoderHelm's work.
     let e2e = Finding {
         point: "end_to_end".into(),
-        detail: "No step lists the 23 documents over the limit.".into(),
+        detail: "No step lists the 17 documents over the limit.".into(),
         settle:
-            "Add a checklist step owned by CoderHelm to query and post all 23 over-limit documents."
+            "Add a checklist step owned by CoderHelm to query and post all 17 over-limit documents."
                 .into(),
         ..Default::default()
     };
@@ -319,7 +319,7 @@ fn question(text: &str, suggestions: &[&str]) -> Question {
         question: text.into(),
         why: "the four pages need a heading".into(),
         suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
-        checked: vec!["the venue pages' current headings".into()],
+        checked: vec!["the marina pages' current headings".into()],
         changes: "the heading text on four pages".into(),
         ..Default::default()
     }
@@ -334,11 +334,11 @@ fn page_copy_with_a_default_is_decided_never_asked_and_never_twice() {
     };
     let qs = vec![
         question(
-            "What H1 and intro copy should each of the four venue pages use? (Default: '{Venue} Summer Camp Registration' plus one sentence.)",
+            "What H1 and intro copy should each of the four marina pages use? (Default: '{Marina} Slip Booking' plus one sentence.)",
             &[],
         ),
         question(
-            "Which heading and intro sentence should the four venue pages show? (Default: '{Venue} Summer Camp Registration' plus one sentence.)",
+            "Which heading and intro sentence should the four marina pages show? (Default: '{Marina} Slip Booking' plus one sentence.)",
             &[],
         ),
     ];
@@ -355,7 +355,7 @@ fn an_irreversible_customer_facing_choice_is_one_yes_no_with_the_work_done() {
         ..Default::default()
     };
     let q = question(
-        "Should the migration email customers whose bookings move to the new venue?",
+        "Should the migration email customers whose bookings move to the new marina?",
         &["email them once", "send nothing"],
     );
     let s = screen::screen(

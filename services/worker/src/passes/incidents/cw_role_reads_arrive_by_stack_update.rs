@@ -205,7 +205,7 @@ fn no_script_writes_a_permission_and_the_script_role_moves_over() {
     // The pasted script only makes the database user and creates or updates
     // the role stack from this release's template.
     let s = common::live::aws::setup_script(
-        "654654210434",
+        "444455556666",
         "0b5f1a5e-0000-4000-8000-000000000000",
         "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml",
         "",

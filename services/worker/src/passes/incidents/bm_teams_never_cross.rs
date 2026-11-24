@@ -291,7 +291,7 @@ fn a_reused_run_id_never_shows_another_teams_events() {
             ),
         ])
     };
-    let today = "2026-11-15";
+    let today = "2030-03-15";
     assert!(common::run_events::owned_by(&row(TEAM_A), TEAM_A, today));
     assert!(!common::run_events::owned_by(&row(TEAM_B), TEAM_A, today));
 }

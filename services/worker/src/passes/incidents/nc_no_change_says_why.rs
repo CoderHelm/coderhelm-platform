@@ -23,16 +23,16 @@ const EARLIER_RUN: &str = "01JRUNEARLIERALARM00000000";
 const PR: u64 = 31;
 
 /// The plan, as the planner wrote it for the alarm.
-const TASKS: &str = "NO_CHANGES_NEEDED: The current rule already matches the crawler: 516 \
-     requests blocked in the last hour, 93% on the expected fingerprint. The counting rule \
-     stayed under its 500 an hour threshold for 72 hours (at most 292). The remaining counts \
-     come from other crawlers.\n\nThe stream behind the open pull request is down to 2 requests.";
+const TASKS: &str = "NO_CHANGES_NEEDED: The current rule already matches the crawler: 610 \
+     requests blocked in the last hour, 90% on the expected fingerprint. The counting rule \
+     stayed under its 400 an hour threshold for 48 hours (at most 310). The remaining counts \
+     come from other crawlers.\n\nThe stream behind the open pull request is down to 3 requests.";
 
 fn plan_fix() -> FixDecision {
     let mut f = FixDecision::default();
     f.evidence.looked_up = vec![
-        "firewall logs, last hour: 516 blocked, 93% on the expected fingerprint".into(),
-        "counting rule, last 72 hours: at most 292 an hour against a 500 threshold".into(),
+        "firewall logs, last hour: 610 blocked, 90% on the expected fingerprint".into(),
+        "counting rule, last 48 hours: at most 310 an hour against a 400 threshold".into(),
     ];
     f
 }
@@ -76,7 +76,7 @@ fn a_no_change_ending_says_why_on_the_run_and_answers_the_alert() {
     let (end, ending) = replay(
         Some((
             Verdict::NotNeeded,
-            "The stream it blocks is down to 2 requests, so the rule it adds has nothing left to stop.".into(),
+            "The stream it blocks is down to 3 requests, so the rule it adds has nothing left to stop.".into(),
         )),
         true,
     );
@@ -91,11 +91,11 @@ fn a_no_change_ending_says_why_on_the_run_and_answers_the_alert() {
     assert!(ending
         .note
         .starts_with("No change needed. The current rule already matches"));
-    assert!(ending.note.contains("at most 292"));
-    assert!(ending.note.contains("down to 2 requests"));
+    assert!(ending.note.contains("at most 310"));
+    assert!(ending.note.contains("down to 3 requests"));
     assert!(ending
         .note
-        .contains("- firewall logs, last hour: 516 blocked"));
+        .contains("- firewall logs, last hour: 610 blocked"));
     assert_eq!(
         ending.record.reason,
         no_change::reason_of(TASKS),
@@ -124,10 +124,10 @@ fn a_no_change_ending_says_why_on_the_run_and_answers_the_alert() {
     // The alert hears back on its channels, with the reason's paragraph.
     let (paragraph, line) = ending.alert.clone().expect("the alert reply");
     assert!(paragraph.starts_with("The current rule already matches the crawler"));
-    assert!(!paragraph.contains("down to 2 requests"), "one paragraph");
+    assert!(!paragraph.contains("down to 3 requests"), "one paragraph");
     assert_eq!(line, call.line);
     let card = common::alert_notify::no_change_message(
-        "ALARM: edge-signature-drift",
+        "ALARM: crawler-rule-drift",
         &format!("{OWNER}/{REPO}"),
         &paragraph,
         &line,

@@ -904,8 +904,8 @@ mod tests {
         let call = |name: &str, path: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": {"path": path}}]});
         let step1 = vec![
             call("write_file", "e2e/tests/a.spec.ts"),
-            call("edit_file", "e2e/data/venues.ts"),
-            call("restore_file", "e2e/data/venues.ts"),
+            call("edit_file", "e2e/data/marinas.ts"),
+            call("restore_file", "e2e/data/marinas.ts"),
         ];
         let fb = settled_first("Fix the finding.", &step1);
         assert!(
@@ -914,7 +914,7 @@ mod tests {
         );
         assert!(fb.contains("- Written: `e2e/tests/a.spec.ts`"), "{fb}");
         assert!(
-            fb.contains("on purpose (leave them as they are): `e2e/data/venues.ts`"),
+            fb.contains("on purpose (leave them as they are): `e2e/data/marinas.ts`"),
             "{fb}"
         );
         // The next step's own decisions replace the section, keeping the rest.
@@ -925,7 +925,7 @@ mod tests {
             fb2.contains("- Written: `e2e/tests/a.spec.ts`, `apps/web/x.tsx`"),
             "{fb2}"
         );
-        assert!(fb2.contains("`e2e/data/venues.ts`"));
+        assert!(fb2.contains("`e2e/data/marinas.ts`"));
         assert_eq!(settled_first("x", &[]), "x");
         // The owed checks stay last, whole.
         let owed = format!("Fix it.{OWED_HEADING}Run these first.");

@@ -38,7 +38,7 @@ use crate::passes::infra_findings;
 
 const ACCOUNT: &str = "111122223333";
 const REGION: &str = "us-east-1";
-const CVE: &str = "CVE-2026-55501";
+const CVE: &str = "CVE-2030-10001";
 /// A name Terraform generated: `identifier_prefix` and 26 characters.
 const ORDERS: &str = "orders-20240311094512345600000001";
 const INFRA: &str = "acme/platform-infra";
@@ -261,9 +261,9 @@ fn code() -> Vec<SourceFile> {
 /// One bulletin: RDS customers act, and the fix is RDS for MySQL 8.0.40.
 fn bulletin() -> Bulletin {
     Bulletin {
-        id: "2026-171-AWS".into(),
+        id: "2026-901-AWS".into(),
         title: "Issue with RDS for MySQL".into(),
-        url: "https://aws.amazon.com/security/security-bulletins/2026-171-AWS/".into(),
+        url: "https://aws.amazon.com/security/security-bulletins/2026-901-AWS/".into(),
         severity: "important".into(),
         published: "2026-11-02".into(),
         updated: "2026-11-02".into(),

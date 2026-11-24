@@ -1,7 +1,7 @@
 //! ui. CI fix rounds met the same failure again and again and repeated
-//! themselves. On one run four rounds read the same missing-content
-//! failure and each concluded "I made no code change"; on another three
-//! rounds read the same cloud-account limit; on a third the error
+//! themselves. On one run several rounds read the same missing-content
+//! failure and each concluded "I made no code change"; on another, rounds
+//! read the same cloud-account limit; on a third the error
 //! signature hashed only the report-upload tail of the log, so two
 //! unrelated runs had the same signature. The stall count rose to one,
 //! but nothing told the next round what the last one had concluded or
@@ -19,13 +19,13 @@ use common::content_gap;
 
 #[test]
 fn a_repeat_is_told_the_last_account_and_to_change_approach() {
-    let last = "I made no code change this round. The failing test is right: staging has no club addresses.";
+    let last = "I made no code change this round. The failing test is right: staging has no marina addresses.";
     let gap = content_gap::names_gap(
-        "Error: venueClub /club-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-club-addresses",
+        "Error: marinaPage /marina-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-marina-addresses",
     );
     let b = content_gap::repeat_brief(1, last, gap.as_ref());
     assert!(b.contains("Do not repeat their approach"));
-    assert!(b.contains("staging has no club addresses"));
+    assert!(b.contains("staging has no marina addresses"));
     assert!(b.contains("tolerant-code route"));
     let b = content_gap::repeat_brief(2, "The account limit was reached.", None);
     assert!(b.contains("different hypothesis"));
