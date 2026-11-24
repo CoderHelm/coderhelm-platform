@@ -111,3 +111,27 @@ test("a list request files nothing: the handler takes it before the create path"
   assert.ok(!list.includes('route`/rest/api/3/issue`'), "the list path never creates");
   assert.ok(list.includes("/rest/api/3/search/jql"));
 });
+
+test("a follow-up is filed with follow-up labels only, never a trigger", () => {
+  // What an older CoderHelm sent: the trigger label and a repo label too.
+  assert.deepEqual(
+    f.followupLabels(["coderhelm", "coderhelm:acme/web", "coderhelm:followup:ABC-12"], "ABC-12"),
+    ["coderhelm:followup:ABC-12"]
+  );
+  assert.deepEqual(
+    f.followupLabels(["coderhelm-followup", "coderhelm:followup:ABC-12"], "ABC-12"),
+    ["coderhelm-followup", "coderhelm:followup:ABC-12"]
+  );
+  assert.deepEqual(f.followupLabels(undefined, "ABC-12"), ["coderhelm:followup:ABC-12"]);
+  assert.ok(f.isFollowupLabel("CoderHelm-Followup"));
+  assert.ok(!f.isFollowupLabel("coderhelm"));
+});
+
+test("a follow-up label is never read as the ticket's repository", () => {
+  assert.deepEqual(f.repoOfLabels(["coderhelm:followup:ABC-12"]), {});
+  assert.deepEqual(f.repoOfLabels(["coderhelm:followup:ABC-12", "coderhelm:acme/web"]), {
+    owner: "acme",
+    name: "web",
+  });
+  assert.deepEqual(f.repoOfLabels(["coderhelm"]), {});
+});

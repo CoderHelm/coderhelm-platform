@@ -290,6 +290,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "run_close::close_runs",
             "run_close::reopen_run",
             "run_close::close_superseded",
+            "followup_dedupe::dedupe",
         ],
     },
     Capability {

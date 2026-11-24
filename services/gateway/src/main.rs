@@ -440,6 +440,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         // A person starts a run on a ticket from outside its tracker (a
         // connected app's start_run).
         .route("/runs/start", post(routes::run_start::start_run))
+        // Close a source's duplicate follow-ups (`followup_dedupe`).
+        .route("/followups/dedupe", post(routes::followup_dedupe::dedupe))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
         .route(

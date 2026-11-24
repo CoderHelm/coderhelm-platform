@@ -41,12 +41,48 @@ function isIssueKey(key) {
 }
 
 /**
- * The label every follow-up of one source ticket carries, beside CoderHelm's
- * usual `coderhelm` and `coderhelm:<repo>` labels. Jira labels hold no
- * spaces, so the key is used as it is.
+ * The label every follow-up of one source ticket carries. Jira labels hold
+ * no spaces, so the key is used as it is.
  */
 function followupLabel(sourceKey) {
   return `coderhelm:followup:${sourceKey}`;
+}
+
+/** The label marking any follow-up CoderHelm filed. Never a trigger. */
+const MARKER_LABEL = "coderhelm-followup";
+
+/** Whether `label` is one of the follow-up labels (the marker or a source's). */
+function isFollowupLabel(label) {
+  const l = String(label || "").trim().toLowerCase();
+  return l === MARKER_LABEL || l.startsWith("coderhelm:followup:");
+}
+
+/**
+ * The labels a follow-up is filed with: only the follow-up labels CoderHelm
+ * sent, plus the source's label. Anything else (`coderhelm`, the team's
+ * trigger label, `coderhelm:<repo>`) is dropped here too, so even a
+ * CoderHelm that still sends them can't file a ticket that starts its own
+ * run: follow-ups never cascade.
+ */
+function followupLabels(labels, sourceKey) {
+  const asked = (Array.isArray(labels) ? labels : []).filter(
+    (l) => typeof l === "string" && isFollowupLabel(l)
+  );
+  return [...new Set([...asked, followupLabel(sourceKey)])];
+}
+
+/**
+ * The repository a ticket's labels pin (`coderhelm:owner/repo`), never a
+ * follow-up label (`coderhelm:followup:ABC-1` names a ticket, not a repo).
+ * `{}` when none does.
+ */
+function repoOfLabels(labels) {
+  const l = (Array.isArray(labels) ? labels : []).find(
+    (x) => typeof x === "string" && x.startsWith("coderhelm:") && !isFollowupLabel(x)
+  );
+  if (!l) return {};
+  const [owner, name] = l.replace("coderhelm:", "").split("/");
+  return { owner, name };
 }
 
 /** A summary as compared for "the same draft": case, spacing and trailing dots aside. */
@@ -213,6 +249,10 @@ module.exports = {
   MAX_DEDUPE,
   isIssueKey,
   followupLabel,
+  followupLabels,
+  isFollowupLabel,
+  repoOfLabels,
+  MARKER_LABEL,
   normalSummary,
   sameSummary,
   dedupeJql,

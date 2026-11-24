@@ -37,6 +37,7 @@ pub mod email;
 pub mod email_metrics;
 pub mod email_settings;
 pub mod entra_sso;
+pub mod followup_dedupe;
 pub mod github;
 pub mod github_hybrid;
 pub mod github_webhook;

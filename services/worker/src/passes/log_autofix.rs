@@ -137,6 +137,7 @@ impl StartEnv for WorkerEnv<'_> {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            followup_of: None,
             after_merge: false,
             merged_note: None,
         });

@@ -410,9 +410,16 @@ struct Ctx<'a> {
     /// The team's Jira comment hook, read once.
     jira_comment_url: Option<String>,
     tokens: tokio::sync::Mutex<HashMap<u64, Option<String>>>,
+    /// What the PR comment and the Jira note say instead of "Closed by X":
+    /// CoderHelm's own closes (a duplicate follow-up) say why in full.
+    said: Option<String>,
 }
 
-async fn load_run(state: &AppState, team_id: &str, run_id: &str) -> Result<Option<Item>, String> {
+pub(crate) async fn load_run(
+    state: &AppState,
+    team_id: &str,
+    run_id: &str,
+) -> Result<Option<Item>, String> {
     state
         .dynamo
         .get_item()
@@ -611,7 +618,9 @@ impl Ctx<'_> {
             } else {
                 None
             };
-            let comment = run_status::pr_close_comment(&self.closer.public, self.reason.as_deref());
+            let comment = self.said.clone().unwrap_or_else(|| {
+                run_status::pr_close_comment(&self.closer.public, self.reason.as_deref())
+            });
             for pr in &steps.close_prs {
                 let closed = match &token {
                     Some(t) => close_pr_on_github(self.state, t, pr, &comment).await,
@@ -629,7 +638,9 @@ impl Ctx<'_> {
             }
         }
         if let (Some(ticket), Some(url)) = (&steps.jira_ticket, &self.jira_comment_url) {
-            let note = run_status::ticket_note(&self.closer.public, self.reason.as_deref());
+            let note = self.said.clone().unwrap_or_else(|| {
+                run_status::ticket_note(&self.closer.public, self.reason.as_deref())
+            });
             let say = common::conversation::Say::status("run", note);
             if let Err(e) = super::conversation::jira_at(
                 self.state,
@@ -702,7 +713,36 @@ async fn ctx<'a>(
         close_pr,
         jira_comment_url: jira,
         tokens: tokio::sync::Mutex::new(HashMap::new()),
+        said: None,
     }
+}
+
+/// CoderHelm closes a run itself (a follow-up that duplicates another): the
+/// same steps as a person's close with "Also close PR" (the status write,
+/// the ticket lock, auto-merge, the PR closed with a comment, the Jira
+/// note), with `said` as the PR comment and the Jira note.
+pub(crate) async fn close_as_coderhelm(
+    state: &AppState,
+    team_id: &str,
+    run_id: &str,
+    said: &str,
+) -> CloseResult {
+    let ctx = Ctx {
+        state,
+        team_id,
+        closer: Closer {
+            email: "coderhelm".into(),
+            name: "CoderHelm".into(),
+            public: "CoderHelm".into(),
+            login: None,
+        },
+        reason: run_status::close_reason(said),
+        close_pr: true,
+        jira_comment_url: jira_comment_url(state, team_id).await,
+        tokens: tokio::sync::Mutex::new(HashMap::new()),
+        said: Some(said.to_string()),
+    };
+    ctx.close_one(run_id).await
 }
 
 fn status_of(outcome: Outcome) -> StatusCode {

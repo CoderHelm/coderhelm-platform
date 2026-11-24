@@ -3512,6 +3512,7 @@ async fn handle_wrong_repo(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     });
@@ -4121,6 +4122,7 @@ fn run_ticket_message(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     }

@@ -52,6 +52,9 @@ struct Jira {
     create_url: String,
     secret: String,
     site: String,
+    /// The team's Jira trigger label (`coderhelm` unless it set another): a
+    /// follow-up never carries it.
+    trigger_label: String,
 }
 
 async fn jira(state: &WorkerState, team_id: &str) -> Jira {
@@ -80,7 +83,66 @@ async fn jira(state: &WorkerState, team_id: &str) -> Jira {
             .unwrap_or_default(),
         secret: text("forge_secret"),
         site: conn.site.clone(),
+        trigger_label: Some(text("trigger_label"))
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "coderhelm".to_string()),
     }
+}
+
+/// The source of the ticket this run works, when the ticket is itself a
+/// follow-up CoderHelm filed: what the gateway said (its labels or
+/// CoderHelm's record), else CoderHelm's record of the key, else the
+/// sentence every follow-up's description ends with. `None` for any other
+/// ticket.
+pub async fn followup_source(state: &WorkerState, msg: &TicketMessage) -> Option<String> {
+    if let Some(src) = &msg.followup_of {
+        return Some(src.clone());
+    }
+    if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.trim().is_empty() {
+        let item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&msg.team_id))
+            .key("sk", attr_s(&ft::of_record_sk(&msg.ticket_id)))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item);
+        if let Some(item) = item {
+            return Some(
+                item.get("source")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    ft::source_of_body(&msg.body)
+}
+
+/// Takes one of today's follow-up slots for `source`
+/// ([`ft::DAILY_CAP_PER_SOURCE`]), atomically across runs. False when the
+/// day's slots are taken, or the count can't be read (nothing is filed
+/// then: a cascade is worse than a late ticket).
+async fn take_daily_slot(state: &WorkerState, team_id: &str, source: &str) -> bool {
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&ft::day_record_sk(source, &day)))
+        .update_expression("ADD filed :one")
+        .condition_expression("attribute_not_exists(filed) OR filed < :cap")
+        .expression_attribute_values(":one", attr_n(1))
+        .expression_attribute_values(":cap", attr_n(ft::DAILY_CAP_PER_SOURCE as i64))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(source, error = %e, "Follow-up daily count not taken: nothing filed");
+        })
+        .is_ok()
 }
 
 /// What the run reaches through the team's connections: Jira when the app
@@ -399,6 +461,12 @@ pub async fn file(
     if matches!(tracker, Tracker::Github { .. }) && msg.repo_owner.is_empty() {
         tracker = Tracker::Comment("the run has no repository to open issues in".into());
     }
+    // Depth one: a run on a follow-up files none of its own, so follow-ups
+    // never cascade. Its drafts go in its comment.
+    if let Some(of) = followup_source(state, msg).await {
+        info!(run_id, of = %of, "The ticket is a follow-up: no follow-ups filed from it");
+        tracker = Tracker::Comment(ft::depth_refusal(&of));
+    }
     // The team's agent permissions decide, as for every write CoderHelm
     // makes outside the pull request.
     if !matches!(tracker, Tracker::Comment(_)) {
@@ -504,6 +572,7 @@ pub async fn file(
         if let Filed::NotFiled(why) = &one {
             if why.contains("lacks the Jira project permission")
                 || why.contains("didn't accept CoderHelm's shared secret")
+                || why == &ft::daily_cap_refusal(&source)
             {
                 stop = Some(why.clone());
             }
@@ -760,7 +829,7 @@ async fn filed_before(
         Tracker::Jira { project, .. } => jira_list(state, j, project, source).await,
         Tracker::Github { repo } => {
             let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), ""));
-            let label = ft::labels(repo, source).last().cloned().unwrap_or_default();
+            let label = ft::source_label(source);
             github
                 .issues_with_label(owner, name, &label)
                 .await
@@ -1005,7 +1074,18 @@ async fn file_one(
 ) -> Filed {
     let sk = record_sk(source, &ft::draft_id(source, draft));
     let description = ft::description(draft, source, &msg.title, run_url);
-    let labels = ft::labels(repo, source);
+    // Never the team's trigger label: filing a follow-up starts no run.
+    let trigger = match tracker {
+        Tracker::Jira { .. } => j.trigger_label.as_str(),
+        _ => "coderhelm",
+    };
+    let labels = ft::labels(source, trigger);
+    // At most DAILY_CAP_PER_SOURCE a day from one source, across runs.
+    if !matches!(tracker, Tracker::Comment(_))
+        && !take_daily_slot(state, &msg.team_id, source).await
+    {
+        return Filed::NotFiled(ft::daily_cap_refusal(source));
+    }
     let filed = match tracker {
         Tracker::Jira { project, site } => {
             let body = json!({
@@ -1042,7 +1122,7 @@ async fn file_one(
         }
         Tracker::Github { repo } => {
             let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), ""));
-            let label = labels.last().cloned().unwrap_or_default();
+            let label = ft::source_label(source);
             let found = github
                 .issues_with_label(owner, name, &label)
                 .await
@@ -1103,8 +1183,48 @@ async fn file_one(
             },
         )
         .await;
+        keep_followup_of(state, msg, run_id, key, source, repo, draft, &description).await;
     }
     filed
+}
+
+/// CoderHelm's record of a filed follow-up by its own key: the gateway
+/// starts no run on it from its label or assignee, a run on it files no
+/// follow-ups, and a person's start from CoderHelm reads the ticket from it.
+#[allow(clippy::too_many_arguments)]
+async fn keep_followup_of(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    key: &str,
+    source: &str,
+    repo: &str,
+    draft: &Draft,
+    description: &str,
+) {
+    if ft::project_of(key).is_none() {
+        // A GitHub issue (`#N`): its labels and text mark it.
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&msg.team_id))
+        .item("sk", attr_s(&ft::of_record_sk(key)))
+        .item("key", attr_s(key.trim()))
+        .item("source", attr_s(source.trim()))
+        .item("repo", attr_s(repo.trim_matches('/')))
+        .item("title", attr_s(draft.summary.trim()))
+        .item("body", attr_s(description))
+        .item("run_id", attr_s(run_id))
+        .item("installation_id", attr_n(msg.installation_id as i64))
+        .item("filed_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(key, error = %e, "Could not keep the follow-up's own record (its labels and text still mark it)");
+    }
 }
 
 /// What the Jira app's answer to one follow-up means. An app older than the

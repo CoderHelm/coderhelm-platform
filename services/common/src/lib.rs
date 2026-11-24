@@ -112,6 +112,7 @@ pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
+pub mod followup_dedupe;
 pub mod followup_tickets;
 /// A team's branch, commit and PR title templates, and how they render.
 pub mod git_conventions;

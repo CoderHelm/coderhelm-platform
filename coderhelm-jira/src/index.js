@@ -138,12 +138,9 @@ exports.handler = async (event, context) => {
 
     const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
 
-    // Extract repo from label if present (coderhelm:owner/repo)
-    const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
-    let commentRepoOwner, commentRepoName;
-    if (repoLabel) {
-      [commentRepoOwner, commentRepoName] = repoLabel.replace("coderhelm:", "").split("/");
-    }
+    // Extract repo from label if present (coderhelm:owner/repo); a
+    // follow-up label (coderhelm:followup:KEY) is no repository.
+    const { owner: commentRepoOwner, name: commentRepoName } = followups.repoOfLabels(labels);
 
     // Download image attachments from the issue (same as issue-update path)
     const imageAttachments = await fetchImageAttachments(fields);
@@ -216,11 +213,8 @@ exports.handler = async (event, context) => {
 
   // Extract repo from explicit label if present (coderhelm:owner/repo)
   const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
-  const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
-  let repoOwner, repoName;
-  if (repoLabel) {
-    [repoOwner, repoName] = repoLabel.replace("coderhelm:", "").split("/");
-  }
+  // A follow-up label (coderhelm:followup:KEY) is no repository.
+  const { owner: repoOwner, name: repoName } = followups.repoOfLabels(labels);
 
   // Download image attachments from the ticket
   const imageAttachments = await fetchImageAttachments(fields);
@@ -406,7 +400,6 @@ async function fileFollowup(body) {
       project: projectKey,
     });
   }
-  const label = followups.followupLabel(source);
   // 2. The ticket already filed for this draft.
   const jql = followups.dedupeJql(projectKey, source);
   if (jql) {
@@ -444,7 +437,9 @@ async function fileFollowup(body) {
     project: { key: projectKey },
     summary: String(summary).slice(0, 254),
     issuetype: { id: type.id },
-    labels: [...new Set([...(Array.isArray(labels) ? labels : []), label])],
+    // Only follow-up labels: never `coderhelm` or the team's trigger, so the
+    // new ticket starts no run of its own. No assignee is ever set.
+    labels: followups.followupLabels(labels, source),
   };
   if (description) fields.description = followups.descriptionAdf(description);
   const res = await api.asApp().requestJira(route`/rest/api/3/issue`, {
