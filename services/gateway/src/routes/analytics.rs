@@ -633,6 +633,11 @@ impl RunRow {
         if common::ci_unrelated::not_ours(&self.ci_end) {
             return CiEnd::RedOnBase;
         }
+        // Red only on a content step listed for before merge
+        // (`common::content_gap`): the run's work is done, not given up.
+        if self.ci_end == common::content_gap::CI_END {
+            return CiEnd::RedOnBase;
+        }
         CiEnd::GaveUp(gave_up_label(&self.ci_end, self))
     }
 }

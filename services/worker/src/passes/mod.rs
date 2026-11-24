@@ -8957,6 +8957,9 @@ pub(crate) enum GaveUp {
     /// Every failing end-to-end test fails for a reason outside the change
     /// and is fixed in a separate pull request.
     UnrelatedTest,
+    /// A failing test waits on the change's own content step that
+    /// CoderHelm can't run (`common::content_gap`): listed before merge.
+    AwaitsContent,
 }
 
 impl GaveUp {
@@ -8969,6 +8972,7 @@ impl GaveUp {
             GaveUp::FixError => "fix_error",
             GaveUp::RedOnBase => "red_on_base",
             GaveUp::UnrelatedTest => "unrelated_test",
+            GaveUp::AwaitsContent => common::content_gap::CI_END,
         }
     }
 }

@@ -58,7 +58,9 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
     assert!(resume::ci_state_of_record("failed", ci_unrelated::CI_END).allows_done());
     let ready = include_str!("../ready.rs");
     let reader = fn_src(ready, "\nasync fn red_on_base(");
-    assert!(reader.contains("ci_unrelated::not_ours"), "{reader}");
+    // `content_gap::allows_done` reads `ci_unrelated::not_ours` first.
+    assert!(reader.contains("content_gap::allows_done"), "{reader}");
+    assert!(common::content_gap::allows_done(ci_unrelated::CI_END));
     // What the pull request says: the test, the proof, the re-run; ready,
     // never "without getting it green".
     let mut s = s;

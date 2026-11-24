@@ -200,6 +200,7 @@ pub mod ci_repro;
 /// A red check the CI fix round showed isn't the change's: re-run once,
 /// then classified on its own outcome, never the run's failure.
 pub mod ci_unrelated;
+pub mod content_gap;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;

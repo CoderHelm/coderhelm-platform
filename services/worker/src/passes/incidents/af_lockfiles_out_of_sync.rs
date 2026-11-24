@@ -217,7 +217,8 @@ async fn out_of_sync_lockfiles_are_regenerated_by_code_before_any_model_round() 
     assert!(at("common::lockfile_sync::mismatches(&logs)") < repair_at);
     assert!(repair_at < at("let over_cycle = cycle >= MAX_CI_FIX_CYCLES;"));
     assert!(
-        repair_at < at("if check_and_record_stall(state, &msg.team_id, &msg.run_id, &logs).await")
+        repair_at
+            < at("if check_and_record_stall(state, &msg.team_id, &msg.run_id, &gap_text).await")
     );
     assert!(repair_at < at("ci_fix_effort(attempt, max_attempts),"));
     // And in a re-run that finds its pull request red, before its model.

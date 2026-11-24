@@ -380,6 +380,11 @@ async fn checklist_facts(
             .filter(|(p, s, _)| s != "removed" && content::is_e2e_spec(p))
             .flat_map(|(p, _, patch)| checklist::data_skips(p, patch))
             .collect(),
+        content_throws: files
+            .iter()
+            .filter(|(_, s, _)| s != "removed")
+            .flat_map(|(p, _, patch)| common::content_gap::content_throws(p, patch))
+            .collect(),
     };
     (facts, maps)
 }
