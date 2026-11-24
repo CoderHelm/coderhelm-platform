@@ -127,6 +127,8 @@ pub mod caller {
     pub const SWEEP_WEEKLY: &str = "sweep:weekly";
     /// Quarantined tests: releases, followed fixes and removals.
     pub const SWEEP_QUARANTINE: &str = "sweep:quarantine";
+    /// Duplicate follow-ups closing themselves.
+    pub const SWEEP_FOLLOWUP_DEDUPE: &str = "sweep:followup_dedupe";
 
     /// The security release's reads (a finding's pull request or run)
     /// while `sweep:security` is held: a few each sweep, so the release
@@ -148,7 +150,7 @@ pub mod caller {
         (SWEEP_REVIEW, 120),
         (SWEEP_DRAFTS, 120),
         (SWEEP_PR_WATCH, 240),
-        (SWEEP_DEPLOYS, 300),
+        (SWEEP_DEPLOYS, 270),
         (SWEEP_REVIEW_REMINDER, 120),
         (SWEEP_PR_OUTCOMES, 120),
         (SWEEP_SKILLS, 60),
@@ -162,6 +164,7 @@ pub mod caller {
         (SWEEP_LEARNING, 100),
         (SWEEP_WEEKLY, 100),
         (SWEEP_QUARANTINE, 90),
+        (SWEEP_FOLLOWUP_DEDUPE, 30),
     ];
 }
 

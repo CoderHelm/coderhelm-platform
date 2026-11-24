@@ -549,6 +549,15 @@ pub fn day_record_sk(source: &str, day: &str) -> String {
     format!("FOLLOWUP_DAY#{}#{day}", source.trim().to_ascii_uppercase())
 }
 
+/// The settings record counting the duplicate follow-ups closed for
+/// `source` on `day` (at most [`DAILY_CAP_PER_SOURCE`]).
+pub fn close_day_record_sk(source: &str, day: &str) -> String {
+    format!(
+        "FOLLOWUP_CLOSE_DAY#{}#{day}",
+        source.trim().to_ascii_uppercase()
+    )
+}
+
 /// Why a run on a follow-up files none of its own (depth one).
 pub fn depth_refusal(source: &str) -> String {
     if source.trim().is_empty() {

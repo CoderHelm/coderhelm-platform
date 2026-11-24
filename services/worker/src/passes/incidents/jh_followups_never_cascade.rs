@@ -124,19 +124,18 @@ fn the_jira_webhook_holds_a_followup_before_any_run_starts() {
     );
 }
 
-/// The small check, faked: what a model reads in the family below.
+/// The small check, faked: its answer for the family below.
 struct FakeCheck(&'static str);
 
 #[async_trait::async_trait]
 impl common::log_repo::live::Judge for FakeCheck {
     async fn judge(&self, _system: &str, user: &str) -> Result<String, String> {
-        assert!(user.contains("ABC-12") && user.contains("ABC-24"));
+        assert!(user.contains("ABC-12") && user.contains("ABC-22"));
         Ok(self.0.to_string())
     }
 }
 
-/// A family of follow-ups of ABC-10 (some filed from the first ones), with
-/// each latest run.
+/// A family of follow-ups of ABC-10, with each latest run.
 fn family() -> Vec<common::followup_dedupe::Candidate> {
     let c = |n: u32, title: &str, status: &str| common::followup_dedupe::Candidate {
         key: format!("ABC-{n}"),
@@ -153,9 +152,9 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
             "completed",
         ),
         c(
-            13,
-            "Require alt text on the image field and the media block",
-            "awaiting_ci",
+            22,
+            "Stop using file names as alt text in the image fragment query",
+            "completed",
         ),
         c(
             14,
@@ -163,8 +162,8 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
             "running",
         ),
         c(
-            15,
-            "Profile photos: fall back to the person's name for alt",
+            19,
+            "Replace generic placeholder alt text with real or empty alt text",
             "running",
         ),
         c(
@@ -172,20 +171,9 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
             "Fix alt on the unused banner and card components",
             "completed",
         ),
-        c(17, "Confirm empty alt images are decorative", "running"),
         c(
             18,
             "Remove the unused banner and card components",
-            "awaiting_ci",
-        ),
-        c(
-            19,
-            "Replace placeholder and blank alt text with real or decorative alt",
-            "running",
-        ),
-        c(
-            20,
-            "Editor: warn when an image's alt is missing",
             "awaiting_ci",
         ),
         c(
@@ -194,71 +182,53 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
             "completed",
         ),
         c(
-            22,
-            "Image alt falls back to the file name in the query layer",
-            "completed",
-        ),
-        c(
-            23,
-            "Replace the remaining placeholder alt fallbacks",
-            "running",
-        ),
-        c(
-            24,
-            "Remove the remaining file name alt fallbacks in queries",
-            "completed",
+            20,
+            "Editor: warn when an image's alt is missing",
+            "awaiting_ci",
         ),
     ]
 }
 
 #[tokio::test]
-async fn duplicate_followups_close_themselves_and_opposed_ones_are_flagged() {
+async fn a_duplicate_closes_only_when_the_matcher_and_the_check_agree() {
     use common::followup_dedupe as fd;
-    let check = FakeCheck(
-        "SAME ABC-12 ABC-22\nSAME ABC-12 ABC-24\nSAME ABC-14 ABC-19\nSAME ABC-14 ABC-23\n\
-         SAME ABC-21 ABC-13\nSAME ABC-21 ABC-20\nOPPOSED ABC-16 ABC-18",
-    );
-    let plan = fd::decide(&family(), Some(&check)).await;
+    let fam = family();
+    // What the matcher reads on its own: 12/22 and 14/19 the same, 21/20 not.
+    let (near_same, _) = fd::matcher_pairs(&fam);
+    assert!(near_same.contains(&(0, 1)), "{near_same:?}");
+    assert!(near_same.contains(&(2, 3)), "{near_same:?}");
+    assert!(!near_same.contains(&(6, 7)), "{near_same:?}");
+    // The check agrees on 12/22, says nothing of 14/19, reads 21/20 as the
+    // same, and 16/18 as opposed.
+    let check = FakeCheck("SAME ABC-12 ABC-22\nSAME ABC-21 ABC-20\nOPPOSED ABC-16 ABC-18");
+    let plan = fd::decide(&fam, Some(&check)).await;
     let closes: Vec<(&str, &str)> = plan
         .close
         .iter()
         .map(|c| (c.dup.as_str(), c.keep.as_str()))
         .collect();
-    assert_eq!(
-        closes,
-        vec![
-            ("ABC-13", "ABC-21"),
-            ("ABC-19", "ABC-14"),
-            ("ABC-20", "ABC-21"),
-            ("ABC-22", "ABC-12"),
-            ("ABC-23", "ABC-14"),
-            ("ABC-24", "ABC-12"),
-        ]
-    );
-    // Fix against delete of the same components: flagged on both, closed on neither.
-    assert_eq!(plan.flag.len(), 1, "{:?}", plan.flag);
-    assert_eq!(
-        (plan.flag[0].a.as_str(), plan.flag[0].b.as_str()),
-        ("ABC-16", "ABC-18")
-    );
-    assert!(plan
-        .close
+    assert_eq!(closes, vec![("ABC-22", "ABC-12")]);
+    // Disagreements and the fix against the delete are flagged, never closed.
+    let flags: Vec<(&str, &str, bool)> = plan
+        .flag
         .iter()
-        .all(|c| c.dup != "ABC-16" && c.dup != "ABC-18"));
-    // The comment the duplicate's pull request and ticket get.
-    let c = plan.close.iter().find(|c| c.dup == "ABC-22").unwrap();
+        .map(|f| (f.a.as_str(), f.b.as_str(), f.opposed))
+        .collect();
+    assert!(flags.contains(&("ABC-14", "ABC-19", false)), "{flags:?}");
+    assert!(flags.contains(&("ABC-21", "ABC-20", false)), "{flags:?}");
+    assert!(flags.contains(&("ABC-16", "ABC-18", true)), "{flags:?}");
+    let c = &plan.close[0];
     assert_eq!(
         fd::close_comment(&c.keep, &c.topic),
         "Duplicate of ABC-12 (Stop using file names as alt text in the image fragment). \
          Closing; the work continues there. Closed by CoderHelm."
     );
-    // With no model, only what the matcher reads as the same closes.
-    let alone = fd::decide(&family(), None).await;
-    assert!(alone.close.len() <= plan.close.len());
+    // Without the check's answer nothing closes.
+    assert_eq!(fd::decide(&fam, None).await, fd::Plan::default());
 }
 
 #[test]
-fn a_duplicate_closes_with_a_persons_close_steps() {
+fn duplicates_close_on_the_hourly_sweep_with_a_persons_close_steps() {
     let close = include_str!("../../../../gateway/src/routes/run_close.rs");
     let at = close
         .find("pub(crate) async fn close_as_coderhelm(")
@@ -266,7 +236,20 @@ fn a_duplicate_closes_with_a_persons_close_steps() {
     let body = &close[at..];
     assert!(body.contains("close_pr: true"));
     assert!(body.contains("ctx.close_one(run_id)"));
-    let sweep = include_str!("../../../../gateway/src/routes/followup_dedupe.rs");
-    assert!(sweep.contains("run_close::close_as_coderhelm(state, team_id, &c.run_id, &said)"));
-    assert!(sweep.contains("fd::flag_comment(other, &f.topic)"));
+    let sweep = include_str!("../followup_dedupe.rs");
+    for step in [
+        "#s = :closed",
+        "release_ticket_lock(",
+        "merge_gate::stop(",
+        "conversation::github(",
+        "close_pull_request(",
+        "conversation::jira(",
+        "log_close(",
+        "take_close_slot(",
+        "claim_once_ttl(",
+    ] {
+        assert!(sweep.contains(step), "the sweep lacks {step}");
+    }
+    let main = include_str!("../../main.rs");
+    assert!(main.contains("passes::followup_dedupe::sweep(&state)"));
 }

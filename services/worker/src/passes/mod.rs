@@ -1307,6 +1307,7 @@ pub mod file_claims;
 mod finish_planned;
 pub mod fix_location;
 pub(crate) mod flaky;
+pub mod followup_dedupe;
 pub mod followups;
 pub mod formatter;
 pub(crate) mod generators;
@@ -10933,7 +10934,7 @@ pub(crate) async fn acquire_ticket_lock(
     }
 }
 
-async fn release_ticket_lock(state: &WorkerState, team_id: &str, ticket_id: &str) {
+pub(crate) async fn release_ticket_lock(state: &WorkerState, team_id: &str, ticket_id: &str) {
     let sk = format!("TICKET_LOCK#{ticket_id}");
     let _ = state
         .dynamo

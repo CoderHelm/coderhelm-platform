@@ -734,6 +734,20 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 unstaled = stale.unstaled,
                 "Stale PR sweep done"
             );
+            // Duplicate follow-ups: each team at most once an hour, the
+            // first tick after a deploy included.
+            let dupes = as_sweep(
+                who::SWEEP_FOLLOWUP_DEDUPE,
+                passes::followup_dedupe::sweep(&state),
+            )
+            .await;
+            info!(
+                teams = dupes.teams,
+                families = dupes.families,
+                closed = dupes.closed,
+                flagged = dupes.flagged,
+                "Follow-up duplicate sweep done"
+            );
             // Agent files gone stale (pushes that changed what they are
             // written from, or older than 30 days with new commits): each
             // repository at most once a day, a few per team per tick.
