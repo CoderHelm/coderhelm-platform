@@ -408,6 +408,7 @@ pub(crate) async fn post_merge_actions(
                 repo,
                 pr_number,
                 base_branch,
+                false,
             )
             .await;
             lines.push(format!(
@@ -481,11 +482,13 @@ pub(crate) async fn cut_tag_if_new(
     repo: &str,
     sha: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // An unreadable tag list is an error: read as "no tags", the next version
+    // would restart at the seed.
     let tags = github
         .list_tags(owner, repo)
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
+        .await?
+        .as_array()
+        .cloned()
         .unwrap_or_default();
     // A freshly created tag at HEAD is always among the newest tags returned, so
     // scanning page 1 reliably catches the "already released this commit" case.
@@ -517,9 +520,11 @@ pub(crate) async fn cut_tag_if_new(
 /// delayed sweep; later merges see the marker and fold in (no second sweep).
 /// Returns true if THIS call armed a new sweep. Fails OPEN on a transient claim
 /// error (arms anyway) — a redundant sweep is harmless (see `cut_tag_if_new`),
-/// a lost release is not.
+/// a lost release is not. `count`: this call is the merge's push, so a
+/// window already waiting counts one more merge (CoderHelm's own merge also
+/// arms, and its push then counts it, once).
 #[allow(clippy::too_many_arguments)]
-async fn schedule_tag_sweep(
+pub(crate) async fn schedule_tag_sweep(
     state: &WorkerState,
     cfg: &OnApproveConfig,
     team_id: &str,
@@ -528,6 +533,7 @@ async fn schedule_tag_sweep(
     repo: &str,
     pr_number: u64,
     base_branch: &str,
+    count: bool,
 ) -> bool {
     let marker = format!("TAGSWEEP#{owner}/{repo}");
     let now = chrono::Utc::now().timestamp() as u64;
@@ -562,6 +568,9 @@ async fn schedule_tag_sweep(
                 .unwrap_or(false);
             if conflict {
                 // A sweep is already armed — fold in, and count the merge.
+                if !count {
+                    return false;
+                }
                 let _ = state
                     .dynamo
                     .update_item()
@@ -592,6 +601,7 @@ async fn schedule_tag_sweep(
             manual: false,
             claimed: false,
             attempt: 0,
+            ..Default::default()
         };
         enqueue_tag_sweep(state, &msg).await;
     }
@@ -650,6 +660,12 @@ pub async fn run_tag_sweep(
         return Ok(());
     }
 
+    // A push to the default branch: the merge joins the release window.
+    if !msg.merged_sha.is_empty() {
+        on_merged(state, &msg).await;
+        return Ok(());
+    }
+
     let owner = &msg.repo_owner;
     let repo = &msg.repo_name;
     let marker = format!("TAGSWEEP#{owner}/{repo}");
@@ -670,6 +686,21 @@ pub async fn run_tag_sweep(
         return Ok(());
     }
 
+    // A release freeze (agents paused, until a time or until lifted): the
+    // release waits for it to end, then goes on by itself.
+    if !msg.manual {
+        let store = crate::agent::policy::store(state);
+        let now_s = chrono::Utc::now().to_rfc3339();
+        if let Ok(p) = store.load(&msg.team_id).await {
+            if let Some(pause) = p.paused(&now_s) {
+                let wait = freeze_wait(pause.until.as_deref(), chrono::Utc::now());
+                info!(repo = %format!("{owner}/{repo}"), reason = %pause.reason, wait, "Tag sweep: agents paused — the release waits");
+                wait_and_retry(state, &msg, wait, msg.ci_waits).await;
+                return Ok(());
+            }
+        }
+    }
+
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -685,9 +716,10 @@ pub async fn run_tag_sweep(
         {
             Ok(b) => msg.base_branch = b,
             Err(e) => {
-                retry_or_record(
+                retry_or_wait(
                     state,
                     &msg,
+                    &*e,
                     &format!("Couldn't read the default branch: {e}"),
                 )
                 .await;
@@ -701,15 +733,82 @@ pub async fn run_tag_sweep(
         Ok(sha) => sha,
         Err(e) => {
             warn!(error = %e, base = %msg.base_branch, "Tag sweep: could not resolve base-branch head");
-            retry_or_record(
+            retry_or_wait(
                 state,
                 &msg,
+                &*e,
                 &format!("Couldn't read the head of {}: {e}", msg.base_branch),
             )
             .await;
             return Ok(());
         }
     };
+
+    // Never a red head: the release waits while its checks run, and a failed
+    // check stops it (said on the Releases page) until a later merge or a
+    // person's "Release now".
+    if !msg.manual {
+        let jobs = match github.list_ci_for_ref(owner, repo, &head).await {
+            Ok(v) => v["check_runs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(super::health_check::Job::from_check_run)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                retry_or_wait(
+                    state,
+                    &msg,
+                    &*e,
+                    &format!("Couldn't read the checks of {}: {e}", short_sha(&head)),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        match head_ci(&jobs) {
+            HeadCi::Green => {}
+            HeadCi::Running(names) if msg.ci_waits < MAX_CI_WAITS => {
+                info!(repo = %format!("{owner}/{repo}"), head = %short_sha(&head), running = ?names, "Tag sweep: the head's checks are running — the release waits");
+                wait_and_retry(state, &msg, CI_WAIT_SECS, msg.ci_waits + 1).await;
+                return Ok(());
+            }
+            HeadCi::Running(names) => {
+                record_failure(
+                    state,
+                    &msg,
+                    &format!(
+                        "The checks of {} on {} were still running after {} hours ({}). CoderHelm \
+                         tags only a green head.",
+                        short_sha(&head),
+                        msg.base_branch,
+                        MAX_CI_WAITS as u64 * CI_WAIT_SECS / 3600,
+                        names.join(", ")
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            HeadCi::Red(names) => {
+                record_failure(
+                    state,
+                    &msg,
+                    &format!(
+                        "{} is red at {}: {} failed. CoderHelm never tags a red {}; the next green \
+                         merge releases everything waiting.",
+                        msg.base_branch,
+                        short_sha(&head),
+                        names.join(", "),
+                        msg.base_branch
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
 
     let cut = cut_tag_if_new(&github, &cfg, owner, repo, &head).await;
     if cut.is_ok() {
@@ -731,7 +830,7 @@ pub async fn run_tag_sweep(
             )
             .await;
             // Prod deploy fires off the tag → schedule the health guard now.
-            if cfg.health_check {
+            if cfg.health_check && msg.pr_number > 0 {
                 let baseline =
                     super::health_check::failing_checks(&github, owner, repo, &msg.base_branch)
                         .await;
@@ -754,10 +853,169 @@ pub async fn run_tag_sweep(
         }
         Err(e) => {
             warn!(error = %e, repo = %format!("{owner}/{repo}"), "Tag sweep: create tag failed");
-            retry_or_record(state, &msg, &format!("GitHub refused the release tag: {e}")).await;
+            retry_or_wait(
+                state,
+                &msg,
+                &*e,
+                &format!("GitHub refused the release tag: {e}"),
+            )
+            .await;
         }
     }
     Ok(())
+}
+
+/// A merge landed on the default branch (its push, whoever merged): when
+/// the repository releases merged changes (`auto_tag`), it joins the waiting
+/// release window, or opens one, so one tag covers everything merged so far.
+/// A window of 0 minutes releases at once.
+async fn on_merged(state: &WorkerState, msg: &crate::models::TagSweepMessage) {
+    let (owner, repo) = (&msg.repo_owner, &msg.repo_name);
+    let cfg = OnApproveConfig::load(state, &msg.team_id, owner, repo).await;
+    if !cfg.auto_tag {
+        return;
+    }
+    // The pull request the merge came from: where the post-merge check of
+    // the release reports.
+    let pr_number = match GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) {
+        Ok(g) => g
+            .pulls_for_commit(owner, repo, &msg.merged_sha)
+            .await
+            .ok()
+            .and_then(|prs| {
+                prs.iter()
+                    .find(|p| p["merged_at"].is_string())
+                    .and_then(|p| p["number"].as_u64())
+            })
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+    info!(repo = %format!("{owner}/{repo}"), sha = %short_sha(&msg.merged_sha), pr_number, "Release: a merge joins the release window");
+    if cfg.tag_batch_minutes == 0 {
+        let now = crate::models::TagSweepMessage {
+            team_id: msg.team_id.clone(),
+            installation_id: msg.installation_id,
+            repo_owner: owner.clone(),
+            repo_name: repo.clone(),
+            base_branch: msg.base_branch.clone(),
+            pr_number,
+            claimed: true,
+            ..Default::default()
+        };
+        enqueue_tag_sweep(state, &now).await;
+        return;
+    }
+    schedule_tag_sweep(
+        state,
+        &cfg,
+        &msg.team_id,
+        msg.installation_id,
+        owner,
+        repo,
+        pr_number,
+        &msg.base_branch,
+        true,
+    )
+    .await;
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// Seconds between looks at a head whose checks still run.
+const CI_WAIT_SECS: u64 = 300;
+/// Looks at a running head before the release says it can't go (3 hours).
+const MAX_CI_WAITS: u32 = 36;
+
+/// The branch head's checks, as the release reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadCi {
+    /// Every check finished and none failed (or the head has none).
+    Green,
+    /// These are still running.
+    Running(Vec<String>),
+    /// These failed.
+    Red(Vec<String>),
+}
+
+/// Pure: whether a head may be tagged. A failed check makes it red whatever
+/// else runs; a job held for an environment's approval is a deploy waiting
+/// on a person, not a check of the code, so it never holds the release.
+pub fn head_ci(jobs: &[super::health_check::Job]) -> HeadCi {
+    let red: Vec<String> = jobs
+        .iter()
+        .filter(|j| j.failed())
+        .map(|j| j.name.clone())
+        .collect();
+    if !red.is_empty() {
+        return HeadCi::Red(red);
+    }
+    let running: Vec<String> = jobs
+        .iter()
+        .filter(|j| !j.done() && !j.awaiting_approval())
+        .map(|j| j.name.clone())
+        .collect();
+    if running.is_empty() {
+        HeadCi::Green
+    } else {
+        HeadCi::Running(running)
+    }
+}
+
+/// Seconds a release waits on a freeze before looking again: until its end
+/// when it has one (at most the queue's longest hop chain allows, an hour),
+/// else 15 minutes.
+pub fn freeze_wait(until: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    until
+        .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+        .map(|u| (u.with_timezone(&chrono::Utc) - now).num_seconds().max(60) as u64 + 5)
+        .unwrap_or(SQS_MAX_DELAY_SECS)
+        .min(3_600)
+}
+
+/// The same release again after `wait_secs`, its window already handled,
+/// counting no failed attempt.
+async fn wait_and_retry(
+    state: &WorkerState,
+    msg: &crate::models::TagSweepMessage,
+    wait_secs: u64,
+    ci_waits: u32,
+) {
+    let mut next = msg.clone();
+    next.claimed = true;
+    next.ci_waits = ci_waits;
+    next.delay_remaining_secs = wait_secs.max(1);
+    if !enqueue_tag_sweep(state, &next).await {
+        record_failure(
+            state,
+            msg,
+            "The release could not be queued again; \"Release now\" cuts it.",
+        )
+        .await;
+    }
+}
+
+/// A failed GitHub call: GitHub's budget being held or spent is a wait, never
+/// a failure (the release goes on at the reset); anything else retries with
+/// a backoff, then is recorded.
+async fn retry_or_wait(
+    state: &WorkerState,
+    msg: &crate::models::TagSweepMessage,
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+    error: &str,
+) {
+    if let Some(wait) = crate::clients::github::rate_limited(e) {
+        info!(repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), wait, "Tag sweep: GitHub's budget is held — the release waits for the reset");
+        wait_and_retry(state, msg, wait.max(60) + 5, msg.ci_waits).await;
+        return;
+    }
+    retry_or_record(state, msg, error).await;
 }
 
 /// Failed cuts retried before the failure is shown on the Releases page.
@@ -813,6 +1071,14 @@ async fn retry_or_record(state: &WorkerState, msg: &crate::models::TagSweepMessa
             return;
         }
     }
+    record_failure(state, msg, error).await;
+}
+
+/// Records why the release can't go for the Releases page, where "Release
+/// now" retries it; the release steps of the merged pull requests say it.
+async fn record_failure(state: &WorkerState, msg: &crate::models::TagSweepMessage, error: &str) {
+    let owner = &msg.repo_owner;
+    let repo = &msg.repo_name;
     warn!(repo = %format!("{owner}/{repo}"), error, "Tag sweep: release blocked — recorded");
     let _ = state
         .dynamo
@@ -827,6 +1093,29 @@ async fn retry_or_record(state: &WorkerState, msg: &crate::models::TagSweepMessa
         .item("attempts", super::attr_n(msg.attempt + 1))
         .send()
         .await;
+}
+
+/// Why the repository's release can't go, as the Releases page shows it;
+/// None when nothing is recorded.
+pub(crate) async fn release_blocked(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&format!("TAGFAIL#{owner}/{repo}")))
+        .send()
+        .await
+        .ok()?
+        .item?;
+    item.get("error")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string())
 }
 
 async fn clear_failure(state: &WorkerState, team_id: &str, owner: &str, repo: &str) {

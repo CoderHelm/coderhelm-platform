@@ -485,6 +485,10 @@ pub async fn follow_merge(
         None if fresh.is_empty() => return,
         None => (fresh, Vec::new()),
         Some(o) => match refollow(&o.steps, &fresh) {
+            // Unchanged: armed again all the same, so a tick chain that
+            // stopped before the merge (a tick GitHub's budget held) goes on
+            // from the merge. A fresh chain id ends any chain still running.
+            None if rearm(&o.steps, true) => (o.steps.clone(), o.context.clone()),
             None => return,
             Some(s) => (s, o.context.clone()),
         },
@@ -543,6 +547,262 @@ pub fn approval_line(steps: &[Step]) -> Option<String> {
         "{what} waits for a person's approval on the Agent permissions page, as the team's release \
          settings ask. CoderHelm does the rest once it is approved."
     ))
+}
+
+/// Release tags newest first: `(name, commit)` of every tag shaped like a
+/// version under `prefix` (pre-releases left out), highest version first.
+pub fn releases_newest_first(tags: &Value, prefix: &str) -> Vec<(String, String)> {
+    fn version(t: &str, prefix: &str) -> Option<Vec<u64>> {
+        let core = t.strip_prefix(prefix).or_else(|| t.strip_prefix('v'))?;
+        core.split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()
+            .filter(|v| !v.is_empty())
+    }
+    let mut out: Vec<(Vec<u64>, String, String)> = tags
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| {
+            let name = t["name"].as_str()?;
+            let sha = t["commit"]["sha"].as_str()?;
+            Some((version(name, prefix)?, name.to_string(), sha.to_string()))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, n, s)| (n, s)).collect()
+}
+
+/// How many of the newest release tags are compared with a merge to find
+/// the first one that contains it.
+const TAGS_LOOKED_AT: usize = 5;
+
+/// The production deploy of a repository whose team releases merged changes
+/// (its `auto_tag` release setting): the release tag that first contains
+/// this merge, once there is one; until then the merge waits for the
+/// repository's batched release (opened here when no window waits, so a
+/// missed push never leaves the merge out), or says why that release is
+/// blocked. Never a card of its own: the team's setting already said yes.
+async fn team_release(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReleaseStepsMessage,
+    cfg: &super::review_actions::OnApproveConfig,
+    base_branch: &str,
+    s: &mut Step,
+    merge_sha: &str,
+) {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    let tags = match github.list_tags(owner, repo).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "release: could not read the release tags");
+            return;
+        }
+    };
+    let mut first: Option<(String, String)> = None;
+    for (name, sha) in releases_newest_first(&tags, &cfg.tag_prefix)
+        .into_iter()
+        .take(TAGS_LOOKED_AT)
+    {
+        let contains = sha == merge_sha
+            || match github.compare_status(owner, repo, merge_sha, &sha).await {
+                Ok(st) => super::release_notes::tag_on_branch(&st),
+                Err(e) => {
+                    warn!(pr = msg.pr_number, error = %e, "release: could not compare the merge with a release tag");
+                    return;
+                }
+            };
+        if !contains {
+            break;
+        }
+        first = Some((name, sha));
+    }
+    if let Some((tag, sha)) = first {
+        s.tag = tag;
+        s.tag_sha = sha;
+        s.status = Status::Running;
+        s.started_at = now();
+        s.detail = format!(
+            "in the release tag `{}`; waiting for `{}`",
+            s.tag, s.workflow
+        );
+        return;
+    }
+    if let Some(why) =
+        super::review_actions::release_blocked(state, &msg.team_id, owner, repo).await
+    {
+        s.detail = format!(
+            "merged; the release is blocked: {}. \"Release now\" on the Releases page releases it",
+            why.trim().trim_end_matches('.')
+        );
+        return;
+    }
+    super::review_actions::schedule_tag_sweep(
+        state,
+        cfg,
+        &msg.team_id,
+        msg.installation_id,
+        owner,
+        repo,
+        msg.pr_number,
+        base_branch,
+        false,
+    )
+    .await;
+    s.detail = format!(
+        "merged, deploying: in the repository's next release tag, one tag for everything merged \
+         (within about {} minutes once `{base_branch}` is green)",
+        cfg.tag_batch_minutes
+    );
+}
+
+/// The one line said when a production deploy finished in this tick
+/// (`was` is its status before it): deployed, in which tag and when, or
+/// that it didn't. None for anything else.
+pub fn deploy_outcome_line(
+    s: &Step,
+    was: Status,
+    owner: &str,
+    repo: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if s.kind != Kind::Deploy || s.env != Env::Production || was == s.status {
+        return None;
+    }
+    let tag = if s.tag.is_empty() {
+        String::new()
+    } else {
+        format!(" in `{}`", s.tag)
+    };
+    let run = if s.run_id > 0 {
+        format!(
+            " (https://github.com/{owner}/{repo}/actions/runs/{})",
+            s.run_id
+        )
+    } else {
+        String::new()
+    };
+    match s.status {
+        Status::Done => Some(format!(
+            "Deployed to production{tag} at {} UTC{run}.",
+            at.format("%H:%M")
+        )),
+        Status::Failed => Some(format!(
+            "Merged, but the production deploy{tag} did not succeed: {}. The post-merge check \
+             follows it up.",
+            s.detail.trim_end_matches('.')
+        )),
+        _ => None,
+    }
+}
+
+/// Notice key: the production deploy's outcome, once per ticket.
+const NOTICE_DEPLOYED: &str = "release_deployed";
+
+/// Says `line` once on the run's ticket (Jira or GitHub issue).
+async fn say_on_ticket(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    line: &str,
+) {
+    let item = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("run_id", AttributeValue::S(run_id.to_string()))
+        .send()
+        .await
+    {
+        Ok(o) => o.item.unwrap_or_default(),
+        Err(e) => {
+            warn!(run_id, error = %e, "release: could not read the run for its ticket");
+            return;
+        }
+    };
+    let Some(msg) = ticket_of_run(team_id, run_id, &item) else {
+        return;
+    };
+    super::post_ticket_notice(
+        state,
+        &msg,
+        run_id,
+        github,
+        NOTICE_DEPLOYED,
+        line,
+        &super::fix_location::jira_text(line),
+        "Released",
+        &[],
+    )
+    .await;
+}
+
+/// The ticket a run record names, as a message the ticket notices take.
+/// None when the run has no ticket to speak on.
+pub fn ticket_of_run(
+    team_id: &str,
+    run_id: &str,
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> Option<crate::models::TicketMessage> {
+    use crate::models::TicketSource;
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let n = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let source = match s("ticket_source").as_str() {
+        "jira" => TicketSource::Jira,
+        "github" | "" if n("issue_number") > 0 => TicketSource::Github,
+        _ => return None,
+    };
+    let repo = s("repo");
+    let (owner, name) = repo.split_once('/')?;
+    Some(crate::models::TicketMessage {
+        github_wait: Default::default(),
+        team_id: team_id.to_string(),
+        installation_id: n("installation_id"),
+        source,
+        ticket_id: s("ticket_id"),
+        title: s("title"),
+        body: String::new(),
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        issue_number: n("issue_number"),
+        sender: String::new(),
+        requester: None,
+        base_branch: s("base_branch"),
+        image_attachments: vec![],
+        continuation: 0,
+        continuation_run_id: None,
+        first_attempt_ms: 0,
+        resume_from: None,
+        retry_of_run: false,
+        model_retries: 0,
+        ticket_type: None,
+        ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
+        team_instructions: String::new(),
+        coder_learning: String::new(),
+        person_direction: None,
+        answers: Vec::new(),
+        related: Vec::new(),
+        new_run_id: Some(run_id.to_string()),
+        followup_of: None,
+        after_merge: false,
+        merged_note: None,
+    })
 }
 
 async fn load(
@@ -625,12 +885,52 @@ async fn send(state: &WorkerState, msg: &ReleaseStepsMessage, delay: i32) -> boo
 /// schedules the next tick while anything is left.
 pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), BoxError> {
     let (owner, repo, pr) = (&msg.repo_owner, &msg.repo_name, msg.pr_number);
-    let Some(mut rec) = load(state, &msg.team_id, owner, repo, pr).await? else {
+    let Some(rec) = load(state, &msg.team_id, owner, repo, pr).await? else {
         return Ok(());
     };
     if rec.chain_id != msg.chain_id || rec.parked {
         return Ok(());
     }
+    let armed_at = rec.armed_at;
+    match tick(state, &msg, rec).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // A tick that failed (GitHub's budget held, a GitHub error) never
+            // ends the release: the same chain is tried again, at the reset
+            // when GitHub asked to wait.
+            if now() - armed_at <= MAX_AGE_SECS {
+                let mut next_msg = msg.clone();
+                next_msg.attempts += 1;
+                let d = retry_delay(crate::clients::github::rate_limited(&*e));
+                warn!(pr, delay = d, error = %e, "release: the tick failed; trying again");
+                send(state, &next_msg, d).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// When a failed tick is tried again: just past GitHub's wait when it asked
+/// for one (within a queue delay's bounds), else the waiting pace.
+pub fn retry_delay(limited: Option<u64>) -> i32 {
+    match limited {
+        Some(w) => (w + 5).clamp(60, 900) as i32,
+        None => WAITING_DELAY,
+    }
+}
+
+/// Whether an unchanged release is armed again on a merge: a step is still
+/// to do once it merged.
+pub fn rearm(steps: &[Step], merged: bool) -> bool {
+    (0..steps.len()).any(|i| matches!(next(steps, i, merged), Next::Start | Next::Check))
+}
+
+async fn tick(
+    state: &WorkerState,
+    msg: &ReleaseStepsMessage,
+    mut rec: Record,
+) -> Result<(), BoxError> {
+    let (owner, repo, pr) = (&msg.repo_owner, &msg.repo_name, msg.pr_number);
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -654,6 +954,7 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
     let gate = crate::agent::policy::gate(state, ctx, None).with_wait(Wait::Return);
     let store = crate::agent::policy::store(state);
     let before = rec.lines();
+    let was: Vec<Status> = rec.steps.iter().map(|s| s.status).collect();
     let asked_before = approval_line(&rec.steps);
     for i in 0..rec.steps.len() {
         match next(&rec.steps, i, merged) {
@@ -710,6 +1011,32 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
                     )
                     .await;
                     continue;
+                }
+                // The team releases merged changes itself (its batched release
+                // tag): the production deploy goes out in that tag, with no
+                // card of its own, and is followed to the end.
+                if merged && s.kind == Kind::Deploy && matches!(s.trigger, Some(On::Tag(_))) {
+                    let cfg = super::review_actions::OnApproveConfig::load(
+                        state,
+                        &msg.team_id,
+                        owner,
+                        repo,
+                    )
+                    .await;
+                    if cfg.auto_tag {
+                        let base = rec.base_branch.clone();
+                        team_release(
+                            state,
+                            &github,
+                            msg,
+                            &cfg,
+                            &base,
+                            &mut rec.steps[i],
+                            &merge_sha,
+                        )
+                        .await;
+                        continue;
+                    }
                 }
                 if s.tool.is_empty() {
                     // A deploy that runs on merge: only waited for.
@@ -803,6 +1130,16 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
                     )
                     .await;
                 }
+            }
+        }
+    }
+    // A production deploy that finished this tick is said once on the run
+    // and on its ticket: deployed (in which tag, when), or that it failed.
+    if !msg.run_id.is_empty() {
+        for (s, w) in rec.steps.iter().zip(&was) {
+            if let Some(line) = deploy_outcome_line(s, *w, owner, repo, chrono::Utc::now()) {
+                super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
+                say_on_ticket(state, &github, &msg.team_id, &msg.run_id, &line).await;
             }
         }
     }
@@ -930,6 +1267,7 @@ async fn start(
         match super::review_actions::cut_tag_if_new(github, &cfg, owner, repo, merge_sha).await {
             Ok(Some(tag)) => {
                 s.tag = tag;
+                s.tag_sha = merge_sha.to_string();
             }
             Ok(None) => {
                 // Already tagged (the team's own tagging on merge).
@@ -943,6 +1281,7 @@ async fn start(
                     .find(|t| t["commit"]["sha"].as_str() == Some(merge_sha))
                     .and_then(|t| t["name"].as_str().map(String::from))
                     .unwrap_or_default();
+                s.tag_sha = merge_sha.to_string();
             }
             Err(e) => {
                 s.status = Status::Failed;
@@ -1007,6 +1346,9 @@ async fn check(
     // on the branch they were started on.
     let (branch, sha) = match &s.trigger {
         Some(On::Merge(b)) => (b.clone(), merge_sha.to_string()),
+        // A batched tag can point past this merge: its run is on the tag's
+        // commit.
+        Some(On::Tag(_)) if !s.tag_sha.is_empty() => (s.tag.clone(), s.tag_sha.clone()),
         Some(On::Tag(_)) => (s.tag.clone(), merge_sha.to_string()),
         _ if s.kind == Kind::Deploy || s.kind == Kind::Purge => {
             (rec.base_branch.clone(), String::new())
@@ -1121,6 +1463,51 @@ mod tests {
             ..Default::default()
         };
         release_plan::steps(&r, &m)
+    }
+
+    #[test]
+    fn a_runs_ticket_is_read_from_its_record() {
+        let mut item = std::collections::HashMap::new();
+        let put = |m: &mut std::collections::HashMap<String, AttributeValue>, k: &str, v: &str| {
+            m.insert(k.to_string(), AttributeValue::S(v.to_string()));
+        };
+        put(&mut item, "ticket_source", "jira");
+        put(&mut item, "ticket_id", "ABC-1");
+        put(&mut item, "repo", "o/r");
+        put(&mut item, "base_branch", "main");
+        item.insert("installation_id".into(), AttributeValue::N("7".into()));
+        let m = ticket_of_run("T", "R", &item).unwrap();
+        assert!(matches!(m.source, crate::models::TicketSource::Jira));
+        assert_eq!((m.ticket_id.as_str(), m.repo_name.as_str()), ("ABC-1", "r"));
+        assert_eq!(m.installation_id, 7);
+        // A GitHub issue needs its number; an alert has no ticket to speak on.
+        put(&mut item, "ticket_source", "github");
+        assert!(ticket_of_run("T", "R", &item).is_none());
+        item.insert("issue_number".into(), AttributeValue::N("12".into()));
+        assert_eq!(ticket_of_run("T", "R", &item).unwrap().issue_number, 12);
+        put(&mut item, "ticket_source", "alert");
+        assert!(ticket_of_run("T", "R", &item).is_none());
+    }
+
+    #[test]
+    fn a_merge_deploy_is_said_without_a_tag() {
+        let mut s = plan()
+            .into_iter()
+            .find(|s| s.id == "deploy_production")
+            .unwrap();
+        s.trigger = Some(On::Merge("main".into()));
+        s.status = Status::Done;
+        let at = chrono::Utc::now();
+        let line = deploy_outcome_line(&s, Status::Running, "o", "r", at).unwrap();
+        assert!(line.starts_with("Deployed to production at "), "{line}");
+        // Staging's deploy is not said on the ticket.
+        let st = plan()
+            .into_iter()
+            .find(|s| s.id == "deploy_staging")
+            .unwrap();
+        let mut st2 = st.clone();
+        st2.status = Status::Done;
+        assert!(deploy_outcome_line(&st2, Status::Running, "o", "r", at).is_none());
     }
 
     fn set(steps: &mut [Step], id: &str, st: Status) {

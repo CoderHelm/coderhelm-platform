@@ -839,6 +839,7 @@ pub fn release_only_steps(m: &Mechanics, checks: &[(Vec<String>, Vec<String>)]) 
             approval_id: String::new(),
             run_id: 0,
             tag: String::new(),
+            tag_sha: String::new(),
             workflow: String::new(),
             inputs: Vec::new(),
             trigger: None,
@@ -1657,6 +1658,10 @@ pub struct Step {
     /// The tag the production release was cut as.
     #[serde(default)]
     pub tag: String,
+    /// The commit that tag points at: a batched release tags the branch's
+    /// head, which can be a later commit than this merge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag_sha: String,
     /// The workflow file it starts or waits on.
     #[serde(default)]
     pub workflow: String,
@@ -1804,6 +1809,7 @@ pub fn steps(r: &Release, m: &Mechanics) -> Vec<Step> {
         approval_id: String::new(),
         run_id: 0,
         tag: String::new(),
+        tag_sha: String::new(),
         urls: Vec::new(),
         find: Vec::new(),
     };
