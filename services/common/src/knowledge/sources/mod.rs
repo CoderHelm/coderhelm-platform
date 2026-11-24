@@ -528,6 +528,58 @@ pub struct Source {
     /// in (Notion, Confluence): "Change connection".
     #[serde(default)]
     pub use_saved_key: bool,
+    /// Syncs in a row that stopped, and since when (cleared by one that
+    /// finishes): the page says it once, with the last one's cause, instead
+    /// of one line per sync.
+    #[serde(default)]
+    pub stops: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stopped_since: String,
+    /// The last sync stopped for a passing reason (a provider or its
+    /// sign-in server briefly unavailable, a rate limit): nothing for a
+    /// person to do, the next sync tries again. The source keeps its status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrying: Option<SourceError>,
+}
+
+impl SourceError {
+    /// Passing: the next sync tries again on its own and nobody needs to
+    /// do anything (the `retry` action).
+    pub fn passing(&self) -> bool {
+        self.action == "retry"
+    }
+}
+
+/// Records one more sync in a row that stopped. A passing cause leaves the
+/// source as it was (Ready, or Queued before its first sync) and says it is
+/// retrying; only a cause a person must fix turns it to [`Status::Error`].
+pub fn note_stop(s: &mut Source, e: SourceError, now: i64) {
+    if s.stops == 0 || s.stopped_since.is_empty() {
+        s.stopped_since = chrono::DateTime::from_timestamp(now, 0)
+            .unwrap_or_default()
+            .to_rfc3339();
+    }
+    s.stops = s.stops.saturating_add(1);
+    if e.passing() {
+        s.status = if s.last_success_at.is_empty() {
+            Status::Queued
+        } else {
+            Status::Ready
+        };
+        s.error = None;
+        s.retrying = Some(e);
+    } else {
+        s.status = Status::Error;
+        s.error = Some(e);
+        s.retrying = None;
+    }
+}
+
+/// A sync finished: the run of stops, if any, is over.
+pub fn note_finished(s: &mut Source) {
+    s.stops = 0;
+    s.stopped_since.clear();
+    s.retrying = None;
 }
 
 impl Source {

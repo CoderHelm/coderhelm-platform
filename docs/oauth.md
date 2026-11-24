@@ -26,7 +26,7 @@ Several kinds of sign-in share that page, because a provider app has one redirec
 - **A sign-in that can't be matched says to start again,** and never claims access was refused.
 - **Failures are logged.** Every failed callback is written to the gateway log ("OAuth sign-in didn't finish") with the kind, the provider's code and the reason. Tokens and codes are never logged.
 
-PKCE (S256) is sent on every one of these sign-ins. Tokens are sealed with KMS for one team, one server and one owner. They are renewed before they expire, a rotated refresh token is never lost, a refused renewal marks the connection "needs reconnect", and disconnecting revokes where the provider supports it.
+PKCE (S256) is sent on every one of these sign-ins. Tokens are sealed with KMS for one team, one server and one owner. They are renewed before they expire, one renewal at a time (a rotated refresh token is never lost or spent twice), and disconnecting revokes where the provider supports it. Only a definitive refusal of a renewal marks the connection "needs reconnect": HTTP 400 or 401 with `invalid_grant`, `invalid_client`, `unauthorized_client`, or the provider's revoked or expired refresh signal. No answer, a timeout, a `429` or a `5xx` is passing: the renewal is asked again a few times within the run, then on the next sync, nothing is marked, and the page says the provider's sign-in server was briefly unavailable. The hybrid broker answers a passing failure as `temporarily_unavailable` with HTTP 503.
 
 ### Hybrid installs through CoderHelm's apps
 

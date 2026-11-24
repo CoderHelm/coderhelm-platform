@@ -264,7 +264,7 @@ impl ConnectorError {
                 "retry",
             ),
             ConnectorError::Busy(_) => (
-                format!("{name} didn't answer in time. The sync tries again on its own."),
+                "Nothing to do: the sync tries again on its own.".to_string(),
                 "retry",
             ),
             ConnectorError::Temporary(_) => ("Sync again in a few minutes.".to_string(), "retry"),

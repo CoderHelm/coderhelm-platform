@@ -73,7 +73,9 @@ pub struct SyncRun {
     pub ended_at: String,
     pub took_secs: i64,
     /// `done`, `problems` (done, some items not read), `waiting` (done,
-    /// some items read again later on their own) or `stopped`.
+    /// some items read again later on their own), `retrying` (ended on a
+    /// passing cause; the next sync tries again) or `stopped` (ended on a
+    /// cause a person must fix).
     pub result: String,
     pub listed: u32,
     pub added: u32,
@@ -152,8 +154,9 @@ pub fn from_outcome(
     };
     let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
     let touched = out.added + out.updated + out.failed + out.skipped;
-    let result = if out.error.is_some() {
-        "stopped"
+    let error = out.error.as_ref().map(|e| super::source_error(src, e));
+    let result = if let Some(e) = &error {
+        stop_result(e)
     } else if out.failed > 0 {
         "problems"
     } else if out.waiting > 0 {
@@ -183,13 +186,24 @@ pub fn from_outcome(
         embedded: n(out.embedded_chunks),
         reused: n(out.reused_chunks),
         via: via.to_string(),
-        error: out.error.as_ref().map(|e| super::source_error(src, e)),
+        error,
         problems: out
             .problems
             .iter()
             .take(MAX_RUN_PROBLEMS)
             .cloned()
             .collect(),
+    }
+}
+
+/// How a run that ended on `e` is recorded: `retrying` when the cause is
+/// passing (the next sync tries again and nobody needs to act), else
+/// `stopped`.
+pub fn stop_result(e: &SourceError) -> &'static str {
+    if e.passing() {
+        "retrying"
+    } else {
+        "stopped"
     }
 }
 
@@ -204,7 +218,7 @@ pub fn stopped(src: &Source, trigger: &str, at: i64, error: SourceError) -> Sync
         trigger: super::trigger::clean(trigger).to_string(),
         started_at: ts.clone(),
         ended_at: ts,
-        result: "stopped".into(),
+        result: stop_result(&error).into(),
         error: Some(error),
         ..Default::default()
     }
@@ -306,8 +320,17 @@ mod tests {
             error: Some(super::super::ConnectorError::RateLimited("busy".into())),
             ..Default::default()
         };
+        // A rate limit is passing: the run is retrying, not stopped.
         assert_eq!(
             from_outcome(&src, "manual", 0, 1, &stopped, "").result,
+            "retrying"
+        );
+        let refused = Outcome {
+            error: Some(super::super::ConnectorError::Reconnect("gone".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_outcome(&src, "manual", 0, 1, &refused, "").result,
             "stopped"
         );
         assert_eq!(
