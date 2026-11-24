@@ -173,13 +173,14 @@ fn a_wait_on_a_person_names_exactly_what_is_missing() {
     let mut v = view("APPROVED", Some("APPROVED"));
     v.requested = vec!["a-reviewer".into()];
     assert!(person_key(&v));
-    // The same line goes to the team's channel.
+    // The line goes on the run page (the record's detail) and the one
+    // status comment; waiting on people never goes to a team channel
+    // (`nt_alerts_channel_alerts_only`).
     let m = wait_message("acme", "web", 7, "Fix the schedule", "https://x/7", &line);
     assert!(m.summary.contains("acme/web#7"));
     assert_eq!(m.buttons.len(), 1);
-    // And on the run page (the record's detail) and the one status comment.
     let eval = fn_src(src(), "async fn evaluate(");
-    assert!(eval.contains("tell_team("));
+    assert!(!eval.contains("tell_team("));
     assert!(eval.contains("find(|(m, _)| *m != Mark::Done)"));
 }
 

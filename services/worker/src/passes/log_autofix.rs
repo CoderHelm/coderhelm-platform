@@ -405,6 +405,7 @@ async fn post_card(
         &cipher,
         &state.config.settings_table_name,
         team_id,
+        common::notify::route::Kind::Alert,
     )
     .await;
     if channels.is_empty() {
@@ -997,6 +998,7 @@ pub async fn notify_pr(
         &cipher,
         &state.config.settings_table_name,
         team_id,
+        common::notify::route::Kind::Update,
     )
     .await;
     if channels.is_empty() {

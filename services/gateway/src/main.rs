@@ -669,6 +669,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             get(routes::alerts::get_notify).put(routes::alerts::put_notify),
         )
         .route("/alert-notify/test", post(routes::alerts::test_notify))
+        .route(
+            "/updates-notify",
+            get(routes::alerts::get_updates_notify).put(routes::alerts::put_updates_notify),
+        )
         .route("/notify/test", post(routes::alerts::test_notify))
         .route("/alerts", get(routes::alerts::list_events))
         .route("/alerts/event", get(routes::alerts::get_event))

@@ -1227,12 +1227,17 @@ async fn route_channels(state: &AppState, route: &Route) -> Channels {
     match route.notify_mode.as_str() {
         alert_notify::MODE_OFF => Channels::default(),
         alert_notify::MODE_CUSTOM => store::open_all(&c, &route.team_id, &route.webhooks).await,
+        // The team's channel for alerts (`notify::route`): the alert
+        // channel, unless it was set not to take them.
         _ => {
-            let team = team_notify_settings(state, &route.team_id).await;
-            if !team.enabled {
-                return Channels::default();
-            }
-            store::open_all(&c, &route.team_id, &team.item).await
+            notify::route::team_channels(
+                &state.dynamo,
+                &c,
+                &state.config.settings_table_name,
+                &route.team_id,
+                notify::route::Kind::Alert,
+            )
+            .await
         }
     }
 }
@@ -2444,46 +2449,122 @@ pub(crate) fn save_error(e: store::SaveError) -> StatusCode {
     }
 }
 
-/// GET /api/alert-notify — the team's alert channels (admin+). Webhooks are
+/// Pure: a team channel's settings as the API shows them: on or off, the
+/// kinds of message it takes (`notify::route`), and its webhooks as hints.
+pub(crate) fn notify_view(item: &HashMap<String, AttributeValue>, sk: &str) -> Value {
+    let on = item
+        .get("enabled")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    let kinds: Vec<&str> = notify::route::kinds(item, sk)
+        .iter()
+        .map(|k| k.key())
+        .collect();
+    let defaults: Vec<&str> = notify::route::default_kinds(sk)
+        .iter()
+        .map(|k| k.key())
+        .collect();
+    json!({
+        "enabled": on,
+        "kinds": kinds,
+        "default_kinds": defaults,
+        "webhooks": store::view(item),
+    })
+}
+
+async fn notify_item(state: &AppState, team_id: &str, sk: &str) -> HashMap<String, AttributeValue> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .unwrap_or_default()
+}
+
+/// GET /api/alert-notify — the team's alert channel (admin+). Webhooks are
 /// shown only as a hint.
 pub async fn get_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
-    let t = team_notify_settings(&state, &claims.team_id).await;
-    Ok(Json(
-        json!({ "enabled": t.enabled, "webhooks": store::view(&t.item) }),
-    ))
+    let sk = notify::route::ALERTS_SK;
+    Ok(Json(notify_view(
+        &notify_item(&state, &claims.team_id, sk).await,
+        sk,
+    )))
+}
+
+/// GET /api/updates-notify — the team's channel for updates and for things
+/// a person has to do (admin+).
+pub async fn get_updates_notify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let sk = notify::route::UPDATES_SK;
+    Ok(Json(notify_view(
+        &notify_item(&state, &claims.team_id, sk).await,
+        sk,
+    )))
 }
 
 #[derive(Deserialize)]
 pub struct PutNotifyRequest {
     #[serde(default)]
     enabled: bool,
+    /// The kinds of message the channel takes ("alert", "action",
+    /// "update"). Left out, the saved kinds (or the channel's default) stay.
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
     /// Each webhook is kept unless the request sets or clears it.
     #[serde(flatten)]
     channels: store::ChannelsInput,
 }
 
-/// PUT /api/alert-notify — set the team's alert channels (admin+). On needs at
-/// least one channel.
+/// PUT /api/alert-notify — set the team's alert channel (admin+). On needs
+/// at least one channel.
 pub async fn put_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<PutNotifyRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
+    save_notify(&state, &claims, notify::route::ALERTS_SK, req).await
+}
+
+/// PUT /api/updates-notify — set the team's updates channel (admin+).
+pub async fn put_updates_notify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<PutNotifyRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    save_notify(&state, &claims, notify::route::UPDATES_SK, req).await
+}
+
+async fn save_notify(
+    state: &AppState,
+    claims: &Claims,
+    sk: &str,
+    req: PutNotifyRequest,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
     req.channels.check().map_err(save_error)?;
-    let prior = team_notify_settings(&state, &claims.team_id).await;
-    let attrs = store::save_attrs(
-        &cipher(&state),
-        &claims.team_id,
-        Some(&prior.item),
-        &req.channels,
-    )
-    .await
-    .map_err(save_error)?;
+    let prior = notify_item(state, &claims.team_id, sk).await;
+    let kinds = match &req.kinds {
+        Some(keys) => notify::route::parse_kinds(keys).map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => notify::route::kinds(&prior, sk),
+    };
+    let attrs = store::save_attrs(&cipher(state), &claims.team_id, Some(&prior), &req.channels)
+        .await
+        .map_err(save_error)?;
     if req.enabled && !store::any_set(&store::as_item(&attrs)) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -2492,18 +2573,19 @@ pub async fn put_notify(
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(alert_notify::TEAM_SETTINGS_SK))
+        .item("sk", attr_s(sk))
         .item("enabled", AttributeValue::Bool(req.enabled))
+        .item(notify::route::KINDS_ATTR, notify::route::kinds_attr(&kinds))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .item("updated_by", attr_s(&claims.email));
     for (k, v) in attrs {
         put = put.item(k, v);
     }
     put.send().await.map_err(|e| {
-        error!(error = %e, "Could not save alert channel");
+        error!(error = %e, sk, "Could not save a team channel");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    info!(team_id = %claims.team_id, enabled = req.enabled, "Alert channel saved");
+    info!(team_id = %claims.team_id, sk, enabled = req.enabled, ?kinds, "Team channel saved");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2574,8 +2656,9 @@ pub struct TestNotifyRequest {
     #[serde(default)]
     teams_webhook_url: String,
     /// Whose saved webhook to test: "alerts" (the team alert channel),
-    /// "route" (with `topic_arn`), "recommendations", or "reviewer" (with
-    /// `repo`). Also picks the sample message.
+    /// "updates" (the team updates channel), "route" (with `topic_arn`),
+    /// "recommendations", or "reviewer" (with `repo`). Also picks the sample
+    /// message.
     #[serde(default)]
     destination: String,
     #[serde(default)]
@@ -2588,6 +2671,7 @@ pub struct TestNotifyRequest {
 fn destination_sk(req: &TestNotifyRequest) -> Option<String> {
     match req.destination.as_str() {
         "" | "alerts" => Some(alert_notify::TEAM_SETTINGS_SK.to_string()),
+        "updates" => Some(notify::route::UPDATES_SK.to_string()),
         "route" if !req.topic_arn.trim().is_empty() => Some(team_route_sk(req.topic_arn.trim())),
         "recommendations" => Some(super::log_analyzer::REC_NOTIFY_SK.to_string()),
         "reviewer"
@@ -2662,6 +2746,10 @@ pub async fn test_notify(
             context: "us-east-1 · test",
         }),
         "recommendations" => notify::messages::test_message("New log findings", &format!("{base}/logs")),
+        "updates" => notify::messages::test_message(
+            "Updates and requests for a person",
+            &format!("{base}/settings/alerts"),
+        ),
         _ => notify::messages::test_message("Review reminders", &format!("{base}/reviewer")),
     };
     use notify::Poster;
@@ -2898,6 +2986,10 @@ mod tests {
         assert_eq!(
             destination_sk(&req("recommendations", "", "")).as_deref(),
             Some("REC_NOTIFY")
+        );
+        assert_eq!(
+            destination_sk(&req("updates", "", "")).as_deref(),
+            Some("UPDATES_NOTIFY")
         );
         assert_eq!(
             destination_sk(&req("reviewer", "", "acme/web")).as_deref(),

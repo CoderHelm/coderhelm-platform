@@ -556,6 +556,23 @@ async fn cards(
             r.finding.id
         );
         let msg = records::card(r, &url);
+        // A P0 is an alert; a P1 is news for the updates channel.
+        let kind = if r.tier() == Some(Tier::P0) {
+            common::notify::route::Kind::Alert
+        } else {
+            common::notify::route::Kind::Update
+        };
+        let channels = channels.get(kind);
+        if channels.is_empty() {
+            common::claim::release(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                team_id,
+                &sk,
+            )
+            .await;
+            continue;
+        }
         let sent = common::notify::deliver_recorded(
             &common::notify::Http(&state.http),
             &channels,

@@ -1605,16 +1605,14 @@ async fn evaluate(
             );
             set_state(state, msg, decision.state, &detail).await;
             // A person's approval that no longer counts is never waited on
-            // silently: the PR's one status comment, and the team's channel
-            // once per commit.
+            // silently: the PR's one status comment says so. Waiting on
+            // people's reviews is a PR's normal state, so it never goes to a
+            // team channel (`incidents::nt_alerts_channel_alerts_only`).
             let person_gap = view.require_human
                 && !person_key(&view)
                 && (!view.approvals.approved_by.is_empty() || !view.approvals.dismissed.is_empty());
             if watched || person_gap {
                 publish_status(state, github, msg, record, &status).await;
-            }
-            if person_gap {
-                tell_team(state, msg, &pr, &detail).await;
             }
             Ok(Next::Recheck)
         }
@@ -2026,7 +2024,7 @@ async fn keep_current(
         BaseMerge::Unresolved { .. } | BaseMerge::CannotPush => {
             set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
             publish_status(state, github, msg, record, &body).await;
-            tell_team(state, msg, pr, &line.1).await;
+            tell_team(state, msg, pr, TeamNotice::Conflict, &line.1).await;
         }
     }
     Ok(Next::Stop)
@@ -2228,26 +2226,53 @@ async fn read_review_rules(
     review_rules(protection.as_ref(), rulesets.as_ref())
 }
 
-/// One message to the team's channel, once per PR commit and wait: what
-/// the merge waits on. Silent where no channel is set up.
+/// Why the gate tells the team, beyond the PR's own status comment. Only
+/// a wait a person has to end is here: a review the branch's rules ask for
+/// is the PR's normal state, and CI, labels and CoderHelm's own review end
+/// by themselves, so none of those is ever posted to a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamNotice {
+    /// A merge conflict CoderHelm could not resolve, or could not push.
+    Conflict,
+}
+
+impl TeamNotice {
+    fn key(self) -> &'static str {
+        match self {
+            TeamNotice::Conflict => "conflict",
+        }
+    }
+}
+
+/// Pure: the claim that makes a notice go out once per PR and reason, ever
+/// (for the record's life): not once per commit or per wording.
+pub(crate) fn told_sk(owner: &str, repo: &str, pr: u64, notice: TeamNotice) -> String {
+    format!(
+        "MERGEGATETOLD#{}/{}#{pr}#{}",
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase(),
+        notice.key()
+    )
+}
+
+/// One "needs you" message, once per PR and reason: what a person has to
+/// do before the merge can go on. It goes only where the team takes action
+/// messages (`common::notify::route`), never to an alert channel that takes
+/// alerts only, and nowhere when none is set up.
 async fn tell_team(
     state: &WorkerState,
     msg: &AwaitMergeMessage,
     pr: &serde_json::Value,
+    notice: TeamNotice,
     line: &str,
 ) {
-    let channels = super::security_fixes::team_channels(state, &msg.team_id).await;
+    let channels = super::security_fixes::team_channels(state, &msg.team_id)
+        .await
+        .get(common::notify::route::Kind::Action);
     if channels.is_empty() {
         return;
     }
-    let sk = format!(
-        "MERGEGATETOLD#{}/{}#{}#{}#{}",
-        msg.repo_owner,
-        msg.repo_name,
-        msg.pr_number,
-        msg.head_sha,
-        common::content_hash(line)
-    );
+    let sk = told_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number, notice);
     let claim = common::claim::claim(
         &state.dynamo,
         &state.config.settings_table_name,

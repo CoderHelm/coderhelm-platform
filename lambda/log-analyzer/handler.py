@@ -1380,6 +1380,7 @@ def record_connection_success(team_id, account_id):
 
 REC_NOTIFY_SK = "REC_NOTIFY"
 TEAM_CHANNEL_SK = "ALERT_NOTIFY"  # the team's alert channel (common::alert_notify)
+UPDATES_CHANNEL_SK = "UPDATES_NOTIFY"  # the team's updates channel (common::notify::route)
 WEBHOOK_HOST_SUFFIXES = (".powerplatform.com", ".logic.azure.com", ".webhook.office.com")
 SLACK_PREFIX = "https://hooks.slack.com/services/"
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
@@ -1460,6 +1461,30 @@ def pick_channels(mode, own, team, team_enabled):
     if mode == "team" and team_enabled:
         return team
     return {}
+
+
+def channel_kinds(sk, item):
+    """The kinds of message a team channel takes: its saved `kinds`, or, saved
+    before kinds existed, alerts only for the alert channel and action and
+    updates for the updates channel. Matches common::notify::route::kinds."""
+    saved = item.get("kinds")
+    if saved is None:
+        return {"action", "update"} if sk == UPDATES_CHANNEL_SK else {"alert"}
+    return {k for k in saved if k in ("alert", "action", "update")}
+
+
+def team_update_channels(team_id, alerts_item, updates_item):
+    """{channel: url} a findings update posts to with the team's channels:
+    the updates channel first, then the alert channel only when it was set to
+    take updates; never an alert channel that takes alerts only. Matches
+    common::notify::route::pick for Kind::Update."""
+    out = {}
+    for sk, item in ((UPDATES_CHANNEL_SK, updates_item), (TEAM_CHANNEL_SK, alerts_item)):
+        if not item or not bool(item.get("enabled", False)) or "update" not in channel_kinds(sk, item):
+            continue
+        for ch, url in open_channels(team_id, item).items():
+            out.setdefault(ch, url)
+    return out
 
 
 def pick_webhook(mode, own_url, team_url, team_enabled):
@@ -1680,13 +1705,17 @@ def notify_new_recommendations(team_id, account_id, recs):
         mode = effective_mode(own.get("notify_mode"))
         if mode == "off":
             return
-        team = settings_table.get_item(Key={"pk": team_id, "sk": TEAM_CHANNEL_SK}).get("Item") or {}
-        enabled = bool(team.get("enabled", False))
+        team = {}
+        if mode == "team":
+            alerts = settings_table.get_item(Key={"pk": team_id, "sk": TEAM_CHANNEL_SK}).get("Item") or {}
+            updates = settings_table.get_item(Key={"pk": team_id, "sk": UPDATES_CHANNEL_SK}).get("Item") or {}
+            # Findings are updates: never in an alert channel that takes alerts only.
+            team = team_update_channels(team_id, alerts, updates)
         channels = pick_channels(
             mode,
             open_channels(team_id, own) if mode == "custom" else {},
-            open_channels(team_id, team) if mode == "team" and enabled else {},
-            enabled,
+            team,
+            bool(team),
         )
         if channels:
             deliver(channels, account_id, recs)
