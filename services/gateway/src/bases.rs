@@ -485,7 +485,64 @@ pub struct Size {
     pub updated_at: Option<String>,
     /// Read live at the source on every question (code, tickets).
     pub live: bool,
+    /// When the newest sync that stopped did, if a source's last sync
+    /// stopped. What `updated_at` says is still what the base holds.
+    pub stopped_at: Option<String>,
 }
+
+/// The later of two times, compared as times (formats differ in their
+/// fractions of a second).
+fn later(a: Option<String>, b: &str) -> Option<String> {
+    let Ok(tb) = chrono::DateTime::parse_from_rfc3339(b) else {
+        return a;
+    };
+    match a.as_deref().map(chrono::DateTime::parse_from_rfc3339) {
+        Some(Ok(ta)) if ta >= tb => a,
+        _ => Some(b.to_string()),
+    }
+}
+
+/// When the team's knowledge bases last took in content, and when the
+/// newest stopped sync stopped: the newest successful sync of a source and
+/// the newest ready upload, never the time a base's settings were edited.
+pub fn knowledge_times(
+    bases: &[common::knowledge::Base],
+    sources: &[common::knowledge::sources::Source],
+    files: &[common::knowledge::FileMeta],
+) -> (Option<String>, Option<String>) {
+    use common::knowledge::{sources::Status, FileStatus};
+    let ours = |kb: &str| bases.iter().any(|b| b.id == kb);
+    let mut updated = None;
+    let mut stopped = None;
+    for s in sources.iter().filter(|s| ours(&s.kb_id)) {
+        updated = later(updated, &s.last_success_at);
+        if s.status == Status::Error && !s.paused {
+            let at = s
+                .error
+                .as_ref()
+                .map(|e| e.at.as_str())
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&s.last_sync_at);
+            stopped = later(stopped, at);
+        }
+    }
+    for f in files
+        .iter()
+        .filter(|f| ours(&f.kb_id) && !f.is_synced() && f.status == FileStatus::Ready)
+    {
+        updated = later(updated, &f.uploaded_at);
+    }
+    (updated, stopped)
+}
+
+/// The times the security scans last finished, on the team's
+/// [`common::security_fixes::STATE_SK`] record.
+const SECURITY_SCAN_FIELDS: &[&str] = &[
+    "advisory_polled_at",
+    "dependabot_checked_at",
+    "osv_synced_at",
+    "epss_synced_at",
+];
 
 impl Size {
     fn add(&mut self, label: &str, rows: &[Item]) {
@@ -585,17 +642,42 @@ pub async fn size(state: &AppState, team_id: &str, key: &str) -> Size {
             )
             .await;
             out.add("security findings", &found);
+            // A scan that found nothing new still refreshed the base.
+            if let Ok(r) = state
+                .dynamo
+                .get_item()
+                .table_name(settings)
+                .key("pk", s(team_id))
+                .key("sk", s(common::security_fixes::STATE_SK))
+                .send()
+                .await
+            {
+                if let Some(i) = r.item() {
+                    for f in SECURITY_SCAN_FIELDS {
+                        out.updated_at = later(out.updated_at.take(), attr(i, f));
+                    }
+                }
+            }
         }
         lookups::TEAM => {
             use common::knowledge::search::Store;
             let st = crate::routes::knowledge::store(state);
             if let Ok(bases) = st.bases(team_id).await {
                 out.counts.push(("knowledge bases".into(), bases.len()));
-                out.updated_at = bases
-                    .iter()
-                    .map(|b| b.updated_at.clone())
-                    .filter(|t| !t.is_empty())
-                    .max();
+                let (sources, files) = tokio::join!(
+                    common::knowledge::sources::store::team_sources(
+                        &state.dynamo,
+                        settings,
+                        team_id
+                    ),
+                    futures::future::join_all(bases.iter().map(|b| st.files(team_id, &b.id))),
+                );
+                let sources = sources.unwrap_or_else(|e| {
+                    warn!(error = %e, "bases: knowledge sources not read");
+                    Vec::new()
+                });
+                let files: Vec<_> = files.into_iter().flatten().flatten().collect();
+                (out.updated_at, out.stopped_at) = knowledge_times(&bases, &sources, &files);
             }
         }
         _ => {}
@@ -780,6 +862,7 @@ pub fn view(base: &Base, size: &Size, audience: &Audience, decision: &Decision) 
         "counts": size.counts.iter().map(|(l, n)| json!({ "label": l, "count": n })).collect::<Vec<_>>(),
         "total": size.total(),
         "updated_at": size.updated_at,
+        "stopped_at": size.stopped_at,
         "live": size.live,
         "access": { "open": decision.is_open(), "why": decision.why(base) },
         "audience": audience,
@@ -1017,5 +1100,82 @@ mod tests {
         assert_eq!(v["access"]["open"], false);
         assert!(v["access"]["why"].as_str().unwrap().contains("role"));
         assert_eq!(v["scope"], "infra:read");
+    }
+
+    #[test]
+    fn knowledge_is_as_fresh_as_its_newest_sync_or_upload_not_its_settings() {
+        use common::knowledge::sources::{Source, SourceError, Status};
+        use common::knowledge::{Base as Kb, FileMeta, FileStatus};
+        // The base was made 13 days ago; its settings never changed since.
+        let bases = vec![Kb {
+            id: "kb".into(),
+            created_at: "2026-11-11T05:43:57.828717375+00:00".into(),
+            updated_at: "2026-11-11T05:43:57.828721806+00:00".into(),
+            ..Default::default()
+        }];
+        let src = |id: &str, kb: &str, ok: &str| Source {
+            id: id.into(),
+            kb_id: kb.into(),
+            status: Status::Ready,
+            last_sync_at: ok.into(),
+            last_success_at: ok.into(),
+            ..Default::default()
+        };
+        let mut sources = vec![
+            src("a", "kb", "2026-11-24T04:48:57+00:00"),
+            src("b", "kb", "2026-11-24T05:07:58+00:00"),
+            // A source of a deleted base doesn't count.
+            src("gone", "deleted", "2026-11-25T00:00:00+00:00"),
+        ];
+        let file = |kb: &str, at: &str, status: FileStatus, source: &str| FileMeta {
+            kb_id: kb.into(),
+            uploaded_at: at.into(),
+            status,
+            source_id: source.into(),
+            ..Default::default()
+        };
+        let mut files = vec![
+            file("kb", "2026-11-20T00:00:00+00:00", FileStatus::Ready, ""),
+            // Still being read, and a synced item: neither is an upload taken in.
+            file(
+                "kb",
+                "2026-11-24T06:00:00+00:00",
+                FileStatus::Processing,
+                "",
+            ),
+            file("kb", "2026-11-24T06:00:00+00:00", FileStatus::Ready, "a"),
+        ];
+        let (updated, stopped) = knowledge_times(&bases, &sources, &files);
+        assert_eq!(updated.as_deref(), Some("2026-11-24T05:07:58+00:00"));
+        assert_eq!(stopped, None);
+
+        // A newer ready upload wins; fractions of a second compare as times.
+        files.push(file(
+            "kb",
+            "2026-11-24T05:07:58.5+00:00",
+            FileStatus::Ready,
+            "",
+        ));
+        let (updated, _) = knowledge_times(&bases, &sources, &files);
+        assert_eq!(updated.as_deref(), Some("2026-11-24T05:07:58.5+00:00"));
+
+        // A sync that stopped is said, and what the base holds keeps its time.
+        sources[1].status = Status::Error;
+        sources[1].last_sync_at = "2026-11-24T05:37:58+00:00".into();
+        sources[1].error = Some(SourceError {
+            message: "Confluence stopped answering.".into(),
+            at: "2026-11-24T05:38:01+00:00".into(),
+            ..Default::default()
+        });
+        let (updated, stopped) = knowledge_times(&bases, &sources, &files);
+        assert_eq!(updated.as_deref(), Some("2026-11-24T05:07:58.5+00:00"));
+        assert_eq!(stopped.as_deref(), Some("2026-11-24T05:38:01+00:00"));
+
+        // A paused source isn't syncing, so it hasn't stopped.
+        sources[1].paused = true;
+        assert_eq!(knowledge_times(&bases, &sources, &files).1, None);
+
+        // Nothing synced or uploaded yet: not read yet, whatever the settings say.
+        assert_eq!(knowledge_times(&bases, &[], &[]), (None, None));
     }
 }
