@@ -194,9 +194,15 @@ fn slug(s: &str) -> String {
     out.trim_end_matches('-').chars().take(60).collect()
 }
 
-/// The chosen steps in order. Each request goes with the services its
-/// handler uses and the callbacks they start (right after it). Then the
-/// blocks keep the model's order except where the code says otherwise:
+/// The chosen steps in order. Each outside service (and the callbacks it
+/// starts) goes right after the request whose handler calls it most
+/// directly (the fewest files between the handler and the call); when
+/// several are as close, the first. A route that forwards every path under
+/// it (a proxy, `/api/*`) reaches its service on every request through it,
+/// so that service goes after the last of the requests in a row through
+/// that file's catch-all routes, with a note that the earlier ones use it
+/// too. Then the blocks keep the model's
+/// order except where the code says otherwise:
 /// - a screen comes before the requests it makes itself (a request belongs
 ///   to the latest screen the model lists that makes it, so a form's own
 ///   call belongs to the form, not the page around it);
@@ -206,8 +212,12 @@ fn slug(s: &str) -> String {
 ///   contradict an order already set).
 ///
 /// Returns (order, linked per step, how many blocks the code had nothing
-/// to say about, so their place is the model's).
-pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) {
+/// to say about, so their place is the model's, and notes for steps placed
+/// after a run of requests).
+pub fn order(
+    refs: &[String],
+    table: &Value,
+) -> (Vec<String>, Vec<bool>, usize, BTreeMap<String, String>) {
     let chosen: BTreeSet<&str> = refs.iter().map(String::as_str).collect();
     let pos = |id: &str| refs.iter().position(|r| r == id).unwrap_or(usize::MAX);
     let kind = |id: &str| table[id]["kind"].as_str().unwrap_or("").to_string();
@@ -227,18 +237,33 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
             .as_array()
             .is_some_and(|w| w.iter().any(|x| x == to))
     };
+    // How deep behind a request's handler a service is (unknown: far).
+    let near = |r: &str, o: &str| table[r]["near"][o].as_u64().unwrap_or(u64::MAX);
+    let requests_in_order: Vec<&String> = refs.iter().filter(|r| kind(r) == "request").collect();
+    // The request each service goes with: the closest, then the first.
+    let owner = |o: &str| -> Option<&String> {
+        requests_in_order
+            .iter()
+            .filter(|r| links(r, o))
+            .min_by_key(|r| near(r, o))
+            .copied()
+    };
     // Blocks: a request with its services and their callbacks; a screen
     // with the services it uses that no chosen request leads to; anything
     // else alone.
     let mut block_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut blocks: Vec<Vec<String>> = Vec::new();
-    for r in refs.iter().filter(|r| kind(r) == "request") {
+    for r in &requests_in_order {
+        let r = *r;
         let i = blocks.len();
         let mut b = vec![r.clone()];
         block_of.insert(r.clone(), i);
         for o in next(r) {
             let k = kind(&o);
-            if (k == "outside" || k == "async") && !block_of.contains_key(&o) {
+            if (k == "outside" || k == "async")
+                && !block_of.contains_key(&o)
+                && owner(&o).is_none_or(|w| w == r)
+            {
                 block_of.insert(o.clone(), i);
                 b.push(o.clone());
                 for a in next(&o) {
@@ -368,6 +393,84 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
             indeg[b] = indeg[b].saturating_sub(1);
         }
     }
+    // A route that forwards every path under it: what it reaches goes after
+    // the last request through it in a row (screens between them don't
+    // break the row; a request through another route does).
+    let mut notes = BTreeMap::new();
+    let routes: Vec<Option<String>> = blocks
+        .iter()
+        .map(|b| {
+            let r = b.first()?;
+            (kind(r) == "request")
+                .then(|| table[r.as_str()]["all"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .collect();
+    let route = |b: usize| routes[b].as_deref();
+    let is_request = |b: usize| blocks[b].first().is_some_and(|r| kind(r) == "request");
+    let is_request: Vec<bool> = (0..blocks.len()).map(is_request).collect();
+    let mut k = 0;
+    while k < seq.len() {
+        let Some(v) = route(seq[k]) else {
+            k += 1;
+            continue;
+        };
+        let mut last = k;
+        let mut run = vec![k];
+        for j in k + 1..seq.len() {
+            if route(seq[j]) == Some(v) {
+                last = j;
+                run.push(j);
+            } else if is_request[seq[j]] {
+                break;
+            }
+        }
+        if last > k {
+            let mut moved = Vec::new();
+            for j in run.iter().filter(|j| **j < last) {
+                let b = seq[*j];
+                moved.extend(blocks[b].drain(1..));
+            }
+            for x in moved {
+                if !blocks[seq[last]].contains(&x) {
+                    notes.insert(
+                        x.clone(),
+                        "The requests before it through the same route use it too.".to_string(),
+                    );
+                    blocks[seq[last]].push(x);
+                }
+            }
+        }
+        k = last + 1;
+    }
+    // A service's callback (a webhook it calls) reports on what the
+    // requests to it started: it comes after the last request in the
+    // journey that uses that service.
+    for k in 0..seq.len() {
+        let b = seq[k];
+        let calls_back: Vec<(String, String)> = blocks[b]
+            .iter()
+            .filter(|o| kind(o) == "outside")
+            .flat_map(|o| {
+                blocks[b]
+                    .iter()
+                    .filter(|a| kind(a) == "async" && links(o, a))
+                    .map(|a| (o.clone(), a.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (o, a) in calls_back {
+            let last = (k + 1..seq.len()).rev().find(|j| {
+                blocks[seq[*j]]
+                    .first()
+                    .is_some_and(|r| kind(r) == "request" && links(r, &o))
+            });
+            if let Some(j) = last {
+                blocks[b].retain(|x| x != &a);
+                blocks[seq[j]].push(a);
+            }
+        }
+    }
     let mut placed = Vec::new();
     let mut linked = Vec::new();
     let mut by_model = 0;
@@ -380,7 +483,7 @@ pub fn order(refs: &[String], table: &Value) -> (Vec<String>, Vec<bool>, usize) 
             linked.push(k == 0 || j > 0 || constrained[*i]);
         }
     }
-    (placed, linked, by_model)
+    (placed, linked, by_model, notes)
 }
 
 /// The model's answer, checked against the candidate table: the journeys
@@ -425,7 +528,11 @@ pub fn check(answer: &Value, todo: &Value) -> (Vec<Value>, Checked) {
             notes.insert(r.clone(), note);
             refs.push(r);
         }
-        let (mut ordered, mut linked, by_model) = order(&refs, table);
+        let (mut ordered, mut linked, by_model, placed_notes) = order(&refs, table);
+        for (r, n) in placed_notes {
+            let prev = notes.get(&r).cloned().unwrap_or_default();
+            notes.insert(r, plain(&format!("{prev} {n}"), 240));
+        }
         rep.model_ordered += by_model;
         if ordered.len() > MAX_STEPS {
             rep.cut += ordered.len() - MAX_STEPS;
@@ -842,13 +949,127 @@ mod tests {
         t["table"]["S1"]["next"] = json!(["R2", "R1"]);
         t["table"]["R2"] = json!({"key": "req:GET /csrf", "kind": "request", "view": "r:4", "label": "GET /csrf", "next": [],
             "evidence": [{"file": "harbor-web/lib/csrf.ts", "line": 1, "token": "/csrf", "from": 1, "window": ["fetch('/csrf')"]}]});
-        let (o, l, m) = order(
+        let (o, l, m, _) = order(
             &["R1".into(), "X1".into(), "S1".into(), "R2".into()],
             &t["table"],
         );
         assert_eq!(o, ["S1", "R2", "R1", "X1"]);
         assert_eq!(l, [true; 4]);
         assert_eq!(m, 0);
+    }
+
+    fn request(key: &str, view: &str, next: Value, near: Value, all: bool) -> Value {
+        let mut r = json!({"key": key, "kind": "request", "view": view, "label": key, "next": next, "near": near,
+            "evidence": [{"file": "harbor-web/lib/api.ts", "line": 1, "token": "fetch", "from": 1, "window": ["fetch()"]}]});
+        if all {
+            r["all"] = json!("harbor-api/src/proxy.module.ts");
+        }
+        r
+    }
+
+    #[test]
+    fn a_service_goes_with_the_request_whose_handler_calls_it_most_directly() {
+        let mut t = todo();
+        // R1's handler reaches Okta three files down; R2's handler calls it
+        // itself.
+        t["table"]["S1"]["next"] = json!(["R1", "R2"]);
+        t["table"]["R1"] = request(
+            "req:POST /api/session",
+            "r:1",
+            json!(["X1"]),
+            json!({"X1": 3}),
+            false,
+        );
+        t["table"]["R2"] = request(
+            "req:POST /api/verify",
+            "r:2",
+            json!(["X1"]),
+            json!({"X1": 0}),
+            false,
+        );
+        let (o, _, _, notes) = order(
+            &["S1".into(), "R1".into(), "R2".into(), "X1".into()],
+            &t["table"],
+        );
+        assert_eq!(o, ["S1", "R1", "R2", "X1"]);
+        assert!(notes.is_empty());
+        // As close: the first request that reaches it.
+        t["table"]["R1"]["near"] = json!({"X1": 0});
+        let (o, _, _, _) = order(
+            &["S1".into(), "R1".into(), "R2".into(), "X1".into()],
+            &t["table"],
+        );
+        assert_eq!(o, ["S1", "R1", "X1", "R2"]);
+    }
+
+    #[test]
+    fn a_service_callback_comes_after_the_last_request_to_that_service() {
+        let mut t = todo();
+        // Two requests to the payment service; it calls a webhook back.
+        t["table"]["S1"]["next"] = json!(["R1", "R2"]);
+        t["table"]["R1"] = request(
+            "req:POST /pay/session",
+            "r:1",
+            json!(["X1"]),
+            json!({"X1": 0}),
+            false,
+        );
+        t["table"]["R2"] = request(
+            "req:POST /pay/confirm",
+            "r:2",
+            json!(["X1"]),
+            json!({"X1": 0}),
+            false,
+        );
+        t["table"]["X1"]["next"] = json!(["A1"]);
+        t["table"]["A1"] = json!({"key": "hook:POST /webhook", "kind": "async", "view": "r:9", "label": "webhook", "next": [],
+            "evidence": [{"file": "harbor-api/src/webhook.ts", "line": 1, "token": "webhook", "from": 1, "window": ["@Post('webhook')"]}]});
+        let refs: Vec<String> = ["S1", "R1", "X1", "A1", "R2"].map(String::from).to_vec();
+        let (o, _, _, _) = order(&refs, &t["table"]);
+        assert_eq!(o, ["S1", "R1", "X1", "R2", "A1"]);
+    }
+
+    #[test]
+    fn a_proxy_service_goes_after_the_last_request_through_the_proxy() {
+        let mut t = todo();
+        // Three requests in a row through one route that forwards every
+        // path, then one through another route.
+        t["table"]["S1"]["next"] = json!(["R1", "R2", "R3", "R4"]);
+        for (id, path) in [("R1", "/proxy/a"), ("R2", "/proxy/b"), ("R3", "/proxy/c")] {
+            t["table"][id] = request(
+                &format!("req:ALL {path}"),
+                "r:7",
+                json!(["X1"]),
+                json!({"X1": 0}),
+                true,
+            );
+        }
+        t["table"]["R4"] = request("req:GET /me", "r:8", json!([]), json!({}), false);
+        let refs: Vec<String> = ["S1", "R1", "R2", "R3", "X1", "R4"]
+            .map(String::from)
+            .to_vec();
+        let (o, l, _, notes) = order(&refs, &t["table"]);
+        assert_eq!(o, ["S1", "R1", "R2", "R3", "X1", "R4"]);
+        assert_eq!(l, [true; 6]);
+        assert_eq!(
+            notes.get("X1").map(String::as_str),
+            Some("The requests before it through the same route use it too.")
+        );
+        // A screen between requests through the proxy doesn't break the row.
+        t["table"]["S2"]["next"] = json!(["R2"]);
+        t["table"]["S1"]["next"] = json!(["R1", "S2"]);
+        let with_screen: Vec<String> = ["S1", "R1", "X1", "S2", "R2", "R4"]
+            .map(String::from)
+            .to_vec();
+        let (o, _, _, _) = order(&with_screen, &t["table"]);
+        assert_eq!(o, ["S1", "R1", "S2", "R2", "X1", "R4"]);
+        // A route that names one path keeps the service after its own request.
+        for id in ["R1", "R2", "R3"] {
+            t["table"][id].as_object_mut().unwrap().remove("all");
+        }
+        let (o, _, _, notes) = order(&refs, &t["table"]);
+        assert_eq!(o, ["S1", "R1", "X1", "R2", "R3", "R4"]);
+        assert!(notes.is_empty());
     }
 
     #[test]

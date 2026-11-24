@@ -452,3 +452,51 @@ test('second-round closers: split services, direct and URL-map calls, SDK calls,
   assert.deepEqual(signup.evidence[0], { file: 'marina-web/components/SignupForm.tsx', line: 1, token: 'SignupForm' });
   for (const x of c.list) for (const e of x.evidence) assert.ok(read.lines(e.file)[e.line - 1].includes(e.token), `${x.key}: ${e.file}:${e.line}`);
 });
+
+test('run order: calls come in the order the code runs them, however deep', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-order-'));
+  const files = {
+    // The sign-up call sits two files down, the sign-in call in the form
+    // itself, and a mutation hook is declared before the one that runs
+    // first: the order is the statements', not the depth's or the hooks'.
+    'web/SignupForm.tsx': `import { signIn } from 'next-auth/react';
+import { useVerify } from './useVerify';
+import {
+  fetchSignup,
+} from './fetchSignup';
+
+export function SignupForm() {
+  const { mutate: verify } = useVerify();
+  const onSubmit = async (data) => {
+    await fetchSignup(data);
+    await signIn('credentials', data);
+    verify(data);
+  };
+  return <form onSubmit={onSubmit} />;
+}
+`,
+    'web/fetchSignup.ts': `export async function fetchSignup(data) {
+  return fetch('/api/signup', { method: 'POST', body: JSON.stringify(data) });
+}
+`,
+    'web/useVerify.ts': `export function useVerify() {
+  return useMutation({ mutationFn: () => fetch('/api/verify') });
+}
+`,
+  };
+  for (const [f, t] of Object.entries(files)) {
+    fs.mkdirSync(path.join(dir, path.dirname(f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), t);
+  }
+  const r = F.reader(dir);
+  const ix = { syms: new Map() };
+  const signup = F.useLine(ix, r, 'web/SignupForm.tsx', 'web/fetchSignup.ts', ['fetchSignup']);
+  const verify = F.useLine(ix, r, 'web/SignupForm.tsx', 'web/useVerify.ts', ['useVerify']);
+  assert.deepEqual([signup, verify], [10, 12]);
+  // The chains: sign-up (form line 10, then its fetch on line 2), sign-in
+  // (the form's own line 11), verify (form line 12, then line 2).
+  const chains = { signup: [signup, 2], signin: [11], verify: [verify, 2] };
+  const sorted = Object.entries(chains).sort(([, a], [, b]) => F.runOrder(a, b)).map(([k]) => k);
+  assert.deepEqual(sorted, ['signup', 'signin', 'verify']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
