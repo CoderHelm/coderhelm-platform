@@ -63,12 +63,15 @@ pub struct Close {
     pub topic: String,
 }
 
-/// Two tickets taking opposite approaches to one topic: both are flagged.
+/// Two tickets flagged on both, neither closed: they take opposite
+/// approaches to one topic (`opposed`), or the matcher and the small check
+/// disagree on whether they are the same work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opposed {
     pub a: String,
     pub b: String,
     pub topic: String,
+    pub opposed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -282,6 +285,7 @@ pub fn plan(cands: &[Candidate], same: &[(usize, usize)], opposed: &[(usize, usi
             a: cands[x].key.clone(),
             b: cands[y].key.clone(),
             topic: topic_of(&cands[x]),
+            opposed: true,
         });
     }
     out.close.sort_by(|a, b| a.dup.cmp(&b.dup));
@@ -298,38 +302,74 @@ fn topic_of(c: &Candidate) -> String {
     t
 }
 
-/// The decision for one family: the matcher, then the small check when a
-/// model is there (without one, only what the matcher reads as the same).
+/// The decision when both readers are in: a pair closes only when the
+/// matcher and the small check both read it as the same topic. A pair one
+/// of them reads as the same and the other doesn't is flagged; a pair
+/// either reads as opposed, or a removal against a fix of what either reads
+/// as the same, is flagged as opposed. Nothing else is touched.
+pub fn agreed(
+    cands: &[Candidate],
+    matcher_same: &[(usize, usize)],
+    model_same: &[(usize, usize)],
+    model_opposed: &[(usize, usize)],
+) -> Plan {
+    let norm = |&(a, b): &(usize, usize)| (a.min(b), a.max(b));
+    let m: Vec<(usize, usize)> = matcher_same.iter().map(norm).collect();
+    let k: Vec<(usize, usize)> = model_same.iter().map(norm).collect();
+    let mut opposed: Vec<(usize, usize)> = model_opposed.iter().map(norm).collect();
+    for p in m.iter().chain(k.iter()) {
+        if removes(&cands[p.0].title) != removes(&cands[p.1].title) && !opposed.contains(p) {
+            opposed.push(*p);
+        }
+    }
+    let both: Vec<(usize, usize)> = m
+        .iter()
+        .filter(|p| k.contains(p) && !opposed.contains(p))
+        .copied()
+        .collect();
+    let mut out = plan(cands, &both, &opposed);
+    let mut unsure: Vec<(usize, usize)> = m
+        .iter()
+        .chain(k.iter())
+        .filter(|p| !both.contains(p) && !opposed.contains(p))
+        .copied()
+        .collect();
+    unsure.sort();
+    unsure.dedup();
+    for (a, b) in unsure {
+        let (x, y) = if rank(&cands[a]) <= rank(&cands[b]) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        out.flag.push(Opposed {
+            a: cands[x].key.clone(),
+            b: cands[y].key.clone(),
+            topic: topic_of(&cands[x]),
+            opposed: false,
+        });
+    }
+    out.flag
+        .sort_by(|a, b| (&a.a, &a.b, a.opposed).cmp(&(&b.a, &b.b, b.opposed)));
+    out.flag.dedup_by(|a, b| a.a == b.a && a.b == b.b);
+    out
+}
+
+/// The decision for one family: the matcher and the small check, closing
+/// only where they agree ([`agreed`]). Without a model, or without its
+/// answer, nothing is decided.
 pub async fn decide(cands: &[Candidate], judge: Option<&dyn Judge>) -> Plan {
+    let Some(j) = judge.filter(|_| cands.len() > 1) else {
+        return Plan::default();
+    };
     let (near_same, near_maybe) = matcher_pairs(cands);
-    let mut same = near_same.clone();
-    let answer = match judge.filter(|_| cands.len() > 1) {
-        Some(j) => {
-            let mut close: Vec<(usize, usize)> = near_same.clone();
-            close.extend(near_maybe.iter().copied());
-            j.judge(SYSTEM, &prompt(cands, &close)).await.ok()
-        }
-        None => None,
+    let mut close: Vec<(usize, usize)> = near_same.clone();
+    close.extend(near_maybe.iter().copied());
+    let Ok(text) = j.judge(SYSTEM, &prompt(cands, &close)).await else {
+        return Plan::default();
     };
-    let opposed = match answer {
-        Some(text) => {
-            let (s, o) = read_answer(Some(&text), cands);
-            for p in s {
-                if !same.contains(&p) {
-                    same.push(p);
-                }
-            }
-            o
-        }
-        // No check: a removal against a fix of what the matcher calls the
-        // same topic is read as opposed, so nothing is closed on a guess.
-        None => near_same
-            .iter()
-            .copied()
-            .filter(|&(a, b)| removes(&cands[a].title) != removes(&cands[b].title))
-            .collect(),
-    };
-    plan(cands, &same, &opposed)
+    let (model_same, model_opposed) = read_answer(Some(&text), cands);
+    agreed(cands, &near_same, &model_same, &model_opposed)
 }
 
 /// What a closed duplicate's pull request and ticket are told.
@@ -339,6 +379,20 @@ pub fn close_comment(keep: &str, topic: &str) -> String {
         keep.trim(),
         topic.trim()
     )
+}
+
+/// What each of two flagged tickets is told ([`Opposed`]).
+pub fn flagged_comment(f: &Opposed, other: &str) -> String {
+    if f.opposed {
+        flag_comment(other, &f.topic)
+    } else {
+        format!(
+            "This ticket and {} may be the same work ({}), but CoderHelm's two checks disagree, so it closed neither. \
+             A person on the team decides whether one of them goes.",
+            other.trim(),
+            f.topic.trim()
+        )
+    }
 }
 
 /// What each of two opposed tickets is told.
@@ -431,6 +485,45 @@ mod tests {
         assert!(p.close.is_empty(), "{p:?}");
         // Still known as covered: a person's start of ABC-3 is refused.
         assert_eq!(p.covering("ABC-3").map(|c| c.keep.as_str()), Some("ABC-1"));
+    }
+
+    #[test]
+    fn only_pairs_both_readers_call_the_same_close() {
+        let v = vec![
+            c("ABC-1", "Fix the alt text", "completed", "01A", true),
+            c("ABC-2", "Fix the alt text again", "running", "01B", true),
+            c(
+                "ABC-3",
+                "Fix the alt text once more",
+                "running",
+                "01C",
+                true,
+            ),
+            c("ABC-4", "Delete the alt helper", "running", "01D", true),
+        ];
+        // Both: 1-2. Matcher only: 1-3. Check only: 2-3. 1-4 fix vs delete.
+        let p = agreed(&v, &[(0, 1), (0, 2), (0, 3)], &[(1, 0), (1, 2)], &[]);
+        let closes: Vec<(&str, &str)> = p
+            .close
+            .iter()
+            .map(|c| (c.dup.as_str(), c.keep.as_str()))
+            .collect();
+        assert_eq!(closes, vec![("ABC-2", "ABC-1")]);
+        let flags: Vec<(&str, &str, bool)> = p
+            .flag
+            .iter()
+            .map(|f| (f.a.as_str(), f.b.as_str(), f.opposed))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("ABC-1", "ABC-3", false),
+                ("ABC-1", "ABC-4", true),
+                ("ABC-2", "ABC-3", false),
+            ]
+        );
+        assert!(flagged_comment(&p.flag[0], "ABC-3").contains("disagree"));
+        assert!(flagged_comment(&p.flag[1], "ABC-4").contains("opposite"));
     }
 
     #[test]

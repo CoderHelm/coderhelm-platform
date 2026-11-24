@@ -236,7 +236,7 @@ pub async fn sweep(state: &AppState, team_id: &str, root: &str, apply: bool) -> 
         for (on, other) in [(&f.a, &f.b), (&f.b, &f.a)] {
             let say = common::conversation::Say::note(
                 &format!("followup_opposed_{}", other.to_ascii_lowercase()),
-                fd::flag_comment(other, &f.topic),
+                fd::flagged_comment(&f, other),
             );
             match super::conversation::jira_at(
                 state,

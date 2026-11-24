@@ -378,7 +378,7 @@ pub fn plan(
 }
 
 /// The teams of this install (their `META` records).
-async fn teams(state: &WorkerState) -> Vec<String> {
+pub(crate) async fn teams(state: &WorkerState) -> Vec<String> {
     use aws_sdk_dynamodb::types::AttributeValue;
     let mut out = Vec::new();
     let mut start = None;
