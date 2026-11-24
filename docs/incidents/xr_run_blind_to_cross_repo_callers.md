@@ -1,0 +1,5 @@
+# xr. `xr_run_blind_to_cross_repo_callers`
+
+**What happened:** Runs planned and reviewed one repository at a time. A ticket renamed the booking endpoint in the booking service; the plan named the route and its test, and the review passed it. The website and the phone app both called that endpoint, behind the slip page and the slip screen. The app map that Chat and `/mcp` read had both callers with their lines, and no run asked it.
+
+**The guarantee:** Every pass that reads code (the planner, the coder and the CI fix, test fix, incident and alarm rounds that run through it, and the reviewer) is offered the app map's lookups, `map_impact` among them, beside the code graph's. A plan whose files reach other repositories on the map goes back once until design.md names them under `## Affected elsewhere`, and a citation there that isn't a real file and line on the map is left out. The reviewer is shown each endpoint the diff changes that other repositories call, with every caller's file:line, to raise as a breaking change. With no map, or one more than a month old, nothing is offered and nothing is said.

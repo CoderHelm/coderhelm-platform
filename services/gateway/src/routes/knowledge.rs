@@ -686,10 +686,17 @@ pub async fn list_bases(
         out.push(base_json(b, &files, &sources));
     }
     out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // The App map is a source too, read directly rather than as passages:
+    // its own card (`app_map::knowledge_card`).
+    let (limits_now, app_map) = tokio::join!(
+        items_per_source(&state, &claims.team_id),
+        super::app_map::knowledge_card(&state, &claims),
+    );
     Ok(Json(json!({
         "bases": out,
         "can_manage": claims.holder().holds("knowledge_manage"),
-        "limits": limits(items_per_source(&state, &claims.team_id).await),
+        "limits": limits(limits_now),
+        "app_map": app_map,
     })))
 }
 

@@ -1877,7 +1877,16 @@ pub async fn generate_review(
     usage: &mut TokenUsage,
 ) -> Result<ReviewOutput, String> {
     let graph_tools = graph.map(|g| g.tools()).unwrap_or_default();
-    let system = review_system_prompt(owner, repo, instructions_block, !graph_tools.is_empty());
+    let mut system = review_system_prompt(
+        owner,
+        repo,
+        instructions_block,
+        graph.is_some_and(|g| g.has_graph_tools()),
+    );
+    // The app map's lookups, for callers in other repositories (`run_map`).
+    if let Some(m) = graph.and_then(|g| g.map()) {
+        system.push_str(&m.prompt_line(super::code_graph::Role::Reviewer));
+    }
     let live_context = format!(
         "{}{}",
         history

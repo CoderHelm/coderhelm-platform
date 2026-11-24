@@ -724,6 +724,68 @@ pub struct MapIndex {
     pub issues: Vec<IndexIssue>,
     /// Whether the map has a Health section at all.
     pub has_health: bool,
+    /// What the map covers, counted at build time (the Knowledge page's
+    /// card). Empty on an index written before it was counted.
+    #[serde(default)]
+    pub coverage: Coverage,
+}
+
+/// What a map covers, for the Knowledge page: screens per app, outside
+/// services, cloud links and repositories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Whether this was counted (an older index has no counts).
+    #[serde(default)]
+    pub counted: bool,
+    #[serde(default)]
+    pub screens: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub outside_services: u32,
+    /// Links between code and the cloud: what deploys or starts it.
+    #[serde(default)]
+    pub cloud_links: u32,
+    #[serde(default)]
+    pub repos: u32,
+    #[serde(default)]
+    pub journeys: u32,
+}
+
+impl Coverage {
+    pub fn of(graph: &Value) -> Self {
+        let kind = |id: &str| {
+            id.strip_prefix("n:")
+                .and_then(|n| arr(graph, "nodes").find(|x| x["id"] == n))
+                .and_then(|x| x["kind"].as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let screens = screen_counts(graph)
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            counted: true,
+            screens,
+            outside_services: arr(graph, "nodes")
+                .filter(|n| n["kind"] == "external")
+                .count() as u32,
+            cloud_links: arr(graph, "links")
+                .filter(|l| {
+                    [&l["a"], &l["b"]]
+                        .iter()
+                        .any(|e| e.as_str().is_some_and(|id| kind(id) == "infra"))
+                })
+                .count() as u32,
+            repos: arr(&graph["meta"], "repos")
+                .count()
+                .max(repo_of_folder(graph).len()) as u32,
+            journeys: arr(graph, "flows").count() as u32,
+        }
+    }
 }
 
 impl MapIndex {
@@ -768,6 +830,7 @@ impl MapIndex {
             repo_parts,
             issues,
             has_health: graph.get("health").is_some(),
+            coverage: Coverage::of(graph),
         }
     }
 
@@ -1463,6 +1526,486 @@ pub fn search(graph: &Value, q: &str) -> Value {
     })
 }
 
+// ── Impact: what changing one thing reaches ───────────────────────────────
+
+/// Most items [`impact`] lists in each of its groups; the rest are counted.
+pub const IMPACT_CAP: usize = 20;
+
+/// The methods an endpoint target may start with (`POST /slips/:id`).
+const METHODS: [&str; 9] = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY", "ALL",
+];
+
+/// What an impact target named.
+enum Target {
+    /// Endpoints by index in `routes`.
+    Endpoints(Vec<usize>),
+    File(String),
+    Part(String),
+}
+
+/// `file:line` of the first evidence on `v`, else `fallback` at line 1, so
+/// every citation is a real place.
+fn first_at(v: &Value, fallback: &str) -> String {
+    arr(v, "evidence")
+        .find_map(|e| {
+            Some(format!(
+                "{}:{}",
+                e["file"].as_str().filter(|f| !f.is_empty())?,
+                e["line"].as_u64().unwrap_or(1).max(1)
+            ))
+        })
+        .unwrap_or_else(|| format!("{fallback}:1"))
+}
+
+fn route_at(r: &Value) -> String {
+    format!(
+        "{}:{}",
+        r["f"].as_str().unwrap_or(""),
+        r["l"].as_u64().unwrap_or(1).max(1)
+    )
+}
+
+fn resolve(graph: &Value, target: &str) -> Option<Target> {
+    let t = target.trim().trim_start_matches("./");
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(i) = t.strip_prefix("r:").and_then(|i| i.parse::<usize>().ok()) {
+        return graph["routes"].get(i).map(|_| Target::Endpoints(vec![i]));
+    }
+    let same_path = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    if let Some((m, p)) = t.split_once(char::is_whitespace) {
+        let m = m.to_ascii_uppercase();
+        let p = p.trim();
+        if METHODS.contains(&m.as_str()) && p.starts_with('/') {
+            let hits: Vec<usize> = arr(graph, "routes")
+                .enumerate()
+                .filter(|(_, r)| {
+                    r["p"].as_str().is_some_and(|rp| same_path(rp, p))
+                        && r["m"]
+                            .as_str()
+                            .is_some_and(|rm| rm.eq_ignore_ascii_case(&m) || m == "ANY")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            return (!hits.is_empty()).then_some(Target::Endpoints(hits));
+        }
+    }
+    if arr(graph, "files").any(|f| f["p"] == t) {
+        return Some(Target::File(t.to_string()));
+    }
+    let id = t.strip_prefix("n:").unwrap_or(t);
+    if node(graph, id).is_some() {
+        return Some(Target::Part(id.to_string()));
+    }
+    if t.starts_with('/') {
+        let hits: Vec<usize> = arr(graph, "routes")
+            .enumerate()
+            .filter(|(_, r)| r["p"].as_str().is_some_and(|rp| same_path(rp, t)))
+            .map(|(i, _)| i)
+            .collect();
+        if !hits.is_empty() {
+            return Some(Target::Endpoints(hits));
+        }
+    }
+    None
+}
+
+/// Keeps the first [`IMPACT_CAP`] of `items`, counting the rest in `more`.
+fn capped(items: Vec<Value>, key: &str, more: &mut Map<String, Value>) -> Value {
+    if items.len() > IMPACT_CAP {
+        more.insert(key.into(), json!(items.len() - IMPACT_CAP));
+    }
+    json!(items.into_iter().take(IMPACT_CAP).collect::<Vec<_>>())
+}
+
+/// What changing one thing reaches across the whole app, in one answer:
+/// `target` is a file on the map (`harbor-api/src/bookings.js`), an
+/// endpoint (`POST /slips/:id/bookings`, or `r:0`) or a part's id. Lists the
+/// callers in other repositories and in the same one, the screens that use
+/// it (with their app and whether they need a signed-in user), the journeys
+/// that pass through it, the outside services it reaches (and those that
+/// call it), the cloud resources that start or deploy it, and the data links
+/// (tables). Every item cites a `file:line`; each group holds at most
+/// [`IMPACT_CAP`] items and counts the rest in `more`. `None` when the map
+/// has no such thing.
+pub fn impact(graph: &Value, target: &str) -> Option<Value> {
+    let t = resolve(graph, target)?;
+    let routes: Vec<&Value> = arr(graph, "routes").collect();
+    let file_of = |p: &str| arr(graph, "files").find(|f| f["p"] == p);
+    let repo_of = |p: &str| {
+        file_of(p)
+            .and_then(|f| f["r"].as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| p.split('/').next().unwrap_or("").to_string())
+    };
+    // What the target is, as map ids and file paths.
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    let mut eps: Vec<usize> = Vec::new();
+    let mut parts: BTreeSet<String> = BTreeSet::new();
+    let described = match &t {
+        Target::Endpoints(is) => {
+            eps = is.clone();
+            for i in is {
+                if let Some(f) = routes[*i]["f"].as_str() {
+                    paths.insert(f.to_string());
+                }
+            }
+            let r = routes[is[0]];
+            json!({"kind": "endpoint", "method": r["m"], "path": r["p"], "name": r["name"], "at": route_at(r)})
+        }
+        Target::File(p) => {
+            paths.insert(p.clone());
+            let f = file_of(p).cloned().unwrap_or(Value::Null);
+            json!({"kind": "file", "path": p, "name": f["name"], "part": f["n"], "repo": f["r"], "at": format!("{p}:1")})
+        }
+        Target::Part(id) => {
+            parts.insert(id.clone());
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for c in arr(graph, "nodes") {
+                    if let (Some(cid), Some(p)) = (c["id"].as_str(), c["parent"].as_str()) {
+                        if parts.contains(p) && parts.insert(cid.to_string()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            for f in arr(graph, "files") {
+                if f["n"].as_str().is_some_and(|n| parts.contains(n)) {
+                    if let Some(p) = f["p"].as_str() {
+                        paths.insert(p.to_string());
+                    }
+                }
+            }
+            let n = node(graph, id).unwrap_or(Value::Null);
+            let at = paths
+                .iter()
+                .next()
+                .map(|p| format!("{p}:1"))
+                .unwrap_or_else(|| first_at(&n, ""));
+            json!({"kind": "part", "id": id, "label": n["label"], "part_kind": n["kind"], "at": at})
+        }
+    };
+    if !matches!(t, Target::Endpoints(_)) {
+        eps = routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["f"].as_str().is_some_and(|f| paths.contains(f)))
+            .map(|(i, _)| i)
+            .collect();
+    }
+    let ep_ids: BTreeSet<String> = eps.iter().map(|i| format!("r:{i}")).collect();
+    let ep_labels: BTreeSet<String> = eps
+        .iter()
+        .map(|i| {
+            format!(
+                "{} {}",
+                routes[*i]["m"].as_str().unwrap_or(""),
+                routes[*i]["p"].as_str().unwrap_or("")
+            )
+            .to_ascii_uppercase()
+        })
+        .collect();
+    let only_endpoints = matches!(t, Target::Endpoints(_));
+    let inside = |id: &str| -> bool {
+        if let Some(p) = id.strip_prefix("f:") {
+            return paths.contains(p);
+        }
+        if let Some(n) = id.strip_prefix("n:") {
+            return parts.contains(n);
+        }
+        ep_ids.contains(id)
+    };
+    let home: BTreeSet<String> = paths.iter().map(|p| repo_of(p)).collect();
+    let kind_of = |id: &str| -> String {
+        id.strip_prefix("n:")
+            .and_then(|n| node(graph, n))
+            .and_then(|n| n["kind"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    // A link into an endpoint target counts when it is for one of them.
+    let for_endpoint = |l: &Value| -> bool {
+        if !only_endpoints {
+            return true;
+        }
+        if l["route"].as_str().is_some_and(|r| ep_ids.contains(r)) {
+            return true;
+        }
+        // An import of the endpoint's file is not a call to the endpoint.
+        if !matches!(l["k"].as_str(), Some("http" | "webhook")) {
+            return false;
+        }
+        let labels: Vec<String> = arr(l, "labels")
+            .filter_map(|x| x.as_str().map(|s| s.to_ascii_uppercase()))
+            .collect();
+        labels.is_empty() || labels.iter().any(|x| ep_labels.contains(x))
+    };
+
+    let mut elsewhere = Vec::new();
+    let mut here = Vec::new();
+    let mut outside = Vec::new();
+    let mut cloud = Vec::new();
+    let mut data = Vec::new();
+    for l in arr(graph, "links") {
+        let (a, b) = (l["a"].as_str().unwrap_or(""), l["b"].as_str().unwrap_or(""));
+        let k = l["k"].as_str().unwrap_or("");
+        let (a_in, b_in) = (inside(a), inside(b));
+        if a_in == b_in && k != "data" {
+            continue;
+        }
+        let other = if a_in { b } else { a };
+        let other_kind = kind_of(other);
+        match k {
+            "data" if a_in || b_in => data.push(json!({
+                "tables": l["tables"],
+                "from": describe_ref(graph, a)["path"],
+                "to": describe_ref(graph, b)["path"],
+                "labels": l["labels"],
+                "at": first_at(l, a.strip_prefix("f:").unwrap_or("")),
+            })),
+            "data" => {}
+            _ if other_kind == "infra" => cloud.push(json!({
+                "id": other,
+                "label": describe_ref(graph, other)["label"],
+                "resource": node(graph, other.trim_start_matches("n:")).map(|n| n["resource"].clone()).unwrap_or(Value::Null),
+                "how": k,
+                "labels": l["labels"],
+                "starts": l["unit"].as_str().map(|u| describe_ref(graph, u)["label"].clone()),
+                "at": first_at(l, if a_in { a } else { b }.trim_start_matches("f:")),
+            })),
+            "nav" => {}
+            _ if b_in && other.starts_with("f:") && for_endpoint(l) => {
+                let p = other.trim_start_matches("f:");
+                let repo = repo_of(p);
+                let item = json!({
+                    "from": p,
+                    "repo": repo,
+                    "kind": k,
+                    "labels": l["labels"],
+                    "at": first_at(l, p),
+                });
+                if home.contains(&repo) {
+                    here.push(item);
+                } else {
+                    elsewhere.push(item);
+                }
+            }
+            _ if other_kind == "external" && (a_in || for_endpoint(l)) => {
+                let n = node(graph, other.trim_start_matches("n:")).unwrap_or(Value::Null);
+                outside.push(json!({
+                    "id": other,
+                    "label": n["label"],
+                    "vendor": n["vendor"],
+                    "direction": if a_in { "uses" } else { "calls in" },
+                    "via": if a_in { a } else { b }.trim_start_matches("f:"),
+                    "labels": l["labels"],
+                    "at": first_at(l, if a_in { a } else { b }.trim_start_matches("f:")),
+                }));
+            }
+            _ => {}
+        }
+    }
+    // Outside services reached a few steps away, through what the target
+    // imports or calls.
+    let mut seen: BTreeSet<String> = paths.iter().map(|p| format!("f:{p}")).collect();
+    let mut front: Vec<String> = seen.iter().cloned().collect();
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for l in arr(graph, "links") {
+            let (a, b) = (l["a"].as_str().unwrap_or(""), l["b"].as_str().unwrap_or(""));
+            if !front.iter().any(|f| f == a) || !matches!(l["k"].as_str(), Some("import" | "http"))
+            {
+                continue;
+            }
+            if b.starts_with("f:") && seen.len() < 400 && seen.insert(b.to_string()) {
+                next.push(b.to_string());
+            } else if kind_of(b) == "external"
+                && !inside(a)
+                && !outside.iter().any(|o| o["id"] == b)
+            {
+                let n = node(graph, b.trim_start_matches("n:")).unwrap_or(Value::Null);
+                outside.push(json!({
+                    "id": b,
+                    "label": n["label"],
+                    "vendor": n["vendor"],
+                    "direction": "reaches",
+                    "via": a.trim_start_matches("f:"),
+                    "labels": l["labels"],
+                    "at": first_at(l, a.trim_start_matches("f:")),
+                }));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        front = next;
+    }
+    // Screens: the screen is one of the files, stands on one (or on one of
+    // the endpoints), or a navigator among them registers it.
+    let screens: Vec<Value> = arr(graph, "screens")
+        .filter(|s| {
+            let behind = arr(s, "behind").any(|b| b["id"].as_str().is_some_and(&inside));
+            let file = s["file"].as_str().is_some_and(|f| paths.contains(f));
+            let nav = arr(&s["nav"], "evidence")
+                .next()
+                .and_then(|e| e["file"].as_str())
+                .is_some_and(|f| paths.contains(f));
+            if only_endpoints {
+                arr(s, "behind").any(|b| b["id"].as_str().is_some_and(|i| ep_ids.contains(i)))
+            } else {
+                behind || file || nav
+            }
+        })
+        .map(|s| {
+            let mut x = screen_json(s);
+            x["gate"] = s["nav"]["gate"].clone();
+            x["at"] = json!(if s["nav"].is_object() {
+                first_at(&s["nav"], s["file"].as_str().unwrap_or(""))
+            } else {
+                format!("{}:1", s["file"].as_str().unwrap_or(""))
+            });
+            x
+        })
+        .collect();
+    let screen_ids: BTreeSet<String> = screens
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_string))
+        .collect();
+    // Journeys passing through it: a step stands on it, or on one of its
+    // screens, or cites one of its files.
+    let journeys: Vec<Value> = arr(graph, "flows")
+        .filter_map(|f| {
+            let mut steps = Vec::new();
+            let mut cites = Vec::new();
+            for (i, s) in arr(f, "steps").enumerate() {
+                let r = s["ref"].as_str().unwrap_or("");
+                let cited: Vec<String> = arr(s, "evidence")
+                    .filter_map(|e| {
+                        Some(format!(
+                            "{}:{}",
+                            e["file"].as_str()?,
+                            e["line"].as_u64().unwrap_or(1).max(1)
+                        ))
+                    })
+                    .collect();
+                let on_cite = !only_endpoints
+                    && arr(s, "evidence")
+                        .any(|e| e["file"].as_str().is_some_and(|p| paths.contains(p)));
+                if inside(r) || screen_ids.contains(r) || on_cite {
+                    steps.push(i + 1);
+                    cites.extend(cited);
+                }
+            }
+            (!steps.is_empty()).then(|| {
+                if cites.is_empty() {
+                    cites.extend(paths.iter().next().map(|p| format!("{p}:1")));
+                }
+                cites.dedup();
+                json!({"id": f["id"], "title": f["title"], "steps": steps, "at": cites})
+            })
+        })
+        .collect();
+    let endpoints: Vec<Value> = eps
+        .iter()
+        .map(|i| {
+            let r = routes[*i];
+            json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "at": route_at(r)})
+        })
+        .collect();
+    let elsewhere_repos: BTreeSet<String> = elsewhere
+        .iter()
+        .filter_map(|c| c["repo"].as_str().map(str::to_string))
+        .collect();
+    let mut more = Map::new();
+    Some(json!({
+        "target": described,
+        "endpoints": capped(endpoints, "endpoints", &mut more),
+        "callers_elsewhere": capped(elsewhere, "callers_elsewhere", &mut more),
+        "other_repos": elsewhere_repos,
+        "callers_here": capped(here, "callers_here", &mut more),
+        "screens": capped(screens, "screens", &mut more),
+        "journeys": capped(journeys, "journeys", &mut more),
+        "outside_services": capped(outside, "outside_services", &mut more),
+        "cloud": capped(cloud, "cloud", &mut more),
+        "data": capped(data, "data", &mut more),
+        "more": more,
+    }))
+}
+
+/// Every `file:line` the map itself names: its evidence (parts, links,
+/// screens, journey steps), its endpoints, and the first line of each file.
+pub fn known_places(graph: &Value) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for f in arr(graph, "files") {
+        if let Some(p) = f["p"].as_str() {
+            out.insert(format!("{p}:1"));
+        }
+    }
+    for r in arr(graph, "routes") {
+        out.insert(route_at(r));
+    }
+    let mut stack = vec![graph];
+    while let Some(x) = stack.pop() {
+        match x {
+            Value::Object(o) => {
+                if let Some(ev) = o.get("evidence").and_then(|e| e.as_array()) {
+                    for e in ev {
+                        if let Some(f) = e["file"].as_str() {
+                            out.insert(format!("{f}:{}", e["line"].as_u64().unwrap_or(1).max(1)));
+                        }
+                    }
+                }
+                stack.extend(o.values().filter(|v| v.is_object() || v.is_array()));
+            }
+            Value::Array(a) => stack.extend(a.iter().filter(|v| v.is_object() || v.is_array())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `cite` (`path:line`) is a real place on the map: one the map
+/// itself names ([`known_places`], what its lookups cite), or a line within
+/// the code lines it counted for that file. `repo` (`owner/name`) places a
+/// path written from the repository's root, or one starting with
+/// `owner/name/`.
+pub fn real_cite(graph: &Value, repo: &str, cite: &str) -> bool {
+    real_cite_in(&known_places(graph), graph, repo, cite)
+}
+
+/// [`real_cite`] with the map's places read once.
+pub fn real_cite_in(places: &BTreeSet<String>, graph: &Value, repo: &str, cite: &str) -> bool {
+    let Some((path, line)) = cite.trim().rsplit_once(':') else {
+        return false;
+    };
+    let Ok(line) = line.trim().parse::<u64>() else {
+        return false;
+    };
+    let path = path.trim().trim_matches('`');
+    let on_map = if arr(graph, "files").any(|f| f["p"] == path) {
+        Some(path.to_string())
+    } else {
+        map_path(graph, repo, path)
+    };
+    let Some(p) = on_map else {
+        return false;
+    };
+    if line == 0 {
+        return false;
+    }
+    if places.contains(&format!("{p}:{line}")) {
+        return true;
+    }
+    let lines = arr(graph, "files")
+        .find(|f| f["p"] == p.as_str())
+        .and_then(|f| f["loc"].as_u64())
+        .unwrap_or(0);
+    line <= lines
+}
+
 /// The top-level parts a set of map ids belongs to (for a mini map).
 pub fn parts_of(graph: &Value, ids: &[String]) -> BTreeSet<String> {
     let part_of_file = |p: &str| {
@@ -1566,14 +2109,19 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
 // ── The map lookups (Chat and /mcp) ────────────────────────────────────────
 
 /// The map lookups, in the order they are offered.
-pub const TOOLS: [&str; 6] = [
+pub const TOOLS: [&str; 7] = [
     "map_overview",
     "map_find",
     "map_part",
     "map_screen",
     "map_file",
     "map_flow",
+    "map_impact",
 ];
+
+/// What `map_impact` is told to be for, the same words everywhere it is
+/// offered (runs, Chat and `/mcp`).
+pub const IMPACT_DESCRIPTION: &str = "Before changing shared code or an endpoint: everything on the app map that changing one thing reaches, in one answer. Give a file's path on the map (repository folder first, like harbor-api/src/bookings.js), an endpoint (method and path, like POST /slips/:id/bookings) or a part's id. Returns the callers in other repositories and in the same one, the screens that use it (their app and whether they need a signed-in user), the journeys that pass through it, the outside services it reaches or that call it, the cloud resources that start or deploy it, and the data links (tables), each with the file:line it rests on.";
 
 pub fn is_tool(name: &str) -> bool {
     TOOLS.contains(&name)
@@ -1589,6 +2137,7 @@ pub fn tool_defs() -> Vec<Value> {
         json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
         json!({"name": TOOLS[4], "description": "One file by its path on the app map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
         json!({"name": TOOLS[5], "description": "One journey on the app map (a user flow such as sign in, password reset or checkout), by its id or the words of its title (like \"mobile sign in\"): every step in order, from the screen through the requests, the server code and outside services to the next screen, each with what happens there and the file:line it cites. Use it to walk someone through a flow.", "input_schema": obj(json!({"journey": {"type": "string"}}), &["journey"])}),
+        json!({"name": TOOLS[6], "description": IMPACT_DESCRIPTION, "input_schema": obj(json!({"target": {"type": "string", "description": "A file's path on the map, an endpoint (METHOD /path) or a part's id."}}), &["target"])}),
     ]
 }
 
@@ -1644,6 +2193,9 @@ impl Lookups {
                 .unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
             "map_flow" => flow_view(&self.graph, &s("journey")).unwrap_or_else(
                 || json!({"error": "No journey has that id or title; map_overview lists them."}),
+            ),
+            "map_impact" => impact(&self.graph, &s("target")).unwrap_or_else(
+                || json!({"error": "Nothing on the map has that path, endpoint or id; use map_find for them."}),
             ),
             _ => json!({"error": "Unknown lookup."}),
         };
@@ -1708,6 +2260,10 @@ pub fn label(name: &str, input: &Value) -> String {
         "map_screen" => format!("Followed the screen {} on the app map", s("screen")),
         "map_file" => format!("Opened {} on the app map", s("path")),
         "map_flow" => format!("Walked through the journey {} on the app map", s("journey")),
+        "map_impact" => format!(
+            "Looked up what changing {} reaches on the app map",
+            s("target")
+        ),
         _ => name.to_string(),
     }
 }
@@ -2513,6 +3069,231 @@ mod tests {
             search(&g, "harbor-mobile signin")["screens"][0]["gate"],
             "signed_out"
         );
+    }
+
+    /// The harbor map with one journey through the booking.
+    pub(crate) fn harbor_with_journey() -> Value {
+        let mut g = harbor();
+        g["flows"] = json!([{
+            "id": "book-a-slip", "title": "Book a slip", "description": "",
+            "steps": [
+                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        g
+    }
+
+    /// Every `at` in an answer, wherever it is.
+    fn cites_in(v: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![v];
+        while let Some(x) = stack.pop() {
+            match x {
+                Value::Object(o) => {
+                    match o.get("at") {
+                        Some(Value::String(s)) => out.push(s.clone()),
+                        Some(Value::Array(a)) => {
+                            out.extend(a.iter().filter_map(|s| s.as_str().map(str::to_string)))
+                        }
+                        _ => {}
+                    }
+                    stack.extend(o.values());
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// An endpoint other repositories call: its callers there with their
+    /// lines, the screens on it with their app and gate, the journey through
+    /// it; every citation a real place on the map.
+    #[test]
+    fn impact_of_an_endpoint_names_its_callers_elsewhere() {
+        let g = harbor_with_journey();
+        let v = impact(&g, "POST /slips/:id/bookings").unwrap();
+        assert_eq!(v["target"]["kind"], "endpoint");
+        assert_eq!(v["target"]["at"], "harbor-api/src/bookings.js:5");
+        let callers: Vec<(&str, &str)> = v["callers_elsewhere"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["from"].as_str().unwrap(), c["at"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            callers,
+            [
+                (
+                    "harbor-mobile/app/screens/SlipDetail.tsx",
+                    "harbor-mobile/app/screens/SlipDetail.tsx:6"
+                ),
+                ("harbor-web/lib/slips.ts", "harbor-web/lib/slips.ts:2"),
+            ]
+        );
+        assert_eq!(v["other_repos"], json!(["harbor-mobile", "harbor-web"]));
+        // An import of the endpoint's file is not a call to it.
+        assert_eq!(v["callers_here"], json!([]));
+        let screens = v["screens"].as_array().unwrap();
+        let detail = screens
+            .iter()
+            .find(|s| s["id"] == "screen:mobile:/(Stack)/SlipDetail")
+            .unwrap();
+        assert_eq!(detail["app"], "harbor-mobile");
+        assert_eq!(detail["gate"], "signed_in");
+        assert_eq!(
+            detail["at"],
+            "harbor-mobile/app/navigation/RootNavigator.tsx:18"
+        );
+        assert!(screens.iter().any(|s| s["id"] == "screen:web:/slips/:id"));
+        assert_eq!(v["journeys"][0]["id"], "book-a-slip");
+        assert_eq!(v["journeys"][0]["steps"], json!([2]));
+        // Stripe is reached through billing.js, which bookings.js imports.
+        let stripe = v["outside_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "n:stripe")
+            .unwrap();
+        assert_eq!(stripe["direction"], "reaches");
+        assert_eq!(stripe["at"], "harbor-api/src/billing.js:1");
+        for c in cites_in(&v) {
+            assert!(real_cite(&g, "", &c), "{c} isn't a real place");
+        }
+        // The same endpoint by its id; a path alone; nothing for a stranger.
+        assert_eq!(
+            impact(&g, "r:0").unwrap()["callers_elsewhere"],
+            v["callers_elsewhere"]
+        );
+        assert_eq!(
+            impact(&g, "/slips/:id/bookings").unwrap()["target"]["kind"],
+            "endpoint"
+        );
+        assert!(impact(&g, "DELETE /slips/:id/bookings").is_none());
+        assert!(impact(&g, "nowhere.js").is_none());
+    }
+
+    /// A file behind a screen and a journey: the screen with its gate, the
+    /// journey's step, and what the file reaches.
+    #[test]
+    fn impact_of_a_file_behind_a_screen_and_a_journey() {
+        let g = harbor_with_journey();
+        let v = impact(&g, "harbor-web/lib/slips.ts").unwrap();
+        assert_eq!(v["target"]["kind"], "file");
+        let s = &v["screens"][0];
+        assert_eq!(s["id"], "screen:web:/slips/:id");
+        assert_eq!(s["at"], "harbor-web/app/slips/[id]/page.tsx:1");
+        assert_eq!(v["journeys"][0]["id"], "book-a-slip");
+        assert_eq!(v["journeys"][0]["steps"], json!([2]));
+        assert!(v["journeys"][0]["at"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("harbor-web/lib/slips.ts:2")));
+        // The page that imports it is its caller in the same repository.
+        assert_eq!(
+            v["callers_here"][0]["from"],
+            "harbor-web/app/slips/[id]/page.tsx"
+        );
+        // The mobile sign-in screen is registered by the navigator file.
+        let nav = impact(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
+        let gates: Vec<(&str, &str)> = nav["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap(), s["gate"].as_str().unwrap()))
+            .collect();
+        assert!(gates.contains(&("SignIn", "signed_out")));
+        assert!(gates.contains(&("Slips", "signed_in")));
+        // The table a nightly job writes.
+        let e = impact(&g, "harbor-api/src/entities/slip.entity.ts").unwrap();
+        assert_eq!(e["data"][0]["tables"], json!(["slip"]));
+        assert_eq!(e["data"][0]["at"], "harbor-infra/dags/nightly_slips.py:6");
+        for c in cites_in(&v)
+            .into_iter()
+            .chain(cites_in(&nav))
+            .chain(cites_in(&e))
+        {
+            assert!(real_cite(&g, "", &c), "{c} isn't a real place");
+        }
+    }
+
+    /// The code a Lambda runs: the function that deploys it and the bucket
+    /// whose uploads start it, each where the infrastructure says so.
+    #[test]
+    fn impact_of_a_lambda_names_what_deploys_and_starts_it() {
+        let g = harbor();
+        let v = impact(&g, "harbor-api/src/receipts/index.js").unwrap();
+        let cloud = v["cloud"].as_array().unwrap();
+        let deploy = cloud.iter().find(|c| c["how"] == "deploy").unwrap();
+        assert_eq!(deploy["id"], "n:infra-harbor-receipts-function");
+        assert_eq!(deploy["resource"], "lambda");
+        assert_eq!(deploy["at"], "harbor-infra/main.tf:5");
+        let trigger = cloud.iter().find(|c| c["how"] == "trigger").unwrap();
+        assert_eq!(trigger["id"], "n:infra-bucket-uploads");
+        assert_eq!(trigger["labels"], json!(["s3:ObjectCreated:*"]));
+        assert_eq!(trigger["starts"], "Harbor receipts function");
+        assert_eq!(trigger["at"], "harbor-infra/main.tf:28");
+        assert_eq!(v["outside_services"][0]["label"], "Amazon S3");
+        // A webhook endpoint: the outside service that calls in.
+        let w = impact(&g, "POST /webhooks/stripe").unwrap();
+        let s = &w["outside_services"].as_array().unwrap();
+        assert!(s
+            .iter()
+            .any(|o| o["id"] == "n:stripe" && o["direction"] == "calls in"));
+        // A part: everything in it.
+        let p = impact(&g, "api").unwrap();
+        assert_eq!(p["target"]["kind"], "part");
+        assert_eq!(p["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(p["other_repos"], json!(["harbor-mobile", "harbor-web"]));
+        // The lookup, its label and its place among the tools.
+        let mut l = Lookups::new(g);
+        let (found, label) = l.lookup("map_impact", &json!({"target": "POST /slips/:id/bookings"}));
+        assert!(found.get("error").is_none());
+        assert_eq!(
+            label,
+            "Looked up what changing POST /slips/:id/bookings reaches on the app map"
+        );
+        assert!(l.parts().contains(&"api".to_string()));
+        assert!(l.lookup("map_impact", &json!({"target": "x"})).0["error"].is_string());
+        assert!(is_tool("map_impact"));
+        assert!(tool_defs().iter().any(
+            |d| d["name"] == "map_impact" && d["input_schema"]["required"] == json!(["target"])
+        ));
+    }
+
+    /// A citation is a file on the map and a line inside it.
+    #[test]
+    fn real_citations_are_files_and_lines_on_the_map() {
+        let g = harbor();
+        assert!(real_cite(&g, "", "harbor-api/src/bookings.js:5"));
+        assert!(real_cite(&g, "harbor/harbor-api", "src/bookings.js:5"));
+        assert!(real_cite(&g, "", "harbor/harbor-api/src/bookings.js:5"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js:9999"));
+        assert!(!real_cite(&g, "", "harbor-api/src/nowhere.js:1"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js:0"));
+    }
+
+    /// What the Knowledge page's card counts, from the map at build time.
+    #[test]
+    fn coverage_counts_screens_services_cloud_and_repos() {
+        let c = MapIndex::of(&harbor()).coverage;
+        assert!(c.counted);
+        assert_eq!(
+            c.screens,
+            BTreeMap::from([("harbor-mobile".into(), 3), ("web".into(), 1)])
+        );
+        assert_eq!(c.outside_services, 4);
+        assert_eq!(c.cloud_links, 2);
+        assert_eq!(c.repos, 4);
+        // An index written before the counts reads as not counted.
+        let old: MapIndex = serde_json::from_value(json!({
+            "repos": {}, "files": [], "repo_parts": {}, "issues": [], "has_health": false
+        }))
+        .unwrap();
+        assert!(!old.coverage.counted);
     }
 
     /// A journey: found by id or title words, each step described with

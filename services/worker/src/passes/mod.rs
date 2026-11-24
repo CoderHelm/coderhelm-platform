@@ -1439,6 +1439,7 @@ mod run_end;
 pub(crate) mod run_files;
 pub mod run_guard;
 pub(crate) mod run_lists;
+pub mod run_map;
 pub(crate) mod scope_ledger;
 mod security;
 pub mod security_fixes;
