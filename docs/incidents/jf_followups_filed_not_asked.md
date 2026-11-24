@@ -4,7 +4,7 @@
 
 **The guarantee:**
 - The planner reads the team's ticket tracker as a capability, with its tool. For Jira, that is the Coderhelm app on the site: it reads tickets, comments, and files follow-up tickets. For a team without Jira, it is GitHub issues when the App may write issues.
-- When a ticket's deliverable is follow-up tickets, the plan lists them in `followup_tickets` and CoderHelm files them itself, right after the plan:
+- When a ticket's deliverable is follow-up tickets, the plan lists them in `followup_tickets` and CoderHelm files them itself, once the plan is final (see `jg_followups_once_per_topic`):
   - in the source ticket's Jira project;
   - linked to the source with the site's "relates to" link type;
   - typed by the project: the type asked for, else Task, else the project's first standard type. Jira keeps a project's default type in its issue type scheme, which the app's scopes can't read;
@@ -16,4 +16,4 @@
 - A run that codes nothing and leaves nothing for a person once its follow-ups are filed ends `completed`, with its findings on the ticket. A plan written before `followup_tickets` existed files the list under proposal.md's follow-up heading, so Retry on such a run files its drafts.
 - No ask, hold or plan step may ask a person to connect, or give access to, a system the run already reaches. The stop judge's rules refuse such an answer and re-ask, and its last pass turns one that still asks into a proceed. The plan's person steps and next step that ask it become CoderHelm's.
 
-**Where it's enforced:** `common::followup_tickets` (drafts, ids, tracker, refusal words, the comment), `common::connected_access` (`asks_to_connect`, in `common::stop_judge::{validate, judge}`), `common::host_steps::tracker`; in the worker, `passes::followups::{planner_caps, reaches, settle, nothing_left, finish_delivered}`, called from `passes::mod` before the fix-location question is judged, and `passes::stop_judge::decide` (the picture's `connected`); in the Jira app, `followups.js` and `createTicketHandler`'s follow-up path (`fileFollowup`).
+**Where it's enforced:** `common::followup_tickets` (drafts, ids, tracker, refusal words, the comment), `common::connected_access` (`asks_to_connect`, in `common::stop_judge::{validate, judge}`), `common::host_steps::tracker`; in the worker, `passes::followups::{planner_caps, reaches, prepare, file, nothing_left, finish_delivered}`, called from `passes::mod` (read before the fix-location question is judged, filed on the final plan), and `passes::stop_judge::decide` (the picture's `connected`); in the Jira app, `followups.js` and `createTicketHandler`'s follow-up path (`fileFollowup`).

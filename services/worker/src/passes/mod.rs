@@ -3197,6 +3197,34 @@ async fn run_passes(
     // updated" path.
     let context_changed = lookup.hash_changed;
     let previous_ticket_text = lookup.previous_ticket_text;
+    // An earlier run's plan that was the ticket's deliverable (findings,
+    // with the follow-up tickets they call for) is taken up again by a new
+    // run of the unchanged ticket, whatever else its key says (history,
+    // lessons): the findings stand, and the new run files what is left of
+    // its drafts instead of planning again and drafting them anew.
+    let findings_plan = if !resumed_plan
+        && !msg.same_run()
+        && !context_changed
+        && dep_run.is_none()
+        && lookup
+            .plan
+            .as_ref()
+            .is_none_or(|p| !p.tasks.contains("- [ ]"))
+    {
+        let prefix = openspec_prefix(
+            &msg.team_id,
+            &msg.ticket_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+        );
+        match lookup.plan.clone() {
+            Some(p) => Some(p),
+            None => load_cached_plan_files(state, &prefix).await,
+        }
+        .filter(followups::reusable_findings)
+    } else {
+        None
+    };
     let mut plan_was_reused = false;
     let mut plan_result = if let Some(run) = dep_run.as_ref() {
         // The bump list is the plan: one task per lockfile, kept as this
@@ -3219,6 +3247,21 @@ async fn run_passes(
         plan
     } else if let Some(plan) = own_plan {
         plan_was_reused = true;
+        plan
+    } else if let Some(plan) = findings_plan {
+        plan_was_reused = true;
+        info!(
+            run_id,
+            "Taking up the earlier run's findings: filing its follow-ups instead of planning again"
+        );
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "Took up the earlier run's findings and follow-up drafts instead of planning again",
+        )
+        .await;
+        plan::mark_plan_run(state, msg, run_id).await;
         plan
     } else if let Some(plan) = lookup.plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
@@ -3632,31 +3675,59 @@ async fn run_passes(
         return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
     }
 
-    // Follow-up tickets the ticket's deliverable asks for are CoderHelm's:
-    // filed now in the source ticket's tracker, once (a retry files nothing
-    // twice), with one comment listing them; and a plan step that asks a
-    // person to connect a system CoderHelm reaches becomes CoderHelm's. A
-    // plan that codes nothing and leaves nothing for a person then ends
-    // here, delivered, instead of asking.
+    // Follow-up tickets the ticket's deliverable asks for are CoderHelm's,
+    // and a plan step that asks a person to connect a system CoderHelm
+    // reaches becomes CoderHelm's. They are read here and filed only once
+    // the plan is final: when the run ends with it (below), or right before
+    // it is implemented (`followups_due` at the implement pass). A plan a
+    // later check sends back files nothing, so planning again never files
+    // twice; and filing reads what is already filed for the ticket first,
+    // so a retry never files a topic twice either.
+    let mut followups_due: Option<followups::Due> = None;
     if !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
         && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
     {
         let proposal = plan_result.proposal.clone();
         if let Some(decision) = plan_result.fix.as_mut() {
-            let settled = followups::settle(state, &github, msg, run_id, decision, &proposal).await;
-            if let Some(settled) = settled.filter(|_| {
-                matches!(
-                    fix_route,
-                    fix_location::Route::OutsideOnly | fix_location::Route::Ask
-                ) && followups::nothing_left(decision, &plan_result.tasks, &msg.answers)
-            }) {
+            followups_due = followups::prepare(state, msg, run_id, decision, &proposal).await;
+            // A plan whose deliverable is its findings (an audit, a
+            // question, follow-ups with nothing left for a person) is
+            // final and ends here, delivered: the follow-ups filed, the
+            // findings on the ticket. It never asks, and never plans again.
+            if matches!(
+                fix_route,
+                fix_location::Route::OutsideOnly | fix_location::Route::Ask
+            ) && followups::delivers_findings(
+                decision,
+                &plan_result.tasks,
+                &msg.answers,
+                followups_due.is_some(),
+            ) {
+                let settled = match followups_due.take() {
+                    Some(due) => Some(
+                        followups::file(
+                            state,
+                            &github,
+                            msg,
+                            run_id,
+                            decision,
+                            due,
+                            Some(followups::Judge {
+                                provider: &provider,
+                                usage,
+                            }),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
                 followups::finish_delivered(
                     state,
                     msg,
                     run_id,
                     decision,
                     &proposal,
-                    &settled,
+                    settled.as_ref(),
                     usage,
                     start,
                     &used_mcp_ids,
@@ -3771,10 +3842,65 @@ async fn run_passes(
             fix_judged.as_ref(),
         )
         .await;
-        close_memory(state, agent_memory.take()).await;
-        if let NoCodeEnd::PlanAgain(why) = ended {
-            return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
+        match ended {
+            // Sent back: this plan files nothing.
+            NoCodeEnd::PlanAgain(why) => {
+                close_memory(state, agent_memory.take()).await;
+                return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
+            }
+            // The run ends with this plan: it is final, so its follow-ups
+            // are filed now, once.
+            NoCodeEnd::Ended => {
+                if let Some(due) = followups_due.take() {
+                    followups::file(
+                        state,
+                        &github,
+                        msg,
+                        run_id,
+                        &mut decision,
+                        due,
+                        Some(followups::Judge {
+                            provider: &provider,
+                            usage,
+                        }),
+                    )
+                    .await;
+                }
+            }
+            NoCodeEnd::Delivered => {
+                let settled = match followups_due.take() {
+                    Some(due) => Some(
+                        followups::file(
+                            state,
+                            &github,
+                            msg,
+                            run_id,
+                            &mut decision,
+                            due,
+                            Some(followups::Judge {
+                                provider: &provider,
+                                usage,
+                            }),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                followups::finish_delivered(
+                    state,
+                    msg,
+                    run_id,
+                    &decision,
+                    &plan_result.proposal,
+                    settled.as_ref(),
+                    usage,
+                    start,
+                    &used_mcp_ids,
+                )
+                .await;
+            }
         }
+        close_memory(state, agent_memory.take()).await;
         return Ok(());
     }
 
@@ -4026,6 +4152,24 @@ async fn run_passes(
 
         close_memory(state, agent_memory.take()).await;
         return Ok(());
+    }
+
+    // The plan passed every check and is the one implemented: its
+    // follow-ups are filed now, once.
+    if let (Some(due), Some(decision)) = (followups_due.take(), plan_result.fix.as_mut()) {
+        followups::file(
+            state,
+            &github,
+            msg,
+            run_id,
+            decision,
+            due,
+            Some(followups::Judge {
+                provider: &provider,
+                usage,
+            }),
+        )
+        .await;
     }
 
     // --- Pass 3: Implement ---
@@ -9089,6 +9233,11 @@ enum NoCodeEnd {
     /// a person must act. The plan is CoderHelm's to make again, for this
     /// reason.
     PlanAgain(String),
+    /// Nothing was left for a person because the plan's deliverable is its
+    /// findings (`followups::delivers_findings`): nothing was posted yet,
+    /// and the run ends delivered (`followups::finish_delivered`), never
+    /// planning again.
+    Delivered,
 }
 
 /// When the run started (RFC 3339): its first attempt when the message
@@ -9169,6 +9318,17 @@ async fn finish_without_code(
                     &gaps,
                     &chrono::Utc::now().to_rfc3339(),
                 ));
+            }
+            // Findings are a deliverable, not a plan that stopped short.
+            common::role_wait::Ending::PlanAgain
+                if followups::delivers_findings(
+                    decision,
+                    tasks,
+                    &msg.answers,
+                    followups::asks_to_file(decision),
+                ) =>
+            {
+                return NoCodeEnd::Delivered;
             }
             common::role_wait::Ending::PlanAgain => {
                 return NoCodeEnd::PlanAgain(format!(
@@ -13806,6 +13966,16 @@ pub(crate) async fn plan_files_of(
         .filter(|p| !p.tasks.trim().is_empty())
 }
 
+/// Whether a cached plan file may be empty and the plan still whole: a plan
+/// that codes nothing (an audit, findings) writes no spec, and may write no
+/// design. Only the proposal and the tasks make a plan. A plan once held
+/// eight follow-up drafts in its proposal and an empty spec.md; every read
+/// of it came back "no plan", so a Retry planned again and filed the drafts
+/// a second time in other words.
+fn may_be_empty(name: &str) -> bool {
+    matches!(name, "spec.md" | "design.md")
+}
+
 async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<plan::PlanResult> {
     let mut files = std::collections::HashMap::new();
     for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
@@ -13821,7 +13991,7 @@ async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<pla
             Ok(output) => {
                 let bytes = output.body.collect().await.ok()?;
                 let text = String::from_utf8(bytes.to_vec()).ok()?;
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && !may_be_empty(name) {
                     return None;
                 }
                 files.insert(*name, text);

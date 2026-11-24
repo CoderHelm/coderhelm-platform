@@ -77,3 +77,37 @@ test("a description keeps its paragraphs and line breaks", () => {
   assert.deepEqual(doc.content[0].content.map((n) => n.type), ["text", "hardBreak", "text"]);
   assert.equal(doc.content[1].content[0].text, "Next paragraph");
 });
+
+test("the list path answers the follow-ups already filed, with their text, and drops non-keys", () => {
+  const issues = [
+    {
+      key: "ABC-96",
+      fields: {
+        summary: "Fix alt on the unused components",
+        status: { name: "To Do" },
+        description: {
+          type: "doc",
+          version: 1,
+          content: [
+            { type: "paragraph", content: [{ type: "text", text: "In Hero.tsx" }, { type: "hardBreak" }, { type: "text", text: "and ContactCard." }] },
+          ],
+        },
+      },
+    },
+    { key: "not a key", fields: { summary: "x" } },
+  ];
+  assert.deepEqual(f.listedIssues(issues), [
+    { key: "ABC-96", summary: "Fix alt on the unused components", description: "In Hero.tsx\nand ContactCard.", status: "To Do" },
+  ]);
+  assert.deepEqual(f.listedIssues(undefined), []);
+  assert.equal(f.adfText("plain", 3), "pla");
+});
+
+test("a list request files nothing: the handler takes it before the create path", () => {
+  const src = require("node:fs").readFileSync(require.resolve("../src/index.js"), "utf8");
+  const handler = src.slice(src.indexOf("exports.createTicketHandler"));
+  assert.ok(handler.includes("listing ? await listFollowups(body) : await fileFollowup(body)"));
+  const list = src.slice(src.indexOf("async function listFollowups"), src.indexOf("async function fileFollowup"));
+  assert.ok(!list.includes('route`/rest/api/3/issue`'), "the list path never creates");
+  assert.ok(list.includes("/rest/api/3/search/jql"));
+});

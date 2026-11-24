@@ -13,7 +13,7 @@
 //! follow-ups are filed by CoderHelm in the source ticket's project, once
 //! per draft across runs (`followup_tickets::draft_id`, the app's label
 //! search), linked and labelled, with one comment listing the keys
-//! (`followups::settle`); a plan written before that field files the list
+//! (`followups::prepare`, `followups::file`); a plan written before that field files the list
 //! under proposal.md's follow-up heading, so Retry on the stuck run files
 //! its eight; a run that codes nothing and leaves nothing for a person ends
 //! delivered (`followups::nothing_left`, `finish_delivered`); and no ask,
@@ -232,20 +232,21 @@ fn once_filed_the_run_ends_delivered_and_asks_no_one() {
     for k in &keys {
         assert!(comment.contains(&format!("{k}: ")), "{k}: {comment}");
     }
-    // The pipeline files before the stop judge looks at the question, and
-    // ends delivered there.
+    // The pipeline settles the plan's filing before the stop judge looks at
+    // the question, and a findings plan ends delivered there (filed only
+    // then: see `jg_followups_once_per_topic`).
     let src = include_str!("../mod.rs");
-    let settle = src
-        .find("followups::settle(state, &github, msg, run_id, decision, &proposal)")
-        .expect("settle is called");
+    let prepare = src
+        .find("followups::prepare(state, msg, run_id, decision, &proposal)")
+        .expect("prepare is called");
     let judge = src
         .find("\"the plan doesn't settle where the fix belongs: {}\"")
         .expect("the fix-location judge");
     assert!(
-        settle < judge,
-        "follow-ups are filed before the question is judged"
+        prepare < judge,
+        "follow-ups are settled before the question is judged"
     );
-    assert!(src[settle..judge].contains("followups::finish_delivered("));
+    assert!(src[prepare..judge].contains("followups::finish_delivered("));
 }
 
 #[test]

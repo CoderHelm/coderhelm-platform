@@ -349,6 +349,31 @@ async function linkToSource(newKey, sourceKey, requestedType) {
 }
 
 /**
+ * The follow-ups already filed from `followup.source` in `projectKey`
+ * (read only): key, summary, description text and status.
+ */
+async function listFollowups(body) {
+  const { projectKey, followup } = body;
+  const jql = followups.dedupeJql(projectKey, followup && followup.source);
+  if (!jql) {
+    return answer(400, { error: "projectKey and followup.source must be keys" });
+  }
+  const found = await api.asApp().requestJira(route`/rest/api/3/search/jql`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jql,
+      maxResults: followups.MAX_DEDUPE,
+      fields: ["summary", "description", "status"],
+    }),
+  });
+  if (!found.ok) {
+    return answer(found.status, { error: "search_failed", details: await jiraError(found), project: projectKey });
+  }
+  return answer(200, { followup: 1, issues: followups.listedIssues((await found.json()).issues) });
+}
+
+/**
  * Files one follow-up ticket of `followup.source` in `projectKey`, once:
  * checks the app's permissions, returns the ticket already filed for the
  * same draft, else creates it with the picked issue type and links it.
@@ -455,14 +480,16 @@ exports.createTicketHandler = async (request) => {
     // A follow-up of a ticket a run worked on: checked, deduplicated, typed
     // and linked (fileFollowup). Only with the shared secret.
     if (body.followup) {
-      if (!projectKey || !summary) {
+      // The list of follow-ups already filed: read only, no summary.
+      const listing = body.followup.list === true;
+      if (!projectKey || (!summary && !listing)) {
         return answer(400, { error: "projectKey and summary required" });
       }
       const config = await storage.get("coderhelm-config");
       if (!config || !config.forgeSecret || body.forge_secret !== config.forgeSecret) {
         return answer(401, { error: "unauthorized" });
       }
-      return await fileFollowup(body);
+      return listing ? await listFollowups(body) : await fileFollowup(body);
     }
 
     if (!projectKey || !summary) {
