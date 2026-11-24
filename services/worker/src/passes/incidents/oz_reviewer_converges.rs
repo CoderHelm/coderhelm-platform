@@ -145,7 +145,7 @@ fn a_finding_the_rounds_deferred_holds_no_more_without_new_code() {
     // The thread of a deferred finding holds the merge no more either.
     let src = include_str!("../review_pr.rs");
     let settle = &src[src.find("pub(crate) fn settle_own_findings(").unwrap()..];
-    assert!(settle[..1600].contains("settled.push(line);\n                continue;"));
+    assert!(settle[..2400].contains("settled.push(line);\n                continue;"));
 }
 
 #[test]

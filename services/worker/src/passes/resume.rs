@@ -3452,11 +3452,13 @@ pub async fn run(
                         if let Some(line) = &unverified {
                             message = format!("{message}\n\n{line}");
                         }
-                        match super::round::land(
+                        match super::round::land_agreeing(
                             &gh,
                             &ci_round.wip_branch,
                             &ci_round.base_sha,
                             &message,
+                            pr_number,
+                            result.evidence.latest_notes(),
                         )
                         .await
                         {
@@ -3940,6 +3942,22 @@ pub async fn run(
                     run_id = msg.run_id,
                     "A workflow passed but others are still running — waiting for full CI"
                 );
+                // A wait with no progress ends (`common::ci_watch`): the
+                // stuck checks are re-run once, then the run stops waiting
+                // and names them.
+                if ci_wait_watchdog(
+                    state,
+                    &msg,
+                    &github,
+                    (&repo_owner, &repo_name, pr_number),
+                    branch_head.as_deref().unwrap_or(&branch),
+                    created_at,
+                )
+                .await
+                {
+                    mark_events_processed(state, &msg.run_id, &events).await;
+                    return Ok(());
+                }
                 // Leave events unprocessed so the next resume re-evaluates with the
                 // full set (and still sees any review feedback that rode along).
                 let still_active = set_run_awaiting_ci(
@@ -4969,7 +4987,16 @@ async fn run_fix_round(
             // commit, one push.
             let message =
                 super::round::round_message(state, &msg.team_id, &ctx.ticket_msg, &round).await;
-            match super::round::land(&gh, &round.wip_branch, &round.base_sha, &message).await {
+            match super::round::land_agreeing(
+                &gh,
+                &round.wip_branch,
+                &round.base_sha,
+                &message,
+                pr.number,
+                r.evidence.latest_notes(),
+            )
+            .await
+            {
                 super::round::Landed::Pushed { files } => {
                     super::round::clear(state, &msg.team_id, &msg.run_id).await;
                     // The pull request changed: its description is rewritten
@@ -5164,6 +5191,14 @@ async fn round_fault(
     super::add_progress_note(state, &msg.team_id, &msg.run_id, &plan.note).await;
     if plan.clean {
         super::round::start_clean(gh, &mut round).await;
+    }
+    // A change refused for undoing an earlier review fix: the next step is
+    // told why, so it keeps that fix or says why it must go
+    // (`round_agree::undoes`).
+    if why.contains(super::round_agree::UNDO_MARK) {
+        round
+            .feedback
+            .push_str(&format!("\n\nYour last change wasn't landed: {why}."));
     }
     park_round(state, msg, ctx, pr, &round, true, created_at, start).await
 }
@@ -5757,6 +5792,17 @@ async fn recheck_planned_work(
     ctx: &mut FixContext,
     pr: &PrRef<'_>,
 ) -> Option<Vec<super::proof::Finding>> {
+    // One verdict on planned work per head (`proof::PLANNED_FIELD`): what
+    // the proof check said on this head stands.
+    let head = ctx
+        .github
+        .get_ref(pr.owner, pr.repo, pr.branch)
+        .await
+        .unwrap_or_default();
+    let stored = super::proof::load_planned(state, &msg.team_id, &msg.run_id).await;
+    if let Some(left) = super::proof::planned_on(stored.as_ref(), &head) {
+        return Some(left.to_vec());
+    }
     let plan = super::run_plan_files(state, &ctx.ticket_msg).await?;
     // Generated outputs their generator settled are never planned work left.
     let settled = super::steps::load(state, &msg.team_id, &msg.run_id)
@@ -5836,6 +5882,19 @@ async fn recheck_planned_work(
             &msg.team_id,
             &msg.run_id,
             &super::round_agree::skipped_note(&skipped),
+        )
+        .await;
+    }
+    if !head.is_empty() {
+        let left: Vec<super::proof::Finding> = super::proof::planned_work(&found)
+            .into_iter()
+            .cloned()
+            .collect();
+        super::proof::save_planned(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &super::proof::PlannedVerdict { head, left },
         )
         .await;
     }
@@ -9686,6 +9745,101 @@ async fn resume_multi_repo(
     Ok(())
 }
 
+/// One look at a CI wait with no result yet (`common::ci_watch`): the
+/// pending set is kept with when it last changed; an hour without progress
+/// re-runs the stuck checks' workflows once, and a second hour stops the
+/// wait. Returns true when the run finished (the caller stops).
+async fn ci_wait_watchdog(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    github: &GitHubClient,
+    (owner, repo, pr_number): (&str, &str, u64),
+    head: &str,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    use common::ci_watch::{self, Step};
+    let Ok(checks) = github.list_ci_for_ref(owner, repo, head).await else {
+        return false;
+    };
+    let pending = ci_watch::pending_of(&checks);
+    let now = chrono::Utc::now().timestamp();
+    let prev =
+        ci_watch::from_json(&run_text(state, &msg.team_id, &msg.run_id, ci_watch::FIELD).await);
+    let (wait, step) = ci_watch::step(prev.as_ref(), head, &pending, now);
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("SET #w = :w")
+        .expression_attribute_names("#w", ci_watch::FIELD)
+        .expression_attribute_values(":w", attr_s(&ci_watch::to_json(&wait)))
+        .send()
+        .await;
+    match step {
+        Step::Wait => false,
+        Step::Rerun => {
+            let mut started = 0;
+            for id in ci_watch::pending_run_ids(&checks) {
+                if github.rerun_workflow_run(owner, repo, id).await.is_ok() {
+                    started += 1;
+                }
+            }
+            warn!(run_id = msg.run_id, pending = ?wait.pending, started, "CI made no progress for an hour: re-running the stuck checks once");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &ci_watch::rerun_note(&wait, started),
+            )
+            .await;
+            false
+        }
+        Step::Stop => {
+            warn!(run_id = msg.run_id, pending = ?wait.pending, "CI made no progress after a re-run: the wait stops");
+            if pr_number > 0 {
+                mark_pr_ready(state, &msg.team_id, github, owner, repo, pr_number).await;
+            }
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &ci_watch::stop_note(&wait, now),
+            )
+            .await;
+            set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+            true
+        }
+    }
+}
+
+/// Arms the run's one delayed CI check (`common::ci_watch::may_arm`):
+/// false when another is already due, so a webhook resume never starts a
+/// second wait chain.
+async fn arm_delayed_check(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) -> bool {
+    use common::ci_watch;
+    let now = chrono::Utc::now().timestamp();
+    let due = now + i64::from(delay_seconds.max(0));
+    match state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("SET #d = :due")
+        .condition_expression("attribute_not_exists(#d) OR #d <= :late")
+        .expression_attribute_names("#d", ci_watch::DUE_FIELD)
+        .expression_attribute_values(":due", attr_n(due as u64))
+        .expression_attribute_values(":late", attr_n((now + ci_watch::DUE_SLACK_SECS) as u64))
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => !format!("{e:?}").contains("ConditionalCheckFailed"),
+    }
+}
+
 /// Counts one more re-arm of the CI wait loop and says whether it may go on.
 async fn may_poll_again(state: &WorkerState, msg: &ResumeMessage) -> bool {
     let polls = state
@@ -9791,6 +9945,13 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
     );
     if state.config.ci_fix_queue_url.is_empty() {
         warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
+        return;
+    }
+    // One wait chain per run: a delayed check while another is due adds
+    // nothing but a second chain (`common::ci_watch::may_arm`). An
+    // immediate re-drive (a short delay) always goes.
+    if delay_seconds >= 60 && !arm_delayed_check(state, msg, delay_seconds).await {
+        info!(run_id = %msg.run_id, "A delayed CI check is already due — not arming another");
         return;
     }
     if !may_poll_again(state, msg).await {

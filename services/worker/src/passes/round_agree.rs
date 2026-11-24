@@ -17,6 +17,11 @@
 //! - When an acceptance criterion of the ticket asks for that item, the
 //!   ticket wins: it is built, and the item carries the criterion, so the
 //!   round's reply to the review says why it stays ([`Sorted::build`]).
+//! - No later round undoes a review fix without saying why ([`undoes`]): a
+//!   round whose change takes back what a review fix added, or puts back
+//!   what one took out, lands only with a line `Undoes <sha>: <why>` in its
+//!   account. Rounds once undid each other's commits on a pull request
+//!   while the review raised the same finding again each time.
 
 use std::collections::HashMap;
 
@@ -272,4 +277,144 @@ pub async fn read(
         out.extend(taken_out(&files_of(&before), &own, sha));
     }
     out
+}
+
+/// What a round's change takes back of one review fix, in one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undo {
+    pub sha: String,
+    pub path: String,
+    pub lines: Vec<String>,
+}
+
+/// What `ours` (the round's change, `(path, patch)`) undoes of each review
+/// fix (`(sha, its files)`): lines it removes that the fix added, or adds
+/// back that the fix removed, at least [`MIN_LINES`] in a file.
+pub fn undoes(fixes: &[(String, Vec<(String, String)>)], ours: &[(String, String)]) -> Vec<Undo> {
+    let mut out = Vec::new();
+    for (sha, files) in fixes {
+        for (path, fix_patch) in files {
+            let Some((_, our_patch)) = ours.iter().find(|(p, _)| p == path) else {
+                continue;
+            };
+            let mut lines = Vec::new();
+            for (fix_sign, our_sign) in [('+', '-'), ('-', '+')] {
+                let mut pool = patch_lines(fix_patch, fix_sign);
+                for l in patch_lines(our_patch, our_sign) {
+                    if let Some(i) = pool.iter().position(|x| *x == l) {
+                        pool.swap_remove(i);
+                        lines.push(l);
+                    }
+                }
+            }
+            if lines.len() >= MIN_LINES {
+                out.push(Undo {
+                    sha: sha.clone(),
+                    path: path.clone(),
+                    lines,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Whether a round's account says why it undoes the review fix `sha`: a
+/// line `Undoes <sha>: <why>` (the short sha is enough) with a reason.
+pub fn says_why(account: &str, sha: &str) -> bool {
+    let short: String = sha.chars().take(7).collect();
+    account.lines().any(|l| {
+        let l = l.trim().trim_start_matches(['-', '*', ' ']);
+        l.strip_prefix("Undoes ")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(who, why)| {
+                !short.is_empty()
+                    && who.trim().trim_matches('`').starts_with(&short)
+                    && why.trim().len() >= 12
+            })
+    })
+}
+
+/// The words every undo refusal carries.
+pub const UNDO_MARK: &str = "it undoes an earlier review fix";
+
+/// What a round is told when it would undo a review fix without saying why.
+pub fn undo_refusal(undos: &[Undo]) -> String {
+    let each: Vec<String> = undos
+        .iter()
+        .map(|u| {
+            format!(
+                "`{}` in {} ({} lines, e.g. `{}`)",
+                u.path,
+                common::truncate_str(&u.sha, 7),
+                u.lines.len(),
+                common::truncate_str(&u.lines[0], 80)
+            )
+        })
+        .collect();
+    format!(
+        "{UNDO_MARK}: {}. Keep that fix and make this change another way, \
+         or, only when the fix was wrong, say why on a line `Undoes <sha>: <why>` in your account",
+        each.join("; ")
+    )
+}
+
+/// The review fixes on pull request `number`, newest last: each review
+/// commit's own files and patches (at most the last five).
+pub async fn review_fixes(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let Ok(commits) = github.list_pr_commits(owner, repo, number).await else {
+        return Vec::new();
+    };
+    let shas: Vec<String> = commits
+        .iter()
+        .filter(|c| answers_review(c["commit"]["message"].as_str().unwrap_or("")))
+        .filter_map(|c| c["sha"].as_str().map(str::to_string))
+        .collect();
+    let mut out = Vec::new();
+    for sha in shas.iter().rev().take(5).rev() {
+        if let Ok(files) = github.commit_changes(owner, repo, sha).await {
+            out.push((
+                sha.clone(),
+                files.into_iter().map(|f| (f.path, f.patch)).collect(),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    #[test]
+    fn a_round_that_takes_back_a_review_fix_must_say_why() {
+        let fix = vec![(
+            "a7185a8aaaa".to_string(),
+            vec![(
+                "src/drawer.tsx".to_string(),
+                "@@\n-document.addEventListener('visibilitychange', onHide);\n-return () => off();\n-const gone = true;\n+window.addEventListener('visibilitychange', onHide, true);\n+return () => offCapture();\n+const gone = isHidden();\n".to_string(),
+            )],
+        )];
+        let ours = vec![(
+            "src/drawer.tsx".to_string(),
+            "@@\n-window.addEventListener('visibilitychange', onHide, true);\n-return () => offCapture();\n-const gone = isHidden();\n+document.addEventListener('visibilitychange', onHide);\n+return () => off();\n+const gone = true;\n".to_string(),
+        )];
+        let u = undoes(&fix, &ours);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].lines.len(), 6);
+        assert!(undo_refusal(&u).contains("Undoes <sha>"));
+        assert!(!says_why("I moved the listener back.", "a7185a8aaaa"));
+        assert!(says_why(
+            "- Undoes a7185a8: the capture listener fires after the page is frozen, so the ticket's document listener is right",
+            "a7185a8aaaa"
+        ));
+        // A change elsewhere undoes nothing.
+        let other = vec![("src/other.tsx".to_string(), ours[0].1.clone())];
+        assert!(undoes(&fix, &other).is_empty());
+    }
 }

@@ -1359,6 +1359,7 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
             ]
             .iter()
             .any(|w| t.contains(w))
+                || common::stop_rules::tooling::names_own_read(&t)
             {
                 out.push(format!(
                     "Step {n} (`{}`) is work CoderHelm's own tools do (reading workflow runs, \

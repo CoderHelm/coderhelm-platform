@@ -826,6 +826,38 @@ async fn round_changes(
     }
 }
 
+/// [`land`], after checking that the round undoes no earlier review fix
+/// on pull request `number` without saying why in its `account`
+/// (`round_agree::undoes`). A round that would is refused with what it
+/// takes back; its work stays on the WIP branch.
+pub(crate) async fn land_agreeing(
+    pr: &Pr<'_>,
+    wip: &str,
+    base_sha: &str,
+    message: &str,
+    number: u64,
+    account: &str,
+) -> Landed {
+    if number > 0 && !wip.is_empty() && !base_sha.is_empty() {
+        let fixes = super::round_agree::review_fixes(pr.github, pr.owner, pr.repo, number).await;
+        if !fixes.is_empty() {
+            if let Ok(Some((_, counts))) = round_changes(pr, wip, base_sha).await {
+                let ours: Vec<(String, String)> =
+                    counts.into_iter().map(|c| (c.path, c.patch)).collect();
+                let unsaid: Vec<super::round_agree::Undo> =
+                    super::round_agree::undoes(&fixes, &ours)
+                        .into_iter()
+                        .filter(|u| !super::round_agree::says_why(account, &u.sha))
+                        .collect();
+                if !unsaid.is_empty() {
+                    return Landed::Refused(super::round_agree::undo_refusal(&unsaid));
+                }
+            }
+        }
+    }
+    land(pr, wip, base_sha, message).await
+}
+
 /// Lands a finished round on the pull request: everything it changed on its
 /// WIP branch since `base_sha`, as ONE commit with `message`, in one push.
 /// Refuses (keeping the WIP branch) when the pull request changed the same

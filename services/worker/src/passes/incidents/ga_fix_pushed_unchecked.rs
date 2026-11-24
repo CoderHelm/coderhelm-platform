@@ -138,8 +138,8 @@ fn a_fix_whose_tests_failed_or_never_ran_is_not_pushed() {
     // the pushed fix against the failing tests.
     let src = include_str!("../resume.rs");
     let at = |n: &str| src.find(n).unwrap_or_else(|| panic!("{n}"));
-    assert!(at("push_checks::before_push(") < at("match super::round::land("));
-    assert!(at("match super::round::land(") < at("push_checks::record_push("));
+    assert!(at("push_checks::before_push(") < at("match super::round::land_agreeing("));
+    assert!(at("match super::round::land_agreeing(") < at("push_checks::record_push("));
 }
 
 #[test]
