@@ -4648,6 +4648,7 @@ async fn fix_context(
         base_branch: t.base_branch.to_string(),
         image_attachments,
         continuation: 0,
+        retry_after_secs: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
         resume_from: None,

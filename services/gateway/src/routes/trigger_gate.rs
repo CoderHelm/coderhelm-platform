@@ -433,6 +433,9 @@ pub async fn gate_ticket_trigger(
             // Waiting for the role's reads goes on by itself (`role_wait`);
             // a second run would wait for the same item.
             "awaiting_setup" => h < 24 * 14,
+            // Waiting for another change to merge goes on by itself
+            // (`change_wait`).
+            "awaiting_change" => h < 24 * 30,
             _ => false,
         }
     }) {

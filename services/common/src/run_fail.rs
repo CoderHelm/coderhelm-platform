@@ -5,6 +5,14 @@
 //! person can read) and in which pass (`failed_pass`). A test below reads the
 //! sources and refuses any other write of the failed status.
 //!
+//! The reason is read first (`run_recovery::ending`). Only an error CoderHelm
+//! gets past by itself (transient, or a state it repairs) is written as
+//! `failed`, and then in plain words with the raw error kept apart
+//! (`error_detail`): the self-heal sweep resumes it from its checkpoint.
+//! Anything else stops the run as "needs you" (`needs_input`, with what a
+//! person does and why): an error nobody classified never ends a run as
+//! `failed`, and no run shows a raw HTTP dump.
+//!
 //! Two failed runs without a reason led here: a feedback pass that lost a race
 //! with a cancel wrote a raw "service error" under another field name over the
 //! cancelled status, and a run whose start failed was left running until the
@@ -46,6 +54,10 @@ pub struct RunFailure<'a> {
     /// Numbers added to fields in the same write (tokens, cost): what this
     /// invocation used, on top of what earlier ones recorded.
     pub add: Vec<(&'static str, AttributeValue)>,
+    /// The recovery path already decided only a person gets past it
+    /// (`run_recovery::next`): the run waits on them with this, whatever
+    /// the reason's own reading.
+    pub needs: Option<&'a crate::run_recovery::NeedsYou>,
 }
 
 /// The status-index sort key of a failed run.
@@ -87,18 +99,61 @@ pub struct Update {
     pub values: HashMap<String, AttributeValue>,
 }
 
-/// The write that marks `run_id` failed.
+/// The status a stop for `reason` writes: `failed` only for an error the
+/// self-heal sweep resumes, else `needs_input` (`run_recovery::ending`).
+pub fn status_for(reason: &str) -> &'static str {
+    match crate::run_recovery::ending(&readable_reason(reason)) {
+        crate::run_recovery::Ending::Parked(_) => STATUS,
+        crate::run_recovery::Ending::NeedsYou(..) => crate::run_status::NEEDS_INPUT,
+    }
+}
+
+/// The write that ends `run_id` for a stop: `failed` (parked for the
+/// self-heal sweep) or "needs you" (see the module comment).
 pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
+    use crate::run_recovery::{self as rr, Ending};
     let s = |v: &str| AttributeValue::S(v.to_string());
+    let raw = readable_reason(f.reason);
     let mut names = HashMap::from([
         ("#s".to_string(), "status".to_string()),
         // Older writes put the reason under `error`; one field from now on.
         ("#legacy".to_string(), "error".to_string()),
+        ("#detail".to_string(), rr::FIELD_ERROR_DETAIL.to_string()),
+        ("#kind".to_string(), rr::FIELD_ERROR_KIND.to_string()),
     ]);
+    let ending = match f.needs {
+        Some(n) => Ending::NeedsYou(rr::classify(&raw), n.clone()),
+        None => rr::ending(&raw),
+    };
+    let (status, sri, plain, kind, wait) = match ending {
+        Ending::Parked(c) => (
+            s(STATUS),
+            s(&status_run_id(run_id)),
+            c.plain.clone(),
+            c.kind,
+            None,
+        ),
+        Ending::NeedsYou(c, needs) => {
+            let wait = crate::run_wait::WaitingOn::action(&needs.action, &needs.detail, "")
+                .unwrap_or_else(|| {
+                    crate::run_wait::WaitingOn::fixed(
+                        "Look at what stopped the run, then press Retry",
+                        &needs.detail,
+                        "",
+                    )
+                });
+            let why = crate::handback::HandBack::new(needs.why, &needs.detail)
+                .unwrap_or_else(|| crate::handback::HandBack::of(needs.why));
+            let [st, sri, wo] = crate::run_wait::needs_input_values(run_id, &wait, &why);
+            (st, sri, needs.detail.clone(), c.kind, Some(wo))
+        }
+    };
     let mut values = HashMap::from([
-        (":failed".to_string(), s(STATUS)),
-        (":sri".to_string(), s(&status_run_id(run_id))),
-        (":err".to_string(), s(&readable_reason(f.reason))),
+        (":failed".to_string(), status),
+        (":sri".to_string(), sri),
+        (":err".to_string(), s(&readable_reason(&plain))),
+        (":detail".to_string(), s(&raw)),
+        (":kind".to_string(), s(kind.code())),
         (":t".to_string(), s(now)),
     ]);
     let pass = match f.pass.map(str::trim).filter(|p| !p.is_empty()) {
@@ -112,8 +167,14 @@ pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
         }
     };
     let mut expression = format!(
-        "SET #s = :failed, status_run_id = :sri, error_message = :err, failed_pass = {pass}, updated_at = :t"
+        "SET #s = :failed, status_run_id = :sri, error_message = :err, failed_pass = {pass}, \
+         #detail = :detail, #kind = :kind, updated_at = :t"
     );
+    if let Some(wo) = wait {
+        names.insert("#wo".into(), crate::run_wait::FIELD_WAITING_ON.to_string());
+        values.insert(":wo".into(), wo);
+        expression.push_str(", #wo = :wo");
+    }
     for (i, (field, value)) in f.extra.iter().enumerate() {
         let (n, v) = (format!("#x{i}"), format!(":x{i}"));
         expression.push_str(&format!(", {n} = {v}"));
@@ -212,12 +273,17 @@ mod tests {
         u.values[k].as_s().unwrap().clone()
     }
 
+    /// A reason the self-heal sweep resumes is parked as failed, in plain
+    /// words, with the raw error kept apart.
+    const PASSING: &str = "HTTP status server error (502 Bad Gateway) for url \
+        (https://api.github.com/repos/o/r/pulls): {\"message\":\"Server Error\"}";
+
     #[test]
     fn a_failure_always_records_a_reason_and_a_pass() {
         let u = update(
             "R1",
             &RunFailure {
-                reason: "  ",
+                reason: PASSING,
                 pass: Some("feedback"),
                 ..Default::default()
             },
@@ -227,10 +293,43 @@ mod tests {
         assert!(u.expression.contains("failed_pass = :pass"));
         assert!(u.expression.contains("status_run_id = :sri"));
         assert!(u.expression.ends_with("REMOVE #legacy"));
-        assert_eq!(sv(&u, ":err"), "Failed without an error message");
+        assert_eq!(sv(&u, ":failed"), STATUS);
+        assert_eq!(
+            sv(&u, ":err"),
+            "GitHub didn't answer for a moment (502 Bad Gateway)."
+        );
+        assert_eq!(sv(&u, ":detail"), PASSING);
+        assert_eq!(sv(&u, ":kind"), "transient");
         assert_eq!(sv(&u, ":pass"), "feedback");
         assert_eq!(sv(&u, ":sri"), "failed#R1");
         assert_eq!(u.names["#legacy"], "error");
+    }
+
+    /// An error nobody classified, or one only a person can get past, never
+    /// ends a run as failed: it waits on a person, saying what to do.
+    #[test]
+    fn an_unclassified_error_never_produces_status_failed() {
+        for reason in [
+            "  ",
+            "boom",
+            "Multi-repo pipeline produced no PRs",
+            "HTTP status client error (422 Unprocessable Entity) for url (https://api.github.com/repos/o/r/pulls): {\"message\":\"Validation Failed\"}",
+            "Monthly token limit exceeded (5 / 4 tokens). Increase your limit in Settings under Token Limit.",
+        ] {
+            let u = update("R1", &RunFailure { reason, ..Default::default() }, "now");
+            assert_ne!(sv(&u, ":failed"), STATUS, "{reason}");
+            assert_eq!(sv(&u, ":failed"), crate::run_status::NEEDS_INPUT, "{reason}");
+            assert_eq!(sv(&u, ":sri"), "needs_input#R1");
+            assert!(u.expression.contains("#wo = :wo"));
+            assert_eq!(u.names["#wo"], crate::run_wait::FIELD_WAITING_ON);
+            let wait: crate::run_wait::WaitingOn =
+                serde_json::from_str(&sv(&u, ":wo")).unwrap();
+            assert!(!wait.action.is_empty() && !wait.handback.is_empty());
+            assert!(!sv(&u, ":err").contains("https://"), "{reason}");
+            assert!(!sv(&u, ":err").contains('{'), "{reason}");
+            assert_ne!(status_for(reason), STATUS);
+        }
+        assert_eq!(status_for(PASSING), STATUS);
     }
 
     #[test]

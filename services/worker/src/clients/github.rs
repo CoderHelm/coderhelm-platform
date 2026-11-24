@@ -411,6 +411,38 @@ pub fn outside_wait(
     outage_in_text(&m).then_some((Cause::Outage, OUTAGE_WAIT_SECS))
 }
 
+/// What a compare's 404 means, from which of its two refs exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare404 {
+    /// The head isn't pushed yet: nothing to compare, so no diff.
+    NoDiffYet,
+    /// The base is gone (deleted or renamed).
+    BaseGone,
+    /// Both are there: the 404 is about something else (the repository,
+    /// access), returned as it is.
+    AsIs,
+}
+
+pub fn compare_404(base_there: bool, head_there: bool) -> Compare404 {
+    match (base_there, head_there) {
+        (false, _) => Compare404::BaseGone,
+        (true, false) => Compare404::NoDiffYet,
+        (true, true) => Compare404::AsIs,
+    }
+}
+
+/// A comparison with nothing in it, shaped like GitHub's.
+pub fn empty_compare() -> serde_json::Value {
+    serde_json::json!({
+        "status": "identical",
+        "ahead_by": 0,
+        "behind_by": 0,
+        "total_commits": 0,
+        "commits": [],
+        "files": [],
+    })
+}
+
 /// A 5xx from GitHub's API, as `status_error_message` writes it.
 fn outage_in_text(m: &str) -> bool {
     m.contains("HTTP status server error (5") && m.contains("api.github.com")
@@ -4019,6 +4051,11 @@ impl GitHubClient {
     // ─── Diff ───────────────────────────────────────────────────
 
     /// Compare two refs.
+    ///
+    /// A 404 is read before it is returned: a `head` that isn't pushed yet
+    /// (a run's branch before its first write) is "no diff yet", an empty
+    /// comparison, never an error; a `base` that is gone says so in words
+    /// the run's recovery reads (`run_recovery::deleted_base_error`).
     pub async fn get_diff(
         &self,
         owner: &str,
@@ -4027,7 +4064,65 @@ impl GitHubClient {
         head: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
-        self.get(&url).await
+        match self.get(&url).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_not_found(&*e) => {
+                let base_there = self.ref_exists(owner, repo, base).await?;
+                let head_there = self.ref_exists(owner, repo, head).await?;
+                match compare_404(base_there, head_there) {
+                    Compare404::NoDiffYet => Ok(empty_compare()),
+                    Compare404::BaseGone => {
+                        Err(common::run_recovery::deleted_base_error(owner, repo, base).into())
+                    }
+                    Compare404::AsIs => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `branch` (or a commit) is in the repository. `Ok(false)` only
+    /// for GitHub's 404; any other error is returned.
+    pub async fn ref_exists(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        match self.get_ref(owner, repo, branch).await {
+            Ok(sha) => Ok(!sha.is_empty()),
+            Err(e) if is_not_found(&*e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Creates a label in the repository (an existing one is kept).
+    pub async fn create_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/labels");
+        match self
+            .post(
+                &url,
+                &serde_json::json!({ "name": name, "color": "ededed" }),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // 422: it exists already.
+            Err(e) if e.to_string().contains("(422 ") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drops the cached installation token: the next request fetches a new one.
+    pub fn forget_token(&self) {
+        if let Ok(mut cache) = self.token_cache.lock() {
+            *cache = None;
+        }
     }
 
     // ─── Issues ─────────────────────────────────────────────────

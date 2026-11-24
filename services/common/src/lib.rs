@@ -264,6 +264,9 @@ pub mod run_prs;
 pub mod scope_ledger;
 pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
+/// A run waiting for another ticket's change to merge, and what it does
+/// when that change moves.
+pub mod change_wait;
 /// How a comment reads: the renderer and lint every comment passes before
 /// it is posted (short, plain, no pasted plans, no history).
 pub mod comment_style;
@@ -341,6 +344,9 @@ pub mod run_fail;
 /// The questions a run asks when it needs a person's answer, and the
 /// answers people give in CoderHelm.
 pub mod run_questions;
+/// What a run does with a pass's error before anything is marked failed:
+/// classified, retried, repaired, or handed to a person in plain words.
+pub mod run_recovery;
 /// Fix rounds on an open pull request: each with its own time budget,
 /// resumable, and never a failed run when one doesn't finish.
 pub mod run_round;

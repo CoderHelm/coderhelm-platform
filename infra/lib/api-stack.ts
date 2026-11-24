@@ -422,6 +422,23 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Self-heal (permanent): every 15 min, runs left failed on an error
+    // CoderHelm now gets past by itself (transient, or a state it repairs)
+    // resume from their checkpoint, at most once per run per deploy. The
+    // worker also runs it once on the first start of each new release.
+    new events.Rule(this, "SelfHealSweepSchedule", {
+      ruleName: `${prefix}-self-heal-sweep`,
+      description: "Resume failed runs whose error CoderHelm now gets past by itself",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "self_heal_sweep",
+          }),
+        }),
+      ],
+    });
+
     // Paused agent work: every 5 min, send again the work kept while a
     // team's agents were paused once the pause has ended (an until-time
     // passing needs nobody to click anything). Does nothing when no team is

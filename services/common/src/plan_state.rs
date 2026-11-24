@@ -584,6 +584,16 @@ pub fn task_view(task: &TaskFacts, runs: &[RunFacts], waits_on: Option<&str>) ->
             let doing = pass_words(&r.current_pass);
             set(&mut v, TaskState::Working, format!("Working: {doing}"));
         }
+        // Waiting for another ticket's change to merge (`change_wait`):
+        // the run's page names it, and the run goes on by itself.
+        "awaiting_change" => {
+            let line = if error.is_empty() {
+                "Waiting for another change to merge".to_string()
+            } else {
+                error.clone()
+            };
+            set(&mut v, TaskState::Working, one_line(&line, 200));
+        }
         "awaiting_ci" => match &open {
             Some(pr) => set(
                 &mut v,

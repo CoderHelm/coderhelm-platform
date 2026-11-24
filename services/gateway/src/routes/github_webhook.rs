@@ -1994,6 +1994,15 @@ async fn handle_pull_request(
     if action != "closed" {
         return Ok(StatusCode::OK);
     }
+    // Runs waiting for another change to merge read their dependency again
+    // (`common::change_wait`): a merge resumes them, a close stops them for
+    // a person. The worker does nothing for a team with no waiting run.
+    let check = WorkerMessage::ChangeWaitCheck(common::messages::ChangeWaitCheckMessage {
+        team_id: team_id.to_string(),
+    });
+    if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &check).await {
+        warn!(error = ?e, "Could not ask waiting runs to read their dependency again");
+    }
     // CoderHelm's review bodies on it become one line each, its resolved
     // threads hidden (any pull request it reviewed, not only its own).
     if let Some(reason) = tidy_reason("pull_request", action, merged) {
