@@ -78,10 +78,10 @@ pub const SYSTEM: &str = "You trace one user journey through a codebase for its 
 
 Start at the entry screen you are given. Follow what the user does there, in the order the code runs it:
 - screen: the screen or form the user is on (cite its component or where it renders);
-- call: where the code makes a request (the fetch, the client method, the SDK or RPC call). Cite the line that spells the request's path or RPC name, and make the token that path or name as written (`/api/auth/signup`, `com.atproto.server.createSession`);
+- call: where the code makes a request (the fetch, the client method, the SDK or RPC call). Cite the line that spells the request's path or RPC name, and make the token that path or name as written (`/api/auth/signup`, `com.example.server.createSession`);
 - handler: the server code that answers that request (the route file's exported method, the controller method's decorator, the API handler);
 - service: the server's own code the handler runs that matters to the journey (the service method that does the work);
-- outside: where the code reaches an outside service (the client call, its SDK import, or the setting that holds its address; make the token the service's setting or package name, like `STRIPE_SECRET_KEY` or `@adyen/api-library`);
+- outside: where the code reaches an outside service (the client call, its SDK import, or the setting that holds its address; make the token the service's setting or package name, like `STRIPE_SECRET_KEY` or `@stripe/stripe-js`);
 - callback: a webhook or event handler that runs later because of this journey;
 - then the next screen the user lands on, and on through each request until the journey's outcome (signed in, booked, paid, the password changed).
 
