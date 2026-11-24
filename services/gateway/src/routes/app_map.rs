@@ -182,6 +182,89 @@ pub fn status_view(st: Option<&am::Status>, map: MapFacts, team_repos: u32, now:
     })
 }
 
+/// What the Knowledge page says about the map: it is not embedded as
+/// passages, runs and Chat look things up in it directly.
+pub const KNOWLEDGE_NOTE: &str = "Not split into passages like a knowledge base: runs and Chat look things up in the map directly.";
+
+/// The App map's card on the Knowledge page: its state (`built`,
+/// `building`, `rebuilding`, `failed` or `not_built`), when it was built,
+/// what it covers, where it is, and whether this person may build it again
+/// (admins, one build at a time through `POST /api/app-map/rebuild`).
+pub fn knowledge_view(
+    st: Option<&am::Status>,
+    map: MapFacts,
+    coverage: Option<&am::Coverage>,
+    can_rebuild: bool,
+    now: i64,
+) -> Value {
+    let (shown, updating) = shown_state(st, map.has_map, now);
+    let state = match (shown, updating) {
+        ("ready", true) => "rebuilding",
+        ("ready", false) => "built",
+        ("building", _) => "building",
+        ("failed", _) => "failed",
+        _ => "not_built",
+    };
+    let s = st.cloned().unwrap_or_default();
+    let built_at = if s.built > 0 { s.built } else { map.written_at };
+    let coverage = coverage.filter(|c| c.counted).map(|c| {
+        json!({
+            "screens": c.screens,
+            "outside_services": c.outside_services,
+            "cloud_links": c.cloud_links,
+            "repos": c.repos,
+            "journeys": c.journeys,
+        })
+    });
+    json!({
+        "state": state,
+        "built_at": if map.has_map { built_at } else { 0 },
+        // With a map there, the last update that didn't finish.
+        "last_failed": map.has_map && s.state == "failed",
+        "note": if state == "failed" || (map.has_map && s.state == "failed") { s.error } else { String::new() },
+        "repos": if map.has_map { map.repos } else { 0 },
+        "coverage": coverage,
+        "href": "/app-map",
+        "can_rebuild": can_rebuild,
+        "embedded": false,
+        "explain": KNOWLEDGE_NOTE,
+    })
+}
+
+/// [`knowledge_view`] for the signed-in team, from the status, when the map
+/// was written and its small index (never the map itself). Reading it never
+/// starts a build.
+pub async fn knowledge_card(state: &AppState, claims: &Claims) -> Value {
+    let bucket = &state.config.bucket_name;
+    let team = claims.team_id.as_str();
+    let (written, index, st) = tokio::join!(
+        am::graph_written_at(&state.s3, bucket, team),
+        am::load_index(&state.s3, bucket, team),
+        am::status(&state.dynamo, &state.config.settings_table_name, team),
+    );
+    let index = index.map(|(i, _)| i);
+    let facts = match written {
+        Some(at) => MapFacts {
+            has_map: true,
+            written_at: at,
+            repos: index
+                .as_ref()
+                .map(|i| i.repos.len() as u32)
+                .or(st.as_ref().map(|s| s.built_repos))
+                .unwrap_or(0),
+        },
+        None => MapFacts::default(),
+    };
+    let can_rebuild = claims.support_view.is_none() && claims.require_role(3).is_ok();
+    knowledge_view(
+        st.as_ref(),
+        facts,
+        index.as_ref().map(|i| &i.coverage),
+        can_rebuild,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
 /// The team's turned-on repositories, counted for the estimate (0 when
 /// they couldn't be read).
 async fn team_repo_count(state: &AppState, team_id: &str) -> u32 {
@@ -825,6 +908,85 @@ mod tests {
             &am::folders(&["harbor/harbor-web".into(), "harbor/harbor-api".into()]),
         );
         g
+    }
+
+    /// The Knowledge page's card: each state, when it was built, what it
+    /// covers, the link, who may build it again, and the line saying it is
+    /// looked up directly rather than split into passages.
+    #[test]
+    fn the_knowledge_card_says_where_the_map_stands() {
+        let now = 1_000_000;
+        let cov = am::MapIndex::of(&harbor()).coverage;
+        let map = MapFacts {
+            has_map: true,
+            written_at: now - 3600,
+            repos: 2,
+        };
+        let ready = am::Status {
+            state: "ready".into(),
+            at: now - 3600,
+            built: now - 3600,
+            ..Default::default()
+        };
+        let v = knowledge_view(Some(&ready), map, Some(&cov), true, now);
+        assert_eq!(v["state"], "built");
+        assert_eq!(v["built_at"], now - 3600);
+        assert_eq!(
+            v["coverage"]["screens"],
+            json!({"harbor-mobile": 3, "web": 1})
+        );
+        assert_eq!(v["coverage"]["outside_services"], 4);
+        assert_eq!(v["coverage"]["cloud_links"], 2);
+        assert_eq!(v["href"], "/app-map");
+        assert_eq!(v["can_rebuild"], true);
+        assert_eq!(v["embedded"], false);
+        assert_eq!(v["explain"], KNOWLEDGE_NOTE);
+        // Building again with a map there; building the first; failed.
+        let running = am::Status {
+            state: "building".into(),
+            at: now - 10,
+            ..ready.clone()
+        };
+        assert_eq!(
+            knowledge_view(Some(&running), map, None, false, now)["state"],
+            "rebuilding"
+        );
+        assert_eq!(
+            knowledge_view(Some(&running), MapFacts::default(), None, false, now)["state"],
+            "building"
+        );
+        let failed = am::Status {
+            state: "failed".into(),
+            at: now - 10,
+            error: "The build couldn't be started.".into(),
+            ..Default::default()
+        };
+        let f = knowledge_view(Some(&failed), MapFacts::default(), None, false, now);
+        assert_eq!(f["state"], "failed");
+        assert_eq!(f["note"], "The build couldn't be started.");
+        assert_eq!(f["built_at"], 0);
+        assert_eq!(f["coverage"], Value::Null);
+        // An update that failed keeps the map built, and says so.
+        let kept = knowledge_view(Some(&failed), map, Some(&cov), false, now);
+        assert_eq!(
+            (kept["state"].as_str(), kept["last_failed"].as_bool()),
+            (Some("built"), Some(true))
+        );
+        assert_eq!(
+            knowledge_view(None, MapFacts::default(), None, false, now)["state"],
+            "not_built"
+        );
+        // An index from before the counts: no counts rather than zeros.
+        assert_eq!(
+            knowledge_view(
+                Some(&ready),
+                map,
+                Some(&am::Coverage::default()),
+                false,
+                now
+            )["coverage"],
+            Value::Null
+        );
     }
 
     #[test]

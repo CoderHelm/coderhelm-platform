@@ -964,6 +964,67 @@ mod tests {
         assert_eq!(mini["graph"]["flows"][0]["id"], "mobile-sign-in");
     }
 
+    /// "What breaks if I change the booking endpoint?": Chat calls
+    /// `map_impact` on it, reads the callers in the other repositories with
+    /// their lines, and the answer cites the map.
+    #[tokio::test]
+    async fn offline_what_a_change_to_the_booking_endpoint_reaches() {
+        let c = ReplayCase {
+            name: "map: what changing the booking endpoint breaks".into(),
+            origin: "variant".into(),
+            intent: "how_to".into(),
+            history: Vec::new(),
+            question: "What breaks if I change POST /slips/:id/bookings?".into(),
+            wants: "The callers in other repositories and the screens, citing files.".into(),
+        };
+        let (host, repos) = replay_fixture();
+        let store = work_store();
+        let steps: Vec<Step> = vec![
+            Box::new(|b| {
+                assert!(
+                    b["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["name"] == "map_impact"),
+                    "{}",
+                    b["tools"]
+                );
+                calls(
+                    "m",
+                    "map_impact",
+                    json!({"target": "POST /slips/:id/bookings"}),
+                )
+            }),
+            Box::new(|b| {
+                let r = super::super::chat_agent::testing::last_result(b);
+                // The map's answer is a citable source of its own.
+                let id = r
+                    .strip_prefix('[')
+                    .and_then(|x| x.split_once(']'))
+                    .map(|(id, _)| id.to_string())
+                    .unwrap_or_default();
+                assert!(id.starts_with('S'), "{r}");
+                assert!(
+                    r.contains("harbor-web/lib/slips.ts:2")
+                        && r.contains("harbor-mobile/app/screens/SlipDetail.tsx:6"),
+                    "{r}"
+                );
+                say(&format!("Changing POST /slips/:id/bookings reaches two other repositories: the website calls it from harbor-web/lib/slips.ts:2 and the phone app from harbor-mobile/app/screens/SlipDetail.tsx:6, behind the Slip page and the SlipDetail screen [{id}]."))
+            }),
+        ];
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, _, _) = replay_with(&model, &host, &repos, &store, &c, Some(harbor_map())).await;
+        assert_eq!(out.calls, ["map_impact"]);
+        assert!(out.fin.grounded);
+        let cited = &out.fin.citations[0];
+        assert_eq!(cited.kind, common::app_map::SOURCE_KIND);
+        assert_eq!(
+            cited.title,
+            "Looked up what changing POST /slips/:id/bookings reaches on the app map"
+        );
+    }
+
     /// The same question with no map built: no map lookups are offered, and
     /// the answer is told to say so in one line and read the code.
     #[tokio::test]

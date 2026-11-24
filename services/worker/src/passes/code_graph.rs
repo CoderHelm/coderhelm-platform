@@ -1169,7 +1169,12 @@ pub fn offer(
             tools.push(d);
         }
     }
-    system.push_str(prompt_line(role));
+    if graphs.has_graph_tools() {
+        system.push_str(prompt_line(role));
+    }
+    if let Some(m) = graphs.map() {
+        system.push_str(&m.prompt_line(role));
+    }
     true
 }
 
@@ -1340,6 +1345,9 @@ pub struct RepoGraphs {
     pr: u64,
     run: common::live::store::RunRef,
     others: tokio::sync::Mutex<HashMap<String, Avail>>,
+    /// The team's app map for this step (`run_map`): its lookups ride with
+    /// the graph's, so every agent that reads code gets them the same way.
+    map: Option<super::run_map::RunMap>,
 }
 
 impl RepoGraphs {
@@ -1382,7 +1390,31 @@ impl RepoGraphs {
             pr,
             run: common::live::store::RunRef::default(),
             others: tokio::sync::Mutex::new(HashMap::new()),
+            map: None,
         }
+    }
+
+    /// Adds the team's app map (read once for this step), when there is one.
+    pub fn with_map(mut self, map: Option<super::run_map::RunMap>) -> Self {
+        self.map = map;
+        self
+    }
+
+    /// Reads the team's app map for this step and adds it (nothing when
+    /// there is none, or it is stale).
+    pub async fn load_map(self, state: &WorkerState) -> Self {
+        let map = super::run_map::RunMap::load(state, &self.team_id, &self.default_repo).await;
+        self.with_map(map)
+    }
+
+    /// The team's app map for this step, when it has one.
+    pub fn map(&self) -> Option<&super::run_map::RunMap> {
+        self.map.as_ref()
+    }
+
+    /// Whether the code graph's own lookups are offered.
+    pub fn has_graph_tools(&self) -> bool {
+        !(matches!(self.default, Avail::Off) && self.allowed.is_empty())
     }
 
     pub fn with_run(mut self, run_id: &str, origin: String) -> Self {
@@ -1406,10 +1438,15 @@ impl RepoGraphs {
     /// being built is offered, so a lookup says so instead of the agent
     /// guessing.
     pub fn tools(&self) -> Vec<ToolDefinition> {
-        if matches!(self.default, Avail::Off) && self.allowed.is_empty() {
-            return Vec::new();
+        let mut out = if self.has_graph_tools() {
+            tools(!self.allowed.is_empty())
+        } else {
+            Vec::new()
+        };
+        if let Some(m) = &self.map {
+            out.extend(m.tools());
         }
-        tools(!self.allowed.is_empty())
+        out
     }
 
     /// Runs a graph tool. `None` when `name` isn't one.
@@ -1419,6 +1456,9 @@ impl RepoGraphs {
         name: &str,
         input: &serde_json::Value,
     ) -> Option<String> {
+        if let Some(out) = self.map.as_ref().and_then(|m| m.handle(name, input)) {
+            return Some(out);
+        }
         if !TOOLS.contains(&name) {
             return None;
         }

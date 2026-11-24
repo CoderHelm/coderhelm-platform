@@ -8,7 +8,8 @@
 //! - `list_bases`, and the typed lookups: `find_tickets`,
 //!   `find_pull_requests`, `find_runs`, `find_findings`, `code_search`,
 //!   `read_file`, `code_symbol`, `history`, and the app map's lookups
-//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`, `map_flow`), the
+//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`, `map_flow`,
+//!   `map_impact`), the
 //!   same ones Chat uses (`common::app_map::Lookups`), over the signed-in
 //!   team's own map.
 //!
@@ -64,6 +65,7 @@ pub const MAP_PART: &str = "map_part";
 pub const MAP_SCREEN: &str = "map_screen";
 pub const MAP_FILE: &str = "map_file";
 pub const MAP_FLOW: &str = "map_flow";
+pub const MAP_IMPACT: &str = "map_impact";
 /// The dashboard route whose check decides a map read: the App map page.
 pub const MAP_ROUTE: &str = "app_map::get_map";
 
@@ -359,6 +361,14 @@ pub const TOOLS: &[Tool] = &[
         schema: || obj(json!({ "journey": { "type": "string", "description": "A journey's id or title words, from map_overview or map_find." } }), &["journey"]),
         output: None,
     },
+    Tool {
+        name: MAP_IMPACT,
+        title: "What a change reaches on the app map",
+        description: common::app_map::IMPACT_DESCRIPTION,
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "target": { "type": "string", "description": "A file's path on the map (like harbor-api/src/bookings.js), an endpoint (METHOD /path, like POST /slips/:id/bookings) or a part's id, from map_overview or map_find." } }), &["target"]),
+        output: None,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Tool> {
@@ -604,12 +614,13 @@ pub fn read_of(tool: &str, args: &Value) -> Result<Read, String> {
             Read::new(GITHUB_HISTORY, take(args, &keys))
         }
         MAP_OVERVIEW => Read::new(MAP_OVERVIEW, json!({})),
-        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE | MAP_FLOW => {
+        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE | MAP_FLOW | MAP_IMPACT => {
             let key = match tool {
                 MAP_FIND => "query",
                 MAP_PART => "id",
                 MAP_SCREEN => "screen",
                 MAP_FLOW => "journey",
+                MAP_IMPACT => "target",
                 _ => "path",
             };
             let r = take(args, &[key]);
@@ -1800,6 +1811,7 @@ mod tests {
             (MAP_SCREEN, json!({ "screen": "/slips/:id" })),
             (MAP_FILE, json!({ "path": "harbor-api/src/bookings.js" })),
             (MAP_FLOW, json!({ "journey": "book a slip" })),
+            (MAP_IMPACT, json!({ "target": "POST /slips/:id/bookings" })),
         ];
         for k in FINDING_KINDS {
             v.push((FIND_FINDINGS, json!({ "kind": k })));
@@ -1832,7 +1844,8 @@ mod tests {
                 MAP_PART,
                 MAP_SCREEN,
                 MAP_FILE,
-                MAP_FLOW
+                MAP_FLOW,
+                MAP_IMPACT
             ]
         );
         for t in &tools {
@@ -2048,7 +2061,8 @@ mod tests {
                 MAP_PART,
                 MAP_SCREEN,
                 MAP_FILE,
-                MAP_FLOW
+                MAP_FLOW,
+                MAP_IMPACT
             ]
         );
         assert!(!names(BTreeSet::from([READ_SCOPE, WORK_SCOPE])).contains(&MAP_PART.to_string()));

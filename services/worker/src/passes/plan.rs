@@ -695,7 +695,11 @@ Then the ```fix_location.json block described above."#,
             &msg.ticket_id,
             msg.issue_number,
         ),
-    );
+    )
+    // The app map: what the planned files are to the team's other
+    // repositories, screens and services (`run_map`).
+    .load_map(state)
+    .await;
     super::code_graph::offer(
         &graphs,
         super::code_graph::Role::Planner,
@@ -907,6 +911,18 @@ Then the ```fix_location.json block described above."#,
         })
         .unwrap_or(false);
     let prompt = format!("{prompt}{}", super::plan_shape::existing_block(&found));
+    // The app map in short, and where the ticket's likely files sit on it.
+    let prompt = match graphs.map() {
+        Some(m) => {
+            let likely: Vec<String> = found
+                .iter()
+                .flat_map(|(_, hits)| hits.iter())
+                .filter_map(|h| h.lines().next().map(|p| p.trim().to_string()))
+                .collect();
+            format!("{prompt}{}", m.planner_section(&likely))
+        }
+        None => prompt,
+    };
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
     for img in &msg.image_attachments {
         if let Some(b64) =
@@ -1099,6 +1115,19 @@ Then the ```fix_location.json block described above."#,
         &ticket_words,
     );
     back.extend(nfr_gaps.iter().cloned());
+    // What the planned files reach on the app map beyond this repository
+    // is in the plan (`run_map`).
+    if let Some(m) = graphs.map() {
+        let groups: Vec<(String, String)> = draft
+            .repo_tasks
+            .iter()
+            .map(|r| (format!("{}/{}", r.owner, r.name), r.tasks.clone()))
+            .collect();
+        back.extend(m.plan_gaps(
+            &super::run_map::planned(&default_repo, &draft.tasks, &groups),
+            &draft.design,
+        ));
+    }
     // The repository's files, once the repository is settled (`check_files`:
     // a re-plan after a switch or a file mismatch): a task whose tag doesn't
     // match the repository goes back in this same send-back, never in a
@@ -1808,6 +1837,14 @@ Then the ```fix_location.json block described above."#,
         // What the coder holds to: the test first, the defaults being
         // built, the dependents to update, the plan's own files.
         files.design = super::habits::with_design_section(&files.design, d, &files.tasks);
+    }
+    // Every place `## Affected elsewhere` cites is a real one on the map.
+    if let Some(m) = graphs.map() {
+        let (design, dropped) = m.checked_design(&files.design);
+        if dropped > 0 {
+            info!(ticket_id = %msg.ticket_id, dropped, "Plan cited places the app map doesn't have; those lines were left out");
+        }
+        files.design = design;
     }
 
     // Write openspec to S3

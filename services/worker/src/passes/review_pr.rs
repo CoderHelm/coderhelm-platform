@@ -2379,15 +2379,24 @@ async fn run_once(
             "reviewer",
             msg.pr_number,
         )
+        .await
+        .load_map(state)
         .await;
         let graph_tools = graphs.tools();
-        let system = if graph_tools.is_empty() {
-            system
-        } else {
+        let system = if graphs.has_graph_tools() {
             format!(
                 "{system}{}",
                 super::code_graph::prompt_line(super::code_graph::Role::Reviewer)
             )
+        } else {
+            system
+        };
+        let system = match graphs.map() {
+            Some(m) => format!(
+                "{system}{}",
+                m.prompt_line(super::code_graph::Role::Reviewer)
+            ),
+            None => system,
         };
         let knowledge =
             super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer", None).await;
@@ -3006,6 +3015,9 @@ async fn run_once(
         "reviewer",
         msg.pr_number,
     )
+    .await
+    // The app map: the change's callers in the team's other repositories.
+    .load_map(state)
     .await;
     let graph_context = if let Some(g) = graphs.ready() {
         let changed_paths: Vec<String> = compare["files"]
@@ -3033,6 +3045,28 @@ async fn run_once(
         }
     } else {
         String::new()
+    };
+    // The cross-repository impact check (`run_map`): an endpoint this pull
+    // request changes that other repositories call is put in front of the
+    // reviewer with each caller's file:line.
+    let graph_context = match graphs.map() {
+        Some(m) => {
+            let changed: Vec<(String, String)> = compare["files"]
+                .as_array()
+                .map(|fs| {
+                    fs.iter()
+                        .filter_map(|f| {
+                            Some((
+                                f["filename"].as_str()?.to_string(),
+                                f["patch"].as_str().unwrap_or("").to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{graph_context}{}", m.review_section(&changed))
+        }
+        None => graph_context,
     };
 
     // CI evidence: the PR's ACTUAL check results for this head, injected into
