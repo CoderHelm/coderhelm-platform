@@ -310,25 +310,21 @@ async fn after_sync(state: &WorkerState, st: &AwsSyncStore, msg: &SyncMessage) {
 
 /// The team's chat channels and an email to each owner and admin.
 async fn tell_admins(state: &WorkerState, team: &str, src: &Source) {
-    use aws_sdk_dynamodb::types::AttributeValue as Av;
     let Some(e) = src.error.as_ref() else { return };
     let app = common::public_urls::app_url(&state.config.stage);
-    let item = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", Av::S(team.to_string()))
-        .key("sk", Av::S(common::alert_notify::TEAM_SETTINGS_SK.into()))
-        .send()
-        .await
-        .ok()
-        .and_then(|o| o.item().cloned())
-        .unwrap_or_default();
     let cipher = common::mcp_credentials::Kms {
         client: &state.kms,
         key_id: "",
     };
-    let channels = common::notify::store::open_all(&cipher, team, &item).await;
+    // A sign-in to renew is a person's to do: the "needs you" channel.
+    let channels = common::notify::route::team_channels(
+        &state.dynamo,
+        &cipher,
+        &state.config.settings_table_name,
+        team,
+        common::notify::route::Kind::Action,
+    )
+    .await;
     if !channels.is_empty() {
         common::notify::deliver(
             &common::notify::Http(&state.http),

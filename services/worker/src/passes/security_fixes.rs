@@ -1910,31 +1910,23 @@ async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
 
 // ── Cards ───────────────────────────────────────────────────────────────
 
-pub(crate) async fn team_channels(state: &WorkerState, team_id: &str) -> common::notify::Channels {
-    let item = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(common::alert_notify::TEAM_SETTINGS_SK))
-        .send()
-        .await
-        .ok()
-        .and_then(|o| o.item().cloned())
-        .unwrap_or_default();
-    let enabled = item
-        .get("enabled")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false);
-    if !enabled {
-        return Default::default();
-    }
+/// The team's channels, opened once: each message picks its own by kind
+/// (`common::notify::route`), so only alerts reach an alert channel.
+pub(crate) async fn team_channels(
+    state: &WorkerState,
+    team_id: &str,
+) -> common::notify::route::TeamChannels {
     let cipher = common::mcp_credentials::Kms {
         client: &state.kms,
         key_id: "",
     };
-    common::notify::store::open_all(&cipher, team_id, &item).await
+    common::notify::route::team(
+        &state.dynamo,
+        &cipher,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await
 }
 
 fn finding_url(state: &WorkerState, id: &str) -> String {
@@ -1949,11 +1941,12 @@ fn finding_url(state: &WorkerState, id: &str) -> String {
 async fn post_card(
     state: &WorkerState,
     team_id: &str,
-    channels: &common::notify::Channels,
+    channels: &common::notify::route::TeamChannels,
     thing: &str,
     stage: Stage,
     f: &Finding,
 ) -> bool {
+    let channels = &channels.get(sec::card_kind(f, stage));
     if channels.is_empty() {
         return false;
     }
@@ -2735,7 +2728,7 @@ async fn cards(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize 
             let msg = sec::digest_card(&waiting, &url, cx.cfg.max_cards_per_day);
             let sent = common::notify::deliver_recorded(
                 &common::notify::Http(&cx.state.http),
-                &channels,
+                &channels.get(common::notify::route::Kind::Update),
                 &msg,
                 "security",
                 &cx.state.dynamo,

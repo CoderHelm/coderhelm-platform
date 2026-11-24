@@ -739,26 +739,16 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
         .unwrap_or_default();
     let base = common::plugins::chat::dashboard(&state.config.stage);
     if !p.notify.is_empty() {
-        let item = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key(
-                "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(team.to_string()),
-            )
-            .key(
-                "sk",
-                aws_sdk_dynamodb::types::AttributeValue::S(
-                    common::alert_notify::TEAM_SETTINGS_SK.into(),
-                ),
-            )
-            .send()
-            .await
-            .ok()
-            .and_then(|o| o.item().cloned())
-            .unwrap_or_default();
-        let mut channels = common::notify::store::open_all(&cipher(state), team, &item).await;
+        // A review request is for a person to act on: the team's "needs
+        // you" channel, never an alert channel that takes alerts only.
+        let mut channels = common::notify::route::team_channels(
+            &state.dynamo,
+            &cipher(state),
+            &state.config.settings_table_name,
+            team,
+            common::notify::route::Kind::Action,
+        )
+        .await;
         if p.notify == "teams" {
             channels.slack = None;
         } else if p.notify == "slack" {

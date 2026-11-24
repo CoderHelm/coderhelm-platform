@@ -749,6 +749,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "alerts::delete_route",
             "alerts::get_notify",
             "alerts::put_notify",
+            "alerts::get_updates_notify",
+            "alerts::put_updates_notify",
             "alerts::get_budget",
             "alerts::put_budget",
             "alerts::test_notify",

@@ -852,7 +852,14 @@ pub async fn on_fix_pr_closed(
         return;
     };
     let cipher = super::alerts::cipher(state);
-    let channels = lf::channels(&state.dynamo, &cipher, table, team_id).await;
+    let channels = lf::channels(
+        &state.dynamo,
+        &cipher,
+        table,
+        team_id,
+        common::notify::route::Kind::Update,
+    )
+    .await;
     let cards = lf::DynamoFixCards {
         dynamo: &state.dynamo,
         table,

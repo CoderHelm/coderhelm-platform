@@ -482,7 +482,7 @@ pub(super) struct Live<'a, 'c> {
     pub cx: &'a Ctx<'c>,
     pub started: Instant,
     pub budget_secs: u64,
-    channels: tokio::sync::OnceCell<common::notify::Channels>,
+    channels: tokio::sync::OnceCell<common::notify::route::TeamChannels>,
 }
 
 impl<'a, 'c> Live<'a, 'c> {
