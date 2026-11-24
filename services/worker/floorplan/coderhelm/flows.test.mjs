@@ -227,10 +227,10 @@ test('helpers read the code the way the closers need', () => {
   assert.deepEqual(F.eventSites("this.events.emit('a.b', x)\n@OnEvent(EMAIL_SEEN)").emits.map((e) => e.name), ['a.b']);
   assert.deepEqual(F.eventSites("this.events.emit('a.b', x)\n@OnEvent(EMAIL_SEEN)").listens.map((e) => e.name), ['EMAIL_SEEN']);
   assert.deepEqual(F.outgoingHooks('await handleWebhookTrigger({});\nasync function sendWebhook() {}').map((h) => h.token), ['handleWebhookTrigger']);
-  assert.deepEqual(F.routeHops('const r = await fetch(`${apiBase}/adyen/sessions/${type}`)').map((h) => h.raw), ['${apiBase}/adyen/sessions/${type}']);
-  const routes = [{ f: 'a.ts', m: 'POST', p: '/exerp/*' }, { f: 'b.ts', m: 'POST', p: '/exerp/persons/createPerson' }, { f: 'c.ts', m: 'GET', p: '/slips/:id' }];
-  assert.equal(F.matchRoute(routes, '/exerp/persons/createPerson', 'POST'), 1);
-  assert.equal(F.matchRoute(routes, '/exerp/persons/getPersonDetail', 'POST'), 0);
+  assert.deepEqual(F.routeHops('const r = await fetch(`${apiBase}/payments/sessions/${type}`)').map((h) => h.raw), ['${apiBase}/payments/sessions/${type}']);
+  const routes = [{ f: 'a.ts', m: 'POST', p: '/harbor/*' }, { f: 'b.ts', m: 'POST', p: '/harbor/boaters/createBoater' }, { f: 'c.ts', m: 'GET', p: '/slips/:id' }];
+  assert.equal(F.matchRoute(routes, '/harbor/boaters/createBoater', 'POST'), 1);
+  assert.equal(F.matchRoute(routes, '/harbor/boaters/getBoater', 'POST'), 0);
   assert.equal(F.matchRoute(routes, '/slips/:p', 'GET'), 2);
   assert.equal(F.matchRoute(routes, '/nowhere', 'GET'), null);
   assert.equal(F.findToken(['a', 'b', 'x token', 'c'], 1, 'token'), 3);

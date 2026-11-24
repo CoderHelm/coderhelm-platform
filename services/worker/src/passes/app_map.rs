@@ -1256,6 +1256,7 @@ async fn step(
             if todo.is_object() {
                 let mut todo = todo.clone();
                 todo["heads"] = json!(job.built);
+                todo["build"] = json!(build);
                 s3_put(
                     state,
                     &am::flows_todo_key(team_id),
@@ -1401,16 +1402,103 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
     common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     let mut usage = TokenUsage::default();
     let client = provider.client();
-    let (new, rep, _) =
-        match fl::ask(&client, &state.config.light_model_id, &todo, &mut usage).await {
-            Ok(x) => x,
-            Err(e) => {
-                // The map stays as it is; the next build asks again.
-                warn!(team_id, error = %e, "App map: the journeys couldn't be written");
-                return Ok(());
+    let model = state.config.light_model_id.clone();
+    // The tracer reads the code the map was built from; the candidate
+    // picker writes the journeys of entries it couldn't trace (or all of
+    // them when the code can't be read).
+    let mut asked = todo.clone();
+    let mut new = Vec::new();
+    let mut fallback = todo.clone();
+    let traced = if super::app_map_trace::enabled() {
+        trace_journeys(
+            state, team_id, &provider, &client, &model, &todo, &mut usage,
+        )
+        .await
+    } else {
+        Err("the tracer is off".to_string())
+    };
+    match traced {
+        Ok(out) => {
+            info!(team_id, flows = out.flows.len(), answers = out.raw.len(), traced = ?out.report, left = out.left.len(), cost = usage.cost_usd, "App map: journeys traced");
+            new = out.flows;
+            let failed: std::collections::BTreeSet<String> = out
+                .failed
+                .iter()
+                .map(|e| e["id"].as_str().unwrap_or("").to_string())
+                .collect();
+            let left: std::collections::BTreeSet<String> = out
+                .left
+                .iter()
+                .map(|e| e["id"].as_str().unwrap_or("").to_string())
+                .collect();
+            fallback["entries"] = json!(todo["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| failed.contains(e["id"].as_str().unwrap_or("")))
+                .collect::<Vec<_>>());
+            // Entries no step reached are asked in the next one.
+            asked["entries"] = json!(todo["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| !left.contains(e["id"].as_str().unwrap_or("")))
+                .collect::<Vec<_>>());
+            if !out.left.is_empty() {
+                let mut rest = todo.clone();
+                rest["entries"] = json!(out.left);
+                s3_put(
+                    state,
+                    &am::flows_todo_key(team_id),
+                    am::gzip(rest.to_string().as_bytes()),
+                )
+                .await?;
+                let build = todo["build"].as_str().unwrap_or("");
+                if !queue(state, team_id, "flows", build, 0, 0).await {
+                    warn!(
+                        team_id,
+                        "App map: the rest of the journeys couldn't be queued"
+                    );
+                }
             }
-        };
-    info!(team_id, flows = new.len(), checked = ?rep, cost = usage.cost_usd, "App map: journeys written");
+        }
+        Err(e) => {
+            info!(team_id, reason = %e, "App map: the journeys are picked from the candidates")
+        }
+    }
+    if fallback["entries"]
+        .as_array()
+        .is_some_and(|e| !e.is_empty())
+    {
+        let ids: std::collections::BTreeSet<String> = fallback["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| e["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        fallback["groups"] = json!(fl::groups(&todo)
+            .into_iter()
+            .filter(|g| g["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| ids.contains(e.as_str().unwrap_or(""))))
+            .collect::<Vec<_>>());
+        match fl::ask(&client, &model, &fallback, &mut usage).await {
+            Ok((picked, rep, _)) => {
+                info!(team_id, flows = picked.len(), checked = ?rep, "App map: journeys picked from the candidates");
+                new.extend(picked);
+            }
+            Err(e) => warn!(team_id, error = %e, "App map: the journeys couldn't be written"),
+        }
+    }
+    info!(
+        team_id,
+        flows = new.len(),
+        cost = usage.cost_usd,
+        "App map: journeys written"
+    );
+    let todo = asked;
     let tgz = s3_get(state, &am::state_key(team_id))
         .await
         .ok_or("the map's state is gone")?;
@@ -1438,6 +1526,78 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The journeys traced through the code at the heads the map was built
+/// from: the repositories read again (the step runs on its own, after the
+/// map), the map's graph for its lookups, the light model a few journeys
+/// at a time until the Lambda's time runs short.
+async fn trace_journeys(
+    state: &WorkerState,
+    team_id: &str,
+    provider: &crate::agent::provider::ModelProvider,
+    client: &crate::agent::anthropic::AnthropicClient,
+    model: &str,
+    todo: &Value,
+    usage: &mut TokenUsage,
+) -> Result<super::app_map_trace::TraceOut, String> {
+    use super::app_map_trace as tr;
+    let heads: BTreeMap<String, String> =
+        serde_json::from_value(todo["heads"].clone()).map_err(|e| e.to_string())?;
+    let repos = super::plan::fetch_team_repos(state, team_id).await;
+    let installation = super::code_graph::team_installation_id(state, team_id)
+        .await
+        .ok_or("no GitHub installation for the team")?;
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        installation,
+        &state.http,
+    )
+    .map_err(|e| e.to_string())?;
+    let folders = am::folders(&repos);
+    let mut budget = MAX_SNAPSHOT_BYTES;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for (repo, sha) in &heads {
+        let Some((owner, name)) = repo.split_once('/') else {
+            continue;
+        };
+        if budget == 0 {
+            break;
+        }
+        let folder = folders
+            .get(repo)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let tarball = github
+            .download_tarball(owner, name, sha)
+            .await
+            .map_err(|e| format!("{repo} couldn't be read: {e}"))?;
+        let (got, _) = repo_entries(&tarball, &folder, &mut budget);
+        files.extend(got);
+    }
+    let snapshot = Snapshot::take(files);
+    let graph = s3_get(state, &am::graph_key(team_id))
+        .await
+        .and_then(|b| am::gunzip(&b, am::MAX_GRAPH_BYTES))
+        .and_then(|j| serde_json::from_slice::<Value>(&j).ok())
+        .ok_or("the map's graph is gone")?;
+    let deadline = job_deadline();
+    let mut gate = crate::agent::policy::gate(
+        state,
+        provider.scope.ctx(common::agent_policy::Agent::Planner),
+        deadline,
+    );
+    let tools = crate::agent::policy::offerable(&mut gate, &tr::tools()).await;
+    // No new journey starts in the last few minutes.
+    let stop = time_left().map(|t| {
+        std::time::Instant::now()
+            + t.saturating_sub(std::time::Duration::from_secs(tr::JOURNEY_SECS + 120))
+    });
+    Ok(tr::trace_all(
+        client, model, &gate, &tools, &snapshot, graph, todo, usage, true, stop,
+    )
+    .await)
 }
 
 async fn next_step(

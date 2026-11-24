@@ -325,6 +325,20 @@ export function propHandlers(lines, line) {
 
 /** Where a function declared in a file runs (1-based lines, from its
  * declaration to its closing brace), or null. */
+/** The 1-based line where the brace or parenthesis opened at or after
+ * line index `a` closes. */
+export function braceEnd(lines, a) {
+  let depth = 0;
+  let opened = false;
+  for (let i = a; i < lines.length; i++) {
+    for (const ch of lines[i].replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""').replace(/\/\/.*$/, '')) {
+      if (ch === '{' || ch === '(') { depth++; opened = true; } else if (ch === '}' || ch === ')') depth--;
+    }
+    if (opened && depth <= 0) return i + 1;
+  }
+  return lines.length;
+}
+
 export function bodyRange(lines, name) {
   const decl = new RegExp('^\\s*(?:export\\s+)?(?:(?:const|let|var)\\s+' + esc(name) + '\\s*=|(?:async\\s+)?function\\s+' + esc(name) + '\\b)');
   const a = lines.findIndex((t) => decl.test(t));
@@ -743,6 +757,75 @@ export function candidates(graph, read) {
   // Server work behind a route: the files its handler reaches, with
   // constructor injection narrowed to the services the method uses.
   const serverFiles = new Map();
+  // From the given spans of a class file: the methods of injected services
+  // they call (`this.payments.charge(`), and inside those only the methods
+  // that run (`this.charge(` in the same class), down three services; and
+  // the functions they import, narrowed to the names used. Each file gets
+  // the spans of its code that runs.
+  const reachMethods = (file, spans, d, at, files) => {
+    const lines = r.lines(file) || [];
+    const di = new Map(hiddenImports(ix, r, classes, file).filter((h) => h.how === 'di').map((h) => [h.prop, h.to]));
+    const textOf = (sp) => sp.map(([x, y]) => lines.slice(x - 1, y).join('\n')).join('\n');
+    const text = textOf(spans);
+    // Services called, by property: the methods and where first called.
+    const calls = new Map();
+    for (const m of text.matchAll(/this\.(\w+)\.(\w+)\s*(?:<[^>()]*>)?\(/g)) {
+      const to = di.get(m[1]);
+      if (!to || to === file) continue;
+      if (!calls.has(to)) calls.set(to, new Set());
+      calls.get(to).add(m[2]);
+    }
+    const firstLine = (re) => {
+      for (const [x, y] of spans) for (let i = x - 1; i < y; i++) if (re.test(lines[i] || '')) return i + 1;
+      return 0;
+    };
+    for (const [to, methods] of calls) {
+      const prop = [...di].find(([, f]) => f === to)?.[0];
+      const line = firstLine(new RegExp('this\\.' + esc(prop) + '\\.'));
+      const own = methodSpans(to, methods);
+      if (!own.length) continue;
+      const had = files.get(to);
+      if (had?.spans) {
+        const fresh = own.filter(([x]) => !had.spans.some(([y]) => y === x));
+        if (!fresh.length) continue;
+        had.spans.push(...fresh);
+      } else if (had) continue;
+      else files.set(to, { d: d + 1, names: null, at: [...at, line], spans: own });
+      if (d + 1 < 4) reachMethods(to, own, d + 1, [...at, line], files);
+    }
+    // Functions it imports, as the code that runs uses them.
+    for (const e of ix.imports.get(file) || []) {
+      if (isTest(e.to) || NOISE_DIR.test('/' + e.to) || files.has(e.to)) continue;
+      const used = (e.names || []).filter((n) => n !== 'default' && n !== '*' && new RegExp('\\b' + esc(n) + '\\b').test(text));
+      if (!used.length) continue;
+      const line = firstLine(new RegExp('\\b(' + used.map(esc).join('|') + ')\\b'));
+      files.set(e.to, { d: d + 1, names: new Set(used), at: [...at, line] });
+      for (const [f, v] of closure(ix, r, classes, e.to, { depth: 2, cap: 20 })) {
+        if (f === e.to || files.has(f)) continue;
+        files.set(f, { ...v, d: d + 1 + v.d, at: [...at, line, ...v.at] });
+      }
+    }
+  };
+  // The lines of a class's methods, with the methods they call on `this`.
+  const methodSpans = (file, names) => {
+    const lines = r.lines(file) || [];
+    const out = [];
+    const seen = new Set();
+    const queue = [...names];
+    while (queue.length) {
+      const n = queue.shift();
+      if (seen.has(n)) continue;
+      seen.add(n);
+      const head = new RegExp('^\\s+(?:(?:public|private|protected|static|async|override|readonly)\\s+)*' + esc(n) + '\\s*(?:<[^>]*>)?\\(');
+      const a = lines.findIndex((t) => head.test(t) && !/^\s*(return|await|if|for|while)\b/.test(t));
+      if (a < 0) continue;
+      const b = braceEnd(lines, a);
+      out.push([a + 1, b]);
+      const body = lines.slice(a, b).join('\n');
+      for (const m of body.matchAll(/this\.(\w+)\s*(?:<[^>()]*>)?\(/g)) if (!seen.has(m[1])) queue.push(m[1]);
+    }
+    return out;
+  };
   const behindRoute = (ri) => {
     if (serverFiles.has(ri)) return serverFiles.get(ri);
     const rt = routes[ri];
@@ -756,14 +839,10 @@ export function candidates(graph, read) {
       for (let i = a + 1; i < lines.length; i++) if (/^\s*@(Get|Post|Put|Patch|Delete|All|Head|Options)\(/.test(lines[i])) { b = i; break; }
       const body = lines.slice(a, b).join('\n');
       const props = new Set([...body.matchAll(/this\.(\w+)\./g)].map((m) => m[1]));
-      // In the controller itself, only the handler method's own lines.
-      files = new Map([[start, { d: 0, names: null, at: [], span: [a + 1, b] }]]);
-      for (const h of hiddenImports(ix, r, classes, rt.f)) {
-        if (!(h.how === 'di' && props.has(h.prop))) continue;
-        // The service runs where the handler first calls it.
-        const call = lines.findIndex((t, i) => i >= a && i < b && t.includes('this.' + h.prop + '.'));
-        for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, { ...v, d: v.d + 1, at: [call + 1, ...v.at] });
-      }
+      // In the controller itself, only the handler method's own lines;
+      // then only the service methods it calls, down to what they call.
+      files = new Map([[start, { d: 0, names: null, at: [], spans: [[a + 1, b]], own: true }]]);
+      reachMethods(rt.f, [[a + 1, b]], 0, [], files);
     } else {
       files = closure(ix, r, classes, start, { depth: 5, cap: 150 });
     }
@@ -960,14 +1039,16 @@ export function candidates(graph, read) {
     hooksFor.set(id, webhookRoutes.filter((ri) => words.some((w) => (routes[ri].p + ' ' + routes[ri].f).toLowerCase().includes(w))));
   }
 
-  const usedAt = (f, v, line) => (v.span ? line >= v.span[0] && line <= v.span[1] : inUse(ix, r, f, v.names, line));
+  const usedAt = (f, v, line) => (v.spans ? v.spans.some(([x, y]) => line >= x && line <= y) : inUse(ix, r, f, v.names, line));
   for (const c of [...list]) {
     if (c.kind !== 'request' || c.route == null) continue;
     const files = behindRoute(c.route);
     for (const [f, v] of files) {
       for (const x of ix.ext.get(f) || []) {
         const el = x.link?.evidence?.[0]?.line;
-        if (v.span && el && !usedAt(f, v, el)) continue;
+        // A service's own client (its base URL, its key) is read outside
+        // the methods; in the controller, only the handler's lines count.
+        if (v.own && el && !usedAt(f, v, el)) continue;
         const o = outside(x.node, f, x.link);
         if (!o) continue;
         link(c, o, 'its handler uses it', at(v, x.link?.evidence?.[0]?.line));
@@ -1210,7 +1291,30 @@ export function family(text) {
 /** Screens a journey can start at: a screen whose name or address says
  * what the journey is. */
 export function entries(c) {
-  return c.list.filter((x) => x.kind === 'screen' && family(`${x.name} ${x.url || ''} ${path.posix.basename(x.file || '')}`));
+  const byId = new Map(c.list.map((x) => [x.id, x]));
+  const own = (x) => family(`${x.name} ${x.url || ''} ${path.posix.basename(x.file || '')}`);
+  const out = [];
+  for (const x of c.list) {
+    if (x.kind !== 'screen') continue;
+    let f = own(x);
+    // A screen whose name says nothing (a public booking page, a signed-out
+    // landing) starts the journey its own code starts: the family of the
+    // requests it makes itself, or of the forms and steps it shows.
+    if (!f) {
+      const votes = new Map();
+      for (const [b, e] of c.edges.get(x.id) || []) {
+        // Its own requests: made in its own file, not
+        // the shared code every screen reaches.
+        if (e.why === 'the screen makes this request' ? (e.rank?.d ?? 9) > 0 : !['a step inside the page', 'the screen shows this form'].includes(e.why)) continue;
+        const y = byId.get(b);
+        const g = y && (y.kind === 'request' ? family(y.path || y.key) : y.kind === 'screen' ? own(y) : null);
+        if (g) votes.set(g, (votes.get(g) || 0) + 1);
+      }
+      f = [...votes].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    }
+    if (f) { x.fam = f; out.push(x); }
+  }
+  return out;
 }
 
 /** Entries in turn across families (sign in, sign up, ...), routed screens
@@ -1323,18 +1427,23 @@ export function revalidate(store, c, read) {
   for (const fl of store?.flows || []) {
     const steps = [];
     let gone = 0;
+    let moved = false;
     for (const st of fl.steps || []) {
       const ev = [];
       let ok = true;
       for (const e of st.evidence || []) {
         const l = findToken(read.lines(e.file), e.line, e.token);
         if (!l) { ok = false; break; }
+        if (l !== e.line) moved = true;
         ev.push({ ...e, line: l });
       }
-      const cand = c.byKey.get(st.key);
+      // A traced step the map has no node for stands on its cited line.
+      const cand = c.byKey.get(st.key) || (String(st.key).startsWith('code:') && ev.length ? { view: st.view } : null);
       if (!ok || !ev.length || !cand) { gone += 1; continue; }
       steps.push({ ...st, evidence: ev, view: cand.view });
     }
+    // A traced journey whose code moved or changed is traced again.
+    if (fl.origin === 'trace' && (moved || gone)) changed.push(fl.entry);
     const total = (fl.steps || []).length || 1;
     const entryOk = c.byKey.has(fl.entry) && steps[0]?.key === fl.entry;
     let why = null;
@@ -1426,7 +1535,7 @@ export function prepare(root, graph, prev) {
   if (todoEntries.length) {
     // One model call per journey family per app, each with only the
     // candidates around that family's entries (and its own list cap).
-    const fam = (e) => family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || 'other';
+    const fam = (e) => e.fam || family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || 'other';
     const appOf = (e) => e.app || (e.file || '').split('/')[0];
     const groups = new Map();
     for (const e of todoEntries) {
