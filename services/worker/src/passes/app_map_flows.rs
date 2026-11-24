@@ -25,7 +25,7 @@ use std::io::Read;
 use serde_json::{json, Value};
 
 /// Steps in one journey, at most.
-pub const MAX_STEPS: usize = 15;
+pub const MAX_STEPS: usize = 25;
 /// Where journeys are kept inside the map's state.
 pub const STORE: &str = "floorplan/coderhelm/flows.json";
 /// The store's format.
@@ -182,7 +182,7 @@ pub fn plain(s: &str, max: usize) -> String {
     common::truncate_str(&t, max).to_string()
 }
 
-fn slug(s: &str) -> String {
+pub fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         if c.is_ascii_alphanumeric() {
@@ -1073,10 +1073,10 @@ mod tests {
     }
 
     #[test]
-    fn a_journey_has_at_most_fifteen_steps() {
+    fn a_journey_has_at_most_max_steps() {
         let mut t = todo();
         let mut steps = vec![json!({"ref": "S1", "note": "start"})];
-        for i in 0..20 {
+        for i in 0..30 {
             let id = format!("S{}", i + 10);
             t["table"][&id] = json!({"key": format!("screen:web:/{i}"), "kind": "screen", "view": format!("f:p{i}.tsx"), "label": "x", "next": [],
                 "evidence": [{"file": format!("p{i}.tsx"), "line": 1, "token": "Page", "from": 1, "window": ["export default function Page() {}"]}]});
@@ -1087,7 +1087,7 @@ mod tests {
             &t,
         );
         assert_eq!(flows[0]["steps"].as_array().unwrap().len(), MAX_STEPS);
-        assert_eq!(rep.cut, 21 - MAX_STEPS);
+        assert_eq!(rep.cut, 31 - MAX_STEPS);
     }
 
     #[test]

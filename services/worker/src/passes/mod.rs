@@ -1262,6 +1262,8 @@ pub mod alert_episodes;
 pub mod app_map;
 /// The app map's journeys: the light model picks and orders the sandbox's candidates, a checker keeps only cited steps.
 pub mod app_map_flows;
+/// The app map's journeys, traced through the code by the light model with read-only tools.
+pub mod app_map_trace;
 pub mod await_merge;
 pub mod aws_permissions;
 pub mod base_images;
