@@ -1455,17 +1455,11 @@ impl GitHubClient {
         self.app_bot_login().await.ok()
     }
 
-    /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
-    /// stamped as committer on every commit the platform creates via the API.
-    /// Used to distinguish our own commits from foreign (user) commits.
-    pub async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        if common::hybrid::client::github_via_broker(&self.private_key) {
-            self.get_installation_token().await?;
-            return common::hybrid::client::bot_login()
-                .ok_or_else(|| "the broker named no bot".into());
-        }
+    /// This GitHub App as GitHub describes it (`GET /app`, with the app's
+    /// own token): its slug and its owner.
+    async fn get_app(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = self.generate_jwt()?;
-        let resp: serde_json::Value = self
+        Ok(self
             .http
             .get(format!("{API_BASE}/app"))
             .header("Authorization", format!("Bearer {jwt}"))
@@ -1475,7 +1469,19 @@ impl GitHubClient {
             .await?
             .error_for_status()?
             .json()
-            .await?;
+            .await?)
+    }
+
+    /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
+    /// stamped as committer on every commit the platform creates via the API.
+    /// Used to distinguish our own commits from foreign (user) commits.
+    pub async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            self.get_installation_token().await?;
+            return common::hybrid::client::bot_login()
+                .ok_or_else(|| "the broker named no bot".into());
+        }
+        let resp = self.get_app().await?;
         let slug = resp
             .get("slug")
             .and_then(|v| v.as_str())
@@ -4485,6 +4491,18 @@ impl GitHubClient {
         sha: &str,
         merge_method: &str,
     ) -> Result<MergeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // The customer details guard holds every merge CoderHelm makes, the
+        // armed auto-merge and any other: a failing or running guard on the
+        // head, or none yet on a public repository, and nothing is merged.
+        // A failed read is an error, never a merge.
+        let pr = self.get_pull_request(owner, repo, pr_number).await?;
+        let public = pr["base"]["repo"]["private"].as_bool() == Some(false);
+        let guarded = public && self.customer_guard_checks(owner).await?;
+        let runs = self.customer_guard_runs(owner, repo, sha).await?;
+        let guard = common::customer_guard::guard_state(&runs);
+        if let Some(why) = common::customer_guard::merge_refusal(guard, guarded) {
+            return Ok(MergeOutcome::NotMergeable(why.to_string()));
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
         let headers = self.auth_headers().await?;
         let mut req = self.http.put(&url).json(&serde_json::json!({
@@ -4509,6 +4527,98 @@ impl GitHubClient {
             409 => Ok(MergeOutcome::HeadMoved(reason)),
             _ => Err(format!("merge failed ({status}): {text}").into()),
         }
+    }
+
+    /// Whether the customer details guard checks `owner`'s public
+    /// repositories on this deployment (`common::customer_guard::checks_repo`).
+    pub async fn customer_guard_checks(
+        &self,
+        owner: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if common::public_urls::self_hosted() {
+            return Ok(true);
+        }
+        let app_owner = self.app_owner_login().await?;
+        Ok(common::customer_guard::checks_repo(
+            false,
+            owner,
+            Some(&app_owner),
+        ))
+    }
+
+    /// The account that owns this GitHub App (GitHub's `GET /app`), read
+    /// once per process.
+    pub async fn app_owner_login(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        static OWNER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        if let Some(o) = OWNER.lock().ok().and_then(|g| g.clone()) {
+            return Ok(o);
+        }
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            // CoderHelm's app through the broker is a self-hosted install,
+            // which never asks (`customer_guard_checks`).
+            return Err("the app's owner is not known through the broker".into());
+        }
+        let resp = self.get_app().await?;
+        let owner = resp["owner"]["login"]
+            .as_str()
+            .filter(|o| !o.is_empty())
+            .ok_or("Missing owner in GET /app response")?
+            .to_string();
+        if let Ok(mut g) = OWNER.lock() {
+            *g = Some(owner.clone());
+        }
+        Ok(owner)
+    }
+
+    /// The customer details guard's check runs on `sha`, every one of them
+    /// (`common::customer_guard::guard_state` takes the newest).
+    pub async fn customer_guard_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let name = common::customer_guard::CHECK_NAME.replace(' ', "%20");
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/commits/{sha}/check-runs?check_name={name}&filter=all&per_page=100"
+        );
+        let v = self.get(&url).await?;
+        Ok(v["check_runs"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every commit of a pull request, oldest first (GitHub lists up to 250).
+    pub async fn list_pr_commits_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get_pages(
+                &format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/commits"),
+                3,
+            )
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every file a pull request changes, as GitHub lists them (its path,
+    /// status and patch; up to 3000).
+    pub async fn list_pull_files_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get_pages(
+                &format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/files"),
+                30,
+            )
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
     }
 
     /// List open PRs for a repo (newest first), used by the review-reminder sweep.

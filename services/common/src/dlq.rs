@@ -38,6 +38,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "infra_analyze",
     "resume",
     "review",
+    "customer_guard",
     "review_reminder",
     "review_sweep",
     // CoderHelm's own reviews and threads on one pull request tidied.

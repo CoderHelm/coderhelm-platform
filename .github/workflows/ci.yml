@@ -32,8 +32,6 @@ jobs:
       # text guard workflow reruns it when the PR's text is edited. Title and
       # body come from the event file, never from a script.
       - name: Public text guard
-        env:
-          GUARD_DENYLIST: ${{ secrets.GUARD_DENYLIST }}
         run: |
           python3 -m unittest discover -s .github/scripts -p test_text_guard.py
           python3 .github/scripts/text_guard.py
@@ -334,3 +332,30 @@ jobs:
           pip install --quiet cfn-lint==1.58.0
           cfn-lint ../infra/cfn/*.yaml
           cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native/access.json" "$RUNNER_TEMP/native"/stacks/*.json
+
+  # Last: CoderHelm's "Customer details guard" check run on the PR's head
+  # (customer names, hosts and keys from its own records, never listed
+  # here) passed or was skipped; failing or missing after five minutes
+  # fails. An edit to the PR's text after this ran sets the guard again,
+  # and the Customer details guard rerun workflow runs this job again.
+  # Prints only pass or fail (.github/scripts/customer_guard_gate.py).
+  customer-guard:
+    name: Customer details guard (CI)
+    needs: [workflows, rust-lint, rust-test, rust, lambda-tests, mcp-proxy, jira-app, infra, installer, native]
+    if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Gate tests
+        run: python3 -m unittest discover -s .github/scripts -p test_customer_guard_gate.py
+      - name: The guard passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/customer_guard_gate.py
