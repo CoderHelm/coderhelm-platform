@@ -340,6 +340,7 @@ const CACHES: &[(&str, &str)] = &[
     ("common/src/reply_compose.rs::CACHE", "thread key plus a hash of the whole prompt it was written from"),
     ("common/src/review_check.rs::REFUSED", "installation id"),
     ("common/src/usage.rs::P", "model prices; install-wide config"),
+    ("common/src/customer_guard/mod.rs::SET", "the common-words list; no data"),
     ("common/src/usage.rs::WARNED", "model id; log throttle"),
     ("gateway/src/mcp_server.rs::SEEN", "grant or key id; throttle"),
     ("gateway/src/middleware/auth.rs::SEEN", "(team, user); throttle"),

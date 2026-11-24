@@ -1299,6 +1299,7 @@ pub mod conventions;
 pub mod conversation;
 mod covering;
 mod cross_repo;
+pub mod customer_guard;
 pub mod dep_fix;
 /// The repository's deploy label, read for the preview of CoderHelm's own
 /// pull request and the auto-merge gate (`common::deploy_label`).

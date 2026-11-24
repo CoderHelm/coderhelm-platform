@@ -60,6 +60,11 @@ pub enum WorkerMessage {
     /// and on a merge or a close; the review sweep covers the rest.
     #[serde(rename = "review_tidy")]
     ReviewTidy(ReviewTidyMessage),
+    /// A public repository's pull request opened, edited or pushed to: the
+    /// customer details guard reads its text again and sets its check run
+    /// (`worker::passes::customer_guard`).
+    #[serde(rename = "customer_guard")]
+    CustomerGuard(CustomerGuardMessage),
     /// Work out one repository's stale pull request plan now, without
     /// changing anything (the dashboard's "Preview"). The scheduled cleanup
     /// rides on the review-reminder tick.
@@ -465,6 +470,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::ReviewTidy(_)
+            | WorkerMessage::CustomerGuard(_)
             | WorkerMessage::StalePrsPreview(_) => f::REVIEW,
             WorkerMessage::SecurityEvent(_) => f::SECURITY,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
@@ -538,6 +544,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::ReviewTidy(_)
+            | WorkerMessage::CustomerGuard(_)
             | WorkerMessage::StalePrsPreview(_)
             | WorkerMessage::SetupAnalyze(_)
             | WorkerMessage::SecurityEvent(_)
@@ -699,6 +706,21 @@ pub struct ReviewTidyMessage {
     pub pr_number: u64,
     /// What sent it: `push`, `checks`, `merged`, `closed`.
     pub reason: String,
+}
+
+/// One pull request the customer details guard reads (`crate::customer_guard`).
+/// It carries no text: the worker reads the pull request fresh from GitHub.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomerGuardMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    /// Tries so far that failed (GitHub or the records unreadable); each is
+    /// sent again after a delay, up to a limit.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).

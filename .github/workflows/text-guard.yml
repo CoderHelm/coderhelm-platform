@@ -1,12 +1,12 @@
 name: Public text guard
 
 # The words a pull request publishes (title, body, commit messages, added
-# lines under docs/) carry no details from a customer install: no denylisted
-# terms (.github/text-guard.sha256, and GUARD_DENYLIST when it is set), AWS
-# account ids, TEAM# ids, ULID run ids, Jira keys or email addresses
-# (.github/scripts/text_guard.py). CI's first job runs the same guard on
-# every push; this workflow reruns it when the PR's title or body is edited,
-# on its own so an edit never cancels or skips the build.
+# lines under docs/) carry no ids from an install: AWS account ids, TEAM#
+# ids, ULID run ids, Jira keys or email addresses
+# (.github/scripts/text_guard.py). Customer names and hosts are CoderHelm's
+# own "Customer details guard" check, which CI waits for. CI runs the same
+# guard on every push; this workflow reruns it when the PR's title or body
+# is edited, on its own so an edit never cancels or skips the build.
 on:
   pull_request:
     branches: [main]
@@ -32,10 +32,7 @@ jobs:
           fetch-depth: 0
       - name: Guard tests
         run: python3 -m unittest discover -s .github/scripts -p test_text_guard.py
-      # Reads the title and body from the event file, never from a script.
-      # The denylist is a secret, so the runner masks it; the script masks
-      # each entry again and prints only the place and the rule of a hit.
+      # Reads the title and body from the event file, never from a script,
+      # and prints only the place and the rule of a hit.
       - name: Scan the PR's text
-        env:
-          GUARD_DENYLIST: ${{ secrets.GUARD_DENYLIST }}
         run: python3 .github/scripts/text_guard.py

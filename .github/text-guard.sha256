@@ -1,6 +1,0 @@
-# SHA-256 digests of denylisted terms, one per line; # starts a comment.
-# A term is normalized first: lowercase, every run of anything but letters
-# and digits as one space. The guard hashes every 1- to 4-word run of each
-# line it checks, and every 12-digit number, and fails on a digest listed here.
-# Add terms with:
-#   python3 .github/scripts/text_guard.py --hash-terms < terms.txt >> .github/text-guard.sha256

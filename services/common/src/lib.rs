@@ -31,6 +31,9 @@ pub mod trace;
 /// Expiring once-only claims (dedup markers, leases) on the settings table.
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
+// The customer details guard: public pull request text carries no install's
+// identifiers, read from CoderHelm's own records and kept in memory only.
+pub mod customer_guard;
 /// A re-review started by an edit of a pull request's description: what
 /// counts as a change, and the keys that queue one review per edit burst.
 pub mod prose;

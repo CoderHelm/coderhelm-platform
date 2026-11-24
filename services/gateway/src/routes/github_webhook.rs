@@ -1886,6 +1886,12 @@ async fn handle_pull_request(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
+    // A public repository's pull request text changed (opened, edited, a
+    // push): the customer details guard reads it again and sets its check.
+    if guards_customer_details(payload) {
+        queue_customer_guard(state, payload, installation_id, team_id).await;
+    }
+
     // A security fix's pull request closed or reopened (CoderHelm's, or a
     // bot's it adopted): its findings follow at once, before any return
     // below. The worker's sweep catches a delivery that never arrives.
@@ -4811,6 +4817,40 @@ async fn queue_review_tidy(
     }
 }
 
+/// Pure: does this pull request event start the customer details guard:
+/// its text or head changed, on a repository GitHub says is public.
+fn guards_customer_details(payload: &Value) -> bool {
+    let action = payload["action"].as_str().unwrap_or("");
+    matches!(action, "opened" | "edited" | "synchronize" | "reopened")
+        && payload["repository"]["private"].as_bool() == Some(false)
+        && payload["pull_request"]["number"].as_u64().is_some()
+}
+
+/// Queues the customer details guard for one pull request. The message
+/// carries no text: the worker reads the pull request fresh.
+async fn queue_customer_guard(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) {
+    let repo = &payload["repository"];
+    let msg = WorkerMessage::CustomerGuard(common::messages::CustomerGuardMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
+        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
+        pr_number: payload["pull_request"]["number"].as_u64().unwrap_or(0),
+        attempt: 0,
+    });
+    if send_to_queue(state, &state.config.ticket_queue_url, &msg)
+        .await
+        .is_err()
+    {
+        warn!("Could not queue the customer details guard; the pull request stays unmerged until its next event");
+    }
+}
+
 pub(crate) async fn send_to_queue(
     state: &AppState,
     queue_url: &str,
@@ -6156,5 +6196,53 @@ mod command_after_merge_tests {
             command_after_merge(false, "pat", "/coderhelm go"),
             (false, None)
         );
+    }
+}
+
+#[cfg(test)]
+mod customer_guard_tests {
+    use super::guards_customer_details;
+    use serde_json::json;
+
+    fn event(action: &str, private: bool) -> serde_json::Value {
+        json!({
+            "action": action,
+            "repository": {"private": private, "name": "tool", "owner": {"login": "example-oss"}},
+            "pull_request": {"number": 7},
+        })
+    }
+
+    #[test]
+    fn a_public_pull_requests_text_changes_start_the_guard() {
+        for a in ["opened", "edited", "synchronize", "reopened"] {
+            assert!(guards_customer_details(&event(a, false)), "{a}");
+            assert!(
+                !guards_customer_details(&event(a, true)),
+                "{a} on a private repo"
+            );
+        }
+        for a in ["closed", "labeled", "review_requested"] {
+            assert!(!guards_customer_details(&event(a, false)), "{a}");
+        }
+        // No `private` field: not known to be public, so nothing is published.
+        let mut e = event("opened", false);
+        e["repository"].as_object_mut().unwrap().remove("private");
+        assert!(!guards_customer_details(&e));
+    }
+
+    /// The guard is queued before any other pull request handling can
+    /// return early, and the message carries no text.
+    #[test]
+    fn the_guard_is_queued_first_and_without_text() {
+        let src = include_str!("github_webhook.rs");
+        let handler = src.split("async fn handle_pull_request(").nth(1).unwrap();
+        let first_return = handler.find("return ").unwrap();
+        let guard = handler.find("queue_customer_guard(").unwrap();
+        assert!(guard < first_return);
+        let queue = src.split("async fn queue_customer_guard(").nth(1).unwrap();
+        let queue = &queue[..queue.find("\n}\n").unwrap()];
+        for field in ["\"title\"", "\"body\""] {
+            assert!(!queue.contains(field), "{field}");
+        }
     }
 }

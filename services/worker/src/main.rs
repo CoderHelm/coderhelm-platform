@@ -398,7 +398,7 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
         // The CI wait and the CI fix rounds it leads to: a run's own steps,
         // which leave the last of the hour to reviews and people's answers.
         M::Resume(_) => who::CI,
-        M::Review(_) => who::REVIEW,
+        M::Review(_) | M::CustomerGuard(_) => who::REVIEW,
         M::MarkReady(_) => who::READY,
         M::AwaitMerge(_)
         | M::ReleaseSteps(_)
@@ -711,6 +711,11 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             )
             .await;
             info!(opened = ?opened, "Release catch-up done");
+        }
+        models::WorkerMessage::CustomerGuard(msg) => {
+            // A check the guard could not set is tried again later; until it
+            // is set the pull request is not merged.
+            passes::customer_guard::run_or_retry(&state, &msg).await;
         }
         models::WorkerMessage::ReviewTidy(msg) => {
             if let Err(e) = passes::review_tidy::run(&state, &msg).await {

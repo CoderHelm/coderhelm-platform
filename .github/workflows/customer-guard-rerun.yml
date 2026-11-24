@@ -1,0 +1,46 @@
+name: Customer details guard rerun
+
+# CoderHelm sets its "Customer details guard" check run again whenever a
+# pull request's text changes (an edit of the title or body, a push). When
+# that happens after CI finished, this runs CI's "Customer details guard
+# (CI)" job of that commit again, so the required CI follows the PR's text.
+# Only the guard's own app's check runs count. It runs from the default
+# branch, checks nothing out and prints no PR text.
+on:
+  check_run:
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: customer-guard-rerun-${{ github.event.check_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    name: Run the CI gate again
+    if: ${{ github.event.check_run.name == 'Customer details guard' && github.event.check_run.app.slug == 'coderhelm' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run the gate job of this commit's CI again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.check_run.head_sha }}
+        run: |
+          run_id=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&event=pull_request&per_page=50" \
+            --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml")] | max_by(.run_number) | .id // empty')
+          if [ -z "$run_id" ]; then
+            echo "pass"
+            exit 0
+          fi
+          job=$(gh api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+            --jq '[.jobs[] | select(.name == "Customer details guard (CI)" and .status == "completed")][0].id // empty')
+          # Still queued or running: it reads the guard's newest result itself.
+          if [ -n "$job" ]; then
+            gh api -X POST "repos/$REPO/actions/jobs/$job/rerun" > /dev/null
+          fi
+          echo "pass"

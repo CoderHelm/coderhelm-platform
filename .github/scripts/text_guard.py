@@ -1,15 +1,8 @@
-"""Public text guard: a pull request's words never carry a customer install's details.
+"""Public text guard: a pull request's words never carry an install's ids.
 
 Scans the PR title, the PR body, every commit message in the PR, and the
 lines the PR adds under docs/, and fails (exit 1) on:
 
-- a term whose SHA-256 is in .github/text-guard.sha256. A term is
-  normalized (lowercase, every run of other characters one space), and the
-  guard hashes every run of 1 to 4 words of each line, and every 12-digit
-  number, so the file names no term. Add one with
-  `python3 .github/scripts/text_guard.py --hash-terms < terms.txt`;
-- optionally, a name or hostname from GUARD_DENYLIST (one regex per line,
-  matched ignoring case; blank lines and lines starting with # are skipped);
 - an AWS account id in an ARN, an ECR host, or after "account", and any
   other standalone 12-digit number (which is how an account id is written);
 - a TEAM# id;
@@ -17,14 +10,17 @@ lines the PR adds under docs/, and fails (exit 1) on:
 - a Jira-style key, apart from the allowlist below;
 - an email address, apart from example and no-reply domains.
 
+Customer names and hosts are not listed here, hashed or not: CoderHelm
+checks those itself from its own records (the "Customer details guard"
+check run; .github/scripts/customer_guard_gate.py makes CI wait for it).
+
 It prints where (the source and the line number) and which rule, never the
-matched text, and masks every denylist entry in the log first.
+matched text.
 
     python3 .github/scripts/text_guard.py            # in Actions, on pull_request
     python3 .github/scripts/text_guard.py --text F    # one file, for a local check
 """
 
-import hashlib
 import json
 import os
 import re
@@ -66,72 +62,6 @@ RE_JIRA = re.compile(r"(?<![A-Za-z0-9-])([A-Z]{2,6})-(\d{2,6})(?![0-9])")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})(?![A-Za-z0-9-])")
 
 
-HASH_FILE = os.path.join(".github", "text-guard.sha256")
-# Terms are matched as runs of up to this many words.
-MAX_TERM_WORDS = 4
-RE_HASH_LINE = re.compile(r"^[0-9a-f]{64}$")
-RE_NUMBER = re.compile(r"(?<!\d)(\d{4}-?\d{4}-?\d{4})(?!\d)")
-
-
-def normalize(text):
-    """Lowercase, every run of anything but letters and digits as one space."""
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
-def term_hash(term):
-    return hashlib.sha256(normalize(term).encode("utf-8")).hexdigest()
-
-
-def load_hashes(path):
-    """(hashes, problems) from a file of SHA-256 hex digests; # starts a comment."""
-    hashes, problems = set(), []
-    if not os.path.exists(path):
-        return hashes, problems
-    with open(path, encoding="utf-8") as f:
-        for n, line in enumerate(f, 1):
-            entry = line.split("#", 1)[0].strip().lower()
-            if not entry:
-                continue
-            if RE_HASH_LINE.match(entry):
-                hashes.add(entry)
-            else:
-                problems.append(f"{path} line {n} is not a SHA-256 hex digest")
-    return hashes, problems
-
-
-def line_hashes(line):
-    """The hash of every 1- to MAX_TERM_WORDS-word run of the line, and of every 12-digit number."""
-    words = normalize(line).split()
-    out = set()
-    for i in range(len(words)):
-        for k in range(1, MAX_TERM_WORDS + 1):
-            if i + k <= len(words):
-                out.add(hashlib.sha256(" ".join(words[i:i + k]).encode("utf-8")).hexdigest())
-    for m in RE_NUMBER.finditer(line):
-        out.add(hashlib.sha256(m.group(1).replace("-", "").encode("utf-8")).hexdigest())
-    return out
-
-
-def load_denylist(raw):
-    """(patterns, problems): compiled entries, and the entries that don't compile, by line."""
-    patterns, problems = [], []
-    for n, line in enumerate((raw or "").splitlines(), 1):
-        entry = line.strip()
-        if not entry or entry.startswith("#"):
-            continue
-        try:
-            patterns.append(re.compile(entry, re.IGNORECASE))
-        except re.error:
-            problems.append(f"GUARD_DENYLIST line {n} is not a valid regex")
-    return patterns, problems
-
-
-def mask_commands(raw):
-    """The ::add-mask:: lines that hide every denylist entry from the log."""
-    return [f"::add-mask::{line.strip()}" for line in (raw or "").splitlines()
-            if line.strip() and not line.strip().startswith("#")]
-
-
 def _account(line):
     for rx in (RE_ARN, RE_ECR, RE_ACCOUNT):
         for m in rx.finditer(line):
@@ -164,11 +94,8 @@ def _email(line):
     return any(not EMAIL_DOMAIN_ALLOW.search(m.group(1).lower()) for m in RE_EMAIL.finditer(line))
 
 
-def rules_for(denylist, hashes=frozenset()):
-    rules = [("denylisted name or host", lambda line: any(p.search(line) for p in denylist))]
-    if hashes:
-        rules.append(("denylisted term", lambda line: not hashes.isdisjoint(line_hashes(line))))
-    rules += [
+def rules_for():
+    return [
         ("AWS account id", _account),
         ("12-digit number", _twelve),
         ("TEAM# id", _team),
@@ -176,7 +103,6 @@ def rules_for(denylist, hashes=frozenset()):
         ("Jira-style key", _jira),
         ("email address", _email),
     ]
-    return rules
 
 
 def scan_lines(lines, rules):
@@ -242,29 +168,8 @@ def report(sources, rules):
     return out
 
 
-def hash_terms(stream):
-    """One digest per input line (a plain term), for .github/text-guard.sha256. Prints no term."""
-    return sorted({term_hash(line) for line in stream if normalize(line)})
-
-
 def main(argv):
-    if len(argv) == 2 and argv[1] == "--hash-terms":
-        for h in hash_terms(sys.stdin):
-            print(h)
-        return 0
-    raw = os.environ.get("GUARD_DENYLIST", "")
-    for cmd in mask_commands(raw):
-        print(cmd)
-    denylist, problems = load_denylist(raw)
-    for p in problems:
-        print(f"::error title=Public text guard::{p}")
-    hashes, hash_problems = load_hashes(os.environ.get("GUARD_HASH_FILE", HASH_FILE))
-    problems += hash_problems
-    for p in hash_problems:
-        print(f"::error title=Public text guard::{p}")
-    if not hashes and not raw.strip():
-        print("::warning title=Public text guard::no denylist hashes or GUARD_DENYLIST here; names and hosts are not checked")
-    rules = rules_for(denylist, hashes)
+    rules = rules_for()
 
     if len(argv) == 3 and argv[1] == "--text":
         with open(argv[2], encoding="utf-8") as f:
@@ -274,14 +179,14 @@ def main(argv):
             event = json.load(f)
         if "pull_request" not in event:
             print("Not a pull request event: nothing to check")
-            return 1 if problems else 0
+            return 0
         sources = sources_from_pr(event)
 
     failures = report(sources, rules)
     for line in failures:
         print(line)
     checked = sum(len(lines) for _, _, lines in sources)
-    if failures or problems:
+    if failures:
         print(f"{len(failures)} line(s) carry details from an install; PR text describes the behaviour and the code change only")
         return 1
     print(f"{checked} lines in {len(sources)} source(s): no customer details")
