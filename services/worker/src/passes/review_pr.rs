@@ -5796,6 +5796,13 @@ pub(crate) fn settle_own_findings(
             // follow-up, not a hold. A finding of it on code changed since
             // is new evidence and holds on its own (`review_discipline`).
             if matches!(s, Settled::Noted { .. }) {
+                // A style-level finding the rounds kept moving is a note
+                // for the reviewer, never a blocker (`own_review_ledger`).
+                if let Settled::Noted { why } = s {
+                    if super::own_review_ledger::is_style(&line) {
+                        super::review_policy::demote(f, &format!("A note, not a block: {why}."));
+                    }
+                }
                 settled.push(line);
                 continue;
             }

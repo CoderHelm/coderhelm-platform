@@ -312,12 +312,38 @@ fn words(text: &str) -> Vec<String> {
     out
 }
 
+/// The style-level findings the review's own checks raise
+/// (`minimal_change`): the same finding wherever the code moved, and a
+/// note, not a block, after [`MAX_STYLE_ATTEMPTS`] rounds on it.
+pub const STYLE_TITLES: &[&str] = &[
+    "A parallel structure next to an existing one",
+    "Near-identical helpers added together",
+];
+
+/// Rounds on one style-level finding before it is CoderHelm's note: each
+/// round moved the duplicate somewhere the next review found it again (one
+/// run took four rounds and $39 on "a parallel structure").
+pub const MAX_STYLE_ATTEMPTS: u32 = 2;
+
+/// Whether a finding line is one of the style-level findings.
+pub fn is_style(line: &str) -> bool {
+    let (title, _) = split_line(line);
+    STYLE_TITLES
+        .iter()
+        .any(|t| norm(&title).starts_with(&norm(t)))
+}
+
 /// Whether two finding lines are the same finding: the same file and most
 /// of the significant words. A later review words a finding differently and
-/// its line moves with the code; it is still the same finding.
+/// its line moves with the code; it is still the same finding. A
+/// style-level finding is the same finding in any file: a fix round that
+/// moved the duplicate elsewhere didn't settle it.
 pub fn same_finding(a: &str, b: &str) -> bool {
     let (ta, pa) = split_line(a);
     let (tb, pb) = split_line(b);
+    if is_style(a) && is_style(b) {
+        return norm(&ta) == norm(&tb);
+    }
     if pa != pb {
         return false;
     }
@@ -481,7 +507,9 @@ impl Ledger {
                     Some((code, rest.get(1).map(|w| w.to_string()).unwrap_or_default()))
                 })
             {
-                if common::stop_rules::tooling::names_own_tooling(&what) {
+                if common::stop_rules::tooling::names_own_tooling(&what)
+                    || common::stop_rules::tooling::names_own_read(&what)
+                {
                     // "Add the hosts to CoderHelm's sandbox allowlist": its
                     // own setup, a block the next round removes.
                     if !blocked.contains(&Blocker::Tooling) {
@@ -509,6 +537,17 @@ impl Ledger {
                     t.blocked += 1;
                     t.last_blocked = blocked.clone();
                 }
+            }
+            // A style-level finding the rounds addressed and the review
+            // raised again: a note, not a block.
+            if is_style(item) && t.attempts >= MAX_STYLE_ATTEMPTS && t.settled.is_none() {
+                t.settled = Some(Settled::Noted {
+                    why: format!(
+                        "a style-level finding CoderHelm's rounds addressed {} times; each time                          the review found it again where the code moved, so it is a note for                          the reviewer, not a blocker",
+                        t.attempts
+                    ),
+                });
+                continue;
             }
             // Two honest rounds that said the same person-gate reason.
             if t.person_claims >= 2 && t.last_blocked.is_empty() {

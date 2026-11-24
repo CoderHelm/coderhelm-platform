@@ -950,6 +950,13 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     if crate::stop_rules::tooling::names_own_tooling(&t) {
         return Outcome::Do(Work::Own(one_line(&a.text)));
     }
+    // Reading a CI or end-to-end result, a log, an artifact or what a page
+    // shows is CoderHelm's own (`github_history`, `check_url`,
+    // `probe_page`): it needs no write permission, whatever the writer
+    // blamed.
+    if crate::stop_rules::tooling::names_own_read(&t) {
+        return Outcome::Do(Work::Own(one_line(&a.text)));
+    }
     if a.kind == Kind::Attempt {
         let cause = one_line(&a.why_not).to_lowercase();
         // Refused a workflow start, with a label that starts the same run:
