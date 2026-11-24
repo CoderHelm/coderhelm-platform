@@ -4,3 +4,4 @@
 # line it checks, and every 12-digit number, and fails on a digest listed here.
 # Add terms with:
 #   python3 .github/scripts/text_guard.py --hash-terms < terms.txt >> .github/text-guard.sha256
+792cea25c9a09cadeef5c2857cffe3a80566fd6e0ffe098d90dd0a8f61cb0ca0
