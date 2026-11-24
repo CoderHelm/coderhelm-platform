@@ -1453,6 +1453,7 @@ pub(crate) mod settle;
 pub mod setup;
 pub mod skill_compat;
 pub mod skill_run;
+pub mod skill_schedule;
 pub mod skill_suggest;
 pub mod skills;
 pub mod skipped_checks;

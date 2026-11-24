@@ -356,6 +356,8 @@ pub mod scorecard;
 mod selfhost_links;
 pub mod skill_apply;
 pub mod skill_compat;
+/// Scheduled skill runs: a team's synced skill run on a schedule or on "Run now".
+pub mod skill_runs;
 pub mod skills;
 /// Stale pull request cleanup: settings, activity and the decision.
 pub mod stale_prs;

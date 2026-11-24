@@ -1510,6 +1510,17 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/skills/activity", get(routes::skills::activity))
         .route("/skills/used", get(routes::skills::used))
+        .route(
+            "/skill-runs",
+            get(routes::skill_runs::list).post(routes::skill_runs::create),
+        )
+        .route("/skill-runs/options", get(routes::skill_runs::options))
+        .route(
+            "/skill-runs/:id",
+            put(routes::skill_runs::update).delete(routes::skill_runs::remove),
+        )
+        .route("/skill-runs/:id/run", post(routes::skill_runs::run_now))
+        .route("/skill-runs/:id/runs", get(routes::skill_runs::runs))
         .route("/activity/summary", get(routes::activity::summary))
         .route("/data-sources", get(routes::data_sources::list))
         .route("/connectors", get(routes::connectors::list))

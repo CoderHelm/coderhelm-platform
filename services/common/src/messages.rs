@@ -259,6 +259,10 @@ pub enum WorkerMessage {
     /// due (`crate::alert_episodes`).
     #[serde(rename = "alert_episode_check")]
     AlertEpisodeCheck(AlertEpisodeCheckMessage),
+    /// One run of a scheduled skill: its EventBridge schedule fired, or an
+    /// admin pressed Run now (`crate::skill_runs`).
+    #[serde(rename = "skill_run")]
+    SkillRun(crate::skill_runs::SkillRunMessage),
 }
 
 /// One later check of an alert episode. A wait longer than SQS allows chains:
@@ -490,6 +494,7 @@ impl WorkerMessage {
             | WorkerMessage::PluginSweep
             | WorkerMessage::PluginTrigger(_)
             | WorkerMessage::PluginResults(_) => f::PLUGIN,
+            WorkerMessage::SkillRun(_) => f::SKILL_RUN,
         }
     }
 
@@ -565,7 +570,8 @@ impl WorkerMessage {
             | WorkerMessage::SupportSync
             | WorkerMessage::AlertEpisodeCheck(_)
             | WorkerMessage::PluginTrigger(_)
-            | WorkerMessage::PluginResults(_) => None,
+            | WorkerMessage::PluginResults(_)
+            | WorkerMessage::SkillRun(_) => None,
         }
     }
 
@@ -612,6 +618,11 @@ impl WorkerMessage {
             WorkerMessage::PluginRun(m) => Some((
                 &m.team_id,
                 format!("Plugin {} run", m.plugin_id),
+                m.run_id.clone(),
+            )),
+            WorkerMessage::SkillRun(m) => Some((
+                &m.team_id,
+                format!("Skill run of schedule {}", m.schedule_id),
                 m.run_id.clone(),
             )),
             _ => None,

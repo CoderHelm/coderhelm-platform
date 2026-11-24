@@ -487,7 +487,7 @@ export class WorkerStack extends cdk.Stack {
                   '  bash -c "$SCRIPT_CMD"; CODE=$?',
                   "  unset GH_TOKEN GITHUB_TOKEN",
                   '  echo "===CODERHELM_SCRIPT_END exit=$CODE==="',
-                  '  ( cd "$CODERHELM_OUT" && find . -type f | sed "s|^\\./||" | head -50 > /tmp/outs.txt',
+                  '  ( cd "$CODERHELM_OUT" && find . -type f | sed "s|^\\./||" | head -400 > /tmp/outs.txt',
                   '    if [ -s /tmp/outs.txt ] && [ -n "$SANDBOX_PUT_URL" ]; then tar czf /tmp/out.tgz -T /tmp/outs.txt && curl -fsS --retry 3 --noproxy "*" -T /tmp/out.tgz "$SANDBOX_PUT_URL" && echo "===CODERHELM_SCRIPT_UPLOADED==="; fi )',
                   'elif [ -n "$CODEGEN_CMD" ]; then',
                   '  # Turbo 2.x prunes env vars in its default STRICT mode, stripping the',

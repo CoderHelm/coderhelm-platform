@@ -716,6 +716,10 @@ pub const CAPABILITIES: &[Capability] = &[
             "skills::set_use_translated",
             "skills::set_always_apply",
             "skills::set_reviews",
+            "skill_runs::create",
+            "skill_runs::update",
+            "skill_runs::remove",
+            "skill_runs::run_now",
         ],
     },
     Capability {

@@ -13,6 +13,8 @@ aws-sdk-dynamodb = { version = "1", default-features = false, features = ["defau
 # mail: one send layer for SES and the hybrid email relay
 aws-sdk-sesv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 chrono = "0.4"
+# skill_runs: a schedule's cron line read in the team's time zone
+chrono-tz = "0.10"
 ulid = "1"
 tracing = "0.1"
 # alert_notify: Teams cards for alerts

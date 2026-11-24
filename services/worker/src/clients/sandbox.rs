@@ -395,6 +395,9 @@ pub struct ScriptRun<'r> {
     /// Hosts the script needs beyond the team's allowlist (GitHub's API for
     /// a script given a token).
     pub hosts: Vec<String>,
+    /// Files of `$CODERHELM_OUT` brought back at most: a skill run's whole
+    /// output folder holds more than one run's outputs.
+    pub max_files: usize,
 }
 
 /// The S3 keys of one script run: its source, its secret and its output.
@@ -893,7 +896,7 @@ impl<'a> SandboxClient<'a> {
                     .logs()
                     .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
                     .unzip_or_default();
-                let captured = self.download_script_out(out_key).await;
+                let captured = self.download_script_out(out_key, run.max_files).await;
                 let mut log = String::new();
                 for attempt in 0..4 {
                     if !group.is_empty() {
@@ -920,7 +923,7 @@ impl<'a> SandboxClient<'a> {
 
     /// The files a script wrote, read with the outputs' caps (none when it
     /// wrote nothing).
-    async fn download_script_out(&self, out_key: &str) -> Captured {
+    async fn download_script_out(&self, out_key: &str, max_files: usize) -> Captured {
         let Ok(obj) = self
             .s3
             .get_object()
@@ -934,7 +937,7 @@ impl<'a> SandboxClient<'a> {
         let Ok(bytes) = obj.body.collect().await.map(|b| b.into_bytes()) else {
             return Captured::default();
         };
-        read_changed_tar(&bytes, MAX_SCRIPT_FILES, MAX_SCRIPT_FILE_BYTES).unwrap_or_default()
+        read_changed_tar(&bytes, max_files.max(1), MAX_SCRIPT_FILE_BYTES).unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]

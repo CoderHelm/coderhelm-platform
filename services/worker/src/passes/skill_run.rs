@@ -451,6 +451,7 @@ impl SkillRun<'_> {
             .run_script(
                 ScriptRun {
                     key: &key,
+                    max_files: crate::clients::sandbox::MAX_SCRIPT_FILES,
                     source,
                     cmd: &cmd,
                     secret: token.as_deref(),

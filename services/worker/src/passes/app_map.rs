@@ -1056,6 +1056,7 @@ async fn step(
         .run_script(
             crate::clients::sandbox::ScriptRun {
                 key: &key,
+                max_files: crate::clients::sandbox::MAX_SCRIPT_FILES,
                 source,
                 cmd: "node driver.mjs",
                 secret: None,

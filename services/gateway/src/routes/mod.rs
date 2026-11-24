@@ -100,6 +100,7 @@ pub mod security;
 pub mod setup;
 pub mod setup_checks;
 pub mod sign_in;
+pub mod skill_runs;
 pub mod skills;
 pub mod sns;
 pub mod sso_claim;
