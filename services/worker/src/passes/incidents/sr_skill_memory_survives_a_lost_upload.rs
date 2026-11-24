@@ -30,7 +30,11 @@ fn a_lost_upload_never_wipes_the_memory_folder() {
     assert!(whole(true, 0, 2, restored.len()));
 
     // The memory rides where the script looks for it.
-    let bytes = pack(&[("count_visits.py".into(), b"print(1)".to_vec())], &restored).unwrap();
+    let bytes = pack(
+        &[("count_visits.py".into(), b"print(1)".to_vec())],
+        &restored,
+    )
+    .unwrap();
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
     let paths: Vec<String> = ar
         .entries()
