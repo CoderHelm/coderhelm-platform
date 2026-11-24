@@ -17,10 +17,15 @@
 //!
 //! Each draft is filed once per source ticket ([`draft_id`]): the worker
 //! keeps what it filed, and the app finds a ticket it already filed for the
-//! same draft, so a retried run never files twice. One comment on the
-//! source ticket lists what was filed ([`comment`]). A refusal is said as
-//! exactly what was refused ([`refusal`]): a missing project permission by
-//! its name, never "connect Jira".
+//! same draft, so a retried run never files twice. A draft worded
+//! differently is still one topic: before filing, the follow-ups already
+//! filed for the source (CoderHelm's records and the tracker's label search,
+//! [`Existing`]) are read, and a draft whose topic one of them covers
+//! ([`topic`]: the normalized title and the key files and components it
+//! names, [`marks`]) is not filed again ([`Filed::Covered`]). One comment on
+//! the source ticket lists what was filed ([`comment`]). A refusal is said
+//! as exactly what was refused ([`refusal`]): a missing project permission
+//! by its name, never "connect Jira".
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +64,363 @@ pub fn normal_summary(s: &str) -> String {
         .to_lowercase()
         .trim_end_matches(['.', ' '])
         .to_string()
+}
+
+/// Words that say nothing about a topic.
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "to", "of", "on", "in", "for", "with", "when", "is", "are",
+    "be", "it", "its", "as", "at", "by", "from", "that", "this", "these", "those", "into", "not",
+    "no", "any", "all", "only", "via", "per", "so", "then", "than", "instead", "where", "which",
+];
+
+/// Whether a token reads as a code identifier in mixed case
+/// (`imageWithAlt`, `ContactCard`): a lowercase letter followed by an
+/// uppercase one.
+fn mixed_case(t: &str) -> bool {
+    let c: Vec<char> = t.chars().collect();
+    c.windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+}
+
+/// A file name's stem (`Hero` of `apps/web/Hero.tsx:85`), when `t` names a
+/// file: a dot followed by a short extension of letters.
+fn file_stem(t: &str) -> Option<String> {
+    let t = t.split(':').next().unwrap_or(t);
+    let base = t.rsplit('/').next().unwrap_or(t);
+    let (stem, ext) = base.rsplit_once('.')?;
+    let ext_ok = (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic());
+    (ext_ok && !stem.is_empty() && stem.chars().any(|c| c.is_ascii_alphabetic()))
+        .then(|| stem.to_ascii_lowercase())
+}
+
+/// The key files and components a text names: file names (their stems),
+/// code identifiers in mixed case, and names in backticks that read as
+/// code (`camp-promo`, `image_with_alt`), all lowercased. Two drafts about the same component share these whatever
+/// their wording.
+pub fn marks(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let ticked: Vec<&str> = text.split('`').skip(1).step_by(2).collect();
+    for t in ticked {
+        let t = t.trim();
+        if t.is_empty() || t.contains(' ') {
+            continue;
+        }
+        if let Some(s) = file_stem(t) {
+            out.insert(s);
+        } else if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && t.chars().any(|c| c.is_ascii_alphabetic())
+            && t.len() > 2
+            // A plain word in backticks (`alt`) is an attribute, not a part.
+            && (mixed_case(t) || t.contains('_') || t.contains('-'))
+        {
+            out.insert(t.to_ascii_lowercase());
+        }
+    }
+    for raw in text.split(|c: char| c.is_whitespace() || ",;()[]{}\"'`".contains(c)) {
+        let t = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(s) = file_stem(raw.trim_matches(|c: char| ",.;:!?".contains(c))) {
+            out.insert(s);
+        } else if mixed_case(t) && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            out.insert(t.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// A title's words as two topics compare them: lowercased, split at
+/// anything not a letter or digit, without stop words, numbers or the
+/// [`marks`] (compared on their own), plurals made singular.
+pub fn topic_words(text: &str) -> std::collections::BTreeSet<String> {
+    let skip = marks(text);
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| !skip.contains(w))
+        .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+        .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+        .map(|w| {
+            if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+                w[..w.len() - 1].to_string()
+            } else {
+                w
+            }
+        })
+        .collect()
+}
+
+/// A follow-up already filed for the source ticket: CoderHelm's own record
+/// of it, or what the tracker's label search returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Existing {
+    pub key: String,
+    pub url: String,
+    pub summary: String,
+    /// The key files and components its description names ([`marks`]).
+    pub marks: Vec<String>,
+}
+
+/// The follow-ups filed for a source, one per key: CoderHelm's records
+/// first, a tracker's answer filling in what a record lacks (an older
+/// record kept no summary).
+pub fn merge_existing(records: Vec<Existing>, tracker: Vec<Existing>) -> Vec<Existing> {
+    let mut out: Vec<Existing> = Vec::new();
+    for e in records.into_iter().chain(tracker) {
+        if e.key.trim().is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|o| o.key == e.key) {
+            Some(o) => {
+                if o.summary.trim().is_empty() {
+                    o.summary = e.summary;
+                }
+                if o.url.trim().is_empty() {
+                    o.url = e.url;
+                }
+                for m in e.marks {
+                    if !o.marks.contains(&m) {
+                        o.marks.push(m);
+                    }
+                }
+            }
+            None => out.push(e),
+        }
+    }
+    out
+}
+
+/// The follow-ups a [`comment`] CoderHelm posted lists (`KEY: summary
+/// (url) [note]` lines), for a record kept before records held summaries.
+pub fn titles_from_comment(text: &str) -> Vec<Existing> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        if project_of(key).is_none() {
+            continue;
+        }
+        let mut summary = rest.to_string();
+        let mut url = String::new();
+        if let Some(i) = summary.find(" [") {
+            summary.truncate(i);
+        }
+        if let Some(i) = summary.rfind(" (http") {
+            url = summary[i + 2..].trim_end_matches(')').to_string();
+            summary.truncate(i);
+        }
+        if summary.starts_with("covered by ") {
+            continue;
+        }
+        out.push(Existing {
+            key: key.to_string(),
+            url,
+            summary: summary.trim().to_string(),
+            marks: Vec::new(),
+        });
+    }
+    out
+}
+
+/// How a draft's topic stands against one filed follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topic {
+    /// The same work: the draft is not filed again.
+    Same,
+    /// Close enough that a small model decides ([`same_topic_prompt`]).
+    Maybe,
+    /// Different work.
+    New,
+}
+
+/// The two numbers [`topic`] reads: how much of the titles' words the two
+/// share (of all their words), and how much of the smaller set of key
+/// files and components they share (0 when either names none).
+pub fn overlap(draft: &Draft, e: &Existing) -> (f32, f32) {
+    let a = topic_words(&draft.summary);
+    let b = topic_words(&e.summary);
+    let union = a.union(&b).count();
+    let words = if union == 0 {
+        0.0
+    } else {
+        a.intersection(&b).count() as f32 / union as f32
+    };
+    let ma = marks(&format!("{}\n{}", draft.summary, draft.description));
+    let mut mb: std::collections::BTreeSet<String> = marks(&e.summary);
+    mb.extend(e.marks.iter().map(|m| m.to_ascii_lowercase()));
+    let small = ma.len().min(mb.len());
+    let files = if small == 0 {
+        0.0
+    } else {
+        ma.intersection(&mb).count() as f32 / small as f32
+    };
+    (words, files)
+}
+
+/// Whether `e` covers `draft`'s topic. The same topic: most of the title's
+/// words, or the same key files and components with some of the words. An
+/// exact summary is always the same.
+pub fn topic(draft: &Draft, e: &Existing) -> Topic {
+    if normal_summary(&draft.summary) == normal_summary(&e.summary) {
+        return Topic::Same;
+    }
+    let (words, files) = overlap(draft, e);
+    if words >= 0.5 || (files >= 0.5 && words >= 0.15) {
+        Topic::Same
+    } else if words >= 0.25 || files > 0.0 {
+        Topic::Maybe
+    } else {
+        Topic::New
+    }
+}
+
+/// The most filed follow-ups the small check weighs for one draft.
+pub const MAX_CANDIDATES: usize = 3;
+
+/// Where a draft stands against the follow-ups filed for its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Near<'a> {
+    /// One of them is the same topic.
+    Same(&'a Existing),
+    /// These may be (closest first, at most [`MAX_CANDIDATES`]): the small
+    /// check decides.
+    Maybe(Vec<&'a Existing>),
+    /// None is near: the draft is new work.
+    New,
+}
+
+/// A draft against the follow-ups filed for its source ([`topic`]).
+pub fn near<'a>(draft: &Draft, existing: &'a [Existing]) -> Near<'a> {
+    let mut maybe: Vec<(&Existing, f32)> = Vec::new();
+    for e in existing {
+        match topic(draft, e) {
+            Topic::Same => return Near::Same(e),
+            Topic::Maybe => {
+                let (w, f) = overlap(draft, e);
+                maybe.push((e, w + f));
+            }
+            Topic::New => {}
+        }
+    }
+    if maybe.is_empty() {
+        return Near::New;
+    }
+    maybe.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Near::Maybe(
+        maybe
+            .into_iter()
+            .take(MAX_CANDIDATES)
+            .map(|(e, _)| e)
+            .collect(),
+    )
+}
+
+/// The files and components a draft names that the follow-up covering it
+/// doesn't: the scope it grew by, said on that ticket instead of a new one.
+pub fn added_scope(draft: &Draft, e: &Existing) -> Vec<String> {
+    let mut known = marks(&e.summary);
+    known.extend(e.marks.iter().map(|m| m.to_ascii_lowercase()));
+    marks(&format!("{}\n{}", draft.summary, draft.description))
+        .into_iter()
+        .filter(|m| !known.contains(m))
+        .collect()
+}
+
+/// The system prompt of the small check on drafts [`topic`] can't settle.
+pub const SAME_TOPIC_SYSTEM: &str = "You compare new follow-up ticket drafts with the tickets \
+     already filed from the same source ticket. For each draft, name the filed ticket that \
+     already covers its work (the same fix, even worded differently or a little narrower or \
+     wider), or \"none\" when the draft is other work. Answer only with a JSON object.";
+
+/// The question for the small check: each draft numbered with the filed
+/// tickets it may be, the answer `{"1": "<KEY>" | "none", ...}`.
+pub fn same_topic_prompt(asks: &[(&Draft, Vec<&Existing>)]) -> String {
+    let mut s = String::from(
+        "For each draft, which filed ticket (if any) already covers the same work?\n\n",
+    );
+    for (i, (d, filed)) in asks.iter().enumerate() {
+        let body = crate::truncate_str(
+            &d.description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            500,
+        )
+        .to_string();
+        s.push_str(&format!(
+            "{}. Draft: {}\n   Draft details: {}\n",
+            i + 1,
+            d.summary.trim(),
+            if body.is_empty() {
+                "none"
+            } else {
+                body.as_str()
+            },
+        ));
+        for e in filed {
+            s.push_str(&format!("   Filed {}: {}\n", e.key, e.summary.trim()));
+        }
+        s.push('\n');
+    }
+    s.push_str("Answer as {\"1\": \"ABC-12\", \"2\": \"none\", ...}.");
+    s
+}
+
+/// The small check's answer: for each draft, the key of the filed ticket
+/// that covers it (`None`: new work). A draft it didn't answer, or answered
+/// with a key it wasn't shown, is covered by its closest candidate: a draft
+/// is never filed beside a ticket that may already cover it; the comment
+/// lists it with that ticket, for a person to file if it is other work.
+pub fn read_same_topic(
+    answer: Option<&str>,
+    asks: &[(&Draft, Vec<&Existing>)],
+) -> Vec<Option<String>> {
+    let v: serde_json::Value = answer
+        .and_then(|t| {
+            let start = t.find('{')?;
+            let end = t.rfind('}')?;
+            serde_json::from_str(t.get(start..=end)?).ok()
+        })
+        .unwrap_or_default();
+    asks.iter()
+        .enumerate()
+        .map(|(i, (_, filed))| {
+            let first = filed.first().map(|e| e.key.clone());
+            match v.get((i + 1).to_string()).and_then(|a| a.as_str()) {
+                Some(a) if a.trim().eq_ignore_ascii_case("none") => None,
+                Some(a) => filed
+                    .iter()
+                    .find(|e| e.key.eq_ignore_ascii_case(a.trim()))
+                    .map(|e| e.key.clone())
+                    .or(first),
+                None => first,
+            }
+        })
+        .collect()
+}
+
+/// The comment on a filed follow-up whose topic a later draft covers with
+/// more scope: what the draft adds, and from where.
+pub fn scope_comment(draft: &Draft, added: &[String], source: &str) -> String {
+    let body = draft
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "More scope for this follow-up of {source}, from a later reading of that ticket's \
+         findings (not filed as a separate ticket): {}{}\n\nAlso names: {}",
+        draft.summary.trim(),
+        if body.is_empty() || normal_summary(&body) == normal_summary(&draft.summary) {
+            String::new()
+        } else {
+            format!(". {body}")
+        },
+        added.join(", ")
+    )
 }
 
 /// The Jira project of a ticket key (`ABC` of `ABC-12`).
@@ -286,6 +648,13 @@ pub enum Filed {
         existing: bool,
         linked: Linked,
     },
+    /// Not filed: a follow-up already filed for the source covers the
+    /// draft's topic (`title` is that ticket's summary).
+    Covered {
+        key: String,
+        url: String,
+        title: String,
+    },
     /// Not filed, and exactly why.
     NotFiled(String),
 }
@@ -293,9 +662,20 @@ pub enum Filed {
 impl Filed {
     pub fn key(&self) -> Option<&str> {
         match self {
-            Filed::Ticket { key, .. } => Some(key),
+            Filed::Ticket { key, .. } | Filed::Covered { key, .. } => Some(key),
             Filed::NotFiled(_) => None,
         }
+    }
+
+    /// Whether this run created the ticket (not found, not covered).
+    pub fn is_new(&self) -> bool {
+        matches!(
+            self,
+            Filed::Ticket {
+                existing: false,
+                ..
+            }
+        )
     }
 }
 
@@ -363,7 +743,12 @@ pub fn comment(drafts: &[Draft], filed: &[Filed], tracker: &Tracker) -> String {
     let made: Vec<(&Draft, &Filed)> = drafts
         .iter()
         .zip(filed.iter())
-        .filter(|(_, f)| f.key().is_some())
+        .filter(|(_, f)| matches!(f, Filed::Ticket { .. }))
+        .collect();
+    let covered: Vec<(&Draft, &Filed)> = drafts
+        .iter()
+        .zip(filed.iter())
+        .filter(|(_, f)| matches!(f, Filed::Covered { .. }))
         .collect();
     let mut parts: Vec<String> = Vec::new();
     if !made.is_empty() {
@@ -395,12 +780,31 @@ pub fn comment(drafts: &[Draft], filed: &[Filed], tracker: &Tracker) -> String {
             }
         }
     }
+    if !covered.is_empty() {
+        parts.push(
+            "Not filed again, because a follow-up already filed from this ticket covers the same \
+             work:"
+                .to_string(),
+        );
+        for (d, f) in &covered {
+            if let Filed::Covered { key, url, title } = f {
+                let mut line = format!("{}: covered by {key}", d.summary.trim());
+                if !title.trim().is_empty() {
+                    line.push_str(&format!(" ({})", title.trim()));
+                }
+                if !url.is_empty() {
+                    line.push_str(&format!(" {url}"));
+                }
+                parts.push(line);
+            }
+        }
+    }
     let missed: Vec<(&Draft, &str)> = drafts
         .iter()
         .zip(filed.iter())
         .filter_map(|(d, f)| match f {
             Filed::NotFiled(why) => Some((d, why.as_str())),
-            Filed::Ticket { .. } => None,
+            Filed::Ticket { .. } | Filed::Covered { .. } => None,
         })
         .collect();
     let unfiled_drafts: Vec<&Draft> = match tracker {
@@ -598,6 +1002,208 @@ mod tests {
         ));
         assert!(!is_filing_step("", "Post the audit table on the ticket"));
         assert!(!is_filing_step("", "Follow-up: open the settings page"));
+    }
+
+    fn filed(key: &str, summary: &str) -> Existing {
+        Existing {
+            key: key.into(),
+            url: String::new(),
+            summary: summary.into(),
+            marks: Vec::new(),
+        }
+    }
+
+    fn draft(summary: &str) -> Draft {
+        Draft {
+            summary: summary.into(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn marks_are_files_components_and_ticked_names() {
+        let m = marks("Fix `apps/web/Hero.tsx:85` and query.ts:5; extend imageWithAlt and ContactCard, not `alt`.");
+        for k in ["hero", "query", "imagewithalt", "contactcard"] {
+            assert!(m.contains(k), "{k}: {m:?}");
+        }
+        assert!(!m.contains("alt"), "{m:?}");
+        assert!(!m.contains("fix"));
+        let w = topic_words("Replace placeholder and whitespace alt text with data-derived alt");
+        assert!(w.contains("placeholder") && w.contains("derived") && !w.contains("and"));
+        assert!(topic_words("Coach images").contains("image"));
+    }
+
+    #[test]
+    fn a_reworded_draft_is_the_topic_already_filed() {
+        let earlier = vec![
+            filed("ABC-92", "Stop using image filenames as alt text in imageFragmentFields"),
+            filed("ABC-93", "Require alt text on imageWithAlt and add alt to mediaAsset images"),
+            filed("ABC-94", "Replace generic placeholder alt text with data-derived or empty alt"),
+            filed("ABC-95", "Coach images: fall back to the coach name for alt; empty when the name is adjacent"),
+            filed("ABC-96", "Fix alt on the unused Hero, ContactCard, FeatureSection and CoachesCarousel components"),
+            filed("ABC-97", "Confirm hardcoded alt=\"\" images are decorative"),
+        ];
+        let same = |s: &str| match near(&draft(s), &earlier) {
+            Near::Same(e) => Some(e.key.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            same("Remove unused Hero, FeatureSection and ContactCard prototype components"),
+            Some("ABC-96".into())
+        );
+        assert_eq!(
+            same("Replace placeholder and whitespace alt text with data-derived or decorative alt"),
+            Some("ABC-94".into())
+        );
+        assert_eq!(
+            same("Studio: warn when image alt is missing on imageWithAlt and coach image"),
+            Some("ABC-93".into())
+        );
+        // The same projection in other words: near, for the small check,
+        // with the ticket it is among the candidates.
+        let Near::Maybe(c) = near(
+            &draft("Image alt falls back to the asset filename in GROQ projections"),
+            &earlier,
+        ) else {
+            panic!("near");
+        };
+        assert!(
+            c.len() <= MAX_CANDIDATES && c.iter().any(|e| e.key == "ABC-92"),
+            "{c:?}"
+        );
+        // Other work stays new.
+        assert_eq!(
+            near(&draft("Content-image alt: apply the same missing-alt warning to block alt fields and title fallbacks on the web"), &earlier),
+            Near::New
+        );
+        assert_eq!(
+            near(&draft("Add a sitemap entry for the camps page"), &earlier),
+            Near::New
+        );
+        // An exact summary is always the same, case and dots aside.
+        assert_eq!(
+            topic(
+                &draft("confirm hardcoded alt=\"\" images are decorative."),
+                &earlier[5]
+            ),
+            Topic::Same
+        );
+    }
+
+    #[test]
+    fn grown_scope_is_what_the_draft_names_beyond_the_ticket() {
+        let e = Existing {
+            marks: vec!["imagewithalt".into()],
+            ..filed("ABC-93", "Require alt text on imageWithAlt")
+        };
+        let d = Draft {
+            summary: "Warn when alt is missing on imageWithAlt".into(),
+            description: "Also the coach image in `coach.ts`.".into(),
+        };
+        assert_eq!(added_scope(&d, &e), vec!["coach".to_string()]);
+        let c = scope_comment(&d, &added_scope(&d, &e), "ABC-89");
+        assert!(
+            c.contains("follow-up of ABC-89") && c.contains("Also names: coach"),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn the_small_check_never_files_beside_a_ticket_it_did_not_clear() {
+        let d = draft("Fall back to the coach name");
+        let a = filed("ABC-95", "Coach images: fall back to the name");
+        let b = filed("ABC-96", "Something near");
+        let asks = vec![
+            (&d, vec![&a, &b]),
+            (&d, vec![&b, &a]),
+            (&d, vec![&a]),
+            (&d, vec![&b]),
+        ];
+        assert_eq!(
+            read_same_topic(
+                Some("ok {\"1\": \"none\", \"2\": \"ABC-95\", \"3\": \"ABC-7\"}"),
+                &asks
+            ),
+            vec![
+                None,
+                Some("ABC-95".into()),
+                Some("ABC-95".into()),
+                Some("ABC-96".into())
+            ],
+            "unanswered or unknown: the closest candidate covers it"
+        );
+        assert_eq!(
+            read_same_topic(None, &asks[..1]),
+            vec![Some("ABC-95".into())]
+        );
+        let p = same_topic_prompt(&asks[..1]);
+        assert!(p.contains("1. Draft: Fall back to the coach name") && p.contains("Filed ABC-95"));
+    }
+
+    #[test]
+    fn the_posted_comment_names_what_was_filed() {
+        let c = "Filed 2 follow-up tickets from this ticket's findings:\n\nABC-98: Remove unused prototypes (https://x.atlassian.net/browse/ABC-98)\n\nABC-99: Studio: warn when alt is missing [filed earlier]\n\nNot filed again, because ...:\n\nOther draft: covered by ABC-96";
+        let t = titles_from_comment(c);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(
+            (t[0].key.as_str(), t[0].summary.as_str(), t[0].url.as_str()),
+            (
+                "ABC-98",
+                "Remove unused prototypes",
+                "https://x.atlassian.net/browse/ABC-98"
+            )
+        );
+        assert_eq!(t[1].summary, "Studio: warn when alt is missing");
+    }
+
+    #[test]
+    fn records_and_the_tracker_merge_by_key() {
+        let rec = Existing {
+            url: "u".into(),
+            ..filed("ABC-1", "")
+        };
+        let found = vec![filed("ABC-1", "From Jira"), filed("ABC-2", "Other")];
+        let m = merge_existing(vec![rec], found);
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            (m[0].summary.as_str(), m[0].url.as_str()),
+            ("From Jira", "u")
+        );
+    }
+
+    #[test]
+    fn a_covered_draft_is_listed_with_its_ticket_not_filed() {
+        let d = vec![draft("Remove unused prototypes"), draft("New work")];
+        let f = vec![
+            Filed::Covered {
+                key: "ABC-96".into(),
+                url: String::new(),
+                title: "Fix alt on the unused components".into(),
+            },
+            Filed::Ticket {
+                key: "ABC-98".into(),
+                url: String::new(),
+                existing: false,
+                linked: Linked::Yes,
+            },
+        ];
+        let c = comment(
+            &d,
+            &f,
+            &Tracker::Jira {
+                project: "ABC".into(),
+                site: String::new(),
+            },
+        );
+        assert!(c.starts_with("Filed 1 follow-up ticket"), "{c}");
+        assert!(
+            c.contains(
+                "Remove unused prototypes: covered by ABC-96 (Fix alt on the unused components)"
+            ),
+            "{c}"
+        );
+        assert!(f[1].is_new() && !f[0].is_new());
+        assert_eq!(f[0].key(), Some("ABC-96"));
     }
 
     #[test]

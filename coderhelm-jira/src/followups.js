@@ -14,6 +14,11 @@
  * 4. links it to the source ticket with the site's "relates to" link type
  *    (`pickLinkType`).
  *
+ * With `followup.list`, the app files nothing: it answers the follow-ups
+ * already filed from the source (`listedIssues`), so CoderHelm matches a
+ * new draft to one by topic before filing. The list asks for no summary,
+ * so an app older than it refuses it (summary required) and files nothing.
+ *
  * These are the pure parts, tested without Forge; index.js makes the calls.
  */
 
@@ -166,7 +171,43 @@ function descriptionAdf(text) {
   };
 }
 
+/** The plain text of an Atlassian document (a description), at most `max` characters. */
+function adfText(doc, max = 2000) {
+  const out = [];
+  const walk = (n) => {
+    if (!n || out.join("").length > max) return;
+    if (typeof n.text === "string") out.push(n.text);
+    if (n.type === "hardBreak") out.push("\n");
+    (Array.isArray(n.content) ? n.content : []).forEach(walk);
+    if (n.type === "paragraph") out.push("\n");
+  };
+  if (typeof doc === "string") return doc.slice(0, max);
+  walk(doc);
+  return out.join("").trim().slice(0, max);
+}
+
+/**
+ * The follow-ups already filed from a source, as the list path answers
+ * them (from a search with `summary`, `description` and `status`), so
+ * CoderHelm compares a new draft with them by topic before filing it.
+ */
+function listedIssues(issues) {
+  return (Array.isArray(issues) ? issues : [])
+    .filter((i) => i && isIssueKey(i.key))
+    .map((i) => {
+      const f = i.fields || {};
+      return {
+        key: i.key,
+        summary: String(f.summary || ""),
+        description: adfText(f.description),
+        status: (f.status && f.status.name) || "",
+      };
+    });
+}
+
 module.exports = {
+  adfText,
+  listedIssues,
   NEEDED_PERMISSIONS,
   PERMISSION_NAMES,
   MAX_DEDUPE,

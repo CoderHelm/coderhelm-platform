@@ -4,13 +4,21 @@
 //! - [`planner_caps`]: the capabilities the planner reads, with the team's
 //!   ticket tracker in them, so a step on Jira is CoderHelm's.
 //! - [`reaches`]: what the run reaches, for the stop judge's picture.
-//! - [`settle`]: once the plan is written, files the drafts the ticket's
-//!   deliverable asks for (in the source ticket's Jira project, else as
-//!   GitHub issues, else in the comment), keeps what was filed so a retry
-//!   files nothing twice, posts one comment listing the new keys, and turns
-//!   the plan's filing steps (and any "connect Jira" step) into CoderHelm's.
-//! - [`nothing_left`] and [`finish_delivered`]: a no-code run whose only
-//!   open work was the filing completes, instead of waiting on a person.
+//! - [`prepare`]: once the plan is written, reads the drafts the ticket's
+//!   deliverable asks for and turns the plan's filing steps (and any
+//!   "connect Jira" step) into CoderHelm's. Nothing is filed yet: a plan a
+//!   later check rejects files nothing.
+//! - [`file`]: once the plan is final (it passed every check, and the run
+//!   ends with it or implements it), files the drafts (in the source
+//!   ticket's Jira project, else as GitHub issues, else in the comment),
+//!   once per topic: the follow-ups already filed for the source (CoderHelm's
+//!   records, its comment on the source, the tracker's label search) are
+//!   read first, and a draft one of them covers is not filed again (its
+//!   added scope goes on that ticket). One comment lists the keys.
+//! - [`delivers_findings`], [`nothing_left`] and [`finish_delivered`]: a
+//!   no-code run whose deliverable is its findings (an audit, a question),
+//!   or whose only open work was the filing, completes instead of waiting
+//!   on a person or planning again.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::connected_access::{self, Reach};
@@ -22,9 +30,11 @@ use tracing::{info, warn};
 
 use super::fix_location::{FixDecision, FixLocation, TicketIntent};
 use super::{attr_n, attr_s, RunUsageValues};
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::WorkerState;
+use common::followup_tickets::{Existing, Near};
 
 /// The settings record of one filed draft.
 pub fn record_sk(source: &str, draft_id: &str) -> String {
@@ -257,19 +267,97 @@ pub fn nothing_left(
     codes_nothing && !asks && !next && !person && !unknown_bug
 }
 
-/// Files the plan's follow-ups and settles the plan's steps. `None` when
-/// the plan files nothing (no drafts, or no step asks for them); the plan's
-/// "connect Jira" asks are dropped either way.
-pub async fn settle(
+/// Whether the plan's deliverable is its findings, so the run ends
+/// delivered with them on the ticket (and its follow-ups filed): a plan
+/// that codes nothing, asks nothing of its own, and either answers a
+/// question (an audit, a review, a scoping: what it found is the work, and
+/// a step it leaves for a person is a recommendation, not a wait) or files
+/// follow-ups and leaves nothing for a person ([`nothing_left`]). Such a
+/// plan is never "a change outside the code that leaves nothing for a
+/// person": it is done.
+pub fn delivers_findings(
+    d: &FixDecision,
+    tasks: &str,
+    answers: &[common::run_questions::Answer],
+    files_followups: bool,
+) -> bool {
+    let codes_nothing = tasks
+        .trim_start()
+        .starts_with(super::fix_location::NO_CODE_CHANGE);
+    if !codes_nothing {
+        return false;
+    }
+    let asks = !common::run_questions::unanswered(
+        common::run_questions::from_lines(&d.questions),
+        answers,
+    )
+    .is_empty();
+    let found = !d.cause.trim().is_empty()
+        || !tasks
+            .trim_start()
+            .trim_start_matches(super::fix_location::NO_CODE_CHANGE)
+            .trim()
+            .is_empty();
+    let answers_a_question = d.intent == TicketIntent::Question && found;
+    !asks && (answers_a_question || (files_followups && nothing_left(d, tasks, answers)))
+}
+
+/// Whether a cached plan was its ticket's deliverable, so a new run of the
+/// unchanged ticket takes it up instead of planning again: it codes
+/// nothing, carries its decision, and drafts follow-up tickets (its own
+/// list, or proposal.md's) for findings it states.
+pub fn reusable_findings(p: &super::plan::PlanResult) -> bool {
+    let Some(d) = p.fix.as_ref() else {
+        return false;
+    };
+    p.tasks
+        .trim_start()
+        .starts_with(super::fix_location::NO_CODE_CHANGE)
+        && !p.proposal.trim().is_empty()
+        && (d.intent == TicketIntent::Question || asks_to_file(d))
+        && !ft::drafts(&d.followup_tickets, &p.proposal).is_empty()
+}
+
+/// The plan's follow-ups, ready to file once the plan is final ([`file`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Due {
+    pub drafts: Vec<Draft>,
+}
+
+/// The filing steps' result while the plan still has checks to pass.
+pub const DUE_LINE: &str =
+    "CoderHelm files these follow-up tickets once the plan has passed its checks";
+
+/// The pure part of [`prepare`]: the plan's "connect" asks for what the run
+/// reaches go, and when the plan asks for follow-ups, its drafts are read
+/// and its filing steps become CoderHelm's. Returns how many asks were
+/// dropped, and the drafts when there are any to file.
+pub fn prepare_plan(d: &mut FixDecision, reach: &[Reach], proposal: &str) -> (usize, Option<Due>) {
+    let dropped = drop_connect_asks(d, reach);
+    if !asks_to_file(d) {
+        return (dropped, None);
+    }
+    let drafts = ft::drafts(&d.followup_tickets, proposal);
+    if drafts.is_empty() {
+        return (dropped, None);
+    }
+    mark_filed(d, DUE_LINE, true);
+    (dropped, Some(Due { drafts }))
+}
+
+/// Reads the plan's follow-ups and makes its filing steps CoderHelm's.
+/// Nothing is filed or posted here: the plan may still be rejected by a
+/// later check, and a rejected plan files nothing. `None` when the plan
+/// files nothing; the plan's "connect Jira" asks are dropped either way.
+pub async fn prepare(
     state: &WorkerState,
-    github: &GitHubClient,
     msg: &TicketMessage,
     run_id: &str,
     d: &mut FixDecision,
     proposal: &str,
-) -> Option<Settled> {
+) -> Option<Due> {
     let reach = reaches(state, &msg.team_id).await;
-    let dropped = drop_connect_asks(d, &reach);
+    let (dropped, due) = prepare_plan(d, &reach, proposal);
     if dropped > 0 {
         info!(
             run_id,
@@ -277,13 +365,31 @@ pub async fn settle(
             "The plan asked a person to connect a system CoderHelm reaches: CoderHelm's now"
         );
     }
-    if !asks_to_file(d) {
-        return None;
-    }
-    let drafts = ft::drafts(&d.followup_tickets, proposal);
-    if drafts.is_empty() {
-        return None;
-    }
+    due
+}
+
+/// The small model check on drafts near a filed follow-up.
+pub struct Judge<'a> {
+    pub provider: &'a ModelProvider,
+    pub usage: &'a mut TokenUsage,
+}
+
+/// Files the plan's follow-ups, once per topic, and settles the plan's
+/// steps. Called only on the plan the run ends with or implements, so an
+/// intermediate plan never files. Before filing, the follow-ups already
+/// filed for the source are read ([`filed_before`]); a draft whose topic one
+/// covers ([`ft::near`], and the small check for the near ones) is not
+/// filed again, and the scope it adds is said on that ticket.
+pub async fn file(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    run_id: &str,
+    d: &mut FixDecision,
+    due: Due,
+    judge: Option<Judge<'_>>,
+) -> Settled {
+    let drafts = due.drafts;
     let source = source_of(msg);
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let j = jira(state, &msg.team_id).await;
@@ -342,16 +448,57 @@ pub async fn settle(
         "{}/runs/detail?id={run_id}",
         common::public_urls::app_url(&state.config.stage)
     );
+    // What is already filed for the source, and where each draft stands.
+    let mut places: Vec<Place> = Vec::new();
+    if !matches!(tracker, Tracker::Comment(_)) {
+        let existing = filed_before(state, github, msg, &tracker, &j, &source).await;
+        let mut asks: Vec<(usize, Vec<Existing>)> = Vec::new();
+        for (i, draft) in drafts.iter().enumerate() {
+            let sk = record_sk(&source, &ft::draft_id(&source, draft));
+            if let Some(k) = kept(state, &msg.team_id, &sk).await {
+                places.push(Place::Kept(k));
+                continue;
+            }
+            match ft::near(draft, &existing) {
+                Near::Same(e) => places.push(Place::Covered(e.clone())),
+                Near::Maybe(c) => {
+                    asks.push((i, c.into_iter().cloned().collect()));
+                    places.push(Place::New);
+                }
+                Near::New => places.push(Place::New),
+            }
+        }
+        if !asks.is_empty() {
+            let answers = same_topic(state, &drafts, &asks, judge).await;
+            for ((i, cands), covered_by) in asks.iter().zip(answers) {
+                if let Some(key) = covered_by {
+                    if let Some(e) = cands.iter().find(|e| e.key == key) {
+                        places[*i] = Place::Covered(e.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut filed: Vec<Filed> = Vec::new();
     let mut stop: Option<String> = None;
-    for draft in &drafts {
+    for (i, draft) in drafts.iter().enumerate() {
         if let Some(why) = &stop {
             filed.push(Filed::NotFiled(why.clone()));
             continue;
         }
-        let one = match &tracker {
-            Tracker::Comment(_) => break,
-            t => file_one(state, github, msg, t, &j, &source, &repo, &run_url, draft).await,
+        let sk = record_sk(&source, &ft::draft_id(&source, draft));
+        let one = match (&tracker, places.get(i)) {
+            (Tracker::Comment(_), _) => break,
+            (_, Some(Place::Kept(k))) => k.filed(),
+            (t, Some(Place::Covered(e))) => {
+                cover(state, github, msg, run_id, t, &source, &sk, draft, e).await
+            }
+            (t, _) => {
+                file_one(
+                    state, github, msg, run_id, t, &j, &source, &repo, &run_url, draft,
+                )
+                .await
+            }
         };
         // A refusal that would refuse every draft the same way stops there.
         if let Filed::NotFiled(why) = &one {
@@ -364,35 +511,10 @@ pub async fn settle(
         filed.push(one);
     }
     let comment = ft::comment(&drafts, &filed, &tracker);
-    let keys: Vec<String> = filed
-        .iter()
-        .filter_map(Filed::key)
-        .map(str::to_string)
-        .collect();
-    let line = if keys.is_empty() {
-        format!(
-            "Not filed: {}. The drafts are on the ticket.",
-            match &tracker {
-                Tracker::Comment(why) => why.clone(),
-                _ => filed
-                    .iter()
-                    .find_map(|f| match f {
-                        Filed::NotFiled(w) => Some(w.clone()),
-                        Filed::Ticket { .. } => None,
-                    })
-                    .unwrap_or_default(),
-            }
-        )
-    } else {
-        format!(
-            "Filed {} of {} follow-up tickets: {}",
-            keys.len(),
-            drafts.len(),
-            keys.join(", ")
-        )
-    };
+    let line = settled_line(&drafts, &filed, &tracker);
     post_comment(state, github, msg, &comment).await;
     super::add_progress_note(state, &msg.team_id, run_id, &line).await;
+    let new = filed.iter().filter(|f| f.is_new()).count();
     let settled = Settled {
         drafts,
         filed,
@@ -401,16 +523,112 @@ pub async fn settle(
         line,
     };
     mark_filed(d, &settled.line, settled.all_filed());
-    info!(run_id, filed = keys.len(), "Follow-up tickets settled");
-    Some(settled)
+    info!(run_id, new, "Follow-up tickets settled");
+    settled
+}
+
+/// The one line for the plan's step and the run page: what was filed new,
+/// what earlier tickets cover, and what wasn't filed and why.
+pub fn settled_line(drafts: &[Draft], filed: &[Filed], tracker: &Tracker) -> String {
+    let new: Vec<&str> = filed
+        .iter()
+        .filter(|f| f.is_new())
+        .filter_map(Filed::key)
+        .collect();
+    let earlier: Vec<&str> = filed
+        .iter()
+        .filter(|f| f.key().is_some() && !f.is_new())
+        .filter_map(Filed::key)
+        .collect();
+    if new.is_empty() && earlier.is_empty() {
+        return format!(
+            "Not filed: {}. The drafts are on the ticket.",
+            match tracker {
+                Tracker::Comment(why) => why.clone(),
+                _ => filed
+                    .iter()
+                    .find_map(|f| match f {
+                        Filed::NotFiled(w) => Some(w.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+            }
+        );
+    }
+    let mut earlier_keys: Vec<&str> = Vec::new();
+    for k in earlier {
+        if !earlier_keys.contains(&k) {
+            earlier_keys.push(k);
+        }
+    }
+    let mut parts = Vec::new();
+    if !new.is_empty() {
+        parts.push(format!(
+            "Filed {} of {} follow-up tickets: {}",
+            new.len(),
+            drafts.len(),
+            new.join(", ")
+        ));
+    } else {
+        parts.push(format!(
+            "No new follow-up tickets: the {} drafts are covered",
+            drafts.len()
+        ));
+    }
+    if !earlier_keys.is_empty() {
+        parts.push(format!(
+            "already filed from this ticket: {}",
+            earlier_keys.join(", ")
+        ));
+    }
+    parts.join("; ")
 }
 
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// What an earlier run filed for this draft, if anything.
-async fn kept(state: &WorkerState, team_id: &str, sk: &str) -> Option<(String, String)> {
+/// Where one draft stands before filing.
+#[derive(Debug, Clone)]
+enum Place {
+    /// An earlier run kept a record for this very draft.
+    Kept(KeptRecord),
+    /// A follow-up already filed covers its topic.
+    Covered(Existing),
+    /// Filed now (the app still finds a ticket with the same summary).
+    New,
+}
+
+/// What an earlier run kept for one draft.
+#[derive(Debug, Clone)]
+struct KeptRecord {
+    key: String,
+    url: String,
+    /// The draft was not filed: `key` covered it.
+    covers: bool,
+}
+
+impl KeptRecord {
+    fn filed(&self) -> Filed {
+        if self.covers {
+            Filed::Covered {
+                key: self.key.clone(),
+                url: self.url.clone(),
+                title: String::new(),
+            }
+        } else {
+            Filed::Ticket {
+                key: self.key.clone(),
+                url: self.url.clone(),
+                existing: true,
+                linked: Linked::Yes,
+            }
+        }
+    }
+}
+
+/// What an earlier run kept for this draft, if anything.
+async fn kept(state: &WorkerState, team_id: &str, sk: &str) -> Option<KeptRecord> {
     let item = state
         .dynamo
         .get_item()
@@ -422,36 +640,362 @@ async fn kept(state: &WorkerState, team_id: &str, sk: &str) -> Option<(String, S
         .ok()?
         .item?;
     let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
-    Some((
-        s("key").filter(|k| !k.is_empty())?,
-        s("url").unwrap_or_default(),
-    ))
+    Some(KeptRecord {
+        key: s("key").filter(|k| !k.is_empty())?,
+        url: s("url").unwrap_or_default(),
+        covers: s("covers").is_some_and(|c| c == "1"),
+    })
 }
 
-async fn keep(state: &WorkerState, msg: &TicketMessage, sk: &str, key: &str, url: &str) {
+/// The settings record of one draft: the ticket it was filed as (or the
+/// one that covers it), with the draft's summary and key files, so the
+/// next run reads what this one filed by topic.
+pub struct Record<'a> {
+    pub sk: &'a str,
+    pub key: &'a str,
+    pub url: &'a str,
+    pub draft: &'a Draft,
+    pub covers: bool,
+}
+
+/// The attribute holding a record's key files and components.
+const MARKS_ATTR: &str = "marks";
+
+async fn keep(state: &WorkerState, msg: &TicketMessage, run_id: &str, r: Record<'_>) {
+    let marks = ft::marks(&format!("{}\n{}", r.draft.summary, r.draft.description))
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
     if let Err(e) = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&msg.team_id))
-        .item("sk", attr_s(sk))
-        .item("key", attr_s(key))
-        .item("url", attr_s(url))
+        .item("sk", attr_s(r.sk))
+        .item("key", attr_s(r.key))
+        .item("url", attr_s(r.url))
         .item("ticket_id", attr_s(&msg.ticket_id))
+        .item("summary", attr_s(r.draft.summary.trim()))
+        .item(MARKS_ATTR, attr_s(&marks))
+        .item("covers", attr_s(if r.covers { "1" } else { "0" }))
+        .item("run_id", attr_s(run_id))
         .item("filed_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await
     {
-        warn!(key, error = %e, "Could not keep a filed follow-up (a retry finds it in the tracker)");
+        warn!(key = r.key, error = %e, "Could not keep a filed follow-up (a retry finds it in the tracker)");
     }
 }
 
-/// Files one draft, once.
+/// A record as an already filed follow-up. A record of a covered draft
+/// names the ticket that covers it, not that ticket's summary.
+pub fn existing_of_record(item: &HashMap<String, AttributeValue>) -> Option<Existing> {
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let key = s("key");
+    if key.trim().is_empty() {
+        return None;
+    }
+    let covers = s("covers") == "1";
+    Some(Existing {
+        key,
+        url: s("url"),
+        summary: if covers { String::new() } else { s("summary") },
+        marks: if covers {
+            Vec::new()
+        } else {
+            s(MARKS_ATTR)
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect()
+        },
+    })
+}
+
+/// The follow-ups already filed for `source`: CoderHelm's records of them,
+/// the comment it posted on the source (for records kept before they held
+/// summaries), and the tracker's label search (the Jira app's list, or the
+/// repository's labelled issues).
+async fn filed_before(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    tracker: &Tracker,
+    j: &Jira,
+    source: &str,
+) -> Vec<Existing> {
+    let prefix = format!("FOLLOWUP#{}#", source.trim().to_ascii_uppercase());
+    let mut records: Vec<Existing> = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let page = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+            .expression_attribute_values(":p", attr_s(&msg.team_id))
+            .expression_attribute_values(":s", attr_s(&prefix))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let Ok(page) = page else { break };
+        records.extend(page.items().iter().filter_map(existing_of_record));
+        match page.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    // What CoderHelm said on the source: its follow-ups comment.
+    let said = match msg.source {
+        TicketSource::Jira => said_followups(state, &msg.team_id, &format!("JIRA#{source}")).await,
+        _ => Vec::new(),
+    };
+    let found = match tracker {
+        Tracker::Jira { project, .. } => jira_list(state, j, project, source).await,
+        Tracker::Github { repo } => {
+            let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), ""));
+            let label = ft::labels(repo, source).last().cloned().unwrap_or_default();
+            github
+                .issues_with_label(owner, name, &label)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, t, url)| Existing {
+                    key: format!("#{n}"),
+                    url,
+                    summary: t,
+                    marks: Vec::new(),
+                })
+                .collect()
+        }
+        Tracker::Comment(_) => Vec::new(),
+    };
+    // A record whose ticket nothing else names (one kept before records
+    // held summaries) still counts as filed, with no topic to compare.
+    ft::merge_existing(ft::merge_existing(records, said), found)
+}
+
+/// The follow-up tickets CoderHelm's own comment on a ticket lists (its
+/// `followups` slot, kept with what CoderHelm said there).
+async fn said_followups(state: &WorkerState, team_id: &str, place: &str) -> Vec<Existing> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key(
+            "sk",
+            attr_s(&format!("{}{place}", common::conversation::SK_PREFIX)),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item);
+    let doc = item
+        .as_ref()
+        .and_then(|i| i.get("doc"))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_default();
+    said_followups_of(&doc)
+}
+
+/// Pure: the follow-ups listed in a kept conversation (`doc`, the list of
+/// what CoderHelm said): every `followups` part and its history.
+pub fn said_followups_of(doc: &Value) -> Vec<Existing> {
+    let mut out: Vec<Existing> = Vec::new();
+    for said in doc.as_array().into_iter().flatten() {
+        let meta = &said["meta"];
+        let mut texts: Vec<&str> = Vec::new();
+        if meta["slot"].as_str() == Some("followups") {
+            texts.extend(said["body"].as_str());
+        }
+        for p in meta["parts"].as_array().into_iter().flatten() {
+            if p["slot"].as_str() == Some("followups") {
+                texts.extend(p["body"].as_str());
+            }
+        }
+        for t in texts {
+            out = ft::merge_existing(out, ft::titles_from_comment(t));
+        }
+    }
+    out
+}
+
+/// The follow-ups the Jira app finds filed for `source` in `project` (its
+/// list path). An app older than that path refuses the empty summary with
+/// a 400 and files nothing; the list is then empty.
+async fn jira_list(state: &WorkerState, j: &Jira, project: &str, source: &str) -> Vec<Existing> {
+    if j.create_url.is_empty() {
+        return Vec::new();
+    }
+    let body = json!({
+        "projectKey": project,
+        "summary": "",
+        "forge_secret": j.secret,
+        "followup": { "source": source, "list": true },
+    });
+    let Ok(r) = state
+        .http
+        .post(&j.create_url)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .timeout(CALL)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    if !r.status().is_success() {
+        return Vec::new();
+    }
+    let v: Value = r.json().await.unwrap_or_default();
+    jira_listed(&v, &j.site)
+}
+
+/// Pure: the app's list answer (`{followup: 1, issues: [{key, summary,
+/// description}]}`) as filed follow-ups.
+pub fn jira_listed(v: &Value, site: &str) -> Vec<Existing> {
+    if v["followup"].as_u64() != Some(1) {
+        return Vec::new();
+    }
+    v["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            let key = i["key"]
+                .as_str()
+                .filter(|k| common::git_conventions::is_ticket_key(k))?;
+            Some(Existing {
+                key: key.to_string(),
+                url: if site.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/browse/{key}", site.trim_end_matches('/'))
+                },
+                summary: i["summary"].as_str().unwrap_or("").to_string(),
+                marks: ft::marks(i["description"].as_str().unwrap_or(""))
+                    .into_iter()
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// The small check on the drafts near a filed follow-up: for each, the key
+/// of the one that covers it, or `None`. Without a model (or when its
+/// answer doesn't read), the closest candidate covers it
+/// ([`ft::read_same_topic`]).
+async fn same_topic(
+    state: &WorkerState,
+    drafts: &[Draft],
+    asks: &[(usize, Vec<Existing>)],
+    judge: Option<Judge<'_>>,
+) -> Vec<Option<String>> {
+    let pairs: Vec<(&Draft, Vec<&Existing>)> = asks
+        .iter()
+        .filter_map(|(i, c)| Some((drafts.get(*i)?, c.iter().collect())))
+        .collect();
+    let answer = match judge {
+        Some(Judge { provider, usage }) => crate::agent::provider::converse_simple(
+            state,
+            provider,
+            provider.primary_model_id(),
+            ft::SAME_TOPIC_SYSTEM,
+            &ft::same_topic_prompt(&pairs),
+            usage,
+        )
+        .await
+        .ok(),
+        None => None,
+    };
+    ft::read_same_topic(answer.as_deref(), &pairs)
+}
+
+/// A draft an already filed follow-up covers: not filed. When the draft
+/// names files or components that ticket doesn't, that scope is said on
+/// the ticket instead. Kept, so a retry reads it as covered.
+#[allow(clippy::too_many_arguments)]
+async fn cover(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    run_id: &str,
+    tracker: &Tracker,
+    source: &str,
+    sk: &str,
+    draft: &Draft,
+    e: &Existing,
+) -> Filed {
+    let added = ft::added_scope(draft, e);
+    if !added.is_empty() {
+        let text = ft::scope_comment(draft, &added, source);
+        let say = common::conversation::Say::status(
+            &format!("followup-scope-{}", ft::draft_id(source, draft)),
+            text,
+        );
+        let sent = match tracker {
+            Tracker::Jira { .. } => super::conversation::jira(
+                state,
+                &msg.team_id,
+                &e.key,
+                say,
+                "info",
+                "More scope from a later reading",
+            )
+            .await
+            .map(|_| ()),
+            Tracker::Github { repo } => match (
+                repo.split_once('/'),
+                e.key.trim_start_matches('#').parse::<u64>(),
+            ) {
+                (Some((owner, name)), Ok(n)) => {
+                    super::conversation::github(github, owner, name, n, say)
+                        .await
+                        .map(|_| ())
+                }
+                _ => Ok(()),
+            },
+            Tracker::Comment(_) => Ok(()),
+        };
+        if let Err(err) = sent {
+            warn!(key = %e.key, error = %err, "Could not say the added scope on the follow-up");
+        }
+    }
+    keep(
+        state,
+        msg,
+        run_id,
+        Record {
+            sk,
+            key: &e.key,
+            url: &e.url,
+            draft,
+            covers: true,
+        },
+    )
+    .await;
+    Filed::Covered {
+        key: e.key.clone(),
+        url: e.url.clone(),
+        title: e.summary.clone(),
+    }
+}
+
+/// Files one draft no follow-up covers.
 #[allow(clippy::too_many_arguments)]
 async fn file_one(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &TicketMessage,
+    run_id: &str,
     tracker: &Tracker,
     j: &Jira,
     source: &str,
@@ -460,14 +1004,6 @@ async fn file_one(
     draft: &Draft,
 ) -> Filed {
     let sk = record_sk(source, &ft::draft_id(source, draft));
-    if let Some((key, url)) = kept(state, &msg.team_id, &sk).await {
-        return Filed::Ticket {
-            key,
-            url,
-            existing: true,
-            linked: Linked::Yes,
-        };
-    }
     let description = ft::description(draft, source, &msg.title, run_url);
     let labels = ft::labels(repo, source);
     let filed = match tracker {
@@ -554,7 +1090,19 @@ async fn file_one(
         Tracker::Comment(why) => Filed::NotFiled(why.clone()),
     };
     if let Filed::Ticket { key, url, .. } = &filed {
-        keep(state, msg, &sk, key, url).await;
+        keep(
+            state,
+            msg,
+            run_id,
+            Record {
+                sk: &sk,
+                key,
+                url,
+                draft,
+                covers: false,
+            },
+        )
+        .await;
     }
     filed
 }
@@ -633,6 +1181,64 @@ async fn post_comment(state: &WorkerState, github: &GitHubClient, msg: &TicketMe
     }
 }
 
+/// The delivered run's report: what was found, the follow-ups, what a
+/// person may do next (a recommendation: the run waits for none of it),
+/// and for a question, the audit itself. Nothing in it asks.
+pub fn delivered_report(
+    decision: &FixDecision,
+    proposal: &str,
+    settled: Option<&Settled>,
+) -> String {
+    // The person's next step is said as a recommendation below, never as
+    // "the one step I need from you".
+    let mut shown = decision.clone();
+    shown.next_step = None;
+    let mut report = super::fix_location::unknown_report(&shown, false);
+    if let Some(i) = report.rfind("I didn't change any code") {
+        report.truncate(i);
+    }
+    let mut out = report.trim_end().to_string();
+    if let Some(s) = settled {
+        out.push_str(&format!("\n\n**Follow-up tickets**\n\n{}", s.comment));
+    }
+    let mut left: Vec<String> = Vec::new();
+    if let Some(n) = decision.next_step.as_ref().filter(|n| n.is_usable()) {
+        left.push(one_line(&n.action));
+    }
+    if let Some(c) = decision.outside_change.as_ref() {
+        for s in c
+            .steps
+            .iter()
+            .filter(|s| s.by.trim() == "person" && !s.done)
+        {
+            left.push(one_line(&s.step));
+        }
+    }
+    for e in decision
+        .end_to_end
+        .iter()
+        .filter(|e| e.by.trim() == "person")
+    {
+        let l = one_line(&e.step);
+        if !l.is_empty() && !left.contains(&l) {
+            left.push(l);
+        }
+    }
+    if !left.is_empty() {
+        out.push_str("\n\n**For a person, when they choose (this ticket is done without it)**\n");
+        for l in &left {
+            out.push_str(&format!("- {l}\n"));
+        }
+    }
+    if decision.intent == TicketIntent::Question && !proposal.trim().is_empty() {
+        out.push_str(&format!(
+            "\n\n**The audit (proposal.md)**\n\n{}",
+            proposal.trim()
+        ));
+    }
+    out
+}
+
 /// Ends a no-code run whose work is done: the findings and the follow-ups
 /// on the ticket, the run `completed` with its decision and report. Nothing
 /// is asked.
@@ -643,27 +1249,13 @@ pub async fn finish_delivered(
     run_id: &str,
     decision: &FixDecision,
     proposal: &str,
-    settled: &Settled,
+    settled: Option<&Settled>,
     usage: &TokenUsage,
     start: &std::time::Instant,
     mcp_ids: &[String],
 ) {
     let title = super::fix_location::ask_title(decision);
-    let mut report = super::fix_location::unknown_report(decision, false);
-    // Not a question: what was found, and the follow-ups.
-    if let Some(i) = report.rfind("I didn't change any code") {
-        report.truncate(i);
-    }
-    let report = format!(
-        "{}\n\n**Follow-up tickets**\n\n{}{}",
-        report.trim_end(),
-        settled.comment,
-        if decision.intent == TicketIntent::Question && !proposal.trim().is_empty() {
-            format!("\n\n**The audit (proposal.md)**\n\n{}", proposal.trim())
-        } else {
-            String::new()
-        }
-    );
+    let report = delivered_report(decision, proposal, settled);
     if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
         let body = super::fix_location::jira_text(&report);
         if let Err(e) = super::conversation::jira(
@@ -825,6 +1417,196 @@ mod tests {
             ("coderhelm", false, ft::TOOL)
         );
         assert!(s.why_person.is_empty() && s.grant.is_empty());
+    }
+
+    #[test]
+    fn preparing_a_plan_files_nothing_and_hands_the_filing_to_coderhelm() {
+        let mut d = audit_plan();
+        let reach = [connected_access::jira(
+            "https://example.atlassian.net",
+            true,
+        )];
+        let proposal = "## Follow-up tickets to file\n1. Add alt validation to `imageWithAlt`.\n2. Fall back to the coach name.\n";
+        let (dropped, due) = prepare_plan(&mut d, &reach, proposal);
+        assert!(dropped >= 2);
+        assert_eq!(due.map(|x| x.drafts.len()), Some(2));
+        assert!(
+            d.outside_change.is_none(),
+            "the outside change was the filing"
+        );
+        assert!(nothing_left(&d, "NO_CODE_CHANGE: audit", &[]));
+        // A plan that asks for no filing has nothing due.
+        let mut plain = FixDecision::default();
+        assert_eq!(prepare_plan(&mut plain, &reach, proposal).1, None);
+    }
+
+    /// The incident's second plan: a question answered, no outside change,
+    /// a person's next step that is only a recommendation.
+    fn findings_plan() -> FixDecision {
+        FixDecision {
+            fix_location: FixLocation::Unknown,
+            intent: TicketIntent::Question,
+            cause: "The named components are unused; the real gaps are the optional alt on the shared schema.".into(),
+            end_to_end: vec![super::super::fix_location::EndToEndStep {
+                step: "Fill alt text on the 3 production records".into(),
+                by: "person".into(),
+                owner: "Content editor".into(),
+                ..Default::default()
+            }],
+            next_step: Some(NextStep {
+                action: "A content editor sets the alt text on the 3 records that have none".into(),
+                why_person: "no write connection to the content store".into(),
+                outcomes: vec![
+                    super::super::fix_location::Outcome {
+                        if_: "set".into(),
+                        means: "the warning flags nothing".into(),
+                    },
+                    super::super::fix_location::Outcome {
+                        if_: "left".into(),
+                        means: "the warning shows on 3".into(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn findings_are_a_deliverable_and_a_person_s_step_is_a_recommendation() {
+        let d = findings_plan();
+        let tasks = "NO_CODE_CHANGE: the decision for each component is in design.md.";
+        assert!(
+            !nothing_left(&d, tasks, &[]),
+            "the old check saw a person's step"
+        );
+        assert!(delivers_findings(&d, tasks, &[], true));
+        assert!(delivers_findings(&d, tasks, &[], false));
+        // A plan that codes is never a findings deliverable.
+        assert!(!delivers_findings(&d, "- [ ] a.ts: [modify] x", &[], true));
+        // An unknown bug with a person's step is not done.
+        let bug = FixDecision {
+            intent: TicketIntent::Bug,
+            ..findings_plan()
+        };
+        assert!(!delivers_findings(&bug, tasks, &[], false));
+        // A plan with its own open question asks it.
+        let asks = FixDecision {
+            questions: vec!["Which dataset is the source of truth?".into()],
+            ..findings_plan()
+        };
+        assert!(!delivers_findings(&asks, tasks, &[], true));
+        let r = delivered_report(&d, "# Audit\n\nThe table.", None);
+        assert!(
+            r.contains("For a person, when they choose (this ticket is done without it)"),
+            "{r}"
+        );
+        assert!(r.contains("A content editor sets the alt text"), "{r}");
+        assert!(r.contains("**The audit (proposal.md)**"), "{r}");
+        for never in [
+            "The one step I need from you",
+            "Reply here",
+            "I didn't change any code",
+        ] {
+            assert!(!r.contains(never), "{never}: {r}");
+        }
+    }
+
+    #[test]
+    fn a_findings_plan_is_taken_up_again_not_planned_again() {
+        let p = super::super::plan::PlanResult {
+            proposal: "## Follow-up tickets to file\n1. Add alt validation.\n".into(),
+            tasks: "NO_CODE_CHANGE: the audit is in proposal.md".into(),
+            fix: Some(findings_plan()),
+            ..Default::default()
+        };
+        assert!(reusable_findings(&p));
+        let coded = super::super::plan::PlanResult {
+            tasks: "- [ ] a.ts: [modify] x".into(),
+            ..p.clone()
+        };
+        assert!(!reusable_findings(&coded));
+        let no_drafts = super::super::plan::PlanResult {
+            proposal: "# Audit\nNothing to file.".into(),
+            ..p.clone()
+        };
+        assert!(!reusable_findings(&no_drafts));
+        let undecided = super::super::plan::PlanResult { fix: None, ..p };
+        assert!(!reusable_findings(&undecided));
+    }
+
+    #[test]
+    fn what_was_filed_before_is_read_from_records_comments_and_the_app() {
+        let mut item = HashMap::new();
+        item.insert("key".to_string(), attr_s("ABC-93"));
+        item.insert("summary".to_string(), attr_s("Require alt on imageWithAlt"));
+        item.insert(MARKS_ATTR.to_string(), attr_s("imagewithalt,mediaasset"));
+        let e = existing_of_record(&item).unwrap();
+        assert_eq!(e.marks, vec!["imagewithalt", "mediaasset"]);
+        item.insert("covers".to_string(), attr_s("1"));
+        let covered = existing_of_record(&item).unwrap();
+        assert!(
+            covered.summary.is_empty(),
+            "a covered draft's words are not the ticket's"
+        );
+        let doc = json!([{
+            "id": "1",
+            "body": "x",
+            "meta": {"slot": "run", "parts": [
+                {"slot": "followups", "body": "Filed 1 follow-up ticket from this ticket's findings:\nABC-98: Remove unused prototypes (https://x/browse/ABC-98)"}
+            ]}
+        }]);
+        let said = said_followups_of(&doc);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].summary, "Remove unused prototypes");
+        let listed = jira_listed(
+            &json!({"followup": 1, "issues": [{"key": "ABC-96", "summary": "Fix alt on the unused components", "description": "In `Hero.tsx` and ContactCard."}, {"key": "nope"}]}),
+            "https://x.atlassian.net",
+        );
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].url, "https://x.atlassian.net/browse/ABC-96");
+        assert!(listed[0].marks.contains(&"contactcard".to_string()));
+        // An app older than the list path answers something else: no list.
+        assert!(jira_listed(&json!({"error": "projectKey and summary required"}), "").is_empty());
+    }
+
+    #[test]
+    fn the_line_says_what_is_new_and_what_earlier_tickets_cover() {
+        let drafts = vec![
+            Draft {
+                summary: "a".into(),
+                ..Default::default()
+            },
+            Draft {
+                summary: "b".into(),
+                ..Default::default()
+            },
+        ];
+        let t = Tracker::Jira {
+            project: "ABC".into(),
+            site: String::new(),
+        };
+        let filed = vec![
+            Filed::Ticket {
+                key: "ABC-98".into(),
+                url: String::new(),
+                existing: false,
+                linked: Linked::Yes,
+            },
+            Filed::Covered {
+                key: "ABC-96".into(),
+                url: String::new(),
+                title: String::new(),
+            },
+        ];
+        assert_eq!(
+            settled_line(&drafts, &filed, &t),
+            "Filed 1 of 2 follow-up tickets: ABC-98; already filed from this ticket: ABC-96"
+        );
+        let none_new = vec![filed[1].clone(), filed[1].clone()];
+        assert_eq!(
+            settled_line(&drafts, &none_new, &t),
+            "No new follow-up tickets: the 2 drafts are covered; already filed from this ticket: ABC-96"
+        );
     }
 
     #[test]
