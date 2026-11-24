@@ -344,6 +344,9 @@ async fn smallest_change_gaps(
     let mut out = super::review_rules::wider_findings(&super::minimal_change::check(
         &files, &base, ticket, has_probe,
     ));
+    // App code that fails a build, deploy or page when CMS content is
+    // missing (`common::content_gap::content_throws`).
+    out.extend(super::review_rules::content_throw_findings(&files));
     // Each one names the line it is about, or it can't block
     // (`review_discipline::unactionable`).
     for f in out.iter_mut() {

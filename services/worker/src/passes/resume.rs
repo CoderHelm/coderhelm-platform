@@ -2951,6 +2951,43 @@ pub async fn run(
                 repair.note()
             );
         }
+        // A red check that names missing content, data or a migration is
+        // read before any fix round, so it never spends the budget
+        // (`common::content_gap`): a failing test that waits only on the
+        // change's own content step CoderHelm can't run ends the CI loop
+        // with that step before merge; any other content gap has the round
+        // make the code tolerate it first.
+        let gap_text = format!("{excerpt_line}\n{logs}");
+        let test_failed = evidence.as_ref().is_some_and(|e| !e.tests.is_empty());
+        let mut content_brief = String::new();
+        match content_verdict(state, &msg.team_id, &msg.run_id, &gap_text, test_failed).await {
+            common::content_gap::Verdict::AwaitsStep { gap, step } => {
+                super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                let check = failing_wf.first().cloned().unwrap_or_default();
+                return finish_awaits_content(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    &github,
+                    &PrRef {
+                        owner: &repo_owner,
+                        repo: &repo_name,
+                        branch: &branch,
+                        number: pr_number,
+                        url: &pr_url,
+                    },
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                    &events,
+                    (&gap, &step, &check, branch_head.as_deref().unwrap_or("")),
+                )
+                .await;
+            }
+            common::content_gap::Verdict::TolerateFirst(gap) => {
+                content_brief = common::content_gap::tolerance_brief(&gap);
+            }
+            common::content_gap::Verdict::NotContent => {}
+        }
         let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
         // Atomically claim a shared auto-fix slot (skipped when the cycle cap has
         // already tripped, so we don't consume a slot on the way out).
@@ -2988,7 +3025,7 @@ pub async fn run(
         // aren't working (noop commits, placeholder stubs, wrong fixes). Stop
         // churning the PR and hand it to a human — this fires long before the
         // coarse cycle cap above.
-        if check_and_record_stall(state, &msg.team_id, &msg.run_id, &logs).await {
+        if check_and_record_stall(state, &msg.team_id, &msg.run_id, &gap_text).await {
             warn!(
                 run_id = msg.run_id,
                 "CI fixes stalled on the same failure — the PR stays a draft with what fails"
@@ -3141,6 +3178,20 @@ pub async fn run(
              Failure summary:\n{failure_logs}{repro_brief}{logs_brief}\n\n\
              Full logs:\n{logs}{review_context}{base_note}{lock_context}"
         );
+        // The same failure met again with no progress: this round is told
+        // what the last one concluded and takes another approach
+        // (`common::content_gap::repeat_brief`), before the stall halt.
+        let repeats = run_number(state, &msg.team_id, &msg.run_id, "stall_count").await;
+        if repeats > 0 {
+            let last = run_text(state, &msg.team_id, &msg.run_id, "last_fix_account").await;
+            let gap = common::content_gap::names_gap(&gap_text);
+            feedback.push_str(&common::content_gap::repeat_brief(
+                repeats,
+                &last,
+                gap.as_ref(),
+            ));
+        }
+        feedback.push_str(&content_brief);
 
         // The CI fix is a round of its own (common::run_round): its own
         // budget, on the run record while it works, and parked for a fresh
@@ -3431,6 +3482,8 @@ pub async fn run(
                             &result.conversation_log,
                         )
                         .await;
+                        save_fix_account(state, &msg.team_id, &msg.run_id, &result.evidence.notes)
+                            .await;
                         if !result.files_modified.is_empty() {
                             super::round::clear(state, &msg.team_id, &msg.run_id).await;
                         }
@@ -7901,6 +7954,146 @@ async fn rerun_unrelated(
     Ok(())
 }
 
+/// The change's outside steps, as the content-gap reading needs them
+/// (`common::content_gap::Step`): a step is blocked when it is a person's,
+/// or when its last try said CoderHelm lacks the access.
+pub(crate) fn content_steps(
+    d: &super::fix_location::FixDecision,
+) -> Vec<common::content_gap::Step> {
+    let Some(c) = d.outside_change.as_ref() else {
+        return Vec::new();
+    };
+    c.steps
+        .iter()
+        .filter(|s| s.doer() != super::outside_work::Doer::ThisPr)
+        .map(|s| {
+            let r = s.result.to_lowercase();
+            common::content_gap::Step {
+                text: format!("{} {} {}", s.step, s.how, s.migration),
+                writes_content: s.step_kind().writes(),
+                done: s.done,
+                blocked: s.doer() == super::outside_work::Doer::Person
+                    || (!s.done
+                        && (r.starts_with("not done")
+                            || r.contains("no staging cms write connection")
+                            || r.contains("grant:"))),
+            }
+        })
+        .collect()
+}
+
+/// Reads a red check for a content gap against the run's own outside
+/// steps, read fresh (an outside step's last try may be newer than the
+/// record this invocation loaded).
+async fn content_verdict(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    failure: &str,
+    test_failed: bool,
+) -> common::content_gap::Verdict {
+    let steps = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("fix_decision")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| super::outside_exec::decision_of(&i))
+        .map(|d| content_steps(&d))
+        .unwrap_or_default();
+    common::content_gap::classify(failure, test_failed, &steps)
+}
+
+/// A failing test waits only on the change's own content step that
+/// CoderHelm can't run: no fix round is spent on it. The pull request says
+/// what to run before merge, the run's note says it, the pull request goes
+/// ready by the one ready decision, and the run is completed
+/// (`ci_end` = `awaits_content`), never failed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_awaits_content(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    usage: &TokenUsage,
+    duration: u64,
+    events: &[RunEvent],
+    (gap, step, check, head): (&common::content_gap::Gap, &str, &str, &str),
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let team_id = &ticket_msg.team_id;
+    super::record_ci_outcome(
+        state,
+        team_id,
+        run_id,
+        super::CiOutcome::HandedOff(super::GaveUp::AwaitsContent),
+    )
+    .await;
+    record_ci_cause(state, team_id, run_id, &gap.line).await;
+    mark_events_processed(state, run_id, events).await;
+    let section =
+        common::ci_lines::failing_section(head, &common::content_gap::section(gap, step, check));
+    match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
+        Ok(p) => {
+            let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &body).await
+            {
+                warn!(run_id, error = %e, "Could not write the content step on the pull request");
+            }
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the pull request to name the content step")
+        }
+    }
+    let note = common::content_gap::run_note(gap, step, check);
+    super::add_progress_note(state, team_id, run_id, &note).await;
+    if !head.is_empty() {
+        super::pr_watch::mark_ci_head(state, team_id, run_id, head).await;
+    }
+    mark_pr_ready(state, team_id, github, pr.owner, pr.repo, pr.number).await;
+    info!(
+        run_id,
+        check, "Red only on a content step before merge: no fix round, the run completed"
+    );
+    complete_run_with_status(
+        state,
+        ticket_msg,
+        run_id,
+        common::run_status::COMPLETED,
+        pr.url,
+        pr.number,
+        pr.branch,
+        usage,
+        duration,
+    )
+    .await
+}
+
+/// Keeps what a CI fix round concluded, for the next round that meets the
+/// same failure (`common::content_gap::repeat_brief`).
+async fn save_fix_account(state: &WorkerState, team_id: &str, run_id: &str, account: &str) {
+    let account = common::truncate_str(account.trim(), 1500);
+    if account.is_empty() {
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET last_fix_account = :a")
+        .expression_attribute_values(":a", attr_s(account))
+        .send()
+        .await;
+}
+
 /// The failure stays red after its one re-run (or none could start): it is
 /// the run's own CI outcome (`ci_end` = `unrelated_test`), named with its
 /// proof on the pull request and the run, the failing test is handed to
@@ -8729,7 +8922,7 @@ pub(crate) async fn red_ci_blocks_completion(
 pub(crate) fn ci_state_of_record(ci_last: &str, ci_end: &str) -> super::outcome::CiState {
     use super::outcome::CiState;
     match (ci_last, ci_end) {
-        ("failed", end) if common::ci_unrelated::not_ours(end) => CiState::RedOnBase,
+        ("failed", end) if common::content_gap::allows_done(end) => CiState::RedOnBase,
         ("failed", _) => CiState::Failing("the pull request's checks".to_string()),
         _ => CiState::Green,
     }

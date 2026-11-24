@@ -21,6 +21,10 @@
 //!   ([`data_skips`]). Only a skip for a stated browser or platform
 //!   condition is allowed; a test that skips on missing content can never
 //!   fail.
+//! - app code never fails a build, deploy or page when CMS content is
+//!   missing or incomplete: it degrades (the field left out, a warning
+//!   logged) and the content step is listed before merge
+//!   (`common::content_gap::content_throws`).
 //!
 //! The counts and results go in the pull request; an item that fails keeps it
 //! a draft.
@@ -682,6 +686,10 @@ pub struct Facts {
     /// "spec: line" (see [`data_skips`]).
     #[serde(default)]
     pub data_skips: Vec<String>,
+    /// App code lines that fail when CMS content is missing, as
+    /// "path: line" (`common::content_gap::content_throws`).
+    #[serde(default)]
+    pub content_throws: Vec<String>,
 }
 
 /// The items that read the diff alone.
@@ -771,6 +779,13 @@ pub fn static_items(f: &Facts) -> Vec<Item> {
                 ),
             ));
         }
+    }
+    if !f.content_throws.is_empty() {
+        out.push(Item::new(
+            "code tolerates missing content",
+            Status::Fail,
+            common::content_gap::throw_instruction(&f.content_throws),
+        ));
     }
     if f.ui && !f.specs.is_empty() {
         if f.responsive_specs.is_empty() {
@@ -946,6 +961,7 @@ mod tests {
             options_found: 0,
             options_untested: vec![],
             data_skips: vec![],
+            content_throws: vec![],
         };
         let items = static_items(&f);
         assert_eq!(failing(&items).len(), 3);
