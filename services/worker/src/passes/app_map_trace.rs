@@ -24,11 +24,1148 @@ use super::app_map::Snapshot;
 use super::app_map_flows as fl;
 use crate::agent::llm::{ToolDefinition, ToolExecutor};
 
-/// Whether the journeys step traces the code (`APP_MAP_JOURNEY_TRACER=on`)
-/// or only picks from the candidates (the default until the tracer passes
-/// the gold set's gate).
+/// Whether the journeys step traces the code (the default) or only picks
+/// from the candidates (`APP_MAP_JOURNEY_TRACER=off`).
 pub fn enabled() -> bool {
-    std::env::var("APP_MAP_JOURNEY_TRACER").is_ok_and(|v| v == "on")
+    std::env::var("APP_MAP_JOURNEY_TRACER").map_or(true, |v| v != "off")
+}
+
+/// What one pass of tracing may cost (a first map's, or a later pass's).
+pub const BUDGET_USD: f64 = 3.0;
+/// What tracing may cost one team in a day, over all its passes.
+pub const DAILY_BUDGET_USD: f64 = 10.0;
+/// What one entry is taken to cost before any has finished.
+pub const EST_ENTRY_USD: f64 = 0.25;
+
+/// One entry finished: its journeys (kept ones only) and what it cost.
+#[derive(Debug, Clone)]
+pub struct Done {
+    pub entry: Value,
+    pub flows: Vec<Value>,
+    pub cost_usd: f64,
+    /// Not traced: a journey already traced passes through it.
+    pub covered: bool,
+}
+
+/// A journey worth keeping: at least 3 steps, starting at a screen.
+pub fn keepable(f: &Value) -> bool {
+    f["steps"].as_array().map(Vec::len).unwrap_or(0) >= 3 && f["steps"][0]["kind"] == "screen"
+}
+
+/// One entry done, kept: its journeys go into the store (the entry marked
+/// asked), and it leaves the queue. Returns the store and the queue after
+/// it, both safe to write down at once: a pass that stops after this point
+/// resumes with the next entry and redoes nothing.
+pub fn checkpoint(store: &Value, todo: &Value, done: &Done) -> (Value, Value) {
+    let id = done.entry["id"].clone();
+    let mut one = todo.clone();
+    one["entries"] = json!([done.entry]);
+    let mut store = fl::merge(store, &one, done.flows.clone());
+    let mut rest = todo.clone();
+    let left: Vec<Value> = todo["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["id"] != id)
+        .cloned()
+        .collect();
+    store["pending"] = json!(left.len());
+    rest["entries"] = json!(left);
+    (store, rest)
+}
+
+/// Whether one more entry may start: what the pass has spent, plus what
+/// each running entry and this one will cost at the pass's average so far
+/// (or the estimate before any has finished), stays within the budget.
+pub fn fits_budget(spent: f64, largest: f64, running: usize, budget: f64) -> bool {
+    // Each running entry and this one are held at the most an entry has
+    // cost so far (or the estimate, whichever is more).
+    let each = largest.max(EST_ENTRY_USD);
+    spent + each * (running + 1) as f64 <= budget
+}
+
+/// What today's tracing has cost a team, from its stored `{day, usd}`
+/// (another day counts as nothing yet).
+pub fn spent_today(record: &Value, today: &str) -> f64 {
+    if record["day"].as_str() == Some(today) {
+        record["usd"].as_f64().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// What the next pass may spend: the pass budget, within what's left of
+/// the day's.
+pub fn pass_budget(spent_today: f64) -> f64 {
+    BUDGET_USD.min((DAILY_BUDGET_USD - spent_today).max(0.0))
+}
+
+/// Where a journey of this kind is done: the end state its last steps must
+/// show (sign in and sign up: the signed-in screen; password reset: the
+/// password set and the screen after; checkout and booking: the
+/// confirmation). `None` when the journey reaches it.
+pub fn short_of_end(family: &str, steps: &[Value]) -> Option<&'static str> {
+    let calls = steps.iter().filter(|s| s["kind"] == "call").count();
+    let last_call = steps.iter().rposition(|s| s["kind"] == "call");
+    let screen_after = |i: Option<usize>| {
+        steps
+            .iter()
+            .enumerate()
+            .any(|(j, s)| s["kind"] == "screen" && i.is_some_and(|i| j > i))
+    };
+    match family {
+        "sign in" | "sign up" if !screen_after(last_call) => {
+            Some("the screen the user lands on once signed in")
+        }
+        "password reset" if calls < 2 || !saves_password(steps) || !screen_after(last_call) => Some(
+            "the new password being set (the request that saves it, from the screen the emailed link or code opens: search the routes for reset-password, new-password or set-password) and the screen after it",
+        ),
+        "checkout" | "booking" if !screen_after(last_call) => {
+            Some("the confirmation the user sees")
+        }
+        _ => None,
+    }
+}
+
+/// The path a cited request goes to, as written: from its first slash,
+/// with template parts as parameters and no query.
+pub fn request_path(token: &str) -> Option<String> {
+    let t = regex::Regex::new(r"\$\{[^}]*\}")
+        .ok()?
+        .replace_all(token, ":p");
+    let at = t.find('/')?;
+    let p: String = t[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '`' | '?' | ')' | ','))
+        .collect();
+    (p.len() > 1).then_some(p)
+}
+
+/// Whether a route pattern that forwards every path under it (`/api/*`,
+/// `/proxy*`, `/api/auth/[...nextauth]`) takes `path`.
+pub fn pattern_takes(pattern: &str, path: &str) -> bool {
+    let prefix = pattern
+        .split(['*', '['])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    !prefix.is_empty()
+        && (path == prefix
+            || path.starts_with(&format!("{prefix}/"))
+            || (pattern.contains(&format!("{prefix}*")) && path.starts_with(prefix)))
+}
+
+/// Whether a journey has the request that saves a new password (after the
+/// one that asks for the reset): its path, name or note says so.
+fn saves_password(steps: &[Value]) -> bool {
+    let re = regex::Regex::new(r"(?i)(change|update|set|reset|new|save)[-_ ]?password|password[-_/ ]?(reset|update|change)")
+        .expect("pattern");
+    steps
+        .iter()
+        .filter(|s| s["kind"] == "call")
+        .skip(1)
+        .any(|s| {
+            re.is_match(s["token"].as_str().unwrap_or(""))
+                || re.is_match(s["note"].as_str().unwrap_or(""))
+        })
+}
+
+/// A request in the journey that goes through a route forwarding every
+/// path (a proxy, a catch-all), found by where the request goes (its path
+/// against the route's pattern, or the forwarding file itself), with no
+/// outside service step after it: the service and where the map found it.
+pub fn proxied_service_missing(
+    todo: &Value,
+    steps: &[Value],
+    snapshot: Option<&Snapshot>,
+) -> Option<String> {
+    let table = &todo["table"];
+    let routes = forwarding_routes(table, snapshot);
+    for (i, s) in steps.iter().enumerate() {
+        if !matches!(s["kind"].as_str(), Some("call" | "handler")) {
+            continue;
+        }
+        let Some(r) = route_of(&routes, s) else {
+            continue;
+        };
+        // That service, not just any outside step, comes after it.
+        if steps[i + 1..]
+            .iter()
+            .any(|t| is_service(table, t, &r.service, &r.cite))
+        {
+            continue;
+        }
+        return Some(format!(
+            "`{}` goes through a route that passes every request under `{}` on; the outside service behind it, {} (the map found it at {}:{}), isn't a step",
+            s["token"].as_str().unwrap_or(""),
+            r.pattern,
+            table[&r.service]["label"].as_str().unwrap_or("the service"),
+            r.cite["file"].as_str().unwrap_or(""),
+            r.cite["line"]
+        ));
+    }
+    None
+}
+
+/// The forwarding route a request step goes through: by its path against
+/// the route's pattern, or by citing the forwarding file itself.
+fn route_of<'r>(routes: &'r [Route], s: &Value) -> Option<&'r Route> {
+    let path = request_path(s["token"].as_str().unwrap_or(""));
+    let file = s["file"].as_str().unwrap_or("");
+    routes.iter().find(|r| {
+        file == r.file
+            || path
+                .as_deref()
+                .is_some_and(|x| pattern_takes(&r.pattern, x))
+    })
+}
+
+/// The kind of journey a trace is: from its title, else its entry's.
+pub fn journey_family(journey: &Value, entry: &Value) -> String {
+    title_family(journey["title"].as_str().unwrap_or(""))
+        .map(str::to_string)
+        .unwrap_or_else(|| entry["family"].as_str().unwrap_or("").replace('-', " "))
+}
+
+/// The kind a journey's title names: from what the user does (the words
+/// before where it starts, "from the login form"), the narrower kinds
+/// first, so a reset or a payment that starts at a sign-in form is that.
+pub fn title_family(title: &str) -> Option<&'static str> {
+    let lower = title.to_lowercase();
+    let action = [" from ", " on the ", " in the ", " at the ", " via "]
+        .iter()
+        .filter_map(|w| lower.find(w))
+        .min()
+        .map_or(lower.as_str(), |i| &lower[..i]);
+    [
+        "password reset",
+        "checkout",
+        "booking",
+        "sign in",
+        "sign up",
+    ]
+    .iter()
+    .copied()
+    .find(|f| family_matches(f, action))
+    .or_else(|| family_of(title))
+}
+
+/// A step cited where the map cites one of its candidates.
+fn step_from(table: &Value, id: &str, which: usize, kind: &str, note: &str) -> Option<Value> {
+    let e = &table[id]["evidence"][which];
+    Some(
+        json!({"kind": kind, "file": e["file"].as_str()?, "line": e["line"].as_u64()?, "token": e["token"].as_str()?, "note": note, "from_map": true}),
+    )
+}
+
+/// A route that forwards every request under it (a proxy, a catch-all):
+/// the file that forwards, the pattern it takes, the outside service it
+/// passes requests on to, and where the code names that service.
+struct Route {
+    file: String,
+    pattern: String,
+    service: String,
+    cite: Value,
+    handler: Option<Value>,
+}
+
+/// Whether a token names a setting (an address read from the environment
+/// or config, `VENDOR_API`), not a package.
+fn is_setting(tok: &str) -> bool {
+    tok.len() >= 3
+        && tok.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The files a source file imports from the same code (relative, `src/`
+/// or `@/` paths), as snapshot paths.
+fn imports_of(snapshot: &Snapshot, file: &str) -> Vec<String> {
+    let Some(b) = snapshot.files.get(file) else {
+        return Vec::new();
+    };
+    let re = regex::Regex::new(r#"(?:from\s+|require\(\s*|import\s+)['"]([^'"]+)['"]"#)
+        .expect("pattern");
+    let text = String::from_utf8_lossy(b);
+    re.captures_iter(&text)
+        .filter_map(|m| resolve_import(snapshot, file, &m[1]))
+        .collect()
+}
+
+/// The snapshot file an import in `file` names (relative, `src/` or `@/`).
+fn resolve_import(snapshot: &Snapshot, file: &str, spec: &str) -> Option<String> {
+    let dir = file.rsplit_once('/').map_or("", |(d, _)| d);
+    let root = file.find("/src/").map_or(dir, |i| &file[..i]);
+    let base = if spec.starts_with('.') {
+        format!("{dir}/{spec}")
+    } else if let Some(r) = spec.strip_prefix("src/") {
+        format!("{root}/src/{r}")
+    } else {
+        format!("{root}/src/{}", spec.strip_prefix("@/")?)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for p in base.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            x => parts.push(x),
+        }
+    }
+    let base = parts.join("/");
+    ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"]
+        .iter()
+        .map(|ext| format!("{base}{ext}"))
+        .find(|f| snapshot.files.contains_key(f))
+}
+
+/// The outside services the map names by a setting: (node, setting).
+fn setting_nodes(table: &Value) -> Vec<(String, String)> {
+    table
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.iter())
+        .filter(|(_, c)| c["kind"] == "outside")
+        .filter_map(|(id, c)| {
+            let t = c["evidence"][0]["token"].as_str()?;
+            is_setting(t).then(|| (id.clone(), t.to_string()))
+        })
+        .collect()
+}
+
+/// The settings a line reads, as whole words.
+fn settings_on<'s>(line: &str, settings: &'s [(String, String)]) -> Vec<&'s (String, String)> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    settings
+        .iter()
+        .filter(|(_, t)| {
+            line.match_indices(t.as_str()).any(|(at, _)| {
+                !line[..at].chars().next_back().is_some_and(word)
+                    && !line[at + t.len()..].chars().next().is_some_and(word)
+            })
+        })
+        .collect()
+}
+
+/// The outside service a service step's code reaches: the call on its
+/// line (else the method it is in), followed through the injected
+/// services it calls (`this.payments.charge(...)`, the member's class
+/// imported from its file) to the first line that reads a service
+/// setting. Where a called method isn't found, or calls nothing further,
+/// the class's own file is read (a client set up in its constructor).
+fn service_reached(
+    snapshot: &Snapshot,
+    settings: &[(String, String)],
+    file: &str,
+    line: usize,
+    depth: usize,
+    seen: &mut BTreeSet<String>,
+) -> Option<(String, Value)> {
+    if depth > 6 || !seen.insert(format!("{file}:{line}")) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(snapshot.files.get(file)?).to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    let at = line.checked_sub(1).filter(|i| *i < lines.len())?;
+    let hit_in = |from: usize, to: usize| -> Option<(String, Value)> {
+        (from..to.min(lines.len())).find_map(|n| {
+            settings_on(lines[n], settings)
+                .first()
+                .map(|(id, t)| (id.clone(), json!({"file": file, "line": n + 1, "token": t})))
+        })
+    };
+    let calls = regex::Regex::new(r"this\.(\w+)\.(\w+)\s*[<(]").expect("pattern");
+    // The method around the line: back to its start, on to its end.
+    let def = regex::Regex::new(
+        r"^\s*(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:async\s+)?(\w+)\s*(?:<[^>]*>)?\(",
+    )
+    .expect("pattern");
+    let keyword = |n: &str| {
+        matches!(
+            n,
+            "if" | "for" | "while" | "switch" | "return" | "catch" | "function" | "await"
+        )
+    };
+    // A route's decorator (`@Post('complete')`) names the method below it.
+    let at = if lines[at].trim_start().starts_with('@') {
+        (at..lines.len().min(at + 8))
+            .find(|n| def.captures(lines[*n]).is_some_and(|c| !keyword(&c[1])))
+            .unwrap_or(at)
+    } else {
+        at
+    };
+    let start = (0..=at)
+        .rev()
+        .find(|n| def.captures(lines[*n]).is_some_and(|c| !keyword(&c[1])))
+        .unwrap_or(at);
+    // Braces count once the parameters close (a parameter's type can have
+    // braces of its own).
+    let mut depth_b = 0i32;
+    let mut parens = 0i32;
+    let mut opened = false;
+    let mut end = lines.len();
+    for (n, l) in lines.iter().enumerate().skip(start) {
+        for ch in l.chars() {
+            match ch {
+                '(' => parens += 1,
+                ')' => parens -= 1,
+                '{' if parens <= 0 => {
+                    depth_b += 1;
+                    opened = true;
+                }
+                '}' if parens <= 0 => depth_b -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth_b <= 0 {
+            end = n + 1;
+            break;
+        }
+    }
+    if depth > 0 {
+        if let Some(h) = hit_in(start, end) {
+            return Some(h);
+        }
+    }
+    let on_line: Vec<(String, String)> = calls
+        .captures_iter(lines[at])
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect();
+    let followed = if on_line.is_empty() {
+        lines[start..end]
+            .iter()
+            .flat_map(|l| {
+                calls
+                    .captures_iter(l)
+                    .map(|c| (c[1].to_string(), c[2].to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        on_line
+    };
+    for (member, method) in followed {
+        let Some(class) = regex::Regex::new(&format!(r"\b{}\s*:\s*(\w+)", regex::escape(&member)))
+            .ok()
+            .and_then(|r| r.captures(&text).map(|c| c[1].to_string()))
+        else {
+            continue;
+        };
+        let Some(spec) = regex::Regex::new(&format!(
+            r#"(?s)import\s*(?:type\s*)?\{{[^}}]*\b{}\b[^}}]*\}}\s*from\s*['"]([^'"]+)['"]"#,
+            regex::escape(&class)
+        ))
+        .ok()
+        .and_then(|r| r.captures(&text).map(|c| c[1].to_string())) else {
+            continue;
+        };
+        let Some(next) = resolve_import(snapshot, file, &spec) else {
+            continue;
+        };
+        let body = String::from_utf8_lossy(snapshot.files.get(&next)?).to_string();
+        let found = body
+            .lines()
+            .position(|l| def.captures(l).is_some_and(|c| c[1] == *method) && !l.contains("this."));
+        let reached = match found {
+            Some(n) => service_reached(snapshot, settings, &next, n + 1, depth + 1, seen),
+            None => None,
+        };
+        // The class's own file, where the method isn't found or calls on.
+        let reached = reached.or_else(|| {
+            body.lines().enumerate().find_map(|(n, l)| {
+                settings_on(l, settings)
+                    .first()
+                    .map(|(id, t)| (id.clone(), json!({"file": next, "line": n + 1, "token": t})))
+            })
+        });
+        if reached.is_some() {
+            return reached;
+        }
+    }
+    None
+}
+
+/// The outside service a forwarding file passes requests on to: the first
+/// service setting its code reads, in the file or in what it imports (two
+/// files deep), cited at that line. Without the code, the route's own
+/// service setting the map ties to it.
+fn service_behind(
+    table: &Value,
+    snapshot: Option<&Snapshot>,
+    file: &str,
+    next: &[String],
+) -> Option<(String, Value)> {
+    let settings: Vec<(&String, &str)> = table
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.iter())
+        .filter(|(_, c)| c["kind"] == "outside")
+        .filter_map(|(id, c)| {
+            let t = c["evidence"][0]["token"].as_str()?;
+            is_setting(t).then_some((id, t))
+        })
+        .collect();
+    if let Some(snap) = snapshot {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut level = vec![file.to_string()];
+        for _ in 0..3 {
+            let mut deeper = Vec::new();
+            for f in level {
+                if !seen.insert(f.clone()) {
+                    continue;
+                }
+                let Some(b) = snap.files.get(&f) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(b);
+                let mut hits: Vec<(&String, usize, &str)> = Vec::new();
+                for (n, l) in text.lines().enumerate() {
+                    for (id, t) in &settings {
+                        let named = l.match_indices(*t).any(|(at, _)| {
+                            let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                            !l[..at].chars().next_back().is_some_and(word)
+                                && !l[at + t.len()..].chars().next().is_some_and(word)
+                        });
+                        if named {
+                            hits.push((id, n + 1, t));
+                        }
+                    }
+                }
+                // The route's own service first, then the first one read.
+                if let Some((id, n, t)) = hits
+                    .iter()
+                    .find(|(id, _, _)| next.contains(id))
+                    .or_else(|| hits.first())
+                {
+                    return Some(((*id).clone(), json!({"file": f, "line": n, "token": t})));
+                }
+                deeper.extend(imports_of(snap, &f));
+            }
+            level = deeper;
+        }
+    }
+    next.iter()
+        .find(|id| settings.iter().any(|(s, _)| s == id))
+        .map(|id| (id.clone(), table[id.as_str()]["evidence"][0].clone()))
+}
+
+/// The forwarding routes the map knows, each with the outside service it
+/// passes requests on to.
+fn forwarding_routes(table: &Value, snapshot: Option<&Snapshot>) -> Vec<Route> {
+    let mut routes: Vec<Route> = Vec::new();
+    for c in table.as_object().into_iter().flat_map(|o| o.values()) {
+        let (Some(f), Some(p)) = (c["all"].as_str(), c["pattern"].as_str()) else {
+            continue;
+        };
+        if routes.iter().any(|r| r.file == f && r.pattern == p) {
+            continue;
+        }
+        let next: Vec<String> = c["next"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .filter(|x| table[x.as_str()]["kind"] == "outside")
+            .collect();
+        if let Some((service, cite)) = service_behind(table, snapshot, f, &next) {
+            let handler = c["evidence"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["file"].as_str() == Some(f))
+                .cloned();
+            routes.push(Route {
+                file: f.to_string(),
+                pattern: p.to_string(),
+                service,
+                cite,
+                handler,
+            });
+        }
+    }
+    routes
+}
+
+/// Whether a step is the outside service `id`: by the map's node, by the
+/// setting or package its line names, or at the line the route names it.
+fn is_service(table: &Value, step: &Value, id: &str, cite: &Value) -> bool {
+    let tok = table[id]["evidence"][0]["token"].as_str().unwrap_or("");
+    step["kind"] == "outside"
+        && (node_for(table, step).as_deref() == Some(id)
+            || (step["file"] == cite["file"] && step["line"] == cite["line"])
+            || (!tok.is_empty()
+                && step["token"]
+                    .as_str()
+                    .is_some_and(|x| !x.is_empty() && (x.contains(tok) || tok.contains(x)))))
+}
+
+/// The screen whose route takes `path` (route parameters match anything).
+fn screen_for_path<'a>(rows: &[(&'a String, &Value)], path: &str) -> Option<&'a String> {
+    let segs = |p: &str| {
+        p.split('/')
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let want = segs(
+        &regex::Regex::new(r"\$\{[^}]*\}")
+            .ok()?
+            .replace_all(path, ":p"),
+    );
+    rows.iter()
+        .filter(|(_, c)| c["kind"] == "screen")
+        .find(|(_, c)| {
+            let Some(url) = c["key"].as_str().and_then(|k| k.splitn(3, ':').nth(2)) else {
+                return false;
+            };
+            let have = segs(url);
+            have.len() == want.len()
+                && !have.is_empty()
+                && have
+                    .iter()
+                    .zip(&want)
+                    .all(|(a, b)| a == b || a.starts_with(':') || b.starts_with(':'))
+        })
+        .map(|(id, _)| *id)
+}
+
+/// Where the code a journey cites builds the link its email sends (a path
+/// with the reset in it, the token as a parameter): the path.
+fn reset_link_in(snapshot: &Snapshot, files: &BTreeSet<String>) -> Option<String> {
+    let re = regex::Regex::new(r#"['"`](?:\$\{[^}]*\})?(/[A-Za-z0-9_\-/${}.:]*?(?:reset|new|set|change|update)[-_]?password[A-Za-z0-9_\-/${}.:]*)"#).ok()?;
+    for f in files {
+        let Some(b) = snapshot.files.get(f) else {
+            continue;
+        };
+        for l in String::from_utf8_lossy(b).lines() {
+            if !l.to_lowercase().contains("url")
+                && !l.to_lowercase().contains("link")
+                && !l.contains("${")
+            {
+                continue;
+            }
+            if let Some(m) = re.captures(l) {
+                return Some(m[1].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The app a candidate belongs to: the folder its first citation is in.
+fn app_of(table: &Value, id: &str) -> String {
+    table[id]["evidence"][0]["file"]
+        .as_str()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A journey's steps completed from the static map, where the code says
+/// what comes next and the trace stopped short of it. Every step added is
+/// cited where the map cites it (so the citation check holds):
+/// - a request through a forwarding route (a proxy, a catch-all) gets the
+///   outside service the route passes it on to, right after it;
+/// - a password reset that never saves the new password gets the page the
+///   reset link opens (the app's reset or password-update route, any app),
+///   the request that saves the password and its handler;
+/// - a journey that reaches a payment service gets the service's callbacks
+///   (the webhooks the map ties to it) and the return page its code sends
+///   the user back to;
+/// - an outside service step the trace put before any request after a
+///   screen goes after the request that uses it.
+pub fn complete_journey(
+    journey: &mut Value,
+    family: &str,
+    todo: &Value,
+    snapshot: Option<&Snapshot>,
+) -> usize {
+    let table = &todo["table"];
+    let mut steps: Vec<Value> = journey["steps"].as_array().cloned().unwrap_or_default();
+    let before = steps.len();
+    // A service step before any request after its screen: it runs when the
+    // request that uses it does.
+    let mut i = 0;
+    while i < steps.len() {
+        if steps[i]["kind"] == "outside" {
+            let last_screen = steps[..i].iter().rposition(|s| s["kind"] == "screen");
+            let call_before = steps[last_screen.map_or(0, |x| x + 1)..i]
+                .iter()
+                .any(|s| s["kind"] == "call");
+            if !call_before {
+                if let Some(c) = steps[i + 1..]
+                    .iter()
+                    .position(|s| s["kind"] == "call")
+                    .map(|c| c + i + 1)
+                {
+                    let s = steps.remove(i);
+                    let at = steps[c..]
+                        .iter()
+                        .position(|t| t["kind"] != "call" && t["kind"] != "handler")
+                        .map_or(steps.len(), |p| p + c);
+                    steps.insert(at, s);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    let routes = forwarding_routes(table, snapshot);
+    let rows: Vec<(&String, &Value)> = table
+        .as_object()
+        .map(|o| o.iter().collect())
+        .unwrap_or_default();
+    let saves = regex::Regex::new(r"(?i)(change|update|set|reset|new|save)[-_ ]?password|password[-_/ ]?(reset|update|change)").expect("pattern");
+    let reset_page = regex::Regex::new(
+        r"(?i)(reset|new|set|change|update)[-_ ]?password|password[-_ ]?(reset|update)",
+    )
+    .expect("pattern");
+    // A reset that never saves the new password.
+    if family == "password reset" && !saves_password(&steps) {
+        let entry_app = steps
+            .first()
+            .and_then(|s| s["file"].as_str())
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        // The page the emailed link opens: where the code the journey cites
+        // builds that link, matched to a screen's route; else the app's
+        // reset or password-update route.
+        let cited: BTreeSet<String> = steps
+            .iter()
+            .filter_map(|s| s["file"].as_str().map(str::to_string))
+            .collect();
+        let built = snapshot
+            .and_then(|snap| reset_link_in(snap, &cited))
+            .and_then(|p| screen_for_path(&rows, &p).cloned());
+        let pages: Vec<&String> = rows
+            .iter()
+            .filter(|(_, c)| {
+                c["kind"] == "screen"
+                    && reset_page.is_match(c["key"].as_str().unwrap_or(""))
+                    && !c["key"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains("forgot")
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        // A routed page (a route the app registers) before a part of one.
+        let mut pages = pages;
+        pages.sort_by_key(|id| {
+            !table[id.as_str()]["key"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("screen:")
+        });
+        // The same app's page first, then another app's (an emailed link
+        // opens the web page from a mobile flow).
+        let mut ordered: Vec<&String> = built.iter().collect();
+        ordered.extend(
+            pages
+                .iter()
+                .filter(|id| app_of(table, id) == entry_app)
+                .copied(),
+        );
+        ordered.extend(
+            pages
+                .iter()
+                .filter(|id| app_of(table, id) != entry_app)
+                .copied(),
+        );
+        // The request that saves the new password, for a page: the map's
+        // (the page's own, else its app's), else the request its app's code
+        // posts to a password-saving path, landing where the route that
+        // takes the path does.
+        let posts = regex::Regex::new(r#"(?i)\.(post|put|patch)\b[^(]*\(\s*['"`]([^'"`]*(?:change|update|set|reset|new|save)[-_]?password[^'"`]*)['"`]"#)
+            .expect("pattern");
+        let saving = |page: &str| -> Option<(Value, Option<Value>)> {
+            let own = table[page]["next"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str())
+                .find(|x| {
+                    table[*x]["kind"] == "request"
+                        && saves.is_match(table[*x]["key"].as_str().unwrap_or(""))
+                })
+                .map(str::to_string);
+            let app = app_of(table, page);
+            let req = own.or_else(|| {
+                rows.iter()
+                    .find(|(id, c)| {
+                        c["kind"] == "request"
+                            && saves.is_match(c["key"].as_str().unwrap_or(""))
+                            && app_of(table, id) == app
+                    })
+                    .map(|(id, _)| (*id).clone())
+            });
+            if let Some(req) = req {
+                let call = step_from(table, &req, 0, "call", "It saves the new password.")?;
+                let handler = (table[&req]["evidence"]
+                    .as_array()
+                    .is_some_and(|e| e.len() > 1))
+                .then(|| {
+                    step_from(
+                        table,
+                        &req,
+                        1,
+                        "handler",
+                        "The server sets the new password.",
+                    )
+                })
+                .flatten();
+                return Some((call, handler));
+            }
+            let snap = snapshot?;
+            for (f, b) in snap.files.range(format!("{app}/")..) {
+                if !f.starts_with(&format!("{app}/")) {
+                    break;
+                }
+                let lower = f.to_lowercase();
+                if ["test", "spec", "mock", "fixture", "stories"]
+                    .iter()
+                    .any(|w| lower.contains(w))
+                {
+                    continue;
+                }
+                for (n, l) in String::from_utf8_lossy(b).lines().enumerate() {
+                    if let Some(m) = posts.captures(l) {
+                        let path = m[2].to_string();
+                        let call = json!({"kind": "call", "file": f, "line": n + 1, "token": path, "note": "It saves the new password.", "from_map": true});
+                        let handler = route_of(&routes, &call)
+                            .and_then(|r| r.handler.clone())
+                            .and_then(|h| {
+                                Some(json!({"kind": "handler", "file": h["file"].as_str()?, "line": h["line"].as_u64()?, "token": h["token"].as_str()?, "note": "The server sets the new password.", "from_map": true}))
+                            });
+                        return Some((call, handler));
+                    }
+                }
+            }
+            None
+        };
+        if let Some((page, (call, handler))) = ordered
+            .iter()
+            .find_map(|p| saving(p).map(|r| ((*p).clone(), r)))
+        {
+            if let Some(st) =
+                step_from(table, &page, 0, "screen", "The reset link opens this page.")
+            {
+                steps.push(st);
+            }
+            steps.push(call);
+            steps.extend(handler);
+        }
+    }
+    // A payment service's callbacks and the page it sends the user back to.
+    let payment =
+        regex::Regex::new(r"(?i)pay|checkout|adyen|stripe|braintree|paypal|square|billing")
+            .expect("pattern");
+    let services: Vec<String> = steps
+        .iter()
+        .filter(|s| s["kind"] == "outside")
+        .filter_map(|s| node_for(table, s))
+        .collect();
+    let pays: Vec<&String> = services
+        .iter()
+        .filter(|id| {
+            payment.is_match(&format!(
+                "{} {}",
+                table[id.as_str()]["key"].as_str().unwrap_or(""),
+                table[id.as_str()]["label"].as_str().unwrap_or("")
+            ))
+        })
+        .collect();
+    // The payment service the journey's requests name (`/adyen/...`).
+    let vendor = regex::Regex::new(
+        r"(?i)\b(adyen|stripe|braintree|paypal|square|checkout\.com|mollie|klarna)\b",
+    )
+    .expect("pattern");
+    let mut named: Vec<String> = Vec::new();
+    for st in &steps {
+        for m in vendor.find_iter(st["token"].as_str().unwrap_or("")) {
+            let w = m.as_str().to_lowercase();
+            if !named.contains(&w) {
+                named.push(w);
+            }
+        }
+    }
+    let paying = !pays.is_empty() || !named.is_empty() || family == "checkout";
+    if paying {
+        let mut words: Vec<String> = pays
+            .iter()
+            .flat_map(|id| {
+                table[id.as_str()]["label"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|w| w.len() >= 4)
+            .collect();
+        for w in named {
+            if !words.contains(&w) {
+                words.push(w);
+            }
+        }
+        let mut hooks: Vec<String> = pays
+            .iter()
+            .flat_map(|id| {
+                table[id.as_str()]["next"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .filter(|x| table[x.as_str()]["kind"] == "async")
+            .collect();
+        for (id, c) in &rows {
+            let k = c["key"].as_str().unwrap_or("").to_lowercase();
+            if c["kind"] == "async"
+                && k.starts_with("hook:")
+                && (words.iter().any(|w| k.contains(w.as_str())) || k.contains("membership"))
+                && !hooks.contains(id)
+            {
+                hooks.push((*id).clone());
+            }
+        }
+        // The return page: the path the journey's code builds for it.
+        if let Some(snap) = snapshot {
+            let ret = regex::Regex::new(r#"(?i)(return|redirect|success|callback)[-_]?(url|path|to)\b[^\n]*?['"`](?:\$\{[^}]*\})?(/[A-Za-z0-9_\-/]+)"#).expect("pattern");
+            let files: BTreeSet<String> = steps
+                .iter()
+                .filter_map(|s| s["file"].as_str().map(str::to_string))
+                .collect();
+            let mut found: Option<String> = None;
+            'files: for f in &files {
+                let Some(b) = snap.files.get(f) else { continue };
+                for l in String::from_utf8_lossy(b).lines() {
+                    if let Some(m) = ret.captures(l) {
+                        found = Some(m[3].to_string());
+                        break 'files;
+                    }
+                }
+            }
+            if let Some(path) = found {
+                let page = rows.iter().find(|(_, c)| {
+                    c["kind"] == "screen"
+                        && c["key"]
+                            .as_str()
+                            .and_then(|k| k.splitn(3, ':').nth(2))
+                            .is_some_and(|u| u.trim_end_matches('/') == path.trim_end_matches('/'))
+                });
+                if let Some((id, _)) = page {
+                    if !steps
+                        .iter()
+                        .any(|s| node_for(table, s).as_deref() == Some(id.as_str()))
+                    {
+                        if let Some(st) = step_from(
+                            table,
+                            id,
+                            0,
+                            "screen",
+                            "The payment service sends the user back to this page.",
+                        ) {
+                            steps.push(st);
+                        }
+                    }
+                }
+            }
+        }
+        for h in hooks {
+            if !steps
+                .iter()
+                .any(|s| node_for(table, s).as_deref() == Some(h.as_str()))
+            {
+                let label = table[&h]["label"].as_str().unwrap_or("its webhook");
+                if let Some(st) = step_from(table, &h, 0, "callback", &format!("Later, {label}.")) {
+                    steps.push(st);
+                }
+            }
+        }
+    }
+    // The outside service behind a forwarding route, and the route's own
+    // handler when the journey names the request but not where it lands.
+    let mut i = 0;
+    while i < steps.len() {
+        let kind = steps[i]["kind"].as_str().unwrap_or("");
+        let by_path = kind == "service"
+            && request_path(steps[i]["token"].as_str().unwrap_or(""))
+                .is_some_and(|x| routes.iter().any(|r| pattern_takes(&r.pattern, &x)));
+        if matches!(kind, "call" | "handler") || by_path {
+            // Once per journey: the first request through the route.
+            if let Some(r) = route_of(&routes, &steps[i]).filter(|r| {
+                !steps
+                    .iter()
+                    .any(|s| is_service(table, s, &r.service, &r.cite))
+            }) {
+                let mut at = i + 1;
+                if kind != "handler" && steps.get(at).is_none_or(|t| t["kind"] != "handler") {
+                    if let Some((f, l, t)) = r.handler.as_ref().and_then(|h| {
+                        Some((
+                            h["file"].as_str()?,
+                            h["line"].as_u64()?,
+                            h["token"].as_str()?,
+                        ))
+                    }) {
+                        steps.insert(
+                            at,
+                            json!({"kind": "handler", "file": f, "line": l, "token": t, "note": format!("The route under `{}` takes it.", r.pattern), "from_map": true}),
+                        );
+                    }
+                }
+                while at < steps.len() && steps[at]["kind"] == "handler" {
+                    at += 1;
+                }
+                let label = table[&r.service]["label"].as_str().unwrap_or("the service");
+                if let (Some(f), Some(l), Some(t)) = (
+                    r.cite["file"].as_str(),
+                    r.cite["line"].as_u64(),
+                    r.cite["token"].as_str(),
+                ) {
+                    steps.insert(
+                        at,
+                        json!({"kind": "outside", "file": f, "line": l, "token": t, "note": format!("The route passes it on to {label}."), "from_map": true}),
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+    // The outside service the server code of a step reaches (a service,
+    // or a handler), right after it (once per service).
+    if let Some(snap) = snapshot {
+        let settings = setting_nodes(table);
+        let mut i = 0;
+        while i < steps.len() {
+            if matches!(steps[i]["kind"].as_str(), Some("service" | "handler"))
+                && steps[i]["from_map"] != true
+            {
+                let (file, line) = (
+                    steps[i]["file"].as_str().unwrap_or("").to_string(),
+                    steps[i]["line"].as_u64().unwrap_or(0) as usize,
+                );
+                let mut seen = BTreeSet::new();
+                if let Some((id, cite)) =
+                    service_reached(snap, &settings, &file, line, 0, &mut seen)
+                {
+                    if !steps.iter().any(|s| is_service(table, s, &id, &cite)) {
+                        let label = table[&id]["label"].as_str().unwrap_or("the service");
+                        if let (Some(f), Some(l), Some(t)) = (
+                            cite["file"].as_str(),
+                            cite["line"].as_u64(),
+                            cite["token"].as_str(),
+                        ) {
+                            steps.insert(
+                                i + 1,
+                                json!({"kind": "outside", "file": f, "line": l, "token": t, "note": format!("Its code calls {label}."), "from_map": true}),
+                            );
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    // Over the cap, the trace's own in-server helper steps give way first
+    // (latest first), so what the code says comes next is kept.
+    while steps.len() > fl::MAX_STEPS {
+        match steps
+            .iter()
+            .rposition(|s| s["kind"] == "service" && s["from_map"] != true)
+        {
+            Some(at) => {
+                steps.remove(at);
+            }
+            None => break,
+        }
+    }
+    steps.truncate(fl::MAX_STEPS);
+    let added = steps.len().saturating_sub(before);
+    journey["steps"] = json!(steps);
+    added
+}
+
+/// What the map knows the entry screen's own code does that the journey
+/// leaves out: the requests it makes itself (not a page's around it) and
+/// the callbacks an outside service in the journey sends.
+pub fn left_out(todo: &Value, entry: &str, steps: &[Value]) -> Vec<String> {
+    let table = &todo["table"];
+    let weak: Vec<&str> = table[entry]["weak"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .collect();
+    let hit = |id: &str| {
+        let c = &table[id];
+        let path = c["key"]
+            .as_str()
+            .unwrap_or("")
+            .split_once(' ')
+            .map(|(_, p)| p.to_string());
+        steps.iter().any(|s| {
+            node_for(table, s).as_deref() == Some(id)
+                || c["evidence"].as_array().into_iter().flatten().any(|e| {
+                    e["file"] == s["file"]
+                        && (e["line"].as_i64().unwrap_or(-99) - s["line"].as_i64().unwrap_or(0))
+                            .abs()
+                            <= 3
+                })
+                || path
+                    .as_deref()
+                    .zip(request_path(s["token"].as_str().unwrap_or("")))
+                    .is_some_and(|(a, b)| a == b)
+        })
+    };
+    let at = |id: &str| {
+        let e = &table[id]["evidence"][0];
+        format!(
+            "{} at {}:{}",
+            table[id]["label"].as_str().unwrap_or(id),
+            e["file"].as_str().unwrap_or(""),
+            e["line"]
+        )
+    };
+    let mut out = Vec::new();
+    for b in table[entry]["next"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+    {
+        if table[b]["kind"] == "request" && !weak.contains(&b) && !hit(b) {
+            out.push(at(b));
+        }
+        if out.len() >= 6 {
+            break;
+        }
+    }
+    // Callbacks of the outside services the journey reaches.
+    for s in steps.iter().filter(|s| s["kind"] == "outside") {
+        let Some(o) = node_for(table, s) else {
+            continue;
+        };
+        for a in table[&o]["next"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str())
+        {
+            if table[a]["kind"] == "async" && !hit(a) && !out.contains(&at(a)) {
+                out.push(at(a));
+            }
+        }
+    }
+    out
 }
 
 /// Tool calls one journey's trace may make.
@@ -66,7 +1203,7 @@ pub fn stops_short(j: &Value) -> Option<String> {
 /// Journeys traced at once.
 pub const CONCURRENCY: usize = 6;
 /// How long one journey's trace may take.
-pub const JOURNEY_SECS: u64 = 240;
+pub const JOURNEY_SECS: u64 = 360;
 /// The map lookups the tracer gets.
 const MAP_TOOLS: [&str; 4] = ["map_screen", "map_file", "map_part", "map_impact"];
 /// What a step can be.
@@ -85,6 +1222,9 @@ Start at the entry screen you are given. Follow what the user does there, in the
 - callback: a webhook or event handler that runs later because of this journey;
 - then the next screen the user lands on, and on through each request until the journey's outcome (signed in, booked, paid, the password changed).
 
+- Start at the entry screen you are given: the first step cites it, in its file.
+- Follow every request the journey's screens make, each in the order the code makes it (a check, then the save, then the confirmation), not one of them.
+- When a handler passes a request on (a catch-all route like `@Post('*')`, a proxy middleware, a client wrapper), follow it to the client that calls the outside service and cite the setting that holds that service's address (`BOOKINGS_API_URL`, `STRIPE_SECRET_KEY`) as the outside step.
 - When a form hands its work to the screen around it (it calls a prop such as `onContinue(email, password)` or `onSubmit`), go to where that prop is passed (the parent renders `<Form onContinue={handleLogin} />`) and follow the parent's handler: that is where the requests are made.
 
 How to work:
@@ -159,7 +1299,11 @@ pub fn token_line(text: &str, line: u64, token: &str) -> Option<u64> {
 /// A submitted journey, checked against the snapshot: every step's file
 /// exists and its line (within 3) holds its token. Returns the steps as
 /// cited (lines moved onto the token) or what is wrong.
-pub fn check_journey(snapshot: &Snapshot, input: &Value) -> Result<Value, Vec<String>> {
+pub fn check_journey(
+    snapshot: &Snapshot,
+    input: &Value,
+    entry_file: Option<&str>,
+) -> Result<Value, Vec<String>> {
     let mut problems = Vec::new();
     let mut steps = Vec::new();
     let given = input["steps"].as_array().cloned().unwrap_or_default();
@@ -205,6 +1349,13 @@ pub fn check_journey(snapshot: &Snapshot, input: &Value) -> Result<Value, Vec<St
     if steps.first().is_some_and(|s| s["kind"] != "screen") {
         problems.push("the first step is the entry screen".to_string());
     }
+    if let (Some(f), Some(first)) = (entry_file, steps.first()) {
+        if first["file"].as_str() != Some(f) {
+            problems.push(format!(
+                "the first step is the entry screen you were given, in {f}"
+            ));
+        }
+    }
     if problems.is_empty() {
         Ok(json!({"title": fl::plain(input["title"].as_str().unwrap_or(""), 80), "steps": steps}))
     } else {
@@ -218,11 +1369,22 @@ pub struct TraceTools<'a> {
     pub lookups: &'a Mutex<am::Lookups>,
     pub answers: Mutex<Vec<Value>>,
     pub calls: AtomicUsize,
+    /// The entry screen's file: every journey starts there.
+    pub entry_file: Option<String>,
+    /// The entry's candidate id, for what the map knows it does.
+    pub entry_id: Option<String>,
     /// Tool calls added for the one retry.
     pub extra: AtomicUsize,
     pub retried: std::sync::atomic::AtomicBool,
     /// What was accepted before the retry.
     pub before: Mutex<Vec<Value>>,
+    /// The candidates and the entry's kind, for the structural checks.
+    pub todo: Option<&'a Value>,
+    pub family: String,
+    /// Journeys sent back once for stopping short (title to the reason).
+    pub sent_back: Mutex<BTreeMap<String, String>>,
+    /// Journeys sent back and not yet resubmitted, kept as open.
+    pub held: Mutex<Vec<Value>>,
 }
 
 impl<'a> TraceTools<'a> {
@@ -232,9 +1394,15 @@ impl<'a> TraceTools<'a> {
             lookups,
             answers: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
+            entry_file: None,
+            entry_id: None,
             extra: AtomicUsize::new(0),
             retried: std::sync::atomic::AtomicBool::new(false),
             before: Mutex::new(Vec::new()),
+            todo: None,
+            family: String::new(),
+            sent_back: Mutex::new(BTreeMap::new()),
+            held: Mutex::new(Vec::new()),
         }
     }
 }
@@ -261,8 +1429,61 @@ impl ToolExecutor for TraceTools<'_> {
             "read_file" => self.snapshot.read_file(input),
             "list_files" => self.snapshot.list_files(input),
             "grep" => self.snapshot.grep(input),
-            "submit" => match check_journey(self.snapshot, input) {
-                Ok(j) => {
+            "submit" => match check_journey(self.snapshot, input, self.entry_file.as_deref()) {
+                Ok(mut j) => {
+                    // A journey that stops short goes back once, with fresh
+                    // tool calls; the second time it is kept, marked open.
+                    let steps = j["steps"].as_array().cloned().unwrap_or_default();
+                    let fam = title_family(j["title"].as_str().unwrap_or(""))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.family.clone());
+                    let mut why = Vec::new();
+                    if let Some(end) = short_of_end(&fam, &steps) {
+                        why.push(format!("it stops before {end}"));
+                    }
+                    if let Some(p) = self
+                        .todo
+                        .and_then(|t| proxied_service_missing(t, &steps, Some(self.snapshot)))
+                    {
+                        why.push(p);
+                    }
+                    if let (Some(t), Some(e)) = (self.todo, self.entry_id.as_deref()) {
+                        let missing = left_out(t, e, &steps);
+                        if !missing.is_empty() {
+                            why.push(format!(
+                                "the map shows this screen's code also makes these, which the journey leaves out: {} (add each where it runs; leave out one that belongs to another journey)",
+                                missing.join("; ")
+                            ));
+                        }
+                    }
+                    let key = j["title"].as_str().unwrap_or("").to_string();
+                    let mut sent = self.sent_back.lock().unwrap_or_else(|e| e.into_inner());
+                    if !why.is_empty() && !sent.contains_key(&key) {
+                        sent.insert(key, why.join("; "));
+                        self.extra.fetch_add(MAX_CALLS, Ordering::Relaxed);
+                        // Kept, open, in case the time runs out before the
+                        // journey comes back; a resubmit replaces it.
+                        let mut held = j.clone();
+                        held["open"] = json!(true);
+                        self.held
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(held);
+                        return Ok(json!(format!(
+                            "Not accepted yet: {}. Read on in the code and submit the whole journey again, from the entry screen to its end. You have {MAX_CALLS} more tool calls.",
+                            why.join("; ")
+                        )));
+                    }
+                    drop(sent);
+                    if !why.is_empty() {
+                        j["open"] = json!(true);
+                    }
+                    // The resubmit stands in for the journey held back.
+                    let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+                    if !held.is_empty() {
+                        held.remove(0);
+                    }
+                    drop(held);
                     let mut a = self.answers.lock().unwrap_or_else(|e| e.into_inner());
                     if a.len() >= MAX_PER_ENTRY {
                         "Not accepted: three journeys from one screen is the most. Reply with one short sentence and stop.".to_string()
@@ -338,33 +1559,45 @@ pub fn hints(todo: &Value, entry: &str) -> String {
     out.join("\n")
 }
 
-/// The kind of journey a name speaks of (as the sandbox's `WORDS`).
+/// The kinds of journey and the words a name of each has (as the
+/// sandbox's `WORDS`).
+const FAMILY_WORDS: [(&str, &str); 5] = [
+    ("sign in", r"(?i)(log[-_ ]?in|sign[-_ ]?in|authenticat)"),
+    (
+        "sign up",
+        r"(?i)(sign[-_ ]?up|register|create[-_ ]?account|request[-_ ]?membership|join|onboard)",
+    ),
+    (
+        "password reset",
+        r"(?i)(forgot|reset[-_ ]?password|recover|password[-_ ]?update|new[-_ ]?password|set[-_ ]?password)",
+    ),
+    (
+        "booking",
+        r"(?i)(book(ing)?|reserv|class[-_ ]?detail|schedul|appointment)",
+    ),
+    (
+        "checkout",
+        r"(?i)(checkout|purchase|payment|basket|cart|buy|subscri|billing|clipcard|credits?\b)",
+    ),
+];
+
+/// The kind of journey a name speaks of.
 pub fn family_of(text: &str) -> Option<&'static str> {
-    const WORDS: [(&str, &str); 5] = [
-        ("sign in", r"(?i)(log[-_ ]?in|sign[-_ ]?in|authenticat)"),
-        (
-            "sign up",
-            r"(?i)(sign[-_ ]?up|register|create[-_ ]?account|request[-_ ]?membership|join|onboard)",
-        ),
-        (
-            "password reset",
-            r"(?i)(forgot|reset[-_ ]?password|recover|password[-_ ]?update|new[-_ ]?password|set[-_ ]?password)",
-        ),
-        (
-            "booking",
-            r"(?i)(book(ing)?|reserv|class[-_ ]?detail|schedul|appointment)",
-        ),
-        (
-            "checkout",
-            r"(?i)(checkout|purchase|payment|basket|cart|buy|subscri|billing|clipcard|credits?\b)",
-        ),
-    ];
-    WORDS.iter().find_map(|(f, re)| {
+    FAMILY_WORDS.iter().find_map(|(f, re)| {
         regex::Regex::new(re)
             .ok()
             .filter(|r| r.is_match(text))
             .map(|_| *f)
     })
+}
+
+/// Whether `text` has the words of the kind `family`.
+fn family_matches(family: &str, text: &str) -> bool {
+    FAMILY_WORDS
+        .iter()
+        .find(|(f, _)| *f == family)
+        .and_then(|(_, re)| regex::Regex::new(re).ok())
+        .is_some_and(|r| r.is_match(text))
 }
 
 /// The journeys an entry starts: its own kind, and the kinds of the screens
@@ -473,6 +1706,10 @@ pub struct Traced {
     pub entries: usize,
     pub traced: usize,
     pub skipped_covered: usize,
+    /// Entries left for a later pass by the budget.
+    pub over_budget: usize,
+    /// Journeys kept that stopped short of their end.
+    pub open: usize,
     pub failed: usize,
     pub steps: usize,
     pub on_map: usize,
@@ -523,6 +1760,10 @@ pub fn to_flow(
                 json!({"key": format!("code:{file}#{}", s["token"].as_str().unwrap_or("")), "kind": kind, "role": role, "view": format!("f:{file}"), "note": s["note"], "evidence": ev, "linked": true})
             }
         };
+        let mut step = step;
+        if s["from_map"] == true {
+            step["from_map"] = json!(true);
+        }
         steps.push(step);
         ids.push(id);
     }
@@ -565,6 +1806,9 @@ pub fn to_flow(
             let seg: Vec<(usize, String)> = on_map
                 .iter()
                 .filter(|(i, _)| *i >= start && *i < end)
+                // A step completed from the map is already where the code
+                // puts it (after the request it serves).
+                .filter(|(i, _)| !units[*i].1.iter().all(|s| s["from_map"] == true))
                 .cloned()
                 .collect();
             if seg.len() > 1 {
@@ -602,7 +1846,21 @@ pub fn to_flow(
             start = end + 1;
         }
     }
-    let steps: Vec<Value> = units.into_iter().flat_map(|(_, v)| v).collect();
+    let mut steps: Vec<Value> = units.into_iter().flat_map(|(_, v)| v).collect();
+    for st in &mut steps {
+        if let Some(o) = st.as_object_mut() {
+            o.remove("from_map");
+        }
+    }
+    // A journey that stopped short says so, quietly, on its last step.
+    if journey["open"] == true {
+        if let Some(last) = steps.last_mut() {
+            let note = last["note"].as_str().unwrap_or("").trim().to_string();
+            last["note"] = json!(format!("{note} The journey may continue past here.")
+                .trim()
+                .to_string());
+        }
+    }
     let title = journey["title"].as_str().unwrap_or("").to_string();
     let title = if title.is_empty() {
         "Journey".to_string()
@@ -614,6 +1872,7 @@ pub fn to_flow(
         "title": title,
         "entry": table[entry_id]["key"],
         "origin": "trace",
+        "open": journey["open"] == true,
         "steps": steps,
     });
     (flow, conflicts)
@@ -632,7 +1891,9 @@ pub struct TraceOut {
     pub failed: Vec<Value>,
     /// Entries not started before `stop` (for the next step).
     pub left: Vec<Value>,
-    /// The traces as the model gave them.
+    /// The traces as the model gave them (the eval saves them, to re-check
+    /// a run with no model call).
+    #[cfg_attr(not(test), expect(dead_code))]
     pub raw: Vec<Value>,
 }
 
@@ -652,6 +1913,8 @@ pub async fn trace_all(
     usage: &mut crate::models::TokenUsage,
     evidence_order: bool,
     stop: Option<std::time::Instant>,
+    budget: f64,
+    done: Option<&tokio::sync::mpsc::UnboundedSender<Done>>,
 ) -> TraceOut {
     let lookups = Mutex::new(am::Lookups::new(graph));
     let entries: Vec<Value> = todo["entries"].as_array().cloned().unwrap_or_default();
@@ -662,6 +1925,9 @@ pub async fn trace_all(
     });
     let usage_all = Mutex::new(crate::models::TokenUsage::default());
     let left = Mutex::new(Vec::new());
+    let running = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
+    let largest = Mutex::new(0.0f64);
     let results: Vec<EntryTraces> = futures::stream::iter(entries.iter().cloned())
         .map(|entry| {
             let lookups = &lookups;
@@ -669,7 +1935,22 @@ pub async fn trace_all(
             let rep = &rep;
             let usage_all = &usage_all;
             let left = &left;
+            let running = &running;
+            let finished = &finished;
+            let largest = &largest;
             async move {
+                // The budget, checked before the entry starts and counting the
+                // entries already running at what an entry has cost so far: a
+                // pass never goes over; what doesn't fit waits for the next.
+                {
+                    let spent = usage_all.lock().unwrap_or_else(|e| e.into_inner()).cost_usd;
+                    if !fits_budget(spent, *largest.lock().unwrap_or_else(|e| e.into_inner()), running.load(Ordering::Relaxed), budget) {
+                        rep.lock().unwrap_or_else(|e| e.into_inner()).over_budget += 1;
+                        left.lock().unwrap_or_else(|e| e.into_inner()).push(entry["id"].clone());
+                        return (entry, Vec::new());
+                    }
+                    running.fetch_add(1, Ordering::Relaxed);
+                }
                 if stop.is_some_and(|s| std::time::Instant::now() >= s) {
                     left.lock().unwrap_or_else(|e| e.into_inner()).push(entry["id"].clone());
                     return (entry, Vec::new());
@@ -683,15 +1964,23 @@ pub async fn trace_all(
                 };
                 if covered.lock().unwrap_or_else(|e| e.into_inner()).contains(&key(&entry)) {
                     rep.lock().unwrap_or_else(|e| e.into_inner()).skipped_covered += 1;
+                    if let Some(d) = done {
+                        let _ = d.send(Done { entry: entry.clone(), flows: Vec::new(), cost_usd: 0.0, covered: true });
+                    }
                     return (entry, Vec::new());
                 }
-                let exec = TraceTools::new(snapshot, lookups);
+                let mut exec = TraceTools::new(snapshot, lookups);
+                exec.todo = Some(todo);
+                exec.entry_id = entry["id"].as_str().map(str::to_string);
+                exec.family = entry["family"].as_str().unwrap_or("").replace('-', " ");
+                exec.entry_file = todo["table"][entry["id"].as_str().unwrap_or("")]["evidence"][0]["file"]
+                    .as_str()
+                    .map(str::to_string);
                 let mut messages = vec![(
                     "user".to_string(),
                     vec![json!({"type": "text", "text": user_prompt(todo, &entry)})],
                 )];
                 let mut u = crate::models::TokenUsage::default();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(JOURNEY_SECS);
                 // A trace that ends without submitting is asked once to
                 // submit; one that stops at a hand-off or before any outside
                 // service is asked once to go on, with more tool calls.
@@ -723,7 +2012,7 @@ pub async fn trace_all(
                         &mut u,
                         MAX_CALLS * MAX_PER_ENTRY + RETRY_CALLS + 8,
                         8_000,
-                        Some(deadline),
+                        None,
                         None,
                         None,
                         None,
@@ -742,6 +2031,12 @@ pub async fn trace_all(
                     );
                 }
                 usage_all.lock().unwrap_or_else(|e| e.into_inner()).merge(&u);
+                running.fetch_sub(1, Ordering::Relaxed);
+                finished.fetch_add(1, Ordering::Relaxed);
+                {
+                    let mut big = largest.lock().unwrap_or_else(|e| e.into_inner());
+                    *big = big.max(u.cost_usd);
+                }
                 let rejected = messages
                     .iter()
                     .flat_map(|(_, b)| b.iter())
@@ -749,6 +2044,7 @@ pub async fn trace_all(
                     .count();
                 let calls = exec.calls.load(Ordering::Relaxed);
                 let mut answers = exec.answers.into_inner().unwrap_or_else(|e| e.into_inner());
+                answers.extend(exec.held.into_inner().unwrap_or_else(|e| e.into_inner()));
                 // A retry that gave nothing keeps what came before.
                 if answers.is_empty() {
                     answers = exec.before.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -758,6 +2054,10 @@ pub async fn trace_all(
                 r.tool_calls += calls;
                 if answers.is_empty() {
                     r.failed += 1;
+                    drop(r);
+                    if let Some(d) = done {
+                        let _ = d.send(Done { entry: entry.clone(), flows: Vec::new(), cost_usd: u.cost_usd, covered: false });
+                    }
                     return (entry, Vec::new());
                 }
                 r.traced += 1;
@@ -765,7 +2065,12 @@ pub async fn trace_all(
                 let made: Vec<(Value, usize, Value)> = answers
                     .into_iter()
                     .map(|j| {
-                        let (f, c) = to_flow(&j, &entry, todo, evidence_order);
+                        // What the static map says comes next, where the
+                        // trace stopped short of it.
+                        let mut done = j.clone();
+                        let fam = journey_family(&done, &entry);
+                        complete_journey(&mut done, &fam, todo, Some(snapshot));
+                        let (f, c) = to_flow(&done, &entry, todo, evidence_order);
                         (f, c, j)
                     })
                     .collect();
@@ -781,6 +2086,13 @@ pub async fn trace_all(
                     if e["key"].as_str().is_some_and(|k| keys.contains(k)) {
                         cov.insert((fam.clone(), app.clone(), e["id"].as_str().unwrap_or("").to_string()));
                     }
+                }
+                drop(cov);
+                // Each journey is handed on as it finishes, for the caller to
+                // keep (a checkpoint) before the next one ends.
+                if let Some(d) = done {
+                    let kept: Vec<Value> = made.iter().map(|(f, _, _)| f.clone()).filter(keepable).collect();
+                    let _ = d.send(Done { entry: entry.clone(), flows: kept, cost_usd: u.cost_usd, covered: false });
                 }
                 (entry, made)
             }
@@ -823,10 +2135,10 @@ pub async fn trace_all(
         let mut kept = 0;
         for (mut flow, conflicts, j) in got {
             raw.push(json!({"entry": entry, "journey": j}));
-            let steps = flow["steps"].as_array().map(Vec::len).unwrap_or(0);
-            if steps < 3 || flow["steps"][0]["kind"] != "screen" {
+            if !keepable(&flow) {
                 continue;
             }
+            let steps = flow["steps"].as_array().map(Vec::len).unwrap_or(0);
             kept += 1;
             rep.steps += steps;
             rep.on_map += flow["steps"]
@@ -836,6 +2148,7 @@ pub async fn trace_all(
                 .filter(|s| !s["key"].as_str().unwrap_or("").starts_with("code:"))
                 .count();
             rep.order_conflicts += conflicts;
+            rep.open += usize::from(flow["open"] == true);
             let base = flow["id"].as_str().unwrap_or("journey").to_string();
             let mut id = base.clone();
             let mut n = 2;
@@ -902,6 +2215,11 @@ mod tests {
             std::env::var("APP_MAP_TRACE_EVAL").expect("APP_MAP_TRACE_EVAL"),
         );
         let evidence_order = std::env::var("TRACE_ORDER").map_or(true, |v| v != "trace");
+        // `TRACE_BUDGET` caps the run as one pass would be (unset: no cap).
+        let budget: f64 = std::env::var("TRACE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(f64::MAX);
         let (client, model) = super::super::review_eval::eval_client().await;
         if std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock") {
             common::model_provider::set_current(
@@ -937,18 +2255,7 @@ mod tests {
             let saved = std::fs::read(dir.join(format!("{set}.traces.json")))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok());
-            let (flows, rep, raw) = if let Some(saved) = saved {
-                let mut rep = Traced::default();
-                let flows: Vec<Value> = saved
-                    .iter()
-                    .map(|t| {
-                        let (f, c) = to_flow(&t["journey"], &t["entry"], &todo, evidence_order);
-                        rep.order_conflicts += c;
-                        f
-                    })
-                    .collect();
-                (flows, rep, saved)
-            } else {
+            let snapshot = {
                 let mut files = BTreeMap::new();
                 let root = dir.join("roots").join(&set);
                 let mut stack = vec![root.clone()];
@@ -969,7 +2276,23 @@ mod tests {
                         }
                     }
                 }
-                let snapshot = Snapshot { files };
+                Snapshot { files }
+            };
+            let (flows, rep, raw) = if let Some(saved) = saved {
+                let mut rep = Traced::default();
+                let flows: Vec<Value> = saved
+                    .iter()
+                    .map(|t| {
+                        let mut done = t["journey"].clone();
+                        let fam = journey_family(&done, &t["entry"]);
+                        complete_journey(&mut done, &fam, &todo, Some(&snapshot));
+                        let (f, c) = to_flow(&done, &t["entry"], &todo, evidence_order);
+                        rep.order_conflicts += c;
+                        f
+                    })
+                    .collect();
+                (flows, rep, saved)
+            } else {
                 let graph: Value = serde_json::from_slice(
                     &std::fs::read(dir.join(format!("{set}.graph.json"))).unwrap(),
                 )
@@ -993,8 +2316,16 @@ mod tests {
                     &mut usage,
                     evidence_order,
                     None,
+                    budget,
+                    None,
                 )
                 .await;
+                let left: Vec<Value> = out.left.iter().map(|e| e["id"].clone()).collect();
+                std::fs::write(
+                    dir.join(format!("{set}.left.json")),
+                    serde_json::to_vec_pretty(&left).unwrap(),
+                )
+                .unwrap();
                 (out.flows, out.report, out.raw)
             };
             println!(
@@ -1027,13 +2358,286 @@ mod tests {
     }
 
     #[test]
+    fn a_journey_that_stops_short_of_its_end_or_of_a_proxied_service_is_found() {
+        let st = |kind: &str, file: &str, line: u64, token: &str| json!({"kind": kind, "file": file, "line": line, "token": token});
+        let reset = vec![
+            st("screen", "web/forgot.tsx", 3, "ForgotForm"),
+            st("call", "web/recover.ts", 9, "/proxy/recover"),
+            st("screen", "web/forgot.tsx", 20, "Check your email"),
+        ];
+        // One call and no new password set: short of a reset's end.
+        assert!(short_of_end("password reset", &reset)
+            .is_some_and(|e| e.starts_with("the new password being set")));
+        let mut done = reset.clone();
+        done.push(st("call", "web/reset.ts", 4, "/reset-password"));
+        done.push(st("screen", "web/updated.tsx", 2, "PasswordUpdated"));
+        assert_eq!(short_of_end("password reset", &done), None);
+        // Two calls are not enough when none saves the new password.
+        let mut two = reset.clone();
+        two.push(st("call", "web/recover.ts", 30, "/proxy/resend"));
+        two.push(st("screen", "web/forgot.tsx", 40, "Sent"));
+        assert!(short_of_end("password reset", &two).is_some());
+        // Signed in: a screen after the last call.
+        assert!(short_of_end("sign in", &reset[..2]).is_some());
+        assert_eq!(short_of_end("sign in", &reset), None);
+        let todo = json!({"table": {
+            "R1": {"key": "req:ALL /proxy*", "kind": "request", "label": "ALL /proxy*", "all": "api/proxy.module.ts", "pattern": "/proxy*", "next": ["X1"],
+                   "evidence": [{"file": "web/recover.ts", "line": 9, "token": "/proxy/recover"}]},
+            "X1": {"key": "n:vendor", "kind": "outside", "label": "Vendor API", "next": [],
+                   "evidence": [{"file": "api/proxy.module.ts", "line": 12, "token": "VENDOR_API"}]},
+        }});
+        // Found by where the request goes, whatever line the trace cites.
+        let mut elsewhere = reset.clone();
+        elsewhere[1] = st("call", "web/other-client.ts", 40, "`${base}/proxy/recover`");
+        assert!(proxied_service_missing(&todo, &elsewhere, None).is_some());
+        assert!(
+            pattern_takes("/vendor/*", "/vendor/persons/x")
+                && pattern_takes("/m*", "/m/login")
+                && !pattern_takes("/api/*", "/apix")
+        );
+        assert_eq!(
+            request_path("`${apiBase}/a/b/${id}?x=1`").as_deref(),
+            Some("/a/b/:p")
+        );
+        let p = proxied_service_missing(&todo, &reset, None).unwrap();
+        assert!(
+            p.contains("Vendor API (the map found it at api/proxy.module.ts:12)"),
+            "{p}"
+        );
+        let mut with = reset.clone();
+        with.insert(2, st("outside", "api/proxy.module.ts", 12, "VENDOR_API"));
+        assert_eq!(proxied_service_missing(&todo, &with, None), None);
+    }
+
+    #[test]
+    fn a_journey_is_completed_from_the_map_where_the_code_says_what_comes_next() {
+        let files: BTreeMap<String, Vec<u8>> = [
+            ("api/src/proxy/proxy.module.ts", "import { client } from './vendor-client';\napp.use('/proxy*', forward);\n"),
+            ("api/src/proxy/vendor-client.ts", "export const base = process.env.VENDOR_API;\n"),
+            ("web/src/actions/recover.ts", "x\nx\nclient.post('/proxy/recover', body);\n"),
+            ("web/src/actions/save.ts", "client.post('/proxy/password/updatePassword', body);\n"),
+            ("web/src/lib/session.ts", "const body = { returnUrl: `${origin}/pay/back` };\npost('/stripe/session', body);\n"),
+            ("api/src/orders/orders.service.ts", "import { Ledger } from '../ledger/ledger.service';\nexport class Orders {\n  constructor(private readonly ledger: Ledger) {}\n  async place(order: { id: string }) {\n    return this.ledger.record(order);\n  }\n}\n"),
+            ("api/src/ledger/ledger.service.ts", "export class Ledger {\n  private base = process.env.LEDGER_API;\n  async record(o: unknown) {\n    return fetch(this.base, o);\n  }\n}\n"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+        .collect();
+        let snapshot = Snapshot { files };
+        let todo = json!({"table": {
+            "R1": {"key": "req:ALL /proxy*", "kind": "request", "label": "ALL /proxy*", "all": "api/src/proxy/proxy.module.ts", "pattern": "/proxy*", "next": ["X2"],
+                   "evidence": [{"file": "web/src/actions/recover.ts", "line": 3, "token": "/proxy/recover"}, {"file": "api/src/proxy/proxy.module.ts", "line": 2, "token": "app.use"}]},
+            "X1": {"key": "n:vendor", "kind": "outside", "label": "Vendor", "next": [],
+                   "evidence": [{"file": "api/.env.sample", "line": 4, "token": "VENDOR_API"}]},
+            "X2": {"key": "n:logger", "kind": "outside", "label": "Logger", "next": [],
+                   "evidence": [{"file": "scripts/x.ts", "line": 9, "token": "@logger/node"}]},
+            "S1": {"key": "screen:web:/reset-password/:token", "kind": "screen", "label": "/reset-password/:token", "next": [],
+                   "evidence": [{"file": "web/src/app/reset-password/[token]/page.tsx", "line": 5, "token": "ResetPage"}]},
+            "S2": {"key": "screen:web:/pay/back", "kind": "screen", "label": "/pay/back", "next": [],
+                   "evidence": [{"file": "web/src/app/pay/back/page.tsx", "line": 3, "token": "PayBack"}]},
+            "X3": {"key": "n:ledger", "kind": "outside", "label": "Ledger", "next": [],
+                   "evidence": [{"file": "api/.env.sample", "line": 7, "token": "LEDGER_API"}]},
+            "A1": {"key": "hook:POST /stripe/webhook", "kind": "async", "label": "POST /stripe/webhook", "next": [],
+                   "evidence": [{"file": "api/src/pay/hooks.ts", "line": 7, "token": "'webhook'"}]},
+        }});
+        let st = |kind: &str, file: &str, line: u64, token: &str| json!({"kind": kind, "file": file, "line": line, "token": token});
+        assert_eq!(
+            title_family("Reset a forgotten password from the login form"),
+            Some("password reset")
+        );
+        assert_eq!(title_family("Buy a plan to join"), Some("checkout"));
+        // A reset that stops at "check your email" through a proxy.
+        let mut reset = json!({"title": "Reset a forgotten password from the login form", "steps": [
+            st("screen", "web/forgot.tsx", 3, "ForgotForm"),
+            st("call", "web/src/actions/recover.ts", 3, "/proxy/recover"),
+            st("screen", "web/forgot.tsx", 20, "Check your email"),
+        ]});
+        let fam = journey_family(&reset, &json!({}));
+        assert!(complete_journey(&mut reset, &fam, &todo, Some(&snapshot)) > 0);
+        let got: Vec<(String, String, u64)> = reset["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["kind"].as_str().unwrap().to_string(),
+                    s["file"].as_str().unwrap().to_string(),
+                    s["line"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let want = |k: &str, f: &str, l: u64| (k.to_string(), f.to_string(), l);
+        assert_eq!(
+            got,
+            vec![
+                want("screen", "web/forgot.tsx", 3),
+                want("call", "web/src/actions/recover.ts", 3),
+                // The route's handler, then the service its code reads (not
+                // the package the map also ties to it).
+                want("handler", "api/src/proxy/proxy.module.ts", 2),
+                want("outside", "api/src/proxy/vendor-client.ts", 1),
+                want("screen", "web/forgot.tsx", 20),
+                // The reset page, and the request its app's code posts to
+                // save the password, landing on the route that takes it.
+                want("screen", "web/src/app/reset-password/[token]/page.tsx", 5),
+                want("call", "web/src/actions/save.ts", 1),
+                want("handler", "api/src/proxy/proxy.module.ts", 2),
+            ]
+        );
+        assert!(reset["steps"].as_array().unwrap()[2..]
+            .iter()
+            .filter(|s| s["file"] != "web/forgot.tsx")
+            .all(|s| s["from_map"] == true));
+        // Every added step's line holds its token.
+        for s in reset["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["from_map"] == true)
+        {
+            let f = s["file"].as_str().unwrap();
+            if let Some(b) = snapshot.files.get(f) {
+                let line = String::from_utf8_lossy(b)
+                    .lines()
+                    .nth(s["line"].as_u64().unwrap() as usize - 1)
+                    .unwrap()
+                    .to_string();
+                assert!(line.contains(s["token"].as_str().unwrap()), "{f}: {line}");
+            }
+        }
+        // A payment gets the page its code sends the user back to and the
+        // payment service's webhook.
+        let mut pay = json!({"title": "Buy a plan to join", "steps": [
+            st("screen", "web/plan.tsx", 1, "Plan"),
+            st("call", "web/src/lib/session.ts", 2, "/stripe/session"),
+        ]});
+        let fam = journey_family(&pay, &json!({}));
+        complete_journey(&mut pay, &fam, &todo, Some(&snapshot));
+        let files: Vec<&str> = pay["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                "web/plan.tsx",
+                "web/src/lib/session.ts",
+                "web/src/app/pay/back/page.tsx",
+                "api/src/pay/hooks.ts"
+            ]
+        );
+        // A service step gets the outside service its code reaches, through
+        // the injected service it calls, cited where the setting is read.
+        let mut order = json!({"title": "Place an order", "steps": [
+            st("screen", "web/cart.tsx", 1, "Cart"),
+            st("service", "api/src/orders/orders.service.ts", 4, "place"),
+        ]});
+        complete_journey(&mut order, "", &todo, Some(&snapshot));
+        let last = order["steps"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            (
+                last["kind"].as_str(),
+                last["file"].as_str(),
+                last["line"].as_u64()
+            ),
+            (
+                Some("outside"),
+                Some("api/src/ledger/ledger.service.ts"),
+                Some(2)
+            )
+        );
+    }
+
+    #[test]
+    fn a_pass_never_starts_an_entry_past_its_budget() {
+        // Nothing spent, two running at the estimate: room for one more.
+        assert!(fits_budget(0.0, 0.0, 2, 1.0));
+        assert!(!fits_budget(0.0, 0.0, 4, 1.0));
+        // Held at the largest entry so far (0.40), 2 running.
+        assert!(fits_budget(1.2, 0.4, 2, 2.5));
+        assert!(!fits_budget(1.2, 0.4, 3, 2.5));
+        // The day's budget caps the pass's.
+        assert_eq!(pass_budget(0.0), BUDGET_USD);
+        assert_eq!(pass_budget(DAILY_BUDGET_USD - 1.0), 1.0);
+        assert_eq!(pass_budget(DAILY_BUDGET_USD + 1.0), 0.0);
+        assert_eq!(
+            spent_today(&json!({"day": "2026-01-02", "usd": 4.0}), "2026-01-02"),
+            4.0
+        );
+        assert_eq!(
+            spent_today(&json!({"day": "2026-01-01", "usd": 4.0}), "2026-01-02"),
+            0.0
+        );
+    }
+
+    /// A pass that stops after any journey resumes with the next entry: no
+    /// entry is traced twice, none is lost, and the store ends the same.
+    #[test]
+    fn a_pass_killed_mid_map_resumes_without_redoing_work() {
+        let entry = |id: &str| json!({"id": id, "key": format!("screen:web:/{id}"), "hash": format!("h-{id}"), "family": "sign-in", "app": "web"});
+        let todo =
+            json!({"entries": [entry("a"), entry("b"), entry("c"), entry("d")], "table": {}});
+        let flow = |id: &str| {
+            json!({"id": format!("j-{id}"), "title": id, "entry": format!("screen:web:/{id}"), "origin": "trace",
+            "steps": [{"key": format!("screen:web:/{id}"), "kind": "screen"}, {"key": "req:GET /x", "kind": "request"}, {"key": "n:y", "kind": "outside"}]})
+        };
+        let traced = std::cell::RefCell::new(Vec::<String>::new());
+        let trace = |e: &Value| {
+            let id = e["id"].as_str().unwrap().to_string();
+            traced.borrow_mut().push(id.clone());
+            Done {
+                entry: e.clone(),
+                flows: vec![flow(&id)],
+                cost_usd: 0.1,
+                covered: false,
+            }
+        };
+        // The first pass is killed after its second journey: what was
+        // written down is the store and the queue after that checkpoint.
+        let mut store = json!({"schema": fl::SCHEMA, "flows": []});
+        let mut queue = todo.clone();
+        for e in todo["entries"].as_array().unwrap().iter().take(2) {
+            let (s, q) = checkpoint(&store, &queue, &trace(e));
+            store = s;
+            queue = q;
+        }
+        assert_eq!(store["pending"], 2);
+        // The resumed pass reads them back and goes on.
+        let saved_store: Value = serde_json::from_str(&store.to_string()).unwrap();
+        let saved_queue: Value = serde_json::from_str(&queue.to_string()).unwrap();
+        let (mut store, mut queue) = (saved_store, saved_queue);
+        while let Some(e) = queue["entries"].as_array().and_then(|a| a.first()).cloned() {
+            let (s, q) = checkpoint(&store, &queue, &trace(&e));
+            store = s;
+            queue = q;
+        }
+        assert_eq!(*traced.borrow(), ["a", "b", "c", "d"]);
+        assert_eq!(store["pending"], 0);
+        let ids: Vec<&str> = store["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["j-a", "j-b", "j-c", "j-d"]);
+        for id in ["a", "b", "c", "d"] {
+            assert_eq!(
+                store["asked"][format!("screen:web:/{id}")],
+                format!("h-{id}")
+            );
+        }
+    }
+
+    #[test]
     fn a_trace_keeps_only_steps_whose_line_holds_their_token() {
         let s = snapshot();
         let ok = json!({"title": "Sign in", "steps": [
             {"kind": "screen", "file": "harbor-web/app/login/page.tsx", "line": 2, "token": "LoginPage", "note": "The sign-in page."},
             {"kind": "call", "file": "harbor-web/lib/session.ts", "line": 2, "token": "/api/session", "note": "Posts the session."},
         ]});
-        let j = check_journey(&s, &ok).unwrap();
+        let j = check_journey(&s, &ok, None).unwrap();
         // The line moves onto the token.
         assert_eq!(j["steps"][0]["line"], 3);
         let bad = json!({"title": "Sign in", "steps": [
@@ -1041,7 +2645,7 @@ mod tests {
             {"kind": "call", "file": "harbor-web/lib/session.ts", "line": 2, "token": "/api/sessions/new", "note": ""},
             {"kind": "handler", "file": "harbor-api/src/session.ts", "line": 1, "token": "POST", "note": ""},
         ]});
-        let p = check_journey(&s, &bad).unwrap_err();
+        let p = check_journey(&s, &bad, None).unwrap_err();
         assert_eq!(p.len(), 2);
         assert!(p[0].starts_with("step 2: harbor-web/lib/session.ts:2 doesn't hold"));
         assert!(p[1].starts_with("step 3: there is no file harbor-api/src/session.ts"));

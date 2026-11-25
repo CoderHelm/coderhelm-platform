@@ -889,7 +889,7 @@ export function candidates(graph, read) {
     const real = how !== 'matched' || !lines || lines.slice(Math.max(0, at0 - 8), at0 + 3).some((t) => HTTP_NEAR.test(t));
     const had = byKey.get(key);
     if (had && real && !had.real && callEv) { had.evidence[0] = callEv; had.real = true; }
-    const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how, all: /\*|\[\.\.\./.test(rt.p || '') ? rt.f : null, real });
+    const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how, all: /\*|\[\.\.\./.test(rt.p || '') ? rt.f : null, pattern: /\*|\[\.\.\./.test(rt.p || '') ? rt.p : null, real });
     if (!c) return null;
     if (!callsByFile.has(site.file)) callsByFile.set(site.file, []);
     callsByFile.get(site.file).push({ c, line: callEv?.line || site.line, real });
@@ -1332,6 +1332,38 @@ export function fairOrder(list) {
   return out;
 }
 
+/** What tracing an entry would reach, from the static graph: the distinct
+ * screens one step away, and the requests (each with its handler) and
+ * outside services they lead to. */
+export function coverage(c, entry) {
+  const by = byIdOf(c);
+  const n = { screen: 0, request: 0, outside: 0, async: 0 };
+  for (const id of subgraph(c, entry, 1)) {
+    const k = by.get(id)?.kind;
+    if (k in n) n[k] += 1;
+  }
+  return n.screen + n.request + n.outside + n.async;
+}
+
+/** Entries in the order to trace them: account and money journeys (sign
+ * in, sign up, password reset, checkout, booking) before any other kind,
+ * each kind's entries by how much of the app their journey reaches, taken
+ * in turn across kinds so the first ones cover every kind. */
+export function rankEntries(c, list) {
+  const KEY = ['sign-in', 'sign-up', 'password-reset', 'checkout', 'booking'];
+  const kinds = new Map();
+  for (const e of list) {
+    const f = e.fam || family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || 'other';
+    if (!kinds.has(f)) kinds.set(f, []);
+    kinds.get(f).push({ e, n: coverage(c, e) });
+  }
+  for (const l of kinds.values()) l.sort((a, b) => b.n - a.n || Number(!!a.e.part) - Number(!!b.e.part));
+  const order = [...kinds.keys()].sort((a, b) => (KEY.includes(a) ? KEY.indexOf(a) : 99) - (KEY.includes(b) ? KEY.indexOf(b) : 99));
+  const out = [];
+  for (let i = 0; out.length < list.length; i++) for (const k of order) if (kinds.get(k)[i]) out.push(kinds.get(k)[i].e);
+  return out;
+}
+
 /** The candidates around an entry: screens within 2 navigation hops and
  * everything their requests reach. */
 export function subgraph(c, entry, hops = 2) {
@@ -1504,7 +1536,7 @@ export function table(c, ids, read) {
       // A route that takes every path under it (`/api/*`, a proxy): the
       // file that forwards them (the requests through it all reach what it
       // forwards to).
-      ...(x.kind === 'request' && x.all ? { all: x.all } : {}),
+      ...(x.kind === 'request' && x.all ? { all: x.all, pattern: x.pattern } : {}),
       // Requests a step has only because its page makes them: they don't
       // place the request under this step.
       weak: [...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.why === 'the page makes this request for the step').map(([b]) => b),
@@ -1530,7 +1562,7 @@ export function prepare(root, graph, prev) {
   for (const e of ent) if (asked[e.key] !== hashes.get(e.key)) redo.add(e.key);
   // Every kind of journey gets its share of the list: entries taken in
   // turn across families, routed screens before forms.
-  const todoEntries = fairOrder(ent.filter((e) => redo.has(e.key)));
+  const todoEntries = rankEntries(c, ent.filter((e) => redo.has(e.key)));
   let todo = null;
   if (todoEntries.length) {
     // One model call per journey family per app, each with only the

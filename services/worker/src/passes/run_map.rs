@@ -143,7 +143,9 @@ impl RunMap {
             Role::Reviewer => " For a changed endpoint or a shared file, call map_impact to find \
                  its callers in other repositories and its screens; a change to an endpoint's \
                  method, path, parameters, body or response that other repositories call is a \
-                 breaking change: raise it, naming each caller's file:line."
+                 breaking change: raise it, naming each caller's file:line. For each user journey \
+                 map_impact lists on a changed file (map_flow gives its steps), check the journey \
+                 still works end to end with the change."
                 .to_string(),
         };
         format!("{intro}{what}")
@@ -276,12 +278,15 @@ impl RunMap {
             ));
         }
         for j in v["journeys"].as_array().into_iter().flatten() {
-            let at = j["at"]
+            // Every step of the journey that stands on it, each at its line.
+            let at: Vec<String> = j["at"]
                 .as_array()
-                .and_then(|a| a.first())
+                .into_iter()
+                .flatten()
                 .map(s)
-                .unwrap_or_default();
-            out.push(format!("journey {} at {at}", s(&j["title"])));
+                .take(6)
+                .collect();
+            out.push(format!("journey {} at {}", s(&j["title"]), at.join(", ")));
         }
         for o in v["outside_services"].as_array().into_iter().flatten() {
             out.push(format!(
@@ -352,6 +357,7 @@ impl RunMap {
     pub fn review_section(&self, changed: &[(String, String)]) -> String {
         let flagged = self.endpoint_changes(changed);
         let mut shared: Vec<String> = Vec::new();
+        let mut journeys: Vec<String> = Vec::new();
         for (path, _) in changed.iter().take(40) {
             let Some(p) = self.map_path(&self.repo, path) else {
                 continue;
@@ -360,6 +366,12 @@ impl RunMap {
                 continue;
             }
             let r = self.reaches(&self.repo, path);
+            for j in r.iter().filter(|x| x.starts_with("journey ")) {
+                let line = format!("- {path} is on {j}");
+                if !journeys.contains(&line) {
+                    journeys.push(line);
+                }
+            }
             let elsewhere: Vec<&String> =
                 r.iter().filter(|x| x.contains(" calls it at ")).collect();
             if !elsewhere.is_empty() {
@@ -374,7 +386,7 @@ impl RunMap {
                 ));
             }
         }
-        if flagged.is_empty() && shared.is_empty() {
+        if flagged.is_empty() && shared.is_empty() && journeys.is_empty() {
             return String::new();
         }
         let mut out = String::from("\n## Cross-repository impact (from the app map)\n");
@@ -398,6 +410,22 @@ impl RunMap {
         if !shared.is_empty() {
             out.push_str("Shared files this pull request changes:\n");
             out.push_str(&shared.join("\n"));
+            out.push('\n');
+        }
+        if !journeys.is_empty() {
+            out.push_str(
+                "User journeys this pull request changes a step of. Check each still works end to \
+                 end with the change (the step it changes, and the steps after it); raise a finding \
+                 naming the journey and the step's file:line when it breaks:\n",
+            );
+            out.push_str(
+                &journeys
+                    .iter()
+                    .take(12)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             out.push('\n');
         }
         let out = common::truncate_str(&out, REVIEW_CHARS).to_string();
@@ -642,6 +670,49 @@ mod tests {
     fn a_map_without_the_repository_offers_nothing() {
         assert!(RunMap::of(harbor(), "harbor/elsewhere").is_none());
         assert!(RunMap::of(json!({"schema": am::GRAPH_SCHEMA}), "harbor/harbor-api").is_none());
+    }
+
+    /// A journey traced through the code (a step the map has no node for,
+    /// standing on its cited line) reaches the run's agents: the planner's
+    /// map_impact lists it with its step's file:line, and the reviewer is
+    /// asked to check it still works.
+    #[test]
+    fn the_planner_and_the_reviewer_get_the_traced_journeys_a_file_is_on() {
+        let mut g = harbor();
+        let store = json!({"flows": [{
+            "id": "book-a-slip", "title": "Book a slip", "entry": "screen:web:/slips", "origin": "trace",
+            "steps": [
+                {"key": "screen:web:/slips", "kind": "screen", "role": "screen", "view": "f:harbor-web/app/slips/page.tsx", "note": "Pick a slip.",
+                 "evidence": [{"file": "harbor-web/app/slips/page.tsx", "line": 1, "token": "Slips"}]},
+                {"key": "code:harbor-api/src/bookings.js#book", "kind": "request", "role": "handler", "view": "f:harbor-api/src/bookings.js", "note": "The API books it.",
+                 "evidence": [{"file": "harbor-api/src/bookings.js", "line": 3, "token": "book"}]},
+                {"key": "n:stripe", "kind": "outside", "role": "outside", "view": "n:stripe", "note": "Stripe charges.",
+                 "evidence": [{"file": "harbor-api/src/bookings.js", "line": 5, "token": "stripe"}]}
+            ]
+        }]});
+        super::super::app_map_flows::put_in_graph(&mut g, &store);
+        let m = RunMap::of(g, "harbor/harbor-api").unwrap();
+        let hits = m.reaches("harbor/harbor-api", "src/bookings.js");
+        let journey = hits
+            .iter()
+            .find(|h| h.starts_with("journey Book a slip"))
+            .unwrap_or_else(|| panic!("{hits:?}"));
+        assert!(
+            journey.contains("harbor-api/src/bookings.js:3"),
+            "{journey}"
+        );
+        let review = m.review_section(&[(
+            "src/bookings.js".to_string(),
+            "@@ -3 +3 @@\n-old\n+new".to_string(),
+        )]);
+        assert!(
+            review.contains("User journeys this pull request changes a step of"),
+            "{review}"
+        );
+        assert!(
+            review.contains("journey Book a slip at harbor-api/src/bookings.js:3"),
+            "{review}"
+        );
     }
 
     /// The planner's overview: the repositories, the parts, where the
