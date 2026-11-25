@@ -1820,7 +1820,9 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = self.send_tracked(req).await?.error_for_status()?;
+        // A refusal keeps its status line, and a rate limit its wait until
+        // GitHub's reset, so a caller can try again at the right time.
+        let resp = ok_or_body(self.send_tracked(req).await?).await?;
         let bytes = resp.bytes().await?;
         if bytes.len() > MAX_TARBALL_BYTES {
             return Err(format!(

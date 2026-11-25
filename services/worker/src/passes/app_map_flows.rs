@@ -588,14 +588,24 @@ pub fn check(answer: &Value, todo: &Value) -> (Vec<Value>, Checked) {
 
 /// The store after a model run: journeys for the entries asked about are
 /// replaced by the new ones (an entry the model wrote nothing for keeps
-/// what it had), and each entry asked about is remembered with its hash so
-/// it is not asked again until it changes.
+/// what it had), and each entry asked about is remembered with its hash and
+/// the files it stands on (`{hash, files}`) so it is not asked again until
+/// it changes; a new extractor alone, with the code as it was, is not a
+/// change (`flows.mjs` `prepare`). What else the store keeps (the screens
+/// the map had, the code by content, what is pending) stays.
 pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
-    let hashes: BTreeMap<String, String> = todo["entries"]
+    let hashes: BTreeMap<String, Value> = todo["entries"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|e| Some((e["key"].as_str()?.into(), e["hash"].as_str()?.into())))
+        .filter_map(|e| {
+            let hash = e["hash"].as_str()?;
+            let asked = match e["files"].as_array() {
+                Some(files) => json!({ "hash": hash, "files": files }),
+                None => json!(hash),
+            };
+            Some((e["key"].as_str()?.into(), asked))
+        })
         .collect();
     let written: BTreeSet<String> = new
         .iter()
@@ -617,7 +627,11 @@ pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
         .collect();
     for mut f in new {
         let entry = f["entry"].as_str().unwrap_or("").to_string();
-        f["hash"] = json!(hashes.get(&entry).cloned().unwrap_or_default());
+        let hash = hashes.get(&entry).map(|a| match a {
+            Value::String(h) => h.clone(),
+            a => a["hash"].as_str().unwrap_or("").to_string(),
+        });
+        f["hash"] = json!(hash.unwrap_or_default());
         let base = f["id"].as_str().unwrap_or("journey").to_string();
         let mut id = base.clone();
         let mut n = 2;
@@ -631,9 +645,16 @@ pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
     let mut asked: serde_json::Map<String, Value> =
         store["asked"].as_object().cloned().unwrap_or_default();
     for (k, h) in hashes {
-        asked.insert(k, json!(h));
+        asked.insert(k, h);
     }
-    json!({ "schema": SCHEMA, "flows": flows, "asked": asked })
+    let mut out = match store {
+        Value::Object(_) => store.clone(),
+        _ => json!({}),
+    };
+    out["schema"] = json!(SCHEMA);
+    out["flows"] = json!(flows);
+    out["asked"] = Value::Object(asked);
+    out
 }
 
 /// A stored journey as the viewer draws it (`graph.flows`): one step per
@@ -1135,6 +1156,26 @@ mod tests {
         let m = merge(&store, &todo(), Vec::new());
         assert_eq!(m["flows"].as_array().unwrap().len(), 2);
         assert_eq!(m["asked"]["screen:web:/login"], "h1");
+        // An entry that names the files it stands on is remembered with
+        // them, and what else the store keeps stays.
+        let mut t = todo();
+        t["entries"][0]["files"] = json!(["harbor-web/app/login/page.tsx"]);
+        let mut kept = store.clone();
+        kept["code"] = json!({"harbor-web/app/login/page.tsx": "c1"});
+        kept["screens"] = json!(["screen:web:/login"]);
+        let m = merge(&kept, &t, Vec::new());
+        assert_eq!(
+            m["asked"]["screen:web:/login"],
+            json!({"hash": "h1", "files": ["harbor-web/app/login/page.tsx"]})
+        );
+        assert_eq!(m["code"], kept["code"]);
+        assert_eq!(m["screens"], kept["screens"]);
+        let m = merge(
+            &kept,
+            &t,
+            vec![json!({"id": "s", "title": "S", "entry": "screen:web:/login", "steps": []})],
+        );
+        assert_eq!(m["flows"][1]["hash"], "h1");
     }
 
     #[test]

@@ -120,6 +120,13 @@ pub fn flows_lease_key(team_id: &str) -> String {
     format!("{}/flows-lease.json", s3_prefix(team_id))
 }
 
+/// When a team's journeys step may next run (`{seq, at}`): exactly one
+/// message carries `seq` as its turn; any other is an older resume and is
+/// dropped, and one that arrives before `at` waits for it.
+pub fn flows_next_key(team_id: &str) -> String {
+    format!("{}/flows-next.json", s3_prefix(team_id))
+}
+
 pub fn describe_key(team_id: &str) -> String {
     format!("{}/describe.json.gz", s3_prefix(team_id))
 }
@@ -188,6 +195,31 @@ pub struct Status {
     /// not asked for again on every visit.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub asked_extractor: String,
+    /// Repositories the journeys step couldn't read from GitHub on its last
+    /// pass (`owner/name`): the journeys through them wait and are traced
+    /// once they can be read, and the list clears itself then
+    /// ([`unread_line`] words it for the page).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<String>,
+}
+
+/// The status's plain line about repositories the journeys couldn't read
+/// (empty when every one could).
+pub fn unread_line(unread: &[String]) -> String {
+    let names: Vec<&str> = unread
+        .iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r))
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => format!(
+            "{one} couldn't be read from GitHub just now, so the journeys through it wait; they are traced once it can be read, and every other journey goes on."
+        ),
+        [rest @ .., last] => format!(
+            "{} and {last} couldn't be read from GitHub just now, so the journeys through them wait; they are traced once they can be read, and every other journey goes on.",
+            rest.join(", ")
+        ),
+    }
 }
 
 impl Status {
@@ -228,6 +260,7 @@ pub fn queue_next(cur: Option<&Status>, now: i64, build: &str) -> Option<Status>
         cut: prev.cut,
         extractor: prev.extractor,
         asked_extractor: prev.asked_extractor,
+        unread: prev.unread,
     })
 }
 
