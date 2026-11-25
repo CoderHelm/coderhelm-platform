@@ -2692,7 +2692,7 @@ mod refresh_tests {
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(
-            "Source ticket: OPS-7\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** **Low**\n\n**Verification**\n1. z",
+            "Source ticket: HARBOR-4\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** **Low**\n\n**Verification**\n1. z",
             &owned,
         );
         let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s}:\n{body}"));

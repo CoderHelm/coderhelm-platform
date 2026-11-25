@@ -570,12 +570,12 @@ mod tests {
         );
         // With a real key, both carry it.
         let run = ForRun {
-            key: Key::Real("OPS-431".into()),
+            key: Key::Real("HARBOR-806".into()),
             ..run
         };
         assert_eq!(
             run.title("fix(deps): security updates for web").text,
-            "OPS-431: Security updates for web"
+            "HARBOR-806: Security updates for web"
         );
         // A Conventional Commits title takes the scope that fits the change.
         let conventional = ForRun {
@@ -590,15 +590,15 @@ mod tests {
         assert_eq!(
             conventional
                 .title_for(
-                    "OPS-431: Warns when the Hero subtitle is too long.",
+                    "HARBOR-806: Warns when the Listing summary is too long.",
                     &["apps/studio/schema.ts".to_string()]
                 )
                 .text,
-            "chore(studio): warn when the Hero subtitle is too long"
+            "chore(studio): warn when the Listing summary is too long"
         );
         assert_eq!(
             run.commit("KEY-1: fix(deps): glob-walk 2.1.0 to 2.1.4"),
-            "OPS-431: Glob-walk 2.1.0 to 2.1.4"
+            "HARBOR-806: Glob-walk 2.1.0 to 2.1.4"
         );
         assert_eq!(run.evidence(), keyed().evidence);
     }

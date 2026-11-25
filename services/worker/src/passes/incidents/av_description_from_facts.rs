@@ -130,26 +130,26 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
     );
     // A key is real only as the run's ticket or in the tracker.
     assert!(!pr_conventions::real_key("KEY-1", None, Some(true)));
-    assert!(!pr_conventions::real_key("HARBOR-431", None, None));
+    assert!(!pr_conventions::real_key("HARBOR-806", None, None));
     // Written now: the repository's form with a real key, or the closest
     // valid form with one sentence saying why, and never an invented key.
     let run = conventions::ForRun {
         title: c.clone(),
         commit: c.clone(),
-        key: Key::Real("HARBOR-431".into()),
+        key: Key::Real("HARBOR-806".into()),
     };
     let now = run.title(OLD_TITLE);
     assert_eq!(
         now.text,
-        "HARBOR-431: Update 3 packages to fix 4 security advisories"
+        "HARBOR-806: Update 3 packages to fix 4 security advisories"
     );
     assert_eq!(
-        pr_conventions::violation(&c, &now.text, &["HARBOR-431".to_string()]),
+        pr_conventions::violation(&c, &now.text, &["HARBOR-806".to_string()]),
         None
     );
     assert_eq!(
         run.commit(OLD_COMMIT),
-        "HARBOR-431: Glob-walk 2.1.0 to 2.1.4"
+        "HARBOR-806: Glob-walk 2.1.0 to 2.1.4"
     );
     let keyless = conventions::ForRun {
         key: Key::None(

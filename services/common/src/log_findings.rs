@@ -3153,16 +3153,16 @@ mod tests {
     fn an_open_finding_says_when_it_resolves_on_its_own() {
         let mut f = Finding {
             status: "pending".into(),
-            last_seen_at: "2026-10-31T03:38:10Z".into(),
+            last_seen_at: "2030-03-02T03:38:10Z".into(),
             ..Default::default()
         };
         // A burst that stopped (no history) gets the analyzer's default.
         assert_eq!(f.quiet_days(), DEFAULT_QUIET_DAYS);
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T03:38:10Z"));
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-05T03:38:10Z"));
         // Back 4 days after it was resolved: twice that.
-        f.last_resolved_at = "2026-10-27T03:48:40.472966+00:00".into();
-        f.reopened_at = "2026-10-31T03:48:51.255562+00:00".into();
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+        f.last_resolved_at = "2030-02-26T03:48:40.472966+00:00".into();
+        f.reopened_at = "2030-03-02T03:48:51.255562+00:00".into();
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-10T03:38:10Z"));
         f.status = "resolved".into();
         assert_eq!(f.resolves_at(), None);
         f.status = "dismissed".into();
@@ -3179,13 +3179,13 @@ mod tests {
     fn came_back_and_acknowledged() -> Finding {
         Finding {
             status: "pending".into(),
-            acknowledged_at: "2026-11-03T06:44:39.346874173+00:00".into(),
-            last_seen_at: "2026-10-31T03:38:10.248+00:00".into(),
-            last_resolved_at: "2026-10-27T03:48:40.472966+00:00".into(),
-            reopened_at: "2026-10-31T03:48:51.255562+00:00".into(),
+            acknowledged_at: "2030-03-05T06:44:39.346874173+00:00".into(),
+            last_seen_at: "2030-03-02T03:38:10.248+00:00".into(),
+            last_resolved_at: "2030-02-26T03:48:40.472966+00:00".into(),
+            reopened_at: "2030-03-02T03:48:51.255562+00:00".into(),
             reopen_count: 1,
             daily_lines: vec![Counted {
-                name: "2026-10-31".into(),
+                name: "2030-03-02".into(),
                 lines: 6296,
             }],
             ..Default::default()
@@ -3225,26 +3225,26 @@ mod tests {
 
     #[test]
     fn a_stale_stored_quiet_period_never_moves_the_date() {
-        // The page used the stored value (missing: 3 days, Nov 3) while the
-        // sweep used 8 (Nov 8). Now both work it out the same way.
+        // The page used the stored value (missing: 3 days, Mar 5) while the
+        // sweep used 8 (Mar 10). Now both work it out the same way.
         let mut f = came_back_and_acknowledged();
         assert_eq!(f.quiet_days(), 8);
         f.quiet_days = Some(3);
         assert_eq!(f.quiet_days(), 8);
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-10T03:38:10Z"));
     }
 
     #[test]
     fn a_resolve_date_still_ahead_is_a_plain_date() {
         let f = came_back_and_acknowledged();
         let ok = Analysis {
-            last_ok_at: "2026-11-07T15:26:49Z".into(),
+            last_ok_at: "2030-03-09T15:26:49Z".into(),
             ..Default::default()
         };
         assert_eq!(
-            resolve_state(&f, Some(&ok), at("2026-11-07T16:00:00Z")),
+            resolve_state(&f, Some(&ok), at("2030-03-09T16:00:00Z")),
             Some(ResolveState::Scheduled {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
     }
@@ -3253,24 +3253,24 @@ mod tests {
     fn a_passed_date_with_analysis_failing_says_why_it_has_not_resolved() {
         let f = came_back_and_acknowledged();
         let failing = Analysis {
-            last_ok_at: "2026-11-02T21:48:40.182316+00:00".into(),
+            last_ok_at: "2030-03-04T21:48:40.182316+00:00".into(),
             error: "An error occurred (AccessDenied) when calling the AssumeRole operation: User: \
                     arn:aws:sts::111122223333:assumed-role/x/coderhelm-prod-log-analyzer is not \
                     authorized to perform: sts:AssumeRole on resource: \
                     arn:aws:iam::111122223333:role/CoderHelmLogReader with an explicit deny in a \
                     permissions boundary: arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"
                 .into(),
-            error_at: "2026-11-09T09:26:49.056528+00:00".into(),
+            error_at: "2030-03-11T09:26:49.056528+00:00".into(),
         };
         assert!(failing.failing());
-        match resolve_state(&f, Some(&failing), at("2026-11-09T10:00:00Z")) {
+        match resolve_state(&f, Some(&failing), at("2030-03-11T10:00:00Z")) {
             Some(ResolveState::Blocked {
                 at,
                 analysis_ok_at,
                 reason,
             }) => {
-                assert_eq!(at, "2026-11-08T03:38:10Z");
-                assert_eq!(analysis_ok_at, "2026-11-02T21:48:40.182316+00:00");
+                assert_eq!(at, "2030-03-10T03:38:10Z");
+                assert_eq!(analysis_ok_at, "2030-03-04T21:48:40.182316+00:00");
                 assert!(reason.contains("permissions boundary"), "{reason}");
                 assert!(!reason.contains("arn:aws"), "{reason}");
             }
@@ -3283,22 +3283,22 @@ mod tests {
         let f = came_back_and_acknowledged();
         // An error from before the last run that worked is history, not a failure.
         let recovered = Analysis {
-            last_ok_at: "2026-11-09T09:26:49Z".into(),
+            last_ok_at: "2030-03-11T09:26:49Z".into(),
             error: "AccessDenied".into(),
-            error_at: "2026-11-09T03:26:49Z".into(),
+            error_at: "2030-03-11T03:26:49Z".into(),
         };
         assert!(!recovered.failing());
         assert_eq!(
-            resolve_state(&f, Some(&recovered), at("2026-11-09T10:00:00Z")),
+            resolve_state(&f, Some(&recovered), at("2030-03-11T10:00:00Z")),
             Some(ResolveState::Due {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
         // No connection item at all: the next run decides.
         assert_eq!(
-            resolve_state(&f, None, at("2026-11-09T10:00:00Z")),
+            resolve_state(&f, None, at("2030-03-11T10:00:00Z")),
             Some(ResolveState::Due {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
     }
@@ -3307,7 +3307,7 @@ mod tests {
     fn a_finding_that_is_not_open_has_no_resolve_state() {
         let mut f = came_back_and_acknowledged();
         f.status = "resolved".into();
-        assert_eq!(resolve_state(&f, None, at("2026-11-09T10:00:00Z")), None);
+        assert_eq!(resolve_state(&f, None, at("2030-03-11T10:00:00Z")), None);
     }
 
     #[test]
@@ -3325,9 +3325,9 @@ mod tests {
 
     #[test]
     fn the_analyzer_and_gateway_time_formats_both_parse() {
-        assert!(parse_time("2026-10-25 14:03:11.123").is_some());
-        assert!(parse_time("2026-11-03T06:44:39.346874173+00:00").is_some());
-        assert!(parse_time("2026-10-31T03:38:10Z").is_some());
+        assert!(parse_time("2030-02-24 14:03:11.123").is_some());
+        assert!(parse_time("2030-03-05T06:44:39.346874173+00:00").is_some());
+        assert!(parse_time("2030-03-02T03:38:10Z").is_some());
         assert!(parse_time("").is_none());
         assert!(parse_time("soon").is_none());
     }

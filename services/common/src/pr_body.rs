@@ -1790,14 +1790,14 @@ mod tests {
             url: "https://tracker.example.com/browse/KEY-123".into(),
         };
         let p = summary_paragraph(
-            "Adds a Studio warning when a subtitle is too long. Editors can still publish.",
+            "Adds a Studio warning when a summary is too long. Editors can still publish.",
             Some(&t),
-            "Posted the 23 over-limit documents on KEY-123.",
+            "Posted the 17 over-limit documents on KEY-123.",
         );
-        assert_eq!(p, "Adds a Studio warning when a subtitle is too long ([KEY-123](https://tracker.example.com/browse/KEY-123)). Editors can still publish.<!-- ch:summary-end --> Posted the 23 over-limit documents on KEY-123.");
+        assert_eq!(p, "Adds a Studio warning when a summary is too long ([KEY-123](https://tracker.example.com/browse/KEY-123)). Editors can still publish.<!-- ch:summary-end --> Posted the 17 over-limit documents on KEY-123.");
         assert_eq!(
             summary_core(&p, "KEY-123"),
-            "Adds a Studio warning when a subtitle is too long. Editors can still publish."
+            "Adds a Studio warning when a summary is too long. Editors can still publish."
         );
         let long = "word ".repeat(90);
         let p = summary_paragraph(&long, Some(&t), "");

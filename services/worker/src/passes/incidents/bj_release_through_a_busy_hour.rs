@@ -31,7 +31,7 @@ const WEB: &str = "acme/web";
 const API: &str = "acme/api";
 
 fn now() -> DateTime<Utc> {
-    at("2026-11-14T20:00:00Z")
+    at("2030-03-16T20:00:00Z")
 }
 
 /// The two repositories as they stood: one bundle pull request each, with

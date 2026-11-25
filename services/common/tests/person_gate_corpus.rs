@@ -61,7 +61,7 @@ fn corpus() -> Vec<Case> {
             why_not: "how a page looks is a judgement only a person can make",
             ..case(Step, "Look at Studio: the page document, the title field", Review)
         },
-        case(OpenItem, "Missing from the end-to-end checklist: no step lists the 23 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 23 over-limit documents. Only a person can settle this: a product decision.", Do),
+        case(OpenItem, "Missing from the end-to-end checklist: no step lists the 17 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 17 over-limit documents. Only a person can settle this: a product decision.", Do),
         // Outside-steps fixtures.
         Case {
             owner: "a content editor",

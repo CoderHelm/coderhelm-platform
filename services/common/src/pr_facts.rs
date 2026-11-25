@@ -1769,7 +1769,7 @@ mod tests {
             head: "abc1234def".into(),
             summary: "Retries the export poller three times before it gives up.".into(),
             why: Some(Why {
-                reference: "OPS-41".into(),
+                reference: "HARBOR-57".into(),
                 title: "Export poller gives up on the first timeout".into(),
                 url: String::new(),
             }),
@@ -1877,12 +1877,12 @@ mod tests {
         assert_eq!(
             out,
             "<!-- coderhelm:lead -->\n\
-             <!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\n\
+             <!-- coderhelm:body v1 ticket=HARBOR-57 head=abc1234 -->\n\
              ### Problem\n\n\
-             Export poller gives up on the first timeout (OPS-41).\n\n\
+             Export poller gives up on the first timeout (HARBOR-57).\n\n\
              ### Changes\n\n\
              Retries the export poller three times before it gives up.<!-- ch:summary-end -->\n\
-             - Approach: decide whether this does what OPS-41 asks. CoderHelm's conclusion: all checks on this head passed.\n\
+             - Approach: decide whether this does what HARBOR-57 asks. CoderHelm's conclusion: all checks on this head passed.\n\
              - Read first: [`src/export/poller.rs`](https://github.com/acme/site/blob/abc1234/src/export/poller.rs) (the retry loop decides when a poll is abandoned).\n\n\
              ### Risk\n\n\
              **Risk:** Low. One module.\n\n\

@@ -37,13 +37,13 @@ pub const SAMPLE_SIZE: usize = 30;
 /// How a key is set off from the summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sep {
-    /// `OPS-12: summary`
+    /// `HARBOR-64: summary`
     Colon,
-    /// `OPS-12 summary`
+    /// `HARBOR-64 summary`
     Space,
-    /// `[OPS-12] summary`
+    /// `[HARBOR-64] summary`
     Bracket,
-    /// `summary (OPS-12)`
+    /// `summary (HARBOR-64)`
     Suffix,
 }
 
@@ -903,16 +903,16 @@ mod tests {
 
     fn keyed_history() -> Vec<Sample> {
         let mut v = people(&[
-            "OPS-412: Lower the sync log level",
-            "OPS-409: Add retry to the poller",
+            "HARBOR-772: Lower the sync log level",
+            "HARBOR-769: Add retry to the poller",
             "Merge pull request #9 from acme/branch",
-            "OPS-401: Fix the empty page",
-            "OPS-399: Handle empty pages",
-            "OPS-398: Cache the token",
+            "HARBOR-761: Fix the empty page",
+            "HARBOR-759: Handle empty pages",
+            "HARBOR-758: Cache the token",
             "Tidy the readme",
-            "OPS-390: Drop the old flag",
-            "OPS-388: Rename the queue",
-            "OPS-381: Split the worker",
+            "HARBOR-750: Drop the old flag",
+            "HARBOR-748: Rename the queue",
+            "HARBOR-741: Split the worker",
         ]);
         v.push(Sample {
             text: "fix(deps): bump glob-walk from 2.1.0 to 2.1.4".into(),
@@ -938,7 +938,7 @@ mod tests {
             "8 of the last 9 merged pull requests written by people"
         );
         // Too few samples, or no clear majority, teach nothing.
-        let few = people(&["OPS-1: a", "OPS-2: b", "OPS-3: c"]);
+        let few = people(&["HARBOR-1: a", "HARBOR-2: b", "HARBOR-3: c"]);
         assert_eq!(
             detect(
                 Kind::Title,
@@ -951,7 +951,14 @@ mod tests {
             Source::Default
         );
         let mixed = people(&[
-            "OPS-1: a", "fix: b", "Do c", "OPS-2: d", "feat: e", "Do f", "OPS-3: g", "fix: h",
+            "HARBOR-1: a",
+            "fix: b",
+            "Do c",
+            "HARBOR-2: d",
+            "feat: e",
+            "Do f",
+            "HARBOR-3: g",
+            "fix: h",
             "Do i",
         ]);
         assert_eq!(
@@ -1017,10 +1024,10 @@ mod tests {
             ..Default::default()
         };
         let was = "fix(deps): bump glob-walk 2.1.0 to 2.1.4 [SECURITY] (CVE-2026-31337)";
-        let w = subject(&keyed, &Key::Real("OPS-431".into()), was);
+        let w = subject(&keyed, &Key::Real("HARBOR-806".into()), was);
         assert_eq!(
             w.text,
-            "OPS-431: Bump glob-walk 2.1.0 to 2.1.4 [SECURITY] (CVE-2026-31337)"
+            "HARBOR-806: Bump glob-walk 2.1.0 to 2.1.4 [SECURITY] (CVE-2026-31337)"
         );
         assert_eq!(w.note, None);
         // No key: the closest valid form, said once, and nothing invented.
@@ -1052,8 +1059,8 @@ mod tests {
         assert_eq!(
             subject(
                 &conventional,
-                &Key::Real("OPS-431".into()),
-                "OPS-431: Bump glob-walk"
+                &Key::Real("HARBOR-806".into()),
+                "HARBOR-806: Bump glob-walk"
             )
             .text,
             "chore: bump glob-walk"
@@ -1066,10 +1073,10 @@ mod tests {
 
     #[test]
     fn a_key_is_real_only_as_the_runs_ticket_or_in_the_tracker() {
-        assert!(real_key("OPS-431", Some("OPS-431"), None));
-        assert!(real_key("OPS-17", None, Some(true)));
-        assert!(!real_key("OPS-17", None, Some(false)));
-        assert!(!real_key("OPS-17", None, None));
+        assert!(real_key("HARBOR-806", Some("HARBOR-806"), None));
+        assert!(real_key("HARBOR-23", None, Some(true)));
+        assert!(!real_key("HARBOR-23", None, Some(false)));
+        assert!(!real_key("HARBOR-23", None, None));
         assert!(!real_key("KEY-1", None, Some(true)));
         assert!(!real_key("#42", Some("#42"), None));
     }
@@ -1091,22 +1098,22 @@ mod tests {
         assert!(v.contains("a ticket key and a summary"), "{v}");
         let v = violation(&keyed, "KEY-1: fix(deps): glob-walk 2.1.0 to 2.1.4", &[]).unwrap();
         assert_eq!(v, "`KEY-1` is a placeholder, not a ticket key");
-        assert_eq!(violation(&keyed, "OPS-431: Bump glob-walk", &[]), None);
+        assert_eq!(violation(&keyed, "HARBOR-806: Bump glob-walk", &[]), None);
     }
 
     #[test]
     fn a_ticket_key_in_one_position_needs_forty_percent() {
         // 4 of 9 with the key at the end, the rest plain or mixed.
         let merged = people(&[
-            "Lower the sync log level (OPS-412)",
-            "Add retry to the poller (OPS-409)",
-            "Fix the empty page (OPS-401)",
-            "Cache the token (OPS-398)",
+            "Lower the sync log level (HARBOR-772)",
+            "Add retry to the poller (HARBOR-769)",
+            "Fix the empty page (HARBOR-761)",
+            "Cache the token (HARBOR-758)",
             "Tidy the readme",
-            "OPS-390: Drop the old flag",
+            "HARBOR-750: Drop the old flag",
             "fix: rename the queue",
             "Split the worker",
-            "[OPS-381] Move the cron",
+            "[HARBOR-741] Move the cron",
         ]);
         let c = detect(
             Kind::Title,
@@ -1120,19 +1127,23 @@ mod tests {
             c.evidence,
             "4 of the last 9 merged pull requests written by people"
         );
-        let w = subject(&c, &Key::Real("OPS-431".into()), "OPS-431: Adds the retry.");
-        assert_eq!(w.text, "Add the retry (OPS-431)");
+        let w = subject(
+            &c,
+            &Key::Real("HARBOR-806".into()),
+            "HARBOR-806: Adds the retry.",
+        );
+        assert_eq!(w.text, "Add the retry (HARBOR-806)");
     }
 
     #[test]
     fn release_tooling_enforces_conventional_commits_with_the_scope_and_case_people_use() {
         let merged = people(&[
-            "feat(studio): add the hero warning",
+            "feat(studio): add the listing warning",
             "fix(api): handle an empty page",
             "fix(studio): keep the draft",
             "Tidy the readme",
             "chore: bump the lockfile",
-            "OPS-1: something",
+            "HARBOR-1: something",
             "docs: explain the deploy",
             "Plain words here",
         ]);
@@ -1152,16 +1163,16 @@ mod tests {
         );
         assert_eq!(c.scopes, vec!["studio".to_string(), "api".to_string()]);
         assert_eq!(c.lower, Some(true));
-        let paths = vec!["apps/studio/schemaTypes/hero.ts".to_string()];
+        let paths = vec!["apps/studio/schemaTypes/listing.ts".to_string()];
         let w = subject_for(
             &c,
             &Key::None("x".into()),
-            "feat: Warns when Hero subtitle exceeds 160 characters.",
+            "feat: Warns when Listing summary exceeds 200 characters.",
             &paths,
         );
         assert_eq!(
             w.text,
-            "feat(studio): warn when Hero subtitle exceeds 160 characters"
+            "feat(studio): warn when Listing summary exceeds 200 characters"
         );
         // No scope fits: none is made up.
         let w = subject_for(
@@ -1186,41 +1197,44 @@ mod tests {
         );
         assert_eq!(tidy_summary("Splitting the worker"), "Split the worker");
         assert_eq!(
-            tidy_summary("[WIP] CoderHelm: Warns when the subtitle is long \u{1F680} [bot]"),
-            "Warn when the subtitle is long"
+            tidy_summary("[WIP] CoderHelm: Warns when the summary is long \u{1F680} [bot]"),
+            "Warn when the summary is long"
         );
-        let long = "OPS-12: Add a warning when the Hero subtitle exceeds one hundred and sixty characters in Studio";
+        let long = "HARBOR-64: Add a warning when the Listing summary exceeds two hundred characters in Studio";
         let fit = fit_title(long);
         assert!(fit.chars().count() <= TITLE_TARGET, "{fit}");
         assert!(!fit.contains('\u{2026}') && !fit.ends_with("..."), "{fit}");
         let plain = Convention::default();
         assert_eq!(
             title_defects(
-                "OPS-12: Adds the warning.",
+                "HARBOR-64: Adds the warning.",
                 &plain,
-                Some("OPS-12"),
+                Some("HARBOR-64"),
                 "coderhelm/feature-warning"
             ),
             vec![
                 "ends with a stop".to_string(),
                 "`Adds` is not imperative".to_string(),
-                "the branch `coderhelm/feature-warning` does not carry OPS-12".to_string(),
+                "the branch `coderhelm/feature-warning` does not carry HARBOR-64".to_string(),
             ]
         );
         assert_eq!(
             title_defects(
-                "OPS-12: Warn when the Hero subtitle exceeds 160 characters",
+                "HARBOR-64: Warn when the Listing summary exceeds 200 characters",
                 &plain,
-                Some("OPS-12"),
-                "coderhelm/OPS-12-hero-subtitle-warning"
+                Some("HARBOR-64"),
+                "coderhelm/HARBOR-64-listing-summary-warning"
             ),
             Vec::<String>::new()
         );
-        assert!(
-            title_defects("WIP Implement OPS-12 [bot]", &plain, Some("OPS-12"), "x")
-                .iter()
-                .any(|d| d.contains("names the ticket"))
-        );
+        assert!(title_defects(
+            "WIP Implement HARBOR-64 [bot]",
+            &plain,
+            Some("HARBOR-64"),
+            "x"
+        )
+        .iter()
+        .any(|d| d.contains("names the ticket")));
     }
 
     #[test]
@@ -1245,11 +1259,11 @@ mod tests {
         assert_eq!(
             subject(
                 &keyed,
-                &Key::Real("OPS-9".into()),
+                &Key::Real("HARBOR-6".into()),
                 "fix(deps): npm security updates for web (14 packages, 31 advisories)"
             )
             .text,
-            "OPS-9: Update 14 npm packages to fix 31 security advisories"
+            "HARBOR-6: Update 14 npm packages to fix 31 security advisories"
         );
     }
 }

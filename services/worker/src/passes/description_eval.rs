@@ -396,7 +396,7 @@ pub fn feature_case() -> Case {
 
 // ── Case 3: an ordinary ticket's pull request ───────────────────────────
 
-pub const TICKET_BEFORE: &str = "Source ticket: OPS-41\n\n1. **Summary** — The export poller retries a timed-out poll three times before it gives up.\n\n2. **Changes**\n\n* `src/export/poller.rs`: the retry loop and its limit.\n* `src/export/writer.rs`: flushes after each batch.\n\n3. **Risk** — **Low**, contract unchanged, one module.\n\n4. **Verification**\n\n1. Run `cargo test -p export`.\n\nAll tests pass and the build is green.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n<sub>Consulted: the platform agent</sub>";
+pub const TICKET_BEFORE: &str = "Source ticket: HARBOR-57\n\n1. **Summary** — The export poller retries a timed-out poll three times before it gives up.\n\n2. **Changes**\n\n* `src/export/poller.rs`: the retry loop and its limit.\n* `src/export/writer.rs`: flushes after each batch.\n\n3. **Risk** — **Low**, contract unchanged, one module.\n\n4. **Verification**\n\n1. Run `cargo test -p export`.\n\nAll tests pass and the build is green.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n<sub>Consulted: the platform agent</sub>";
 
 pub fn ticket_case() -> Case {
     let files = vec![(
@@ -416,7 +416,7 @@ pub fn ticket_case() -> Case {
     Case {
         name: "an ordinary ticket's pull request",
         before: TICKET_BEFORE.to_string(),
-        title: "OPS-41: Export poller gives up on the first timeout",
+        title: "HARBOR-57: Export poller gives up on the first timeout",
         facts: description_facts::facts(&Inputs {
             head: "abc1234def567890",
             body: TICKET_BEFORE,
@@ -424,7 +424,7 @@ pub fn ticket_case() -> Case {
             floor: &floor,
             checks: Some(&checks),
             why: Some(Why {
-                reference: "OPS-41".into(),
+                reference: "HARBOR-57".into(),
                 title: "Export poller gives up on the first timeout".into(),
                 url: String::new(),
             }),
@@ -461,7 +461,7 @@ pub fn ticket_case() -> Case {
         ],
         collapsed: vec![
             "* `src/export/poller.rs`: the retry loop and its limit.",
-            "Source ticket: OPS-41",
+            "Source ticket: HARBOR-57",
         ],
     }
 }
@@ -600,22 +600,22 @@ fn ci(name: &str, outcome: Outcome) -> CheckFact {
 }
 
 /// The written walkthrough of the UI change: what the model wrote.
-pub const UI_WRITTEN: &str = "## Implementation notes\n\n- `hero-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 160 characters, so publishing is never blocked.\n- `hero-block.ts` and `schemaTypes/index.ts`: register the rule on the Default variant only; other Hero variants have their own layouts.\n- Rejected: `Rule.max(160)`, which is an error and would block 23 published documents from being re-saved.\n";
+pub const UI_WRITTEN: &str = "## Implementation notes\n\n- `listing-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 200 characters, so publishing is never blocked.\n- `listing-block.ts` and `schemaTypes/index.ts`: register the rule on the Default variant only; other Listing variants have their own layouts.\n- Rejected: `Rule.max(200)`, which is an error and would block 17 published documents from being re-saved.\n";
 
 /// Example A of the layout: a small UI validation change with one thing a
 /// person must do after merge.
 pub fn ui_facts() -> Facts {
     Facts {
         head: "d78bb24e1f0a9c3b5d7e2f4a6c8b0d1e3f5a7c9b".into(),
-        summary: "Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characters, so editors fix long subtitles before they break the hero layout. Editors can still publish.".into(),
+        summary: "Adds a Studio warning when a Listing (Default) summary is longer than 200 characters, so editors fix long summaries before they break the listing layout. Editors can still publish.".into(),
         why: Some(Why {
             reference: "KEY-123".into(),
-            title: "Hero subtitle character limit".into(),
+            title: "Listing summary character limit".into(),
             url: "https://tracker.example.com/browse/KEY-123".into(),
         }),
         files: vec![
-            file("apps/studio/schemaTypes/blocks/hero-block-validation.ts", "added", 21),
-            file("apps/studio/schemaTypes/blocks/hero-block.ts", "modified", 4),
+            file("apps/studio/schemaTypes/blocks/listing-block-validation.ts", "added", 21),
+            file("apps/studio/schemaTypes/blocks/listing-block.ts", "modified", 4),
             file("apps/studio/schemaTypes/index.ts", "modified", 2),
         ],
         files_complete: true,
@@ -631,7 +631,7 @@ pub fn ui_facts() -> Facts {
             level: "Low".into(),
             why: "warning-level validation only; no schema, data, or publish-flow change".into(),
             look_first: Some((
-                "apps/studio/schemaTypes/blocks/hero-block-validation.ts".into(),
+                "apps/studio/schemaTypes/blocks/listing-block-validation.ts".into(),
                 "the rule, +21 lines".into(),
             )),
             rollback: "revert this PR and redeploy Studio; nothing to undo in data".into(),
@@ -650,7 +650,7 @@ pub fn ui_facts() -> Facts {
                 },
             },
             Step {
-                what: "Post the 23 documents already over the limit on KEY-123".into(),
+                what: "Post the 17 documents already over the limit on KEY-123".into(),
                 how: String::new(),
                 when: When::Any,
                 owner: "CoderHelm".into(),
@@ -659,7 +659,7 @@ pub fn ui_facts() -> Facts {
                 },
             },
             Step {
-                what: "Look at document `/private-events/weddings`, Hero, Sub Title field".into(),
+                what: "Look at document `/slips/summer-moorings`, Listing, Summary field".into(),
                 how: String::new(),
                 when: When::Any,
                 owner: "the reviewer".into(),
@@ -671,17 +671,17 @@ pub fn ui_facts() -> Facts {
         ],
         checked: vec![Checked {
             what: "Studio in local dev, manual".into(),
-            result: "warning shows at 161 characters; Publish stays enabled".into(),
+            result: "warning shows at 201 characters; Publish stays enabled".into(),
             when: String::new(),
         }],
-        how_to_check: "`npm test -- hero-block-validation`".into(),
-        review_question: "Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit subtitles block publishing?".into(),
+        how_to_check: "`npm test -- listing-block-validation`".into(),
+        review_question: "Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit summaries block publishing?".into(),
         preview_url: "https://preview.example.com/studio".into(),
         screens: Some(Screens::Images {
             before: "https://github.com/user-attachments/assets/before-example".into(),
-            before_alt: "Sub Title field with a 190-character subtitle and no warning".into(),
+            before_alt: "Summary field with a 236-character summary and no warning".into(),
             after: "https://github.com/user-attachments/assets/after-example".into(),
-            after_alt: "Same field showing the warning 'Over 160 characters (190)'".into(),
+            after_alt: "Same field showing the warning 'Over 200 characters (236)'".into(),
             caption: String::new(),
         }),
         run_url: "https://app.example.com/runs/detail?id=run-4812".into(),
@@ -834,7 +834,7 @@ pub const DEPENDENCY_48_WRITTEN: &str = "## Changes\n\n### next 14.2.15 to 15.1.
 /// a lead of bold labels, a numbered list that swallowed the lines after
 /// it, workflows that never run on a pull request listed as not run, and
 /// seven folds.
-pub const OLD_LAYOUT_BEFORE: &str = "<!-- coderhelm:lead -->\nAdds a Studio warning when a Hero (Default) subtitle is longer than 160 characters.\n\n**Check:** `cd apps/studio && npm run deploy:staging`; 6 recorded checks passed on `d78bb24`.\n**Risk:** **Low**.\n**Needed from you:**\n1. After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: add `workflow_dispatch` to the deploy workflow. (a person on the team)\n2. Look at Studio: /private-events/weddings, hero Sub Title field. (the reviewer)\n3. Missing from the end-to-end checklist: the documents already over the limit. Add a checklist step owned by CoderHelm to query and post them. (a person)\n   **Review:** decide whether this does what KEY-123 asks. Feedback wanted: is a warning enough.\n   **Look at first:**\n- `Deploy to Production` did not run on `d78bb24`. What it checks is not verified.\n- `Deploy Preview` did not run on `d78bb24`. What it checks is not verified.\n- and 6 more: [the full list is on the run page](https://app.example.com/runs/detail?id=run-4812).\n<!-- /coderhelm:lead -->\n\nSource ticket: KEY-123\n\n<details><summary><a name=\"coderhelm-description\"></a>Description</summary><!-- fold -->\n\nAdds the warning rule.\n\n</details><!-- fold -->\n\n<details><summary><a name=\"coderhelm-more\"></a>More</summary><!-- fold -->\n\n## Implementation notes\n\n- `hero-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 160 characters, so publishing is never blocked.\n\n</details><!-- fold -->";
+pub const OLD_LAYOUT_BEFORE: &str = "<!-- coderhelm:lead -->\nAdds a Studio warning when a Listing (Default) summary is longer than 200 characters.\n\n**Check:** `cd apps/studio && npm run deploy:staging`; 6 recorded checks passed on `d78bb24`.\n**Risk:** **Low**.\n**Needed from you:**\n1. After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: add `workflow_dispatch` to the deploy workflow. (a person on the team)\n2. Look at Studio: /slips/summer-moorings, listing Summary field. (the reviewer)\n3. Missing from the end-to-end checklist: the documents already over the limit. Add a checklist step owned by CoderHelm to query and post them. (a person)\n   **Review:** decide whether this does what KEY-123 asks. Feedback wanted: is a warning enough.\n   **Look at first:**\n- `Deploy to Production` did not run on `d78bb24`. What it checks is not verified.\n- `Deploy Preview` did not run on `d78bb24`. What it checks is not verified.\n- and 6 more: [the full list is on the run page](https://app.example.com/runs/detail?id=run-4812).\n<!-- /coderhelm:lead -->\n\nSource ticket: KEY-123\n\n<details><summary><a name=\"coderhelm-description\"></a>Description</summary><!-- fold -->\n\nAdds the warning rule.\n\n</details><!-- fold -->\n\n<details><summary><a name=\"coderhelm-more\"></a>More</summary><!-- fold -->\n\n## Implementation notes\n\n- `listing-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 200 characters, so publishing is never blocked.\n\n</details><!-- fold -->";
 
 /// Where the golden files are.
 fn golden_path(name: &str) -> std::path::PathBuf {
@@ -849,7 +849,7 @@ pub fn golden_cases() -> Vec<(&'static str, &'static str, String, Facts)> {
     vec![
         (
             "ui_change",
-            "feat(studio): warn when Hero subtitle exceeds 160 characters",
+            "feat(studio): warn when Listing summary exceeds 200 characters",
             UI_WRITTEN.to_string(),
             ui_facts(),
         ),
@@ -861,7 +861,7 @@ pub fn golden_cases() -> Vec<(&'static str, &'static str, String, Facts)> {
         ),
         (
             "before_rewritten",
-            "KEY-123: Warn when the Hero subtitle exceeds 160 characters",
+            "KEY-123: Warn when the Listing summary exceeds 200 characters",
             OLD_LAYOUT_BEFORE.to_string(),
             Facts {
                 steps: vec![
