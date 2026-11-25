@@ -846,6 +846,7 @@ pub fn release_only_steps(m: &Mechanics, checks: &[(Vec<String>, Vec<String>)]) 
             project_id: String::new(),
             dataset: String::new(),
             started_at: 0,
+            finished_at: 0,
             urls: urls.clone(),
             find: find.clone(),
         });
@@ -1679,11 +1680,19 @@ pub struct Step {
     /// When it was started (unix seconds), to find its workflow run.
     #[serde(default)]
     pub started_at: i64,
+    /// When the workflow run it waited on finished (unix seconds), 0 until
+    /// then: the time said with a deploy's outcome.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub finished_at: i64,
     /// For a check: the pages to load and the terms each must show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub find: Vec<String>,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// Why CoderHelm can't run migrations itself, and the access to grant.
@@ -1793,6 +1802,7 @@ pub fn steps(r: &Release, m: &Mechanics) -> Vec<Step> {
             .unwrap_or_default(),
         dataset: m.source(env).map(|s| s.dataset.clone()).unwrap_or_default(),
         started_at: 0,
+        finished_at: 0,
         tool: String::new(),
         id,
         kind,
