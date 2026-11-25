@@ -12,7 +12,10 @@
 //   output comes back in parts the worker joins;
 // - fixtures/harbor-graph.json (what the Rust adapter's tests read) still has
 //   the shape this release writes, so a bump that changes the format fails
-//   here (regenerate with make-fixture.mjs, then fix the adapter).
+//   here (regenerate with make-fixture.mjs, then fix the adapter);
+// - on the made-up marina website in fixtures/marina, each page its catch-all
+//   route dispatches to by type is a screen with its URL and its renderer,
+//   and a journey runs through them (fixtures/marina-graph.json likewise).
 //
 //   node --test services/worker/floorplan/
 import test from 'node:test';
@@ -20,7 +23,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { drive, harborAnswers, output, read, run, shape, workdir } from './harness.mjs';
+import { drive, harborAnswers, marinaAnswers, output, read, run, shape, workdir } from './harness.mjs';
 import * as flows from './coderhelm/flows.mjs';
 
 test('a first map builds, and the screen reaches the endpoint and the service behind it', () => {
@@ -168,4 +171,57 @@ test('journeys kept from the last map are re-checked and drawn on it', () => {
   const hidden = drive(third);
   assert.equal(hidden.result.flows.kept.length, 1);
   assert.ok(!(hidden.graph.flows || []).some((f) => f.coderhelm));
+});
+
+test('the pages a catch-all route dispatches to by type are screens, and a journey runs through them', () => {
+  const first = workdir(marinaAnswers(), 'start', {}, 'marina');
+  const { result, graph } = drive(first);
+  assert.equal(result.build.ok, true, JSON.stringify(result.build.errors));
+  assert.equal(result.coderhelm.ok, true, result.coderhelm.error);
+  assert.deepEqual(shape(read('fixtures/marina-graph.json')), shape(graph));
+  const dispatched = graph.screens.filter((s) => s.fw === 'dispatch');
+  assert.deepEqual(dispatched.map((s) => [s.name, s.url, s.nav.renderer]).sort(), [
+    ['Berth list', '/(berth-index)/*', 'BerthListRenderer'],
+    ['Berth page', '/berths/:segment2', 'BerthRenderer'],
+    ['Member checkout', '/members/checkout', 'MemberCheckoutRenderer'],
+    ['Member signup', '/members/join', 'MemberSignupRenderer'],
+    ['Notice page', '/(notice)/*', 'NoticeRenderer'],
+  ]);
+  // the catch-all route itself stays a screen
+  assert.ok(graph.screens.some((s) => s.url === '/*' && s.fw === 'next-app'));
+  const signup = dispatched.find((s) => s.url === '/members/join');
+  assert.equal(signup.file, 'marina-web/lib/renderers.tsx');
+  assert.deepEqual(signup.nav.evidence.map((e) => [e.file, e.line]), [['marina-web/lib/renderers.tsx', 19], ['marina-web/app/[...slug]/page.tsx', 10], ['marina-web/lib/resolve.ts', 13]]);
+  // what is behind it is what its renderer uses, not every renderer in the file
+  assert.deepEqual(signup.behind.map((b) => b.id), ['f:marina-web/lib/renderers.tsx', 'f:marina-web/components/SignupForm.tsx', 'r:1', 'f:marina-web/app/api/members/route.ts']);
+  // journeys start at the dispatched sign-up page, and the form there goes on to the checkout page
+  const keys = result.flows.todo.entries.map((e) => e.key);
+  assert.ok(keys.includes('screen:site:/members/join'), keys.join(', '));
+  const c = flows.candidates(graph, flows.reader(path.join(first, 'root')));
+  const at = (key) => c.list.find((x) => x.key === key) || assert.fail(key);
+  const join = at('screen:site:/members/join');
+  const checkout = at('screen:site:/members/checkout');
+  assert.ok(c.edges.get(join.id)?.has(checkout.id) || [...(c.edges.get(join.id)?.keys() || [])].some((k) => c.list.find((x) => x.id === k)?.key === checkout.key), 'the sign-up form goes on to the checkout page');
+  assert.deepEqual(join.span, [19, 23]);
+  // a journey through both, as the worker would store it, is drawn with each step on its own screen
+  const step = (key, note) => { const x = at(key); return { key, kind: x.kind, view: x.view, note, evidence: x.evidence, linked: true }; };
+  const member = c.list.find((x) => x.kind === 'request' && x.key.includes('/api/members'));
+  const store = { schema: flows.SCHEMA, asked: {}, flows: [{ id: 'join-the-marina', title: 'Join the marina', entry: 'screen:site:/members/join', origin: 'model', steps: [
+    step('screen:site:/members/join', 'The boater fills in the sign-up form.'),
+    step(member.key, 'The form saves the new member.'),
+    step('screen:site:/members/checkout', 'The boater pays for the season.'),
+  ] }] };
+  const second = workdir({}, 'refresh', { flows: 'visible' }, 'marina');
+  fs.writeFileSync(path.join(second, 'state.tgz'), output(first, 'state.b64'));
+  assert.equal(spawnSync('tar', ['xzf', 'state.tgz', '-C', 'root'], { cwd: second }).status, 0);
+  fs.mkdirSync(path.join(second, 'root', 'floorplan', 'coderhelm'), { recursive: true });
+  fs.writeFileSync(path.join(second, 'root', flows.STORE), JSON.stringify(store));
+  const again = drive(second);
+  assert.equal(again.result.flows.kept.length, 1, JSON.stringify(again.result.flows.report));
+  const drawn = again.graph.flows.find((f) => f.id === 'join-the-marina');
+  assert.deepEqual(drawn.steps.map((s) => [s.ref, s.screen || null]), [
+    ['f:marina-web/lib/renderers.tsx', 'screen:site:/members/join'],
+    ['r:1', null],
+    ['f:marina-web/lib/renderers.tsx', 'screen:site:/members/checkout'],
+  ]);
 });

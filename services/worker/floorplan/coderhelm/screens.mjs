@@ -1,5 +1,5 @@
 // Screens Floorplan doesn't find (React Navigation, Expo Router at its real root, Sanity Studio,
-// CMS page kinds, Flutter, Android, iOS), merged into graph.screens through Floorplan's own
+// screens a dynamic route dispatches to by type, Flutter, Android, iOS), merged into graph.screens through Floorplan's own
 // exported buildScreens: each detected screen becomes a hint ({fw, url, target}), and Floorplan
 // computes what is behind it with its own code. Our fields go on `nav`.
 //
@@ -13,7 +13,7 @@ import { fp } from './lib/fp.mjs';
 import * as RN from './screens/react-navigation.mjs';
 import * as EXPO from './screens/expo-router.mjs';
 import * as SANITY from './screens/sanity.mjs';
-import * as CMS from './screens/cms-routes.mjs';
+import * as DISPATCH from './screens/dispatch.mjs';
 import * as FLUTTER from './screens/flutter.mjs';
 import * as ANDROID from './screens/android.mjs';
 import * as IOS from './screens/ios.mjs';
@@ -21,8 +21,9 @@ import * as IOS from './screens/ios.mjs';
 export const CAPS = { perApp: 400, total: 1500, edgesPerScreen: 12, edgesTotal: 4000, detectorMs: 20000 };
 const GATE = { 'signed-in': 'signed_in', 'signed-out': 'signed_out' };
 
-/** Which detectors a repository needs, from cheap signals in its manifests and file names. */
-function signals(root, repo) {
+/** Which detectors a repository needs, from cheap signals in its manifests and file names, and
+ *  the dynamic routes the map already has there. */
+function signals(root, repo, routes = []) {
   const files = listFiles(path.join(root, repo), { exts: /(^package\.json$|^pubspec\.yaml$|^AndroidManifest\.xml$|\.swift$|\.storyboard$|^sanity\.config\.[jt]sx?$|\.(tsx?|jsx?|vue|astro|svelte)$)/, max: 60000 });
   const pkgs = files.filter((f) => /(^|\/)package\.json$/.test(f)).map((f) => read(path.join(root, repo), f) || '').join('\n');
   const rnApp = /"(react-native|expo)"\s*:/.test(pkgs);
@@ -32,7 +33,7 @@ function signals(root, repo) {
     expo: /"expo-router"\s*:/.test(pkgs),
     rnApp: rnApp || /"react-native"/.test(pkgs),
     sanity: files.some((f) => /(^|\/)sanity\.config\.[jt]sx?$/.test(f)),
-    cms: files.some((f) => /(\[\[?\.\.\.[^\]]+\]\]?|\[[^\]/]+\]|\$)(\/(page|index|\+page))?\.(tsx?|jsx?|vue|astro|svelte)$/.test(f)),
+    dispatch: routes.length > 0 || files.some((f) => DISPATCH.routeOf(f)),
     flutter,
     android: !rnApp && !flutter && files.some((f) => /(^|\/)AndroidManifest\.xml$/.test(f)),
     ios: !rnApp && !flutter && files.some((f) => /\.(swift|storyboard)$/.test(f)),
@@ -50,13 +51,15 @@ function timed(name, fn, notes) {
 
 const pseudo = (group, name) => `/(${String(group || 'App').replace(/[^\w-]/g, '_')})/${String(name).replace(/[\s#?]+/g, '_')}`;
 
-/** Every repository's detector results, as hints in Floorplan's shape plus our fields. */
-export function detect(root, repos) {
+/** Every repository's detector results, as hints in Floorplan's shape plus our fields. `screens`
+ *  are the ones Floorplan found (any router it reads): a dynamic one may dispatch by type. */
+export function detect(root, repos, { screens = [] } = {}) {
   const notes = [], ms = {}, hints = [], edges = [], expoRoots = new Map(), rnRepos = new Set();
   let unnamed = 0;
   const add = (repo, h) => { if (h.target && h.url) hints.push({ ...h, repo, target: `${repo}/${h.target}` }); };
   for (const repo of repos) {
-    const sig = signals(root, repo);
+    const routes = screens.filter((s) => String(s.file || '').startsWith(repo + '/') && /(^|\/)(\*|:[^/]+|\[[^\]]+\])$/.test(String(s.url || ''))).map((s) => ({ file: s.file.slice(repo.length + 1), url: s.url }));
+    const sig = signals(root, repo, routes);
     const dir = path.join(root, repo);
     if (sig.rnApp) rnRepos.add(repo);
     const run = (name, fn) => { const [r, t] = timed(name, fn, notes); ms[name] = (ms[name] || 0) + t; return r; };
@@ -92,9 +95,12 @@ export function detect(root, repos) {
         for (const k of st.pageKinds) add(repo, { fw: 'sanity-doc', url: `/(structure)/${k.name}`, target: k.file, name: k.title || k.name, kind: 'page-kind', nav: { navigator: 'studio', group: 'structure', gate: null, file: `${repo}/${k.file}`, line: k.line, singleton: k.singleton || undefined } });
       }
     }
-    if (sig.cms) {
-      const r = run('cms-routes', () => CMS.detect(dir));
-      for (const c of r?.catchAlls || []) for (const k of c.pageKinds.slice(0, 80)) add(repo, { fw: 'cms-page-kind', url: `${c.route.replace(/\/\*$/, '').replace(/\/:\w+$/, '')}/(${k.name})`, target: k.file, name: k.name, kind: 'page-kind', nav: { navigator: c.route, group: 'page kinds', gate: null, file: `${repo}/${k.file}`, line: k.line, catchAll: `${repo}/${c.file}`, renderer: k.renderer } });
+    if (sig.dispatch) {
+      // each screen a dynamic route dispatches to: its renderer's file and line, the URL the resolver
+      // gives its type (route = null when only the route's own pattern is known), and where the
+      // dispatch and the URL were read
+      const r = run('dispatch', () => DISPATCH.detect(dir, { routes }));
+      for (const c of r?.dispatchers || []) for (const k of c.screens) add(repo, { fw: 'dispatch', url: k.url, target: k.file, name: k.name, kind: 'screen', nav: { navigator: c.route, group: 'dispatched', gate: null, route: k.urlFrom ? k.url : null, type: k.type, types: k.types, renderer: k.renderer, dispatcher: `${repo}/${c.file}`, urlFrom: k.urlFrom ? k.urlFrom.how : 'route', file: `${repo}/${k.file}`, line: k.line, also: [[`${repo}/${k.table.file}`, k.table.line, 0.9], ...(k.urlFrom ? [[`${repo}/${k.urlFrom.file}`, k.urlFrom.line, 0.85]] : [])] } });
     }
     if (sig.flutter) {
       const r = run('flutter', () => FLUTTER.detect(dir));
@@ -164,7 +170,9 @@ export function mergeScreens({ graph, scan, root, found }) {
   const floorplanFiles = new Set(graph.screens.map((s) => s.file));
   // ours give way to Floorplan's screen for the same file (its strong routers), except where
   // its screens were just found to be fake
-  const hints = capHints(found.hints.filter((h) => fileSet.has(h.target) && !isTest(h.target) && !floorplanFiles.has(h.target)), notes);
+  // (a screen a route dispatches to is its own screen even in a file Floorplan lists: the renderers
+  // often sit in the route file, or several in one file)
+  const hints = capHints(found.hints.filter((h) => fileSet.has(h.target) && !isTest(h.target) && (h.fw === 'dispatch' || !floorplanFiles.has(h.target))), notes);
   const files = new Map();
   for (const h of hints) { if (!files.has(h.target)) files.set(h.target, { path: h.target, screens: [] }); files.get(h.target).screens.push({ fw: h.fw, url: h.url, target: h.target }); }
   const ours = fp.buildScreens({ graph, scan: { ...scan, files: [...files.values()] }, root });
@@ -176,8 +184,9 @@ export function mergeScreens({ graph, scan, root, found }) {
     const h = byKey.get(`${s.file}|${s.url}`);
     if (!h || ids.has(s.id)) continue;
     ids.add(s.id);
-    const { file, line, gateAt, gateFrom, ...nav } = h.nav;
+    const { file, line, gateAt, gateFrom, also, ...nav } = h.nav;
     const evidence = [ev(file, line, 'code', 0.95)];
+    for (const [f, l, c] of also || []) if (fileSet.has(f)) evidence.push(ev(f, l, 'code', c));
     if (gateAt) evidence.push(ev(gateAt[0], gateAt[1], 'code', 0.85));
     else if (h.nav.gate && gateFrom && gateFrom !== file) evidence.push(ev(gateFrom, line, 'code', 0.8));
     s.name = h.name || s.name;
@@ -185,6 +194,8 @@ export function mergeScreens({ graph, scan, root, found }) {
     s.source = 'coderhelm';
     s.nav = { app: h.repo, ...Object.fromEntries(Object.entries(nav).filter(([, v]) => v !== undefined)), evidence };
     if (s.nav.navigators && s.nav.navigators.length < 2) delete s.nav.navigators;
+    // what is behind a dispatched screen is what its renderer uses, not its whole file
+    if (h.fw === 'dispatch' && h.nav.renderer) { try { s.behind = focusedBehind(graph, root, s.file, h.nav.renderer); } catch { /* Floorplan's walk stays */ } }
     added.push(s);
   }
   graph.screens.push(...added);
@@ -235,4 +246,113 @@ function navEdges(graph, found, added) {
     links.set(key, { a: 'f:' + fromFile, b: 'f:' + to.file, k: 'nav', w: 1, labels: [String(e.kind || 'navigate')], from, to: to.id, inferred: false, evidence: [ev(fromFile, e.line, 'code', 0.9)] });
   }
   return [...links.values()];
+}
+
+/**
+ * What is behind one renderer of a file that holds several (a dispatched screen): the files its own
+ * code uses (followed only through the names it uses, a few levels down), the requests made inside
+ * those parts, the server code that handles them and the outside services they reach. Same items
+ * and notes as Floorplan's own walk.
+ */
+export function focusedBehind(graph, root, file, symbol, { depth = 3, cap = 60 } = {}) {
+  const files = new Map(graph.files.map((f) => [f.p, f]));
+  const routes = graph.routes || [];
+  const outLinks = new Map();
+  for (const l of graph.links || []) { if (!outLinks.has(l.a)) outLinks.set(l.a, []); outLinks.get(l.a).push(l); }
+  const lines = new Map();
+  const linesOf = (p) => { if (!lines.has(p)) { const t = read(root, p); lines.set(p, t == null ? null : t.split('\n')); } return lines.get(p); };
+  const rangesOf = (p, focus) => {
+    if (!focus) return null;
+    const s = (files.get(p)?.s || []).map((x) => ({ name: x[0], line: x[2] })).sort((a, b) => a.line - b.line);
+    const n = linesOf(p)?.length || 0;
+    const rs = [];
+    s.forEach((x, i) => { if (focus.has(x.name)) rs.push([x.line, (s[i + 1]?.line || n + 1) - 1]); });
+    if (!rs.length) {
+      // a symbol Floorplan does not list: from its declaration to the next top-level line
+      const ls = linesOf(p) || [];
+      for (const name of focus) {
+        const at = ls.findIndex((l) => new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function|const|let|var|class)\\s*\\*?\\s*${name.replace(/\$/g, '\\$')}\\b`).test(l));
+        if (at < 0) continue;
+        let end = at + 1;
+        while (end < ls.length && !/^(?:export\s|function\s|const\s|let\s|var\s|class\s|async\s)/.test(ls[end])) end++;
+        rs.push([at + 1, end]);
+      }
+    }
+    return rs.length ? rs : null;
+  };
+  const textOf = (p, rs) => { const ls = linesOf(p); if (!ls) return ''; return rs ? rs.map(([a, b]) => ls.slice(a - 1, b).join('\n')).join('\n') : ls.join('\n'); };
+  const inRanges = (line, rs) => !rs || rs.some(([a, b]) => line >= a && line <= b);
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stem = (p) => { const b = path.posix.basename(p).replace(/\.[^.]+$/, ''); return b === 'index' ? path.posix.basename(path.posix.dirname(p)) : b; };
+
+  const seen = new Map([[file, { d: 0, focus: new Set([symbol]), parent: null }]]);
+  const queue = [file];
+  while (queue.length) {
+    const p = queue.shift();
+    const v = seen.get(p);
+    if (v.d >= depth) continue;
+    const rs = rangesOf(p, v.focus);
+    const text = textOf(p, rs);
+    const whole = v.focus ? textOf(p, null) : text;
+    for (const l of outLinks.get('f:' + p) || []) {
+      if (l.k !== 'import' || !l.b.startsWith('f:')) continue;
+      const to = l.b.slice(2);
+      if (!files.has(to) || isTest(to) || to === file) continue;
+      const names = (l.names || []).filter((n) => n !== 'default' && n !== '*');
+      let used = names.filter((n) => new RegExp(`(^|[^\\w$.])${esc(n)}\\b`).test(text));
+      let focus = used.length ? new Set(used) : null;
+      if (!used.length) {
+        // a default or namespace import: the local name it is imported as, used in the text
+        const st = esc(stem(to));
+        const alias = [...whole.matchAll(new RegExp(`import\\s+(?:\\*\\s+as\\s+)?([A-Za-z_$][\\w$]*)[^;]*?from\\s*["'][^"']*${st}(?:\\.\\w+)?["']`, 'g'))].map((m) => m[1]);
+        if (!alias.some((a) => new RegExp(`\\b${esc(a)}\\b`).test(text))) continue;
+        focus = null;
+      }
+      const had = seen.get(to);
+      if (had) {
+        if (had.focus && (!focus || [...focus].some((n) => !had.focus.has(n)))) { had.focus = focus ? new Set([...had.focus, ...focus]) : null; queue.push(to); }
+        continue;
+      }
+      if (seen.size >= cap) continue;
+      seen.set(to, { d: v.d + 1, focus, parent: p });
+      queue.push(to);
+    }
+  }
+  const nameOf = (p) => files.get(p)?.name || stem(p);
+  const items = [{ id: 'f:' + file, note: 'The screen itself', kind: 'screen' }];
+  // shared building blocks (a UI kit, type files, helpers half the app imports) are not this screen's parts
+  const indeg = new Map();
+  for (const l of graph.links || []) if (l.k === 'import' && l.b.startsWith('f:')) indeg.set(l.b, (indeg.get(l.b) || 0) + 1);
+  const appFiles = graph.files.filter((f) => f.n === files.get(file)?.n).length;
+  const noise = (p) => /(^|\/)(ui|icons?|primitives|types?)\//i.test(p) || /\.(d|types?)\.[jt]sx?$|(^|\/)(types?|utils?|constants?)\.[jt]sx?$/i.test(p) || (indeg.get('f:' + p) || 0) >= Math.max(6, Math.round(appFiles * 0.05));
+  const parts = [...seen.entries()].filter(([p]) => p !== file && !noise(p))
+    .sort((a, b) => a[1].d - b[1].d || (files.get(b[0])?.loc || 0) - (files.get(a[0])?.loc || 0));
+  for (const [p, v] of parts.slice(0, 4)) {
+    const b = path.posix.basename(p);
+    const http = (outLinks.get('f:' + p) || []).some((l) => l.k === 'http');
+    const note = /^use[A-Z]/.test(b) || /(^|\/)hooks?\//.test(p) ? 'Logic this screen uses'
+      : /^[a-z]/.test(b) && /\.(ts|js|mjs)$/.test(b) ? (http ? 'Talks to the server for this screen' : 'Helper code this screen uses')
+        : v.d <= 1 ? 'A component on this screen' : `Part of ${nameOf(v.parent)}`;
+    items.push({ id: 'f:' + p, note, kind: 'part' });
+  }
+  const reqs = [];
+  const exts = new Map();
+  for (const [p, v] of [...seen.entries()].sort((a, b) => a[1].d - b[1].d)) {
+    const rs = rangesOf(p, v.focus);
+    for (const l of outLinks.get('f:' + p) || []) {
+      if (l.k === 'http') for (const [ri, line] of l.calls || []) { if (ri != null && routes[ri] && inRanges(line, rs) && !reqs.includes(ri)) reqs.push(ri); }
+      if (l.b.startsWith('n:') && !exts.has(l.b)) exts.set(l.b, p);
+    }
+  }
+  const routeName = (r) => String(r.name || `${r.m || ''} ${r.p || ''}`).trim();
+  for (const ri of reqs.slice(0, 6)) items.push({ id: 'r:' + ri, note: `Asks the server for ${routeName(routes[ri]).replace(/^./, (c) => c.toLowerCase())}`, kind: 'request' });
+  const servers = new Map();
+  for (const ri of reqs.slice(0, 6)) { const f = routes[ri].f; if (f && files.has(f) && !servers.has(f)) servers.set(f, routeName(routes[ri])); }
+  for (const [f, n] of [...servers].slice(0, 4)) {
+    items.push({ id: 'f:' + f, note: `Server code that handles ${n.replace(/^./, (c) => c.toLowerCase())}`, kind: 'server' });
+    for (const l of outLinks.get('f:' + f) || []) if (l.b.startsWith('n:') && !exts.has(l.b)) exts.set(l.b, f);
+  }
+  const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
+  for (const [id, via] of [...exts].filter(([id]) => nodes.get(id.slice(2))?.kind === 'external').slice(0, 3)) items.push({ id, note: `Outside service, used by ${nameOf(via)}`, kind: 'outside' });
+  return items;
 }

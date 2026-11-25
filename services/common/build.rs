@@ -15,8 +15,9 @@
 use std::path::{Path, PathBuf};
 
 /// Raised by hand when the map's contract changes in a way none of the
-/// hashed files show (the worker's own handling of the graph).
-const CONTRACT: &str = "1";
+/// hashed files show (the worker's own handling of the graph). 2: screens a
+/// route dispatches to by type, and journey steps that name their screen.
+const CONTRACT: &str = "2";
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {

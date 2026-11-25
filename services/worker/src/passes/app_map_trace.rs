@@ -601,34 +601,65 @@ fn is_service(table: &Value, step: &Value, id: &str, cite: &Value) -> bool {
                     .is_some_and(|x| !x.is_empty() && (x.contains(tok) || tok.contains(x)))))
 }
 
-/// The screen whose route takes `path` (route parameters match anything).
+/// The screen whose route takes `path`: exact segments beat route
+/// parameters, a parameter beats a catch-all (`*`), and `(group)` segments
+/// are not in the address. None when two screens take it equally well (the
+/// screens a catch-all route dispatches to by a type the address does not
+/// show).
 fn screen_for_path<'a>(rows: &[(&'a String, &Value)], path: &str) -> Option<&'a String> {
-    let segs = |p: &str| {
-        p.split('/')
-            .filter(|x| !x.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    let want = segs(
-        &regex::Regex::new(r"\$\{[^}]*\}")
-            .ok()?
-            .replace_all(path, ":p"),
-    );
-    rows.iter()
-        .filter(|(_, c)| c["kind"] == "screen")
-        .find(|(_, c)| {
-            let Some(url) = c["key"].as_str().and_then(|k| k.splitn(3, ':').nth(2)) else {
-                return false;
-            };
-            let have = segs(url);
-            have.len() == want.len()
-                && !have.is_empty()
-                && have
-                    .iter()
-                    .zip(&want)
-                    .all(|(a, b)| a == b || a.starts_with(':') || b.starts_with(':'))
-        })
-        .map(|(id, _)| *id)
+    let want: Vec<String> = regex::Regex::new(r"\$\{[^}]*\}")
+        .ok()?
+        .replace_all(path.split(['?', '#']).next().unwrap_or(""), ":p")
+        .split('/')
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut best: Option<(&'a String, u32)> = None;
+    let mut tie = false;
+    for (id, c) in rows.iter().filter(|(_, c)| c["kind"] == "screen") {
+        let Some(url) = c["key"].as_str().and_then(|k| k.splitn(3, ':').nth(2)) else {
+            continue;
+        };
+        let Some(score) = route_score(url, &want) else {
+            continue;
+        };
+        match best {
+            Some((_, b)) if score < b => {}
+            Some((x, b)) if score == b => tie |= x != *id,
+            _ => {
+                best = Some((id, score));
+                tie = false;
+            }
+        }
+    }
+    best.filter(|_| !tie).map(|(id, _)| id)
+}
+
+/// How well a route pattern takes an address's segments (higher is
+/// closer), or None when it does not.
+fn route_score(pattern: &str, want: &[String]) -> Option<u32> {
+    let have: Vec<&str> = pattern
+        .split('/')
+        .filter(|x| !x.is_empty() && !(x.starts_with('(') && x.ends_with(')')))
+        .collect();
+    if have.is_empty() && !want.is_empty() {
+        return None;
+    }
+    let mut score = 0;
+    for (i, h) in have.iter().enumerate() {
+        if *h == "*" || h.starts_with("[...") || h.starts_with("[[...") {
+            return (i < want.len() || h.starts_with("[[")).then_some(score + 1);
+        }
+        let w = want.get(i)?;
+        if h == w {
+            score += 4;
+        } else if h.starts_with(':') || h.starts_with('[') || w.starts_with(':') {
+            score += 2;
+        } else {
+            return None;
+        }
+    }
+    (have.len() == want.len()).then_some(score)
 }
 
 /// Where the code a journey cites builds the link its email sends (a path
@@ -1688,6 +1719,15 @@ fn node_for(table: &Value, step: &Value) -> Option<String> {
         if !want.contains(&c["kind"].as_str().unwrap_or("")) {
             continue;
         }
+        // A screen that is one renderer of a file holding several takes the
+        // lines it spans (a near citation still wins).
+        let span = (c["span"][0].as_i64(), c["span"][1].as_i64());
+        if let (Some(a), Some(b)) = span {
+            let in_file = c["evidence"][0]["file"].as_str() == Some(file);
+            if in_file && line >= a && line <= b && best.as_ref().is_none_or(|(d, _)| 3 < *d) {
+                best = Some((3, id.clone()));
+            }
+        }
         for e in c["evidence"].as_array().into_iter().flatten() {
             if e["file"].as_str() == Some(file) {
                 let d = (e["line"].as_i64().unwrap_or(-99) - line).abs();
@@ -2694,5 +2734,67 @@ mod tests {
         let (flow, conflicts) = to_flow(&journey, &entry, &todo, false);
         assert_eq!(flow["steps"][1]["key"], "req:POST /api/session");
         assert_eq!(conflicts, 0);
+    }
+
+    /// An address reaches the screen whose pattern fits it best: an exact
+    /// path a resolver gives one dispatched page beats the catch-all, and
+    /// a catch-all's dispatched pages, which differ only by a type the
+    /// address does not show, reach none of them.
+    #[test]
+    fn an_address_reaches_its_best_fitting_screen() {
+        let ids: Vec<String> = ["S1", "S2", "S3", "S4", "S5"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        let rows_v = [
+            json!({"key": "screen:web:/*", "kind": "screen"}),
+            json!({"key": "screen:web:/members/join", "kind": "screen"}),
+            json!({"key": "screen:web:/berths/:segment2", "kind": "screen"}),
+            json!({"key": "screen:web:/(notice)/*", "kind": "screen"}),
+            json!({"key": "screen:web:/(story)/*", "kind": "screen"}),
+        ];
+        let rows: Vec<(&String, &Value)> = ids.iter().zip(rows_v.iter()).collect();
+        assert_eq!(
+            screen_for_path(&rows, "/members/join").map(String::as_str),
+            Some("S2")
+        );
+        assert_eq!(
+            screen_for_path(&rows, "/berths/${id}").map(String::as_str),
+            Some("S3")
+        );
+        assert_eq!(
+            screen_for_path(&rows, "/members/join?from=home").map(String::as_str),
+            Some("S2")
+        );
+        // the catch-all and its two dispatched pages fit equally: none
+        assert_eq!(screen_for_path(&rows, "/news/high-tide"), None);
+        // with only the route itself it is the route
+        let one: Vec<(&String, &Value)> = rows[..1].to_vec();
+        assert_eq!(
+            screen_for_path(&one, "/news/high-tide").map(String::as_str),
+            Some("S1")
+        );
+        assert_eq!(route_score("/(notice)/*", &[]), None);
+    }
+
+    /// A traced step inside one renderer of a file that holds several
+    /// lands on that renderer's screen, not on its neighbour's.
+    #[test]
+    fn a_step_inside_a_renderer_lands_on_its_screen() {
+        let table = json!({
+            "S1": {"key": "screen:web:/members/join", "kind": "screen", "span": [19, 23], "evidence": [{"file": "web/lib/renderers.tsx", "line": 19}]},
+            "S2": {"key": "screen:web:/members/checkout", "kind": "screen", "span": [24, 28], "evidence": [{"file": "web/lib/renderers.tsx", "line": 24}]},
+        });
+        let at = |line: i64| {
+            node_for(
+                &table,
+                &json!({"kind": "screen", "file": "web/lib/renderers.tsx", "line": line}),
+            )
+        };
+        assert_eq!(at(21).as_deref(), Some("S1"));
+        assert_eq!(at(27).as_deref(), Some("S2"));
+        // a citation near a screen's own line still wins
+        assert_eq!(at(25).as_deref(), Some("S2"));
+        assert_eq!(at(40), None);
     }
 }

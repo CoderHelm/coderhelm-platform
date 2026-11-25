@@ -1275,15 +1275,38 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
 }
 
 /// A screen in short: where it is, which app and navigator hold it, and
-/// whether it needs a signed-in user.
+/// whether it needs a signed-in user. A screen a dynamic route dispatches
+/// to by type also says the type, its renderer and where it is declared,
+/// the route file that dispatches to it, and whether its URL pattern was
+/// read from the code (`url_from`) or is the route's own.
 fn screen_json(s: &Value) -> Value {
     let mut out = json!({"id": s["id"], "url": s["url"], "name": s["name"], "app": s["app"], "file": s["file"]});
     let nav = &s["nav"];
     if nav.is_object() {
         keep(&mut out, nav, &["navigator", "group", "gate"]);
         out["app"] = nav["app"].clone();
+        if let Some(route) = nav["dispatcher"].as_str() {
+            out["dispatch"] = json!({
+                "type": nav["type"],
+                "renderer": nav["renderer"],
+                "renderer_at": first_at(nav, s["file"].as_str().unwrap_or("")),
+                "route_file": route,
+                "url_from": nav["urlFrom"],
+            });
+            keep(&mut out["dispatch"], nav, &["types"]);
+        }
     }
     out
+}
+
+/// The screens in the order the overview lists them: an app's own screens
+/// (routes, screens a route dispatches to, app screens) before the content
+/// editor's document kinds and tools, which a large studio would otherwise
+/// push off the list.
+fn screens_listed(graph: &Value) -> Vec<&Value> {
+    let mut v: Vec<&Value> = arr(graph, "screens").collect();
+    v.sort_by_key(|s| matches!(s["kind"].as_str(), Some("page-kind" | "tool")));
+    v
 }
 
 /// One link as the lookups return it. Links CoderHelm's detectors added
@@ -1317,7 +1340,7 @@ pub fn overview(graph: &Value) -> Value {
     json!({
         "project": graph["project"],
         "parts": arr(graph, "nodes").map(|n| json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").take(80).map(screen_json).collect::<Vec<_>>(),
+        "screens": screens_listed(graph).into_iter().take(80).map(screen_json).collect::<Vec<_>>(),
         "screen_count": screen_counts(graph),
         "journeys": arr(graph, "flows").take(60).map(|f| json!({"id": f["id"], "title": f["title"], "steps": f["steps"].as_array().map(|a| a.len()).unwrap_or(0)})).collect::<Vec<_>>(),
         "journeys_still_being_traced": graph["coderhelm"]["journeys_pending"].as_u64().unwrap_or(0),
@@ -1430,7 +1453,17 @@ pub fn file_view(graph: &Value, path: &str) -> Option<Value> {
 
 /// Everything behind one screen, as Floorplan traced it, each step described.
 pub fn screen_view(graph: &Value, id_or_url: &str) -> Option<Value> {
-    let s = arr(graph, "screens").find(|s| s["id"] == id_or_url || s["url"] == id_or_url)?;
+    let q = id_or_url.trim();
+    let s = arr(graph, "screens")
+        .find(|s| s["id"] == q || s["url"] == q)
+        .or_else(|| {
+            // its name, as the overview and search list it ("Member checkout")
+            arr(graph, "screens").find(|s| {
+                s["name"]
+                    .as_str()
+                    .is_some_and(|n| !q.is_empty() && n.eq_ignore_ascii_case(q))
+            })
+        })?;
     let steps: Vec<Value> = arr(s, "behind")
         .map(|b| {
             let mut d = describe_ref(graph, b["id"].as_str().unwrap_or(""));
@@ -1491,6 +1524,10 @@ pub fn flow_view(graph: &Value, id_or_words: &str) -> Option<Value> {
             let mut d = describe_ref(graph, s["ref"].as_str().unwrap_or(""));
             d["step"] = json!(i + 1);
             d["note"] = s["note"].clone();
+            // the screen the step stands on, when its file holds several
+            if let Some(sc) = s["screen"].as_str().filter(|x| x.starts_with("screen:")) {
+                d["screen"] = describe_ref(graph, sc);
+            }
             if let Some(ev) = s["evidence"].as_array() {
                 d["cites"] = json!(ev
                     .iter()
@@ -1537,7 +1574,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
         "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["summary"], &n["id"], &n["vendor"], &json!(arr(n, "env").chain(arr(n, "hosts")).chain(arr(n, "domains")).chain(arr(n, "services")).filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))])).take(20).map(|n| { let mut x = node_json(n); if let Some(o) = x.as_object_mut() { o.remove("evidence"); } x }).collect::<Vec<_>>(),
         "files": arr(graph, "files").filter(|f| hit(&[&f["p"], &f["name"], &f["d"]])).take(30).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"]})).collect::<Vec<_>>(),
         "endpoints": arr(graph, "routes").enumerate().filter(|(_, r)| hit(&[&r["m"], &r["p"], &r["name"], &r["d"]])).take(30).map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "file": r["f"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"]])).take(20).map(screen_json).collect::<Vec<_>>(),
+        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"], &s["nav"]["type"], &s["nav"]["renderer"]])).take(20).map(screen_json).collect::<Vec<_>>(),
         "journeys": arr(graph, "flows").filter(|f| hit(&[&f["id"], &f["title"], &f["description"]])).take(20).map(|f| json!({"id": f["id"], "title": f["title"]})).collect::<Vec<_>>(),
     })
 }
@@ -1910,7 +1947,8 @@ pub fn impact(graph: &Value, target: &str) -> Option<Value> {
                 let on_cite = !only_endpoints
                     && arr(s, "evidence")
                         .any(|e| e["file"].as_str().is_some_and(|p| paths.contains(p)));
-                if inside(r) || screen_ids.contains(r) || on_cite {
+                let on_screen = s["screen"].as_str().is_some_and(|x| screen_ids.contains(x));
+                if inside(r) || screen_ids.contains(r) || on_screen || on_cite {
                     steps.push(i + 1);
                     cites.extend(cited);
                 }
@@ -3085,6 +3123,37 @@ mod tests {
             search(&g, "harbor-mobile signin")["screens"][0]["gate"],
             "signed_out"
         );
+    }
+
+    /// A content editor's many document kinds never push an app's own
+    /// screens (routes, the pages a route dispatches to) off the overview.
+    #[test]
+    fn the_overview_lists_app_screens_before_editor_kinds() {
+        let mut g = harbor();
+        let kinds: Vec<Value> = (0..90)
+            .map(|i| json!({"id": format!("screen:studio:/(structure)/k{i}"), "url": format!("/(structure)/k{i}"), "name": format!("Kind {i}"), "kind": "page-kind", "file": "harbor-web/lib/slips.ts", "behind": []}))
+            .collect();
+        let mut all = kinds;
+        all.extend(g["screens"].as_array().unwrap().iter().cloned());
+        all.push(json!({"id": "screen:web:/(notice)/*", "url": "/(notice)/*", "name": "Notice page", "kind": "screen", "fw": "dispatch", "file": "harbor-web/lib/slips.ts", "behind": [],
+            "nav": {"app": "harbor-web", "dispatcher": "harbor-web/app/slips/[id]/page.tsx", "type": "notice", "renderer": "NoticeRenderer", "urlFrom": "route", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}]}}));
+        g["screens"] = json!(all);
+        let o = overview(&g);
+        let listed = o["screens"].as_array().unwrap();
+        assert_eq!(listed.len(), 80);
+        assert!(listed.iter().any(|s| s["url"] == "/slips/:id"));
+        let notice = listed.iter().find(|s| s["name"] == "Notice page").unwrap();
+        assert_eq!(
+            notice["dispatch"]["renderer_at"],
+            "harbor-web/lib/slips.ts:2"
+        );
+        assert_eq!(
+            notice["dispatch"]["route_file"],
+            "harbor-web/app/slips/[id]/page.tsx"
+        );
+        // a screen nothing dispatches carries no dispatch record
+        let slip = listed.iter().find(|s| s["url"] == "/slips/:id").unwrap();
+        assert!(slip.get("dispatch").is_none());
     }
 
     /// The harbor map with one journey through the booking.
