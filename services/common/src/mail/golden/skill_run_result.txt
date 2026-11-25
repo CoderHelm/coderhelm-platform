@@ -1,0 +1,16 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a scheduled skill run ended
+
+The scheduled run of the visit-count skill ended.
+
+How it went:
+> Finished: /classes grew from 120 to 400.
+> Report: reports/2026-11-30.html
+
+Its report and every file it made are on the run's page.
+
+Open the run: https://helm.example.org/runs/detail?id=r1
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

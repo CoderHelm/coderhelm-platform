@@ -430,6 +430,14 @@ impl Connections for CatalogConnections<'_> {
         Ok(schemas
             .into_iter()
             .map(|t| ToolDef {
+                read_only: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a["readOnlyHint"].as_bool()),
+                destructive: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a["destructiveHint"].as_bool()),
                 name: t.name,
                 description: t.description,
                 input_schema: t.input_schema,

@@ -24,6 +24,10 @@ pub struct McpToolSchema {
     pub description: String,
     #[serde(rename = "inputSchema", alias = "input_schema")]
     pub input_schema: Value,
+    /// The server's hints (`readOnlyHint`, `destructiveHint`), when it gives
+    /// them.
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 
 /// Plugin info needed to invoke MCP servers.
@@ -157,6 +161,7 @@ fn remote_schemas(b: &RemoteBinding) -> Vec<McpToolSchema> {
                 name: tool.to_string(),
                 description,
                 input_schema,
+                annotations: None,
             })
         })
         .collect()

@@ -24,6 +24,9 @@
 pub mod aws;
 pub mod cron;
 pub mod engine;
+pub mod resolve;
+pub mod risk;
+pub mod stdio;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +45,7 @@ pub const MAX_TOOLS: usize = 30;
 pub const HISTORY: usize = 30;
 /// The largest budget a schedule may set.
 pub const MAX_BUDGET_USD: f64 = 50.0;
-pub const MAX_MINUTES: u32 = 60;
+pub const MAX_MINUTES: u32 = 120;
 /// What a new schedule gets.
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const DEFAULT_MINUTES: u32 = 30;
@@ -54,7 +57,9 @@ pub const STALE_RUN_SECS: i64 = 2 * 60 * 60;
 pub const ATHENA_TOOL: &str = "aws_athena_query";
 
 /// One tool the skill calls, by the name the skill uses, and where it comes
-/// from: `server` is a connected MCP server's id, `tool` its tool.
+/// from: `server` is a connected MCP server's id, `sandbox:<id>` for a stdio
+/// server the run starts in its sandbox, or `coderhelm:<name>` for one of
+/// CoderHelm's own connections; `tool` is its name there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ToolGrant {
     /// The name the skill (and so the agent) calls it by:
@@ -64,11 +69,18 @@ pub struct ToolGrant {
     /// The server's own name for it; empty means the same as `name`.
     #[serde(default)]
     pub tool: String,
-    /// An admin vouched that this tool only reads (its name doesn't say so,
-    /// like `run_query`). Never lowers a tool whose name says it
-    /// sends, deletes or publishes.
+    /// An admin's word on its risk (`read` or `write`), over the server's
+    /// annotations and the model's reading. Never lowers a tool that sends,
+    /// publishes or deletes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// Older schedules' "only reads" tick: the same as `risk: read`.
     #[serde(default)]
     pub reads_only: bool,
+    /// Added by an admin, not found in the skill: kept when the skill's
+    /// tools are read again.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 impl ToolGrant {
@@ -80,12 +92,23 @@ impl ToolGrant {
         }
     }
 
-    /// The risk this tool runs at in a skill run.
+    /// The admin's word on its risk, if any.
+    pub fn admin_risk(&self) -> Option<Risk> {
+        match self.risk.as_deref().and_then(Risk::parse) {
+            Some(r) => Some(r),
+            None if self.reads_only => Some(Risk::Read),
+            None => None,
+        }
+    }
+
+    /// Its risk by name alone: what can be checked before its server is
+    /// asked (a tool whose name says it sends or deletes is never granted).
     pub fn risk(&self) -> Risk {
         let by_name = classify_external(self.server_tool());
         match by_name {
-            Risk::Write if self.reads_only => Risk::Read,
-            r => r,
+            Risk::Consequential => Risk::Consequential,
+            Risk::Write => self.admin_risk().unwrap_or(Risk::Write),
+            Risk::Read => self.admin_risk().unwrap_or(Risk::Read),
         }
     }
 }
@@ -102,6 +125,10 @@ pub struct AwsGrant {
     /// Data one run may scan, in GB.
     #[serde(default = "default_gb")]
     pub max_gb: f64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_region() -> String {
@@ -130,15 +157,34 @@ impl Default for Budget {
     }
 }
 
-/// Where a run's result goes besides its run page.
+/// Where a run's result goes besides its run page. Each `*_on` is `off`,
+/// `always` or `failure`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Destinations {
-    /// The team's chat channels (Slack, Teams): `off`, `always` or `failure`.
+    /// The team's chat channels (Slack, Teams).
     #[serde(default)]
     pub chat: String,
     /// Open an issue in the skill's repository when a scheduled run fails.
     #[serde(default)]
     pub issue_on_failure: bool,
+    /// People emailed through CoderHelm's mailer.
+    #[serde(default)]
+    pub emails: Vec<String>,
+    #[serde(default)]
+    pub email_on: String,
+    /// A Jira ticket each run comments on, through the team's Jira app.
+    #[serde(default)]
+    pub jira_ticket: String,
+    #[serde(default)]
+    pub jira_comment_on: String,
+    /// A Jira project a failed scheduled run files a ticket in.
+    #[serde(default)]
+    pub jira_project: String,
+}
+
+/// Whether a destination set to `on` hears about a run that `failed`.
+pub fn wants(on: &str, failed: bool) -> bool {
+    on == "always" || (on == "failure" && failed)
 }
 
 /// The last run, kept on the schedule for the list.
@@ -164,6 +210,16 @@ pub struct Schedule {
     pub paused: bool,
     #[serde(default)]
     pub tools: Vec<ToolGrant>,
+    /// Read the skill's tools again before each run and map any new one
+    /// (on unless an admin turned it off).
+    #[serde(default = "yes")]
+    pub auto_tools: bool,
+    /// Stdio MCP servers the run starts in its sandbox, pinned.
+    #[serde(default)]
+    pub stdio: Vec<stdio::StdioServer>,
+    /// What the last reading of the skill's tools found.
+    #[serde(default)]
+    pub resolution: Option<resolve::Resolution>,
     #[serde(default)]
     pub aws: Option<AwsGrant>,
     /// Off by default: a tool that writes is refused before it runs.
@@ -234,6 +290,36 @@ pub struct SkillRunMessage {
     pub trigger: String,
     #[serde(default)]
     pub requested_by: String,
+    /// The step a long run goes on from (its saved state); empty for its
+    /// first step.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resume: String,
+    /// `run` (default) or `resolve`: only read the skill's tools and map
+    /// them, for the schedule's page.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+}
+
+/// A schedule being made: its skill, and what reading the skill's tools
+/// found, for the form (`SKILLRESOLVE#<id>`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Draft {
+    pub id: String,
+    pub skill_repo: String,
+    pub skill_path: String,
+    pub skill_name: String,
+    #[serde(default)]
+    pub aws: Option<AwsGrant>,
+    #[serde(default)]
+    pub resolution: Option<resolve::Resolution>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+pub fn resolve_sk(id: &str) -> String {
+    format!("SKILLRESOLVE#{id}")
 }
 
 pub fn schedule_sk(id: &str) -> String {
@@ -379,11 +465,58 @@ pub fn validate(s: &mut Schedule) -> Result<(), String> {
             "The time budget per run is 1 to {MAX_MINUTES} minutes."
         ));
     }
-    s.notify.chat = match s.notify.chat.trim() {
-        "" | "off" => "off".into(),
-        "always" | "failure" => s.notify.chat.trim().into(),
-        other => return Err(format!("'{other}' isn't off, always or failure.")),
+    let when = |v: &str| -> Result<String, String> {
+        match v.trim() {
+            "" | "off" => Ok("off".into()),
+            "always" | "failure" => Ok(v.trim().into()),
+            other => Err(format!("'{other}' isn't off, always or failure.")),
+        }
     };
+    s.notify.chat = when(&s.notify.chat)?;
+    s.notify.email_on = when(&s.notify.email_on)?;
+    s.notify.jira_comment_on = when(&s.notify.jira_comment_on)?;
+    let mut emails = Vec::new();
+    for e in &s.notify.emails {
+        let e = e.trim().to_ascii_lowercase();
+        if e.is_empty() {
+            continue;
+        }
+        if !crate::mail::relay::valid_address(&e) {
+            return Err(format!("'{e}' isn't an email address."));
+        }
+        if !emails.contains(&e) {
+            emails.push(e);
+        }
+    }
+    if emails.len() > 20 {
+        return Err("Email at most 20 people.".into());
+    }
+    s.notify.emails = emails;
+    s.notify.jira_ticket = s.notify.jira_ticket.trim().to_ascii_uppercase();
+    if !s.notify.jira_ticket.is_empty()
+        && !crate::git_conventions::is_ticket_key(&s.notify.jira_ticket)
+    {
+        return Err(format!(
+            "'{}' isn't a Jira ticket key.",
+            s.notify.jira_ticket
+        ));
+    }
+    s.notify.jira_project = s.notify.jira_project.trim().to_ascii_uppercase();
+    if !s.notify.jira_project.is_empty()
+        && !(s.notify.jira_project.len() <= 20
+            && s.notify
+                .jira_project
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+    {
+        return Err(format!(
+            "'{}' isn't a Jira project key.",
+            s.notify.jira_project
+        ));
+    }
+    if s.stdio.len() > 5 {
+        return Err("A schedule runs at most 5 sandbox servers.".into());
+    }
     if s.instructions.len() > 2_000 {
         return Err("Keep the instructions under 2,000 characters.".into());
     }

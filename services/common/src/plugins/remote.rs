@@ -63,6 +63,8 @@ impl Connections for RemoteMcp {
                 name: t.name.clone(),
                 description: t.description.clone(),
                 input_schema: t.input_schema.clone(),
+                read_only: t.read_only,
+                destructive: t.destructive,
             })
             .collect())
     }

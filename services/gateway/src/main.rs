@@ -1515,6 +1515,8 @@ fn build_app(state: Arc<AppState>) -> Router {
             get(routes::skill_runs::list).post(routes::skill_runs::create),
         )
         .route("/skill-runs/options", get(routes::skill_runs::options))
+        .route("/skill-runs/resolve", post(routes::skill_runs::resolve))
+        .route("/skill-runs/resolve/:id", get(routes::skill_runs::resolved))
         .route(
             "/skill-runs/:id",
             put(routes::skill_runs::update).delete(routes::skill_runs::remove),

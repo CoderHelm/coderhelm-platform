@@ -252,6 +252,12 @@
   ],
   "wafv2:GetLoggingConfiguration": [
    "webacl"
+  ],
+  "cloudfront:ListDistributions": [
+   ""
+  ],
+  "cloudfront:GetDistribution": [
+   "distribution"
   ]
  }
 }

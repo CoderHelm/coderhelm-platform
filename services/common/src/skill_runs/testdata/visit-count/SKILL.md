@@ -7,7 +7,8 @@ Count this week's page visits and compare them with last week's.
 
 ## Hard rules
 
-- **Read-only.** The only tool this skill uses is `traffic_counts`.
+- **Read-only.** The only tool this skill uses is `traffic_counts`. It may tag a page with the
+  `tag_page` tool when asked to. It never calls the `set_banner` tool.
 - **Stop on missing access.** If `traffic_counts` fails with an access error, run `needs-login`
   and stop. Never write a partial report.
 

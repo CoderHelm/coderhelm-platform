@@ -720,6 +720,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "skill_runs::update",
             "skill_runs::remove",
             "skill_runs::run_now",
+            "skill_runs::resolve",
         ],
     },
     Capability {
