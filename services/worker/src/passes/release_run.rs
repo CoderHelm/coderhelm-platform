@@ -28,6 +28,9 @@
 //! State is one record per pull request in the settings table; ticks are
 //! self-scheduled SQS messages (`release_steps`), one chain per record. The
 //! pull request's release section is rewritten from the record each tick.
+//! Each save records when the next tick is due (`next_tick_at`): a chain that
+//! died (a lost message, a failed send, a crash) leaves a record whose tick
+//! is overdue, and the review sweep resumes it ([`resume_stalled`]).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +77,16 @@ pub struct Record {
     pub armed_at: i64,
     #[serde(default)]
     pub parked: bool,
+    /// The installation the ticks read GitHub as (0 on records written
+    /// before it was kept: the team's installation then).
+    #[serde(default)]
+    pub installation_id: u64,
+    /// The run the release belongs to, where its outcome is said.
+    #[serde(default)]
+    pub run_id: String,
+    /// The pull request closed without merging: nothing is left to do.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 impl Record {
@@ -301,8 +314,11 @@ async fn arm_steps(
         chain_id: ulid::Ulid::new().to_string(),
         armed_at: now(),
         parked: false,
+        installation_id,
+        run_id: run_id.to_string(),
+        closed: false,
     };
-    if let Err(e) = save(state, team_id, owner, repo, pr_number, &rec).await {
+    if let Err(e) = save(state, team_id, owner, repo, pr_number, &rec, now()).await {
         warn!(pr = pr_number, error = %e, "release: could not save the release record");
         return;
     }
@@ -578,58 +594,110 @@ pub fn releases_newest_first(tags: &Value, prefix: &str) -> Vec<(String, String)
 /// the first one that contains it.
 const TAGS_LOOKED_AT: usize = 5;
 
+/// The oldest release tag that holds the merge, from the newest tags in
+/// order with whether each holds it: a tag holds everything an older one
+/// does, so the first that does not ends the look.
+pub fn first_tag_holding(newest_first: &[((String, String), bool)]) -> Option<(String, String)> {
+    newest_first
+        .iter()
+        .take_while(|(_, holds)| *holds)
+        .last()
+        .map(|(t, _)| t.clone())
+}
+
+/// The release tag that first holds `merge_sha` (its name and commit),
+/// `None` when no release tag holds it yet. An unreadable tag list or
+/// compare is an error, never "not released".
+async fn tag_holding(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    tag_prefix: &str,
+    merge_sha: &str,
+) -> Result<Option<(String, String)>, BoxError> {
+    let tags = github.list_tags(owner, repo).await?;
+    let mut looked: Vec<((String, String), bool)> = Vec::new();
+    for (name, sha) in releases_newest_first(&tags, tag_prefix)
+        .into_iter()
+        .take(TAGS_LOOKED_AT)
+    {
+        let holds = sha == merge_sha
+            || super::release_notes::tag_on_branch(
+                &github.compare_status(owner, repo, merge_sha, &sha).await?,
+            );
+        looked.push(((name, sha), holds));
+        if !holds {
+            break;
+        }
+    }
+    Ok(first_tag_holding(&looked))
+}
+
+/// A production tag deploy whose merge a release tag already holds: it
+/// shipped in that tag, so the step follows that tag's deploy run to its
+/// outcome. Nothing is cut and nothing is asked.
+pub fn follow_shipped(s: &mut Step, tag: &str, tag_sha: &str) {
+    s.tag = tag.to_string();
+    s.tag_sha = tag_sha.to_string();
+    s.status = Status::Running;
+    s.started_at = now();
+    s.detail = format!(
+        "in the release tag `{}`; waiting for `{}`",
+        s.tag, s.workflow
+    );
+}
+
+/// The approval card a step asked before its change shipped in `tag`: it
+/// is no longer needed, so it expires (it stays in the audit with why), and
+/// nobody is asked to approve a change already in production.
+async fn retire_card(state: &WorkerState, team_id: &str, approval_id: &str, tag: &str) {
+    use common::agent_policy::audit::{self, ActorKind, Event};
+    let store = crate::agent::policy::store(state);
+    let Ok(Some(mut a)) = store.get_approval(team_id, approval_id).await else {
+        return;
+    };
+    if a.status != ApprovalStatus::Pending {
+        return;
+    }
+    a.status = ApprovalStatus::Expired;
+    a.decided_at = Some(chrono::Utc::now().to_rfc3339());
+    a.note = format!("Not needed: the change already shipped in the release tag `{tag}`.");
+    if store
+        .update_approval(team_id, &a, ApprovalStatus::Pending)
+        .await
+        .unwrap_or(false)
+    {
+        store
+            .audit(
+                team_id,
+                Event::new(
+                    "system",
+                    ActorKind::System,
+                    audit::action::EXPIRED,
+                    "already shipped",
+                )
+                .approval(&a.id)
+                .run(&a.run_id)
+                .tool(&a.tool, a.risk.map_or("", |r| r.as_str())),
+            )
+            .await;
+    }
+}
+
 /// The production deploy of a repository whose team releases merged changes
-/// (its `auto_tag` release setting): the release tag that first contains
-/// this merge, once there is one; until then the merge waits for the
-/// repository's batched release (opened here when no window waits, so a
-/// missed push never leaves the merge out), or says why that release is
-/// blocked. Never a card of its own: the team's setting already said yes.
+/// (its `auto_tag` release setting) while no release tag holds this merge
+/// yet: the merge waits for the repository's batched release (opened here
+/// when no window waits, so a missed push never leaves the merge out), or
+/// says why that release is blocked. Never a card of its own: the team's
+/// setting already said yes.
 async fn team_release(
     state: &WorkerState,
-    github: &GitHubClient,
     msg: &ReleaseStepsMessage,
     cfg: &super::review_actions::OnApproveConfig,
     base_branch: &str,
     s: &mut Step,
-    merge_sha: &str,
 ) {
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
-    let tags = match github.list_tags(owner, repo).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(pr = msg.pr_number, error = %e, "release: could not read the release tags");
-            return;
-        }
-    };
-    let mut first: Option<(String, String)> = None;
-    for (name, sha) in releases_newest_first(&tags, &cfg.tag_prefix)
-        .into_iter()
-        .take(TAGS_LOOKED_AT)
-    {
-        let contains = sha == merge_sha
-            || match github.compare_status(owner, repo, merge_sha, &sha).await {
-                Ok(st) => super::release_notes::tag_on_branch(&st),
-                Err(e) => {
-                    warn!(pr = msg.pr_number, error = %e, "release: could not compare the merge with a release tag");
-                    return;
-                }
-            };
-        if !contains {
-            break;
-        }
-        first = Some((name, sha));
-    }
-    if let Some((tag, sha)) = first {
-        s.tag = tag;
-        s.tag_sha = sha;
-        s.status = Status::Running;
-        s.started_at = now();
-        s.detail = format!(
-            "in the release tag `{}`; waiting for `{}`",
-            s.tag, s.workflow
-        );
-        return;
-    }
     if let Some(why) =
         super::review_actions::release_blocked(state, &msg.team_id, owner, repo).await
     {
@@ -695,6 +763,25 @@ pub fn deploy_outcome_line(
             s.detail.trim_end_matches('.')
         )),
         _ => None,
+    }
+}
+
+/// When a finished run ended (its last update), 0 when it doesn't say.
+pub fn finished_at(run: &Value) -> i64 {
+    run["updated_at"]
+        .as_str()
+        .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+        .map(|t| t.timestamp())
+        .unwrap_or(0)
+}
+
+/// The time said with a step's outcome: when its run finished, so a deploy
+/// followed after the fact is said at the time it went out.
+pub fn said_at(s: &Step) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    match chrono::Utc.timestamp_opt(s.finished_at, 0) {
+        chrono::LocalResult::Single(t) if s.finished_at > 0 => t,
+        _ => chrono::Utc::now(),
     }
 }
 
@@ -813,6 +900,18 @@ async fn load(
     repo: &str,
     pr: u64,
 ) -> Result<Option<Record>, BoxError> {
+    Ok(load_meta(state, team, owner, repo, pr)
+        .await?
+        .map(|(r, _)| r))
+}
+
+async fn load_meta(
+    state: &WorkerState,
+    team: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<(Record, Meta)>, BoxError> {
     let r = state
         .dynamo
         .get_item()
@@ -821,16 +920,42 @@ async fn load(
         .key("sk", AttributeValue::S(record_sk(owner, repo, pr)))
         .send()
         .await?;
-    let Some(data) = r
-        .item()
-        .and_then(|i| i.get("data"))
-        .and_then(|v| v.as_s().ok())
-    else {
-        return Ok(None);
-    };
-    Ok(serde_json::from_str(data).ok())
+    Ok(r.item().and_then(of_item))
 }
 
+/// A release item as the table holds it: the record (`data`) and its tick
+/// bookkeeping. None when it holds no readable record.
+pub fn of_item(item: &Item) -> Option<(Record, Meta)> {
+    let data = item.get("data").and_then(|v| v.as_s().ok())?;
+    let rec: Record = serde_json::from_str(data).ok()?;
+    let n = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|x| x.parse::<i64>().ok())
+    };
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    Some((
+        rec,
+        Meta {
+            write_id: s("write_id"),
+            updated_at: n("updated_at"),
+            next_tick_at: n("next_tick_at"),
+            resume_attempts: n("resume_attempts").unwrap_or(0).max(0) as u32,
+            last_error: s("last_error"),
+        },
+    ))
+}
+
+/// Saves the record with when its next tick is due (`next_at`, 0 when no
+/// tick follows). Each save writes a new `write_id`, so a resume claimed
+/// against an older read of the item fails. The item is replaced whole, so
+/// a saved tick also clears the resume count and the last error: the chain
+/// moves again.
 async fn save(
     state: &WorkerState,
     team: &str,
@@ -838,6 +963,7 @@ async fn save(
     repo: &str,
     pr: u64,
     rec: &Record,
+    next_at: i64,
 ) -> Result<(), BoxError> {
     state
         .dynamo
@@ -847,9 +973,374 @@ async fn save(
         .item("sk", AttributeValue::S(record_sk(owner, repo, pr)))
         .item("data", AttributeValue::S(serde_json::to_string(rec)?))
         .item("updated_at", AttributeValue::N(now().to_string()))
+        .item("next_tick_at", AttributeValue::N(next_at.to_string()))
+        .item("write_id", AttributeValue::S(ulid::Ulid::new().to_string()))
         .send()
         .await?;
     Ok(())
+}
+
+/// A failed tick: its error and when the next tick is due (0 when none is
+/// sent), written only while the item is the one the tick read.
+async fn note_failure(
+    state: &WorkerState,
+    team: &str,
+    (owner, repo, pr): (&str, &str, u64),
+    seen: &Meta,
+    error: &str,
+    next_at: i64,
+) {
+    let (cond, vals) = seen.unchanged();
+    let mut req = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team.to_string()))
+        .key("sk", AttributeValue::S(record_sk(owner, repo, pr)))
+        .update_expression("SET last_error = :e, next_tick_at = :t, write_id = :nw")
+        .condition_expression(cond)
+        .expression_attribute_values(":e", AttributeValue::S(error.to_string()))
+        .expression_attribute_values(":t", AttributeValue::N(next_at.to_string()))
+        .expression_attribute_values(":nw", AttributeValue::S(ulid::Ulid::new().to_string()));
+    for (k, v) in vals {
+        req = req.expression_attribute_values(k, v);
+    }
+    if let Err(e) = req.send().await {
+        let lost = e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false);
+        if !lost {
+            warn!(pr, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "release: could not record the failed tick");
+        }
+    }
+}
+
+// ── Resuming a stopped chain ────────────────────────────────────────────────
+
+type Item = std::collections::HashMap<String, AttributeValue>;
+
+/// How long past its due time a tick may be before its chain counts as
+/// stopped: a queued retry waits at most 15 minutes, and a tick runs well
+/// within the rest.
+const STALL_GRACE_SECS: i64 = 30 * 60;
+/// Resumes in a row that did not get a tick through before the sweep stops
+/// resuming a record (its `last_error` says why). A tick that saves resets
+/// the count.
+pub const MAX_RESUMES: u32 = 3;
+/// Counted GitHub requests a resumed tick makes, asked of the budget first.
+const TICK_REQUESTS: u64 = 6;
+/// Pages of the settings table one sweep reads.
+const RESUME_MAX_PAGES: usize = 50;
+/// The sort key every release record starts with.
+const RECORD_PREFIX: &str = "RELEASE#";
+
+/// A release item's tick bookkeeping, next to the record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// Changes with every write: a claim against an older read fails.
+    /// Empty on items written before it was kept.
+    pub write_id: String,
+    pub updated_at: Option<i64>,
+    /// When the next tick is due; 0 when none is queued. `None` on items
+    /// written before it was kept.
+    pub next_tick_at: Option<i64>,
+    /// Resumes since a tick last saved.
+    pub resume_attempts: u32,
+    pub last_error: String,
+}
+
+impl Meta {
+    /// The condition that the item is still the one read: its `write_id`,
+    /// or, on an item written before it was kept, no `write_id` and the same
+    /// `updated_at`.
+    pub fn unchanged(&self) -> (&'static str, Vec<(&'static str, AttributeValue)>) {
+        if !self.write_id.is_empty() {
+            return (
+                "write_id = :seen",
+                vec![(":seen", AttributeValue::S(self.write_id.clone()))],
+            );
+        }
+        match self.updated_at {
+            Some(u) => (
+                "attribute_not_exists(write_id) AND updated_at = :seen",
+                vec![(":seen", AttributeValue::N(u.to_string()))],
+            ),
+            None => (
+                "attribute_exists(sk) AND attribute_not_exists(write_id) AND attribute_not_exists(updated_at)",
+                vec![],
+            ),
+        }
+    }
+
+    /// Whether `now`, the item as it stands, is still the one this was read
+    /// from: what [`Self::unchanged`] asks the table.
+    #[cfg(test)]
+    pub fn still(&self, now: &Meta) -> bool {
+        if !self.write_id.is_empty() {
+            return now.write_id == self.write_id;
+        }
+        now.write_id.is_empty() && now.updated_at == self.updated_at
+    }
+
+    /// When the next tick was due: as recorded, or on an item written before
+    /// that was kept, a waiting tick's pace after its last write.
+    pub fn due_at(&self, rec: &Record) -> i64 {
+        match self.next_tick_at {
+            Some(t) => t,
+            None => self.updated_at.unwrap_or(0).max(rec.armed_at) + i64::from(WAITING_DELAY),
+        }
+    }
+}
+
+/// What the sweep does with one release record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stall {
+    /// Nothing: finished, held, parked, closed, or its tick is in flight.
+    Live,
+    /// Its chain stopped with work left: resume it.
+    Resume,
+    /// Its chain stopped, and `MAX_RESUMES` resumes in a row did not get a
+    /// tick through: left, with its last error.
+    GaveUp,
+}
+
+/// Pure: whether a release record's tick chain stopped with work left, by
+/// its record and bookkeeping at `now`.
+pub fn stall(rec: &Record, meta: &Meta, now: i64) -> Stall {
+    if rec.parked || rec.closed || delay(&rec.steps, true).is_none() {
+        return Stall::Live;
+    }
+    let due = meta.due_at(rec);
+    // A tick in flight is due ahead, or only just past due.
+    if due > 0 && now <= due + STALL_GRACE_SECS {
+        return Stall::Live;
+    }
+    if meta.resume_attempts >= MAX_RESUMES {
+        return Stall::GaveUp;
+    }
+    Stall::Resume
+}
+
+/// The repository and pull request a release record's sort key names.
+pub fn parse_sk(sk: &str) -> Option<(String, String, u64)> {
+    let rest = sk.strip_prefix(RECORD_PREFIX)?;
+    let (full, pr) = rest.rsplit_once('#')?;
+    let (owner, repo) = full.split_once('/')?;
+    let pr = pr.parse::<u64>().ok()?;
+    (!owner.is_empty() && !repo.is_empty() && pr > 0).then(|| (owner.into(), repo.into(), pr))
+}
+
+/// The record a resume saves: a fresh chain (any tick of the stopped one
+/// that still arrives is dropped), a fresh age (the time its chain lay
+/// stopped is not the release waiting), and where its outcome is said.
+pub fn resumed(rec: &Record, installation_id: u64, run_id: &str, now: i64) -> Record {
+    let mut r = rec.clone();
+    r.chain_id = ulid::Ulid::new().to_string();
+    r.armed_at = now;
+    r.installation_id = installation_id;
+    if r.run_id.is_empty() {
+        r.run_id = run_id.to_string();
+    }
+    r
+}
+
+/// The error a resume records when it has none: the previous resume's tick
+/// never ran.
+pub fn resume_error(meta: &Meta) -> String {
+    if !meta.last_error.is_empty() || meta.resume_attempts == 0 {
+        return meta.last_error.clone();
+    }
+    "the tick sent on the last resume never ran".to_string()
+}
+
+/// One sweep's account of the release records it read.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Resumed {
+    pub resumed: Vec<String>,
+    pub gave_up: usize,
+    /// Left for a later sweep: GitHub's budget held, or another sweep or a
+    /// tick wrote the record first.
+    pub left: usize,
+}
+
+/// Release records whose tick chain stopped with work left (a lost
+/// message, a failed send, a crash, an old bug) are resumed: each gets one
+/// normal tick on a fresh chain, claimed against the item as read, so two
+/// sweeps never both resume it and a chain still running is never
+/// doubled. GitHub's budget is asked first. After `MAX_RESUMES` resumes in
+/// a row that got no tick through, the record is left with its last error.
+pub async fn resume_stalled(state: &WorkerState) -> Resumed {
+    let now = now();
+    let mut out = Resumed::default();
+    let mut found: Vec<(String, String, Record, Meta)> = Vec::new();
+    let mut start: Option<Item> = None;
+    for _ in 0..RESUME_MAX_PAGES {
+        let res = state
+            .dynamo
+            .scan()
+            .table_name(&state.config.settings_table_name)
+            .filter_expression("begins_with(sk, :p)")
+            .expression_attribute_values(":p", AttributeValue::S(RECORD_PREFIX.to_string()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let page = match res {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Stalled releases: scan failed");
+                break;
+            }
+        };
+        for item in page.items() {
+            let (Some(pk), Some(sk)) = (
+                item.get("pk").and_then(|v| v.as_s().ok()),
+                item.get("sk").and_then(|v| v.as_s().ok()),
+            ) else {
+                continue;
+            };
+            let Some((rec, meta)) = of_item(item) else {
+                continue;
+            };
+            match stall(&rec, &meta, now) {
+                Stall::Live => {}
+                Stall::GaveUp => out.gave_up += 1,
+                Stall::Resume => found.push((pk.clone(), sk.clone(), rec, meta)),
+            }
+        }
+        match page.last_evaluated_key {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_PR_WATCH,
+    );
+    let mut installs: std::collections::HashMap<String, Option<u64>> = Default::default();
+    for (team_id, sk, rec, meta) in found {
+        let Some((owner, repo, pr)) = parse_sk(&sk) else {
+            continue;
+        };
+        let iid = if rec.installation_id > 0 {
+            Some(rec.installation_id)
+        } else {
+            match installs.get(&team_id) {
+                Some(v) => *v,
+                None => {
+                    let v = super::review_reminder::team_installation_id(state, &team_id).await;
+                    installs.insert(team_id.clone(), v);
+                    v
+                }
+            }
+        };
+        let Some(iid) = iid else {
+            continue;
+        };
+        // A held budget: looked at again on a later sweep, never counted.
+        if !budget.allows(state, iid, TICK_REQUESTS).await {
+            out.left += 1;
+            continue;
+        }
+        let run_id = if rec.run_id.is_empty() {
+            super::covering::runs_for_pr(state, &team_id, &format!("{owner}/{repo}"), pr)
+                .await
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        } else {
+            rec.run_id.clone()
+        };
+        let fresh = resumed(&rec, iid, &run_id, now);
+        let error = resume_error(&meta);
+        if !claim(state, &team_id, &sk, &fresh, &meta, &error).await {
+            out.left += 1;
+            continue;
+        }
+        let msg = ReleaseStepsMessage {
+            team_id: team_id.clone(),
+            installation_id: iid,
+            repo_owner: owner.clone(),
+            repo_name: repo.clone(),
+            pr_number: pr,
+            run_id: fresh.run_id.clone(),
+            chain_id: fresh.chain_id.clone(),
+            attempts: 0,
+        };
+        if send(state, &msg, 0).await {
+            info!(team_id, repo = %format!("{owner}/{repo}"), pr, attempt = meta.resume_attempts + 1, "Stalled releases: resumed the release steps");
+            out.resumed.push(format!("{owner}/{repo}#{pr}"));
+        } else {
+            // Counted as a failed resume: the next sweep tries again, up to
+            // `MAX_RESUMES`.
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", AttributeValue::S(team_id.clone()))
+                .key("sk", AttributeValue::S(sk.clone()))
+                .update_expression("SET last_error = :e, next_tick_at = :z")
+                .expression_attribute_values(
+                    ":e",
+                    AttributeValue::S("the resumed tick could not be queued".into()),
+                )
+                .expression_attribute_values(":z", AttributeValue::N("0".into()))
+                .send()
+                .await;
+        }
+    }
+    out
+}
+
+/// Claims a stalled record for one resume: saves `fresh` (its new chain),
+/// the tick due now, and one more resume, only while the item is still the
+/// one read (`seen`). False when another sweep or a tick wrote it first.
+async fn claim(
+    state: &WorkerState,
+    team_id: &str,
+    sk: &str,
+    fresh: &Record,
+    seen: &Meta,
+    error: &str,
+) -> bool {
+    let Ok(data) = serde_json::to_string(fresh) else {
+        return false;
+    };
+    let t = now();
+    let (cond, vals) = seen.unchanged();
+    let mut put = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(sk.to_string()))
+        .item("data", AttributeValue::S(data))
+        .item("updated_at", AttributeValue::N(t.to_string()))
+        .item("next_tick_at", AttributeValue::N(t.to_string()))
+        .item("write_id", AttributeValue::S(ulid::Ulid::new().to_string()))
+        .item(
+            "resume_attempts",
+            AttributeValue::N((seen.resume_attempts + 1).to_string()),
+        )
+        .condition_expression(cond);
+    if !error.is_empty() {
+        put = put.item("last_error", AttributeValue::S(error.to_string()));
+    }
+    for (k, v) in vals {
+        put = put.expression_attribute_values(k, v);
+    }
+    match put.send().await {
+        Ok(_) => true,
+        Err(e) => {
+            let lost = e
+                .as_service_error()
+                .map(|se| se.is_conditional_check_failed_exception())
+                .unwrap_or(false);
+            if !lost {
+                warn!(sk, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Stalled releases: could not claim the record");
+            }
+            false
+        }
+    }
 }
 
 async fn send(state: &WorkerState, msg: &ReleaseStepsMessage, delay: i32) -> bool {
@@ -886,7 +1377,7 @@ async fn send(state: &WorkerState, msg: &ReleaseStepsMessage, delay: i32) -> boo
 /// schedules the next tick while anything is left.
 pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), BoxError> {
     let (owner, repo, pr) = (&msg.repo_owner, &msg.repo_name, msg.pr_number);
-    let Some(rec) = load(state, &msg.team_id, owner, repo, pr).await? else {
+    let Some((rec, meta)) = load_meta(state, &msg.team_id, owner, repo, pr).await? else {
         return Ok(());
     };
     if rec.chain_id != msg.chain_id || rec.parked {
@@ -898,17 +1389,41 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
         Err(e) => {
             // A tick that failed (GitHub's budget held, a GitHub error) never
             // ends the release: the same chain is tried again, at the reset
-            // when GitHub asked to wait.
-            if now() - armed_at <= MAX_AGE_SECS {
+            // when GitHub asked to wait. A resumed chain's failed tick is
+            // left to the sweep, which counts it and stops after
+            // `MAX_RESUMES` in a row.
+            let limited = crate::clients::github::rate_limited(&*e);
+            let d = retry_delay(limited);
+            let again = retry_after_failure(now() - armed_at, meta.resume_attempts, limited);
+            let next_at = if again { now() + i64::from(d) } else { 0 };
+            note_failure(
+                state,
+                &msg.team_id,
+                (owner, repo, pr),
+                &meta,
+                common::truncate_str(e.to_string().trim(), 300),
+                next_at,
+            )
+            .await;
+            if again {
                 let mut next_msg = msg.clone();
                 next_msg.attempts += 1;
-                let d = retry_delay(crate::clients::github::rate_limited(&*e));
                 warn!(pr, delay = d, error = %e, "release: the tick failed; trying again");
                 send(state, &next_msg, d).await;
+            } else {
+                warn!(pr, error = %e, "release: the tick failed; the stalled-release sweep looks again");
             }
             Err(e)
         }
     }
+}
+
+/// Whether a failed tick's chain tries again itself: while the release is
+/// young enough, unless the chain is a resume that has not ticked yet
+/// (`resume_attempts` > 0), whose failure the sweep counts. A held GitHub
+/// budget is a wait, never a failure: that chain always waits it out.
+pub fn retry_after_failure(age: i64, resume_attempts: u32, limited: Option<u64>) -> bool {
+    age <= MAX_AGE_SECS && (resume_attempts == 0 || limited.is_some())
 }
 
 /// When a failed tick is tried again: just past GitHub's wait when it asked
@@ -940,11 +1455,20 @@ async fn tick(
     )?;
     let p = github.get_pull_request(owner, repo, pr).await?;
     let merged = p["merged"].as_bool().unwrap_or(false);
+    if rec.installation_id == 0 {
+        rec.installation_id = msg.installation_id;
+    }
+    if rec.run_id.is_empty() {
+        rec.run_id = msg.run_id.clone();
+    }
     if p["state"].as_str() == Some("closed") && !merged {
         info!(
             pr,
             "release: the pull request closed without merging; release stopped"
         );
+        // Recorded, so the stalled-release sweep never resumes it.
+        rec.closed = true;
+        save(state, &msg.team_id, owner, repo, pr, &rec, 0).await?;
         return Ok(());
     }
     let merge_sha = p["merge_commit_sha"].as_str().unwrap_or("").to_string();
@@ -1013,9 +1537,6 @@ async fn tick(
                     .await;
                     continue;
                 }
-                // The team releases merged changes itself (its batched release
-                // tag): the production deploy goes out in that tag, with no
-                // card of its own, and is followed to the end.
                 if merged && s.kind == Kind::Deploy && matches!(s.trigger, Some(On::Tag(_))) {
                     let cfg = super::review_actions::OnApproveConfig::load(
                         state,
@@ -1024,18 +1545,35 @@ async fn tick(
                         repo,
                     )
                     .await;
+                    // A release tag already holds the merge (a later tag
+                    // shipped it, a person tagged it, the tick chain stopped
+                    // and was resumed): it shipped in that tag, and the step
+                    // follows that tag's deploy. No tag is cut and no card
+                    // is asked for a change already released; a card asked
+                    // before it shipped expires.
+                    match tag_holding(&github, owner, repo, &cfg.tag_prefix, &merge_sha).await {
+                        Ok(Some((tag, sha))) => {
+                            if s.status == Status::Approval && !s.approval_id.is_empty() {
+                                retire_card(state, &msg.team_id, &s.approval_id, &tag).await;
+                            }
+                            follow_shipped(&mut rec.steps[i], &tag, &sha);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Unknown whether it shipped: nothing is cut or
+                            // asked this tick; the next one looks again.
+                            warn!(pr, error = %e, "release: could not read the release tags");
+                            continue;
+                        }
+                    }
+                    // The team releases merged changes itself (its batched
+                    // release tag): the production deploy goes out in that
+                    // tag, with no card of its own, and is followed to the
+                    // end.
                     if cfg.auto_tag {
                         let base = rec.base_branch.clone();
-                        team_release(
-                            state,
-                            &github,
-                            msg,
-                            &cfg,
-                            &base,
-                            &mut rec.steps[i],
-                            &merge_sha,
-                        )
-                        .await;
+                        team_release(state, msg, &cfg, &base, &mut rec.steps[i]).await;
                         continue;
                     }
                 }
@@ -1105,7 +1643,11 @@ async fn tick(
     if again.is_some() && age > MAX_AGE_SECS {
         rec.parked = true;
     }
-    save(state, &msg.team_id, owner, repo, pr, &rec).await?;
+    let next_at = match (again, rec.parked) {
+        (Some(d), false) => now() + i64::from(d),
+        _ => 0,
+    };
+    save(state, &msg.team_id, owner, repo, pr, &rec, next_at).await?;
     let after = rec.lines();
     if after != before {
         let body = p["body"].as_str().unwrap_or("");
@@ -1138,7 +1680,7 @@ async fn tick(
     // and on its ticket: deployed (in which tag, when), or that it failed.
     if !msg.run_id.is_empty() {
         for (s, w) in rec.steps.iter().zip(&was) {
-            if let Some(line) = deploy_outcome_line(s, *w, owner, repo, chrono::Utc::now()) {
+            if let Some(line) = deploy_outcome_line(s, *w, owner, repo, said_at(s)) {
                 super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
                 say_on_ticket(state, &github, &msg.team_id, &msg.run_id, &line).await;
             }
@@ -1378,6 +1920,9 @@ async fn check(
         return;
     };
     s.run_id = run["id"].as_u64().unwrap_or(0);
+    if run_outcome(run).is_some() {
+        s.finished_at = finished_at(run);
+    }
     match run_outcome(run) {
         None => {
             s.detail = format!(
@@ -1631,6 +2176,167 @@ mod tests {
         let a = gate_args("o", "r", 7, &s[0]);
         assert_eq!(a, gate_args("o", "r", 7, &s[0]));
         assert_eq!(a["environment"], "staging");
+    }
+
+    fn record(steps: Vec<Step>) -> Record {
+        Record {
+            steps,
+            chain_id: "c1".into(),
+            armed_at: 1_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stopped_chain_with_work_left_is_picked() {
+        let t = 100_000;
+        let rec = record(plan());
+        // A tick is due ahead, or only just past due: in flight.
+        let due = |at| Meta {
+            write_id: "w".into(),
+            updated_at: Some(at - 60),
+            next_tick_at: Some(at),
+            ..Default::default()
+        };
+        assert_eq!(stall(&rec, &due(t + 60), t), Stall::Live);
+        assert_eq!(stall(&rec, &due(t - 60), t), Stall::Live);
+        // Past due by more than the grace: stopped.
+        assert_eq!(
+            stall(&rec, &due(t - STALL_GRACE_SECS - 1), t),
+            Stall::Resume
+        );
+        // No tick queued (a resumed chain's failed tick) with work left.
+        assert_eq!(stall(&rec, &due(0), t), Stall::Resume);
+        // An older record: judged by its last write.
+        let old = Meta {
+            updated_at: Some(t - 600),
+            ..Default::default()
+        };
+        assert_eq!(stall(&rec, &old, t), Stall::Live);
+        let old = Meta {
+            updated_at: Some(t - 3 * 3600),
+            ..Default::default()
+        };
+        assert_eq!(stall(&rec, &old, t), Stall::Resume);
+        // Nothing left, held, parked or closed: never resumed.
+        let mut done = plan();
+        for s in done.iter_mut() {
+            s.status = Status::Done;
+        }
+        assert_eq!(stall(&record(done), &old, t), Stall::Live);
+        let mut held = plan();
+        set(&mut held, "expand_staging", Status::Declined);
+        assert_eq!(stall(&record(held), &old, t), Stall::Live);
+        let mut parked = record(plan());
+        parked.parked = true;
+        assert_eq!(stall(&parked, &old, t), Stall::Live);
+        let mut closed = record(plan());
+        closed.closed = true;
+        assert_eq!(stall(&closed, &old, t), Stall::Live);
+    }
+
+    #[test]
+    fn a_claim_holds_only_against_the_item_it_read() {
+        let read = Meta {
+            write_id: "w1".into(),
+            updated_at: Some(50),
+            next_tick_at: Some(10),
+            ..Default::default()
+        };
+        let (cond, vals) = read.unchanged();
+        assert_eq!(cond, "write_id = :seen");
+        assert_eq!(vals[0].1, AttributeValue::S("w1".into()));
+        // A tick or another sweep wrote it since: the claim fails.
+        let written = Meta {
+            write_id: "w2".into(),
+            ..read.clone()
+        };
+        assert!(read.still(&read) && !read.still(&written));
+        // An older item without a write id: its last write time, and still
+        // no write id (a tick that saved in the same second added one).
+        let legacy = Meta {
+            updated_at: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(
+            legacy.unchanged().0,
+            "attribute_not_exists(write_id) AND updated_at = :seen"
+        );
+        assert!(legacy.still(&legacy));
+        assert!(!legacy.still(&Meta {
+            write_id: "w9".into(),
+            updated_at: Some(50),
+            ..Default::default()
+        }));
+        // The resume gets a new chain: a late tick of the old one is dropped
+        // by `run`'s chain check.
+        let rec = record(plan());
+        let fresh = resumed(&rec, 9, "r", 2_000);
+        assert_ne!(fresh.chain_id, rec.chain_id);
+        let src = include_str!("release_run.rs");
+        let run = &src[src.find("pub async fn run(").unwrap()..];
+        assert!(run.contains("if rec.chain_id != msg.chain_id || rec.parked"));
+    }
+
+    #[test]
+    fn a_merge_already_in_a_tag_is_followed_not_tagged() {
+        let mut s = plan()
+            .into_iter()
+            .find(|s| s.id == "deploy_production")
+            .unwrap();
+        s.status = Status::Approval;
+        s.approval_id = "a1".into();
+        let looked = vec![
+            (("v3.1.0".to_string(), "s310".to_string()), true),
+            (("v3.0.0".to_string(), "s300".to_string()), false),
+        ];
+        let (tag, sha) = first_tag_holding(&looked).unwrap();
+        follow_shipped(&mut s, &tag, &sha);
+        assert_eq!(s.status, Status::Running);
+        assert_eq!((s.tag.as_str(), s.tag_sha.as_str()), ("v3.1.0", "s310"));
+        assert!(approval_line(std::slice::from_ref(&s)).is_none());
+        // The newest tag doesn't hold it: none does.
+        assert!(first_tag_holding(&looked[1..]).is_none());
+        assert!(first_tag_holding(&[]).is_none());
+        // Its outcome is said at the time the run finished.
+        let run = serde_json::json!({"status": "completed", "conclusion": "success",
+            "updated_at": "2030-01-02T03:04:05Z"});
+        s.finished_at = finished_at(&run);
+        s.status = Status::Done;
+        assert_eq!(said_at(&s).format("%H:%M").to_string(), "03:04");
+        let line = deploy_outcome_line(&s, Status::Running, "o", "r", said_at(&s)).unwrap();
+        assert!(line.starts_with("Deployed to production in `v3.1.0` at 03:04 UTC"));
+    }
+
+    #[test]
+    fn resumes_stop_after_the_cap_with_their_error() {
+        let rec = record(plan());
+        let mut m = Meta {
+            updated_at: Some(0),
+            next_tick_at: Some(0),
+            ..Default::default()
+        };
+        for n in 0..MAX_RESUMES {
+            m.resume_attempts = n;
+            assert_eq!(stall(&rec, &m, 100_000), Stall::Resume);
+        }
+        m.resume_attempts = MAX_RESUMES;
+        assert_eq!(stall(&rec, &m, 100_000), Stall::GaveUp);
+        // A resume that left no error says the last one's tick never ran.
+        m.resume_attempts = 1;
+        assert_eq!(
+            resume_error(&m),
+            "the tick sent on the last resume never ran"
+        );
+        m.last_error = "GitHub answered 502".into();
+        assert_eq!(resume_error(&m), "GitHub answered 502");
+        assert_eq!(resume_error(&Meta::default()), "");
+        // A resumed chain's failed tick is the sweep's to count; a first
+        // chain tries again itself, and a held budget is always a wait.
+        assert!(!retry_after_failure(10, 1, None));
+        assert!(retry_after_failure(10, 1, Some(60)));
+        assert!(retry_after_failure(10, 0, None));
+        assert!(!retry_after_failure(MAX_AGE_SECS + 1, 0, None));
     }
 
     #[test]

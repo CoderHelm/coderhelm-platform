@@ -711,6 +711,20 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             )
             .await;
             info!(opened = ?opened, "Release catch-up done");
+            // Release steps whose tick chain stopped with work left (a lost
+            // message, a failed send, a crash) are resumed with one normal
+            // tick each, claimed so two sweeps never both resume one.
+            let stalled = as_sweep(
+                who::SWEEP_PR_WATCH,
+                passes::release_run::resume_stalled(&state),
+            )
+            .await;
+            info!(
+                resumed = ?stalled.resumed,
+                gave_up = stalled.gave_up,
+                left = stalled.left,
+                "Stalled releases done"
+            );
         }
         models::WorkerMessage::CustomerGuard(msg) => {
             // A check the guard could not set is tried again later; until it
