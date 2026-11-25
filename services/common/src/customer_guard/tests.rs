@@ -268,13 +268,13 @@ fn the_merge_is_refused_while_the_guard_fails_runs_or_is_missing_on_a_public_rep
     let skipped = guard_state(&run("completed", json!("neutral")));
     let other = vec![json!({"name": "Lint", "status": "completed", "conclusion": "failure"})];
     assert_eq!(guard_state(&other), GuardState::Missing);
-    assert!(merge_refusal(failing, true).is_some());
-    assert!(merge_refusal(failing, false).is_some());
-    assert!(merge_refusal(running, true).is_some());
-    assert!(merge_refusal(GuardState::Missing, true).is_some());
-    assert_eq!(merge_refusal(GuardState::Missing, false), None);
-    assert_eq!(merge_refusal(skipped, true), None);
-    assert_eq!(merge_refusal(GuardState::Passing, true), None);
+    assert!(merge_refusal(failing, true, Some(0)).is_some());
+    assert!(merge_refusal(failing, false, Some(0)).is_some());
+    assert!(merge_refusal(running, true, Some(0)).is_some());
+    assert!(merge_refusal(GuardState::Missing, true, Some(0)).is_some());
+    assert_eq!(merge_refusal(GuardState::Missing, false, Some(0)), None);
+    assert_eq!(merge_refusal(skipped, true, Some(0)), None);
+    assert_eq!(merge_refusal(GuardState::Passing, true, Some(0)), None);
 }
 
 #[test]
@@ -285,6 +285,7 @@ fn only_a_members_branch_of_the_repo_itself_is_checked() {
         author_login: login.into(),
         author_type: kind.into(),
         author_association: assoc.into(),
+        author_can_write: false,
     };
     assert!(trusted(&o("example-oss/helmkit", "MEMBER", "dana", "User")));
     assert!(trusted(&o("example-oss/helmkit", "OWNER", "dana", "User")));
@@ -411,4 +412,34 @@ fn the_hosted_side_checks_only_its_operators_repositories() {
     assert!(!checks_repo(false, "Quorvex-Labs", Some("example-oss")));
     assert!(!checks_repo(false, "example-oss", None));
     assert!(!checks_repo(false, "example-oss", Some("")));
+}
+
+#[test]
+fn a_guard_that_never_runs_stops_holding_merges_after_the_grace() {
+    let late = Some(MISSING_GRACE_SECS + 1);
+    assert_eq!(merge_refusal(GuardState::Missing, true, late), None);
+    assert!(merge_refusal(GuardState::Missing, true, None).is_some());
+    assert!(merge_refusal(GuardState::Missing, true, Some(60)).is_some());
+    // A failing or running guard holds the merge however old the head is.
+    assert!(merge_refusal(GuardState::Failing, true, late).is_some());
+    assert!(merge_refusal(GuardState::Running, true, late).is_some());
+}
+
+#[test]
+fn a_member_whose_membership_is_private_is_trusted_by_write_access() {
+    // GitHub shows the app a private member as a contributor.
+    let mut o = Origin {
+        base_repo: "example-oss/helmkit".into(),
+        head_repo: "example-oss/helmkit".into(),
+        author_login: "dana".into(),
+        author_type: "User".into(),
+        author_association: "CONTRIBUTOR".into(),
+        author_can_write: false,
+    };
+    assert!(!trusted(&o));
+    o.author_can_write = true;
+    assert!(trusted(&o));
+    // Write access never trusts a fork.
+    o.head_repo = "dana/helmkit".into();
+    assert!(!trusted(&o));
 }

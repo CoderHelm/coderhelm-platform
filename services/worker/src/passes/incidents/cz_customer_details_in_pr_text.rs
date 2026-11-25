@@ -70,7 +70,7 @@ fn a_leaked_name_fails_with_only_its_place_and_the_fix_turns_it_green() {
         "patch": "@@ -0,0 +1,1 @@\n+Hit velmorafreight.atlassian.net",
     })];
     let (v, hits) = decide(
-        &leaked,
+        &guard::Origin::from_pr(&leaked),
         || sources(&leaked, &msgs, &files, &|_| None),
         &terms,
     );
@@ -95,7 +95,11 @@ fn a_leaked_name_fails_with_only_its_place_and_the_fix_turns_it_green() {
         "MEMBER",
     );
     let msgs = commits("Retry once");
-    let (v, _) = decide(&fixed, || sources(&fixed, &msgs, &[], &|_| None), &terms);
+    let (v, _) = decide(
+        &guard::Origin::from_pr(&fixed),
+        || sources(&fixed, &msgs, &[], &|_| None),
+        &terms,
+    );
     assert_eq!(v.conclusion, "success");
 }
 
@@ -104,8 +108,18 @@ fn a_fork_cannot_use_the_check_to_test_a_name() {
     let terms = guard::derive(&install(), &["example-oss"]);
     let probe = pr("Is Velmora Freight a customer?", "outsider/helmkit", "NONE");
     let plain = pr("Is anyone a customer?", "outsider/helmkit", "NONE");
-    let a = decide(&probe, || panic!("never read"), &terms).0;
-    let b = decide(&plain, || panic!("never read"), &terms).0;
+    let a = decide(
+        &guard::Origin::from_pr(&probe),
+        || panic!("never read"),
+        &terms,
+    )
+    .0;
+    let b = decide(
+        &guard::Origin::from_pr(&plain),
+        || panic!("never read"),
+        &terms,
+    )
+    .0;
     assert_eq!(
         check_body("f00dbabe1234", &a),
         check_body("f00dbabe1234", &b)
@@ -118,7 +132,7 @@ fn coderhelm_never_merges_while_the_guard_fails() {
     let failing = vec![
         json!({"name": guard::CHECK_NAME, "id": 1, "started_at": "t", "status": "completed", "conclusion": "failure"}),
     ];
-    assert!(merge_refusal(guard_state(&failing), true).is_some());
+    assert!(merge_refusal(guard_state(&failing), true, Some(0)).is_some());
     // The one merge call checks the guard before it merges.
     let client = include_str!("../../clients/github.rs");
     let merge = client

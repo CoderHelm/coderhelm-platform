@@ -691,6 +691,12 @@ pub struct Origin {
     pub author_type: String,
     /// GitHub's `author_association` (`OWNER`, `MEMBER`, `COLLABORATOR`, ...).
     pub author_association: String,
+    /// The author has write access or more to the repository, from GitHub's
+    /// collaborator permission. GitHub shows an app an organization member
+    /// whose membership is private as a plain contributor in
+    /// `author_association`, so membership alone misses most members; write
+    /// access is what lets someone push a branch to the repository at all.
+    pub author_can_write: bool,
 }
 
 impl Origin {
@@ -702,6 +708,7 @@ impl Origin {
             author_login: s(&pr["user"]["login"]),
             author_type: s(&pr["user"]["type"]),
             author_association: s(&pr["author_association"]),
+            author_can_write: false,
         }
     }
 }
@@ -714,12 +721,17 @@ pub fn is_own_app(login: &str, user_type: &str) -> bool {
 
 /// Pure: may the guard evaluate this pull request's text. Only a branch of
 /// the repository itself (never a fork), opened by an organization member
-/// or owner, or by CoderHelm's own app. Anything else is skipped with one
+/// or owner, someone with write access to the repository, or CoderHelm's
+/// own app. Anything else is skipped with one
 /// fixed output, so the check is never an oracle for outsiders.
 pub fn trusted(o: &Origin) -> bool {
-    let same_repo = !o.head_repo.is_empty() && o.head_repo.eq_ignore_ascii_case(&o.base_repo);
     let member = matches!(o.author_association.as_str(), "OWNER" | "MEMBER");
-    same_repo && (member || is_own_app(&o.author_login, &o.author_type))
+    same_repo(o) && (member || o.author_can_write || is_own_app(&o.author_login, &o.author_type))
+}
+
+/// Pure: is the head a branch of the repository itself (never a fork).
+pub fn same_repo(o: &Origin) -> bool {
+    !o.head_repo.is_empty() && o.head_repo.eq_ignore_ascii_case(&o.base_repo)
 }
 
 /// Pure: does the guard check this repository's pull requests. A
@@ -856,16 +868,29 @@ pub fn guard_state(runs: &[serde_json::Value]) -> GuardState {
     }
 }
 
-/// Pure: why CoderHelm won't merge, from the guard's state on the head and
+/// How long a guarded head may wait for the guard's first run before a
+/// merge goes ahead without it: longer than the guard's own retries take, so
+/// only a guard that never runs at all (it is not set up for the
+/// installation, say) stops holding merges. CI then checks the PR with its
+/// own rules (`.github/scripts/customer_guard_gate.py`).
+pub const MISSING_GRACE_SECS: i64 = 60 * 60;
+
+/// Pure: why CoderHelm won't merge, from the guard's state on the head,
 /// whether the guard checks this pull request (a public repository it
-/// [`checks_repo`]). None: the guard doesn't hold it back.
-pub fn merge_refusal(state: GuardState, guarded: bool) -> Option<&'static str> {
+/// [`checks_repo`]), and how long ago the head was committed (`None`:
+/// unknown). None: the guard doesn't hold it back. A failing or running
+/// guard always holds it; a missing one only within [`MISSING_GRACE_SECS`].
+pub fn merge_refusal(
+    state: GuardState,
+    guarded: bool,
+    head_age_secs: Option<i64>,
+) -> Option<&'static str> {
     match state {
         GuardState::Failing => {
             Some("Customer details guard is failing: the PR text carries a customer detail")
         }
         GuardState::Running => Some("Customer details guard is still running"),
-        GuardState::Missing if guarded => {
+        GuardState::Missing if guarded && head_age_secs.is_none_or(|a| a < MISSING_GRACE_SECS) => {
             Some("Customer details guard has not run on this commit yet")
         }
         _ => None,
