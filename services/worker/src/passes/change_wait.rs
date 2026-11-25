@@ -212,52 +212,48 @@ pub struct Checked {
 /// page saying why (the dependency's run stopped).
 pub async fn check_all(state: &WorkerState, team: Option<&str>) -> Checked {
     let mut out = Checked::default();
-    let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    for _ in 0..200 {
-        let res = match team {
-            Some(t) => state
-                .dynamo
-                .query()
-                .table_name(&state.config.runs_table_name)
-                .index_name("status-index")
-                .key_condition_expression("team_id = :t AND begins_with(status_run_id, :p)")
-                .expression_attribute_values(":t", attr_s(t))
-                .expression_attribute_values(":p", attr_s(&format!("{AWAITING_CHANGE}#")))
-                .set_exclusive_start_key(start.take())
-                .send()
-                .await
-                .map(|p| (p.items().to_vec(), p.last_evaluated_key().cloned()))
-                .map_err(|e| e.to_string()),
-            None => state
-                .dynamo
-                .scan()
-                .table_name(&state.config.runs_table_name)
-                .filter_expression("#s = :w")
-                .expression_attribute_names("#s", "status")
-                .expression_attribute_values(":w", attr_s(AWAITING_CHANGE))
-                .set_exclusive_start_key(start.take())
-                .send()
-                .await
-                .map(|p| (p.items().to_vec(), p.last_evaluated_key().cloned()))
-                .map_err(|e| e.to_string()),
-        };
-        let (page, next) = match res {
-            Ok(x) => x,
-            Err(e) => {
-                warn!(error = %e, "Waiting runs couldn't be listed");
-                break;
-            }
-        };
-        items.extend(
-            page.into_iter()
-                .filter(|i| s(i, "status") == AWAITING_CHANGE),
-        );
-        match next {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
+    // Read to the last page either way: one team's waiting runs by the
+    // status index, or every team's runs by key (a capped scan of the runs
+    // table stopped before the later runs).
+    let read = match team {
+        Some(t) => {
+            super::team_runs::read_all(|start| async move {
+                state
+                    .dynamo
+                    .query()
+                    .table_name(&state.config.runs_table_name)
+                    .index_name("status-index")
+                    .key_condition_expression("team_id = :t AND begins_with(status_run_id, :p)")
+                    .expression_attribute_values(":t", attr_s(t))
+                    .expression_attribute_values(":p", attr_s(&format!("{AWAITING_CHANGE}#")))
+                    .set_exclusive_start_key(start)
+                    .send()
+                    .await
+                    .map(|p| (p.items().to_vec(), p.last_evaluated_key().cloned()))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+        }
+        None => {
+            let filter = super::team_runs::Filter {
+                expr: "#s = :w",
+                names: vec![("#s", "status")],
+                values: vec![(":w", attr_s(AWAITING_CHANGE))],
+                projection: None,
+            };
+            Ok(super::team_runs::matching(state, "Waiting runs", &filter).await)
+        }
+    };
+    let items: Vec<HashMap<String, AttributeValue>> = match read {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(error = %e, "Waiting runs couldn't be listed");
+            Vec::new()
         }
     }
+    .into_iter()
+    .filter(|i| s(i, "status") == AWAITING_CHANGE)
+    .collect();
     out.waiting = items.len();
     for item in items {
         match check_one(state, &item).await {

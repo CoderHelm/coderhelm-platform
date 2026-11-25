@@ -800,33 +800,18 @@ pub async fn self_heal_sweep(state: &WorkerState) -> SweepReport {
     let version = super::proof::checks_version();
     let mut report = SweepReport::default();
     let since = (chrono::Utc::now() - chrono::Duration::days(SWEEP_DAYS)).to_rfc3339();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    let mut found: Vec<HashMap<String, AttributeValue>> = Vec::new();
-    for _ in 0..200 {
-        let page = match state
-            .dynamo
-            .scan()
-            .table_name(&state.config.runs_table_name)
-            .filter_expression("#s = :failed AND updated_at >= :since")
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":failed", attr_s(common::run_status::FAILED))
-            .expression_attribute_values(":since", attr_s(&since))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Self-heal sweep: scan failed");
-                break;
-            }
-        };
-        found.extend(page.items().iter().cloned());
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
-        }
-    }
+    // Each team's runs, read by key to the last page: a capped scan of the
+    // runs table stopped before the later runs.
+    let filter = super::team_runs::Filter {
+        expr: "#s = :failed AND updated_at >= :since",
+        names: vec![("#s", "status")],
+        values: vec![
+            (":failed", attr_s(common::run_status::FAILED)),
+            (":since", attr_s(&since)),
+        ],
+        projection: None,
+    };
+    let found = super::team_runs::matching(state, "Self-heal sweep", &filter).await;
     report.failed = found.len();
     for item in found {
         if report.resumed + report.handed >= SWEEP_MAX {

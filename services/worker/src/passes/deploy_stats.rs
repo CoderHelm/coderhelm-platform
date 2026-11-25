@@ -71,8 +71,6 @@ const CAP_DELAY_SECS: u64 = 60;
 const MAX_FAILED_PASSES: i64 = 8;
 /// The most deployments of one commit read for a run's deploys.
 const MAX_DEPLOYMENTS: usize = 10;
-/// The most progress items one sweep reads.
-const SWEEP_MAX_PAGES: usize = 50;
 
 /// GitHub refused because the app has no access to Actions here.
 fn is_no_access(e: &(dyn std::error::Error + Send + Sync)) -> bool {
@@ -941,8 +939,9 @@ async fn update(
         }
         expr.push_str(&format!(" REMOVE {}", names.join(", ")));
     }
-    if let Err(e) = req.update_expression(expr).send().await {
-        warn!(sk, error = %e, "Deploys backfill: could not write a marker");
+    match req.update_expression(expr).send().await {
+        Ok(_) => index_team(state, team_id, sk).await,
+        Err(e) => warn!(sk, error = %e, "Deploys backfill: could not write a marker"),
     }
 }
 
@@ -986,6 +985,9 @@ async fn claim_lease(
         .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
         .send()
         .await;
+    if r.is_ok() {
+        index_team(state, team_id, ds::BACKFILL_PROGRESS_SK).await;
+    }
     match r {
         Ok(out) => Ok(Some(
             out.attributes()
@@ -1157,45 +1159,40 @@ pub fn should_resume(progress: &Item, now: i64) -> bool {
 /// Runs with the 15-minute sweep; the lease keeps it from doubling a pass.
 pub async fn sweep(state: &WorkerState) -> usize {
     let now = Utc::now().timestamp();
-    let mut start: Option<Item> = None;
     let mut teams = Vec::new();
     let mut health = Vec::new();
-    for _ in 0..SWEEP_MAX_PAGES {
-        // One scan reads both: unfinished backfills, and every team's deploy
-        // health item (`check_health`).
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("(sk = :sk AND attribute_not_exists(done)) OR sk = :h")
-            .expression_attribute_values(":sk", av(ds::BACKFILL_PROGRESS_SK))
-            .expression_attribute_values(":h", av(ds::health::SK))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
+    // The teams with a progress or health item come from the settings
+    // index, and their items are read by key: the settings table is never
+    // scanned (a capped scan of it stopped before reaching them).
+    let table = &state.config.settings_table_name;
+    let members =
+        match common::settings_index::members(&state.dynamo, table, &ds::index_spec()).await {
+            Ok(m) => m,
             Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Deploys backfill sweep: scan failed");
-                break;
+                warn!(error = %e, "Deploys backfill sweep: could not read the index");
+                return 0;
             }
         };
-        for item in page.items() {
-            let Some(pk) = item.get("pk").and_then(|v| v.as_s().ok()) else {
+    for pk in members {
+        let (progress, health_item) = match team_items(state, &pk).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(team_id = %pk, error = %e, "Deploys backfill sweep: could not read the team's items");
                 continue;
-            };
-            let sk = item.get("sk").and_then(|v| v.as_s().ok());
-            if sk.is_some_and(|s| s == ds::health::SK) {
-                if health_due(item, now) {
-                    health.push((pk.clone(), item.clone()));
-                }
-            } else if should_resume(item, now) {
-                teams.push((pk.clone(), gap_open(Some(item)).is_some()));
             }
+        };
+        if progress.is_none() && health_item.is_none() {
+            common::settings_index::remove(&state.dynamo, table, ds::INDEX, &pk).await;
+            continue;
         }
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
+        if let Some(item) = health_item.filter(|i| health_due(i, now)) {
+            health.push((pk.clone(), item));
+        }
+        // A finished backfill (`done` written) is never resumed.
+        if let Some(item) = progress.filter(|i| !i.contains_key("done")) {
+            if should_resume(&item, now) {
+                teams.push((pk.clone(), gap_open(Some(&item)).is_some()));
+            }
         }
     }
     let mut started = 0;
@@ -1237,6 +1234,45 @@ pub async fn sweep(state: &WorkerState) -> usize {
     started
 }
 
+/// A team's backfill progress item and deploy health item, read by key.
+async fn team_items(
+    state: &WorkerState,
+    team_id: &str,
+) -> Result<(Option<Item>, Option<Item>), String> {
+    let get = |sk: &'static str| async move {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(team_id))
+            .key("sk", av(sk))
+            .send()
+            .await
+            .map(|r| r.item().cloned())
+            .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())
+    };
+    let (p, h) = tokio::join!(get(ds::BACKFILL_PROGRESS_SK), get(ds::health::SK));
+    Ok((p?, h?))
+}
+
+/// Names the team in the sweep's index ([`ds::INDEX`]) when `sk` is one of
+/// the items the sweep reads. A failed add waits for the daily rebuild.
+async fn index_team(state: &WorkerState, team_id: &str, sk: &str) {
+    if sk != ds::BACKFILL_PROGRESS_SK && sk != ds::health::SK {
+        return;
+    }
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        ds::INDEX,
+        team_id,
+    )
+    .await
+    {
+        warn!(team_id, error = %e, "Deploys: could not add the team to the sweep index");
+    }
+}
+
 fn item_s(i: &Item, k: &str) -> String {
     i.get(k)
         .and_then(|v| v.as_s().ok())
@@ -1276,7 +1312,8 @@ async fn records_since(
 ) -> Result<Vec<(DateTime<Utc>, String)>, String> {
     let mut out = Vec::new();
     let mut start: Option<Item> = None;
-    for _ in 0..SWEEP_MAX_PAGES {
+    // Every page: a cap would leave the newest records out.
+    loop {
         let page = state
             .dynamo
             .query()

@@ -1489,6 +1489,7 @@ pub mod stop_pr;
 pub mod supervisor;
 pub mod support_sync;
 pub mod syntax_check;
+pub mod team_runs;
 pub(crate) mod terraform;
 #[allow(dead_code)]
 mod test;

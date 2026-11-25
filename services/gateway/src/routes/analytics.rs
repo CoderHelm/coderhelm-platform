@@ -1506,6 +1506,18 @@ async fn note_bot_run(state: &AppState, team_id: &str, run: &Value) {
         .await
     {
         warn!(error = %e, "Could not count a workflow run for deploy health");
+        return;
+    }
+    // The worker's sweep finds the health item through this index.
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        common::deploy_stats::INDEX,
+        team_id,
+    )
+    .await
+    {
+        warn!(error = %e, "Could not add the team to the deploy sweep index");
     }
 }
 

@@ -2430,45 +2430,31 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     let mut report = SweepReport::default();
     let now = chrono::Utc::now();
     let cutoff = (now - chrono::Duration::days(SWEEP_WINDOW_DAYS)).to_rfc3339();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    let mut candidates = Vec::new();
-    for _ in 0..200 {
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.runs_table_name)
-            .filter_expression(
-                "#s IN (:done, :old_done, :held) AND pr_number > :zero AND updated_at >= :cut \
-                 AND attribute_not_exists(draft_settled)",
-            )
-            .projection_expression(
-                "team_id, run_id, #s, pr_number, pr_url, repo, installation_id, draft_hold",
-            )
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))
-            .expression_attribute_values(":old_done", attr_s(common::run_status::SUCCESS))
-            .expression_attribute_values(
+    // Each team's runs, read by key to the last page: a capped scan of the
+    // runs table stopped before the later runs.
+    let filter = super::team_runs::Filter {
+        expr: "#s IN (:done, :old_done, :held) AND pr_number > :zero AND updated_at >= :cut \
+               AND attribute_not_exists(draft_settled)",
+        names: vec![("#s", "status")],
+        values: vec![
+            (":done", attr_s(common::run_status::COMPLETED)),
+            (":old_done", attr_s(common::run_status::SUCCESS)),
+            (
                 ":held",
                 AttributeValue::S(common::run_status::NEEDS_INPUT.to_string()),
-            )
-            .expression_attribute_values(":zero", attr_n(0))
-            .expression_attribute_values(":cut", attr_s(&cutoff))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Draft sweep scan failed");
-                break;
-            }
-        };
-        candidates.extend(page.items().iter().filter_map(candidate_of));
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
-        }
-    }
+            ),
+            (":zero", attr_n(0)),
+            (":cut", attr_s(&cutoff)),
+        ],
+        projection: Some(
+            "team_id, run_id, #s, pr_number, pr_url, repo, installation_id, draft_hold",
+        ),
+    };
+    let candidates: Vec<_> = super::team_runs::matching(state, "Draft sweep", &filter)
+        .await
+        .iter()
+        .filter_map(candidate_of)
+        .collect();
     let mut clients: HashMap<u64, GitHubClient> = HashMap::new();
     // Asked before each pull request: a peek is one read, a decision up to
     // `SWEEP_DECISION_REQUESTS`. The sweep never spends the runs' share of
