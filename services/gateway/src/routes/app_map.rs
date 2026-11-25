@@ -330,9 +330,12 @@ pub async fn get_map(
     );
     let now = chrono::Utc::now().timestamp();
     // The index is written after the map (and the page's copy before the
-    // index): one older than the map belongs to an earlier map.
+    // index): one older than the map belongs to an earlier map. A copy made
+    // the way an earlier release made it is written again from the map.
     let index = match (index, written) {
-        (Some((idx, at)), Some(map_at)) if at + 1 >= map_at => Some(idx),
+        (Some((idx, at)), Some(map_at)) if at + 1 >= map_at && idx.copy >= am::COPY_VERSION => {
+            Some(idx)
+        }
         (_, Some(_)) if !status_only => backfill(&state, team).await,
         _ => None,
     };
@@ -525,9 +528,10 @@ async fn one(
     kind: &str,
     q: &MapQuery,
 ) -> Result<Json<Value>, StatusCode> {
-    let graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
+    let mut graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
+    am::name_by_repo(&mut graph);
     view(&graph, kind, q).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -1483,6 +1487,69 @@ mod tests {
         assert!(graph(State(state.clone()), Extension(admin("TEAM#marina")))
             .await
             .is_err());
+    }
+
+    /// A page's copy made by an earlier release (its System cards still under
+    /// their old names) is written again from the stored map on the next
+    /// read, once: the cards are titled by their repositories without a new
+    /// build.
+    #[tokio::test]
+    async fn an_earlier_releases_copy_is_named_by_repository_without_a_build() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#harbor";
+        let g = harbor();
+        f.store.put_object(
+            "bucket",
+            &am::graph_key(team),
+            am::gzip(g.to_string().as_bytes()),
+        );
+        let old_view = am::for_viewer(g.clone(), "then");
+        f.store.put_object(
+            "bucket",
+            &am::view_key(team),
+            am::gzip(old_view.to_string().as_bytes()),
+        );
+        let old_index = am::MapIndex {
+            copy: 0,
+            ..am::MapIndex::of(&g)
+        };
+        f.store.put_object(
+            "bucket",
+            &am::index_key(team),
+            am::gzip(&serde_json::to_vec(&old_index).unwrap()),
+        );
+        let body = read_map(&state, team).await;
+        assert!(body["graph_url"].is_string());
+        let view = f.store.object("bucket", &am::view_key(team)).unwrap();
+        let copy: Value =
+            serde_json::from_slice(&am::gunzip(&view.body, am::MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let api = copy["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "api")
+            .unwrap();
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        let (idx, _) = am::load_index(&state.s3, "bucket", team).await.unwrap();
+        assert_eq!(idx.copy, am::COPY_VERSION);
+        // Read again: not written again.
+        read_map(&state, team).await;
+        assert_eq!(
+            f.store.object("bucket", &am::view_key(team)).unwrap().at,
+            view.at
+        );
+        // The page's lookups name the part the same way.
+        let q = MapQuery {
+            id: "api".into(),
+            ..Default::default()
+        };
+        let Json(p) = part(State(state.clone()), Extension(admin(team)), Query(q))
+            .await
+            .unwrap();
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
     }
 
     /// A page view at a large team's map size, through the real handler: the

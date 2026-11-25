@@ -2156,6 +2156,59 @@ mod tests {
         );
     }
 
+    /// The map tools on /mcp name each System part by its repository, the
+    /// way the App map page does, and keep the plain role beside it.
+    #[test]
+    fn the_map_tools_name_parts_by_their_repositories() {
+        let answer = |tool: &str, input: Value| -> Value {
+            let read = read_of(tool, &input).unwrap();
+            let (text, _) =
+                map_read(Some(harbor("harbor")), &mut Registry::default(), &read).unwrap();
+            let body = text.split_once("] ").unwrap().1;
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+        };
+        let o = answer(MAP_OVERVIEW, json!({}));
+        let part = |id: &str| {
+            o["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            (
+                part("api")["label"].clone(),
+                part("api")["role"].clone(),
+                part("api")["repos"].clone()
+            ),
+            (
+                json!("harbor-api"),
+                json!("Booking service"),
+                json!(["harbor-api"])
+            )
+        );
+        assert_eq!(part("web")["label"], "harbor-web");
+        assert_eq!(part("web")["role"], "Harbor website");
+        // An outside service keeps its own name and has no role.
+        assert_eq!(part("stripe")["label"], "Stripe");
+        assert!(part("stripe").get("role").is_none());
+        let p = answer(MAP_PART, json!({ "id": "api" }));
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
+        assert_eq!(p["part"]["repos"], json!(["harbor-api"]));
+        let f = answer(MAP_FIND, json!({ "query": "harbor-api" }));
+        assert!(
+            f["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == "api" && p["label"] == "harbor-api"),
+            "{f}"
+        );
+    }
+
     /// A journey on /mcp: the same lookup as Chat's, every step citing its
     /// file and line, cited back to the App map page.
     #[test]

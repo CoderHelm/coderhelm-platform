@@ -194,11 +194,14 @@ impl RunMap {
                 .flatten()
                 .filter(|n| n["parent"].is_null())
                 .map(|n| {
+                    let kind = match n["role"].as_str() {
+                        Some(role) => format!("{}, {role}", n["kind"].as_str().unwrap_or("")),
+                        None => n["kind"].as_str().unwrap_or("").to_string(),
+                    };
                     format!(
-                        "- {} `{}` ({}): {}",
+                        "- {} `{}` ({kind}): {}",
                         n["label"].as_str().unwrap_or(""),
                         n["id"].as_str().unwrap_or(""),
-                        n["kind"].as_str().unwrap_or(""),
                         common::truncate_str(n["summary"].as_str().unwrap_or(""), 140)
                     )
                 })
@@ -722,7 +725,10 @@ mod tests {
         let m = api();
         let s = m.planner_section(&["src/bookings.js".into(), "src/nowhere.js".into()]);
         assert!(s.contains("harbor/harbor-web (`harbor-web/`)"), "{s}");
-        assert!(s.contains("- Booking service `api` (service)"), "{s}");
+        assert!(
+            s.contains("- harbor-api `api` (service, Booking service)"),
+            "{s}"
+        );
         assert!(
             s.contains("The ticket's likely files sit in: `api`."),
             "{s}"
