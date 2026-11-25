@@ -5,8 +5,10 @@
 //! check is green. If the repo configures an (operator-set, never hardcoded)
 //! deploy label, it is added once per commit after both keys are in and the
 //! gate waits for that deploy's CI. It NEVER merges on failing, still-running
-//! or unreadable CI. Bound to the reviewed head: a later commit stops the gate
-//! (the review of the new commit re-arms it).
+//! or unreadable CI, nor on a head its base has moved past (the head's green
+//! CI never ran on the merged result): it brings the base in and waits for CI
+//! on that commit (`MergeOutcome::BaseMoved`). Bound to the reviewed head: a
+//! later commit stops the gate (the review of the new commit re-arms it).
 //!
 //! Event-driven, with bounded polling only as a fallback:
 //! - Waiting on people never polls. An approval, a dismissal or a new review
@@ -1805,7 +1807,33 @@ async fn merge(
             set_state(state, msg, STATE_HEAD_MOVED, &reason).await;
             Ok(Next::Stop)
         }
+        MergeOutcome::BaseMoved(base) => {
+            // The base moved since this head's checks ran, whether or not
+            // the branch's rules ask for it to be current: CoderHelm brings
+            // the base in, and the gate goes on on that commit, where CI
+            // runs on the merged result and is read again before merging.
+            info!(
+                pr = msg.pr_number,
+                base = %base,
+                "await-merge: the base moved since the head's checks ran — bringing it in"
+            );
+            lines.push(base_moved_line(&base));
+            let pr = github.get_pull_request(owner, repo, msg.pr_number).await?;
+            keep_current(state, github, msg, record, &pr, BaseNeed::Behind, lines).await
+        }
     }
+}
+
+/// Pure: the status line when the base moved past the head that passed.
+pub(crate) fn base_moved_line(base: &str) -> (Mark, String) {
+    (
+        Mark::Waiting,
+        format!(
+            "`{base}` has commits this branch doesn't, so its checks never ran on the merged \
+             result: CoderHelm merges `{base}` into this branch and merges once the checks pass \
+             on that commit"
+        ),
+    )
 }
 
 /// Why the base has to come in before the PR can merge.
