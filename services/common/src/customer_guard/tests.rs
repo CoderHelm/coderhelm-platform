@@ -443,3 +443,72 @@ fn a_member_whose_membership_is_private_is_trusted_by_write_access() {
     o.head_repo = "dana/helmkit".into();
     assert!(!trusted(&o));
 }
+
+/// Terms of a synthetic install whose customer team is named "Acme Robots".
+fn acme_terms() -> TermSet {
+    let records = InstallRecords {
+        teams: vec![
+            TeamRecords {
+                names: vec!["Acme Robots".into()],
+                project_keys: vec!["ACRB".into()],
+                ..Default::default()
+            },
+            own(),
+        ],
+        install: TeamRecords::default(),
+    };
+    derive(&records, &["example-oss"])
+}
+
+#[test]
+fn a_branch_name_with_a_term_fails_naming_only_the_branch() {
+    let set = acme_terms();
+    let hits = scan(&[Source::Branch("fix/acme-robots-login".into())], &set);
+    assert_eq!(
+        hits,
+        vec![Hit {
+            place: Place::Branch,
+            kind: Kind::TeamName
+        }]
+    );
+    let v = verdict(&hits);
+    assert_eq!(v.conclusion, "failure");
+    assert!(v.annotations.is_empty(), "a branch has no file to annotate");
+    let body = check_body("abc", &v).to_string().to_lowercase();
+    assert!(body.contains("- branch name: "), "{body}");
+    for needle in ["acme", "robots", "acrb", Kind::TeamName.as_str()] {
+        assert!(!body.contains(needle), "{needle} in the check run");
+    }
+}
+
+#[test]
+fn a_branch_name_splits_words_on_slashes_dashes_and_underscores() {
+    let set = acme_terms();
+    for branch in [
+        "fix/acme-robots-login",
+        "fix/acme_robots_login",
+        "acme/robots",
+        "feature/AcmeRobots",
+        "chore/acmerobots-sync",
+        "fix/acrb-12-login",
+    ] {
+        let hits = scan(&[Source::Branch(branch.into())], &set);
+        assert_eq!(hits.len(), 1, "{branch}");
+        assert_eq!(hits[0].place, Place::Branch, "{branch}");
+    }
+    // Words are whole: a term inside a longer word is not one.
+    for branch in ["fix/acmerobotsx", "fix/xacme-robots", "fix/acme-login"] {
+        assert!(
+            scan(&[Source::Branch(branch.into())], &set).is_empty(),
+            "{branch}"
+        );
+    }
+}
+
+#[test]
+fn a_branch_name_of_common_words_passes() {
+    for branch in ["fix/retry-the-sync", "guard_branch_name", "main", ""] {
+        let v = verdict(&scan(&[Source::Branch(branch.into())], &acme_terms()));
+        assert_eq!(v.conclusion, "success", "{branch}");
+    }
+}

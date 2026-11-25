@@ -12,12 +12,15 @@
 //!
 //! A term is matched on word boundaries, ignoring case and the separators
 //! between its words, and inside joined forms ("Acme Robots", "acme-robots",
-//! "AcmeRobots" and "acmerobots" are one term). A term made only of common
+//! "AcmeRobots" and "acmerobots" are one term). The head branch name is read
+//! the same way: its `/`, `-` and `_` separate words, so
+//! `fix/acme-robots-login` carries "Acme Robots". A term made only of common
 //! words ([`is_generic`]), or of three characters or fewer, is skipped; a
 //! Jira project key is matched as a ticket key (`KEY-123`) whatever its length.
 //!
 //! What the guard says in public is only where: "PR text contains a customer
-//! detail" and the place (the title, a body line, a commit, a file and line).
+//! detail" and the place (the title, the branch name, a body line, a commit,
+//! a file and line).
 //! It never names the term or its kind, and it never counts terms.
 //!
 //! Only a pull request whose head is the repository itself (never a fork)
@@ -45,7 +48,7 @@ pub const SKIPPED_SUMMARY: &str =
     "Checked only for pull requests from a branch of this repository by a member of its organization.";
 
 pub const PASSED_TITLE: &str = "No customer details";
-pub const PASSED_SUMMARY: &str = "The title, the body, the commit messages and the added documentation and fixture lines carry no customer details.";
+pub const PASSED_SUMMARY: &str = "The title, the branch name, the body, the commit messages and the added documentation and fixture lines carry no customer details.";
 
 /// What a term is, for the guard's own logs (with the position, never the
 /// text). The check run never shows it.
@@ -480,9 +483,19 @@ pub fn derive(records: &InstallRecords, own_accounts: &[&str]) -> TermSet {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Place {
     Title,
-    Body { line: usize },
-    Commit { sha: String, line: usize },
-    File { path: String, line: usize },
+    /// The pull request's head branch name.
+    Branch,
+    Body {
+        line: usize,
+    },
+    Commit {
+        sha: String,
+        line: usize,
+    },
+    File {
+        path: String,
+        line: usize,
+    },
 }
 
 impl Place {
@@ -490,6 +503,7 @@ impl Place {
     pub fn describe(&self) -> String {
         match self {
             Place::Title => "PR title".to_string(),
+            Place::Branch => "branch name".to_string(),
             Place::Body { line } => format!("PR body line {line}"),
             Place::Commit { sha, line } => {
                 let short: String = sha.chars().take(7).collect();
@@ -504,6 +518,10 @@ impl Place {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Title(String),
+    /// The head branch name (`head.ref`). Its `/`, `-` and `_` part words
+    /// like any other separator, so `fix/acme-robots-login` reads as
+    /// "fix acme robots login".
+    Branch(String),
     Body(String),
     Commit {
         sha: String,
@@ -573,6 +591,11 @@ pub fn scan(sources: &[Source], terms: &TermSet) -> Vec<Hit> {
             Source::Title(t) => {
                 for (_, l) in lines_of(t) {
                     check(Place::Title, l);
+                }
+            }
+            Source::Branch(b) => {
+                for (_, l) in lines_of(b) {
+                    check(Place::Branch, l);
                 }
             }
             Source::Body(b) => {

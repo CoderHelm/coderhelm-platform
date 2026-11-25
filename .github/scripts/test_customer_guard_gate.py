@@ -111,6 +111,18 @@ class Gate(unittest.TestCase):
         self.assertTrue(any("email address" in line for line in lines))
         self.assertFalse(any("zorbmail" in line for line in lines + [why]))
 
+    def test_the_fallback_reads_the_branch_name(self):
+        ev = {"pull_request": {"title": "Retry the sync", "body": "", "head": {"sha": "abc", "ref": "fix/ZZQ-12-login"},
+                               "base": {"sha": "def"}}}
+        with mock.patch("text_guard._git", return_value=""):
+            passed, why, lines = g.fallback(ev)
+        self.assertFalse(passed)
+        self.assertEqual(lines, ["::error title=Public text guard::branch name line 1: Jira-style key"])
+        self.assertFalse(any("ZZQ" in line for line in lines + [why]))
+        ev["pull_request"]["head"]["ref"] = "fix/retry-the-sync"
+        with mock.patch("text_guard._git", return_value=""):
+            self.assertTrue(g.fallback(ev)[0])
+
     def test_it_prints_why_and_never_text(self):
         out = io.StringIO()
         env = {"GITHUB_REPOSITORY": "o/r", "HEAD_SHA": "abc"}

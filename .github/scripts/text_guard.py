@@ -1,7 +1,7 @@
 """Public text guard: a pull request's words never carry an install's ids.
 
-Scans the PR title, the PR body, every commit message in the PR, and the
-lines the PR adds under docs/, and fails (exit 1) on:
+Scans the PR title, the head branch name, the PR body, every commit message
+in the PR, and the lines the PR adds under docs/, and fails (exit 1) on:
 
 - an AWS account id in an ARN, an ECR host, or after "account", and any
   other standalone 12-digit number (which is how an account id is written);
@@ -146,10 +146,14 @@ def _git(*args):
 
 
 def sources_from_pr(event):
-    """[(label, file or None, numbered lines)] for the PR's title, body, commits and docs/ additions."""
+    """[(label, file or None, numbered lines)] for the PR's title, head branch name, body, commits and docs/ additions."""
     pr = event["pull_request"]
     base, head = pr["base"]["sha"], pr["head"]["sha"]
-    sources = [("PR title", None, numbered(pr.get("title"))), ("PR body", None, numbered(pr.get("body")))]
+    sources = [
+        ("PR title", None, numbered(pr.get("title"))),
+        ("branch name", None, numbered((pr.get("head") or {}).get("ref"))),
+        ("PR body", None, numbered(pr.get("body"))),
+    ]
     for sha in _git("rev-list", "--reverse", f"{base}..{head}").split():
         sources.append((f"commit {sha[:12]} message", None, numbered(_git("log", "-1", "--format=%B", sha))))
     diff = _git("diff", "-U0", "--no-color", "--no-ext-diff", f"{base}...{head}", "--", "docs/")
