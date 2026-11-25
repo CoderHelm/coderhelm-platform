@@ -44,7 +44,7 @@ pub fn visible() -> bool {
 /// Journeys are shown unless the install turns them off: they passed the
 /// ship gate on the gold set (step recall, no invented and no out-of-order
 /// steps).
-const SHOWN_BY_DEFAULT: bool = false;
+const SHOWN_BY_DEFAULT: bool = true;
 
 /// The instructions the model reads. The model chooses which candidates
 /// belong to each journey; the checker puts them in order from the code.
@@ -701,6 +701,11 @@ pub fn put_in_graph(graph: &mut Value, store: &Value) {
             .map(for_viewer),
     );
     graph["flows"] = json!(flows);
+    // Journeys still being traced, so the map says so instead of nothing.
+    if !graph["coderhelm"].is_object() {
+        graph["coderhelm"] = json!({});
+    }
+    graph["coderhelm"]["journeys_pending"] = json!(store["pending"].as_u64().unwrap_or(0));
 }
 
 /// The map's state with one file replaced (or added).

@@ -109,6 +109,17 @@ pub fn flows_todo_key(team_id: &str) -> String {
 
 /// The worksheets a description step had no time left for, continued in
 /// the next step.
+/// What tracing journeys has cost a team today (`{day, usd}`).
+pub fn flows_spend_key(team_id: &str) -> String {
+    format!("{}/flows-spend.json", s3_prefix(team_id))
+}
+
+/// Who is tracing a team's journeys now (`{until}`), so a message
+/// delivered twice runs once.
+pub fn flows_lease_key(team_id: &str) -> String {
+    format!("{}/flows-lease.json", s3_prefix(team_id))
+}
+
 pub fn describe_key(team_id: &str) -> String {
     format!("{}/describe.json.gz", s3_prefix(team_id))
 }
@@ -748,6 +759,9 @@ pub struct Coverage {
     pub repos: u32,
     #[serde(default)]
     pub journeys: u32,
+    /// Journeys still being traced (entries waiting for a later pass).
+    #[serde(default)]
+    pub journeys_pending: u32,
 }
 
 impl Coverage {
@@ -784,6 +798,7 @@ impl Coverage {
                 .count()
                 .max(repo_of_folder(graph).len()) as u32,
             journeys: arr(graph, "flows").count() as u32,
+            journeys_pending: graph["coderhelm"]["journeys_pending"].as_u64().unwrap_or(0) as u32,
         }
     }
 }
@@ -1305,6 +1320,7 @@ pub fn overview(graph: &Value) -> Value {
         "screens": arr(graph, "screens").take(80).map(screen_json).collect::<Vec<_>>(),
         "screen_count": screen_counts(graph),
         "journeys": arr(graph, "flows").take(60).map(|f| json!({"id": f["id"], "title": f["title"], "steps": f["steps"].as_array().map(|a| a.len()).unwrap_or(0)})).collect::<Vec<_>>(),
+        "journeys_still_being_traced": graph["coderhelm"]["journeys_pending"].as_u64().unwrap_or(0),
         "health": graph["health"]["summary"],
         "repos": graph["meta"]["repos"],
         "counts": graph["meta"]["counts"],

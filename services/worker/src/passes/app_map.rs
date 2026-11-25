@@ -1367,7 +1367,6 @@ async fn describe(
 /// the sandbox's candidates; the checker keeps only cited steps. The result
 /// goes into the map's state (`flows.json`) and, when shown, the map.
 async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
-    use super::app_map_flows as fl;
     let Some(todo) = s3_get(state, &am::flows_todo_key(team_id))
         .await
         .and_then(|b| am::gunzip(&b, 64 * 1024 * 1024))
@@ -1375,15 +1374,6 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
     else {
         return Ok(());
     };
-    // Taken before the model is asked, so a message delivered twice asks
-    // once; if the answer is lost, the next build asks again.
-    let _ = state
-        .s3
-        .delete_object()
-        .bucket(&state.config.bucket_name)
-        .key(am::flows_todo_key(team_id))
-        .send()
-        .await;
     let job: Job = s3_get(state, &am::job_key(team_id))
         .await
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -1393,6 +1383,43 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
         info!(team_id, "App map: journeys are for an older build, skipped");
         return Ok(());
     }
+    // One step at a time: a message delivered twice, or a watchdog that
+    // fires while a pass runs, leaves it to the pass that holds the lease.
+    let now = chrono::Utc::now().timestamp();
+    let held = s3_get(state, &am::flows_lease_key(team_id))
+        .await
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    if held.is_some_and(|l| l["until"].as_i64().unwrap_or(0) > now) {
+        info!(team_id, "App map: another step is tracing the journeys");
+        return Ok(());
+    }
+    let lease = |until: i64| json!({ "until": until }).to_string().into_bytes();
+    s3_put(state, &am::flows_lease_key(team_id), lease(now + 16 * 60)).await?;
+    let build = todo["build"].as_str().unwrap_or("").to_string();
+    // If this Lambda stops for good, the queue is picked up again.
+    let _ = queue(state, team_id, "flows", &build, 0, 900).await;
+    let result = flows_pass(state, team_id, todo, &build).await;
+    let _ = state
+        .s3
+        .delete_object()
+        .bucket(&state.config.bucket_name)
+        .key(am::flows_lease_key(team_id))
+        .send()
+        .await;
+    result
+}
+
+/// One pass over the journeys still to trace: as many as the pass's budget
+/// (within the day's) holds, each kept as it finishes, the rest left queued
+/// for a later pass.
+async fn flows_pass(
+    state: &WorkerState,
+    team_id: &str,
+    todo: Value,
+    build: &str,
+) -> Result<(), String> {
+    use super::app_map_flows as fl;
+    use super::app_map_trace as tr;
     let provider = crate::agent::provider::ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
@@ -1401,82 +1428,123 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
     .await
     .map_err(|e| format!("no model for this team: {e}"))?;
     common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
-    let mut usage = TokenUsage::default();
     let client = provider.client();
     let model = state.config.light_model_id.clone();
-    // The tracer reads the code the map was built from; the candidate
-    // picker writes the journeys of entries it couldn't trace (or all of
-    // them when the code can't be read).
-    let mut asked = todo.clone();
-    let mut new = Vec::new();
-    let mut fallback = todo.clone();
-    let traced = if super::app_map_trace::enabled() {
-        trace_journeys(
-            state, team_id, &provider, &client, &model, &todo, &mut usage,
-        )
+    let mut usage = TokenUsage::default();
+    let mut tgz = s3_get(state, &am::state_key(team_id))
         .await
-    } else {
-        Err("the tracer is off".to_string())
-    };
-    match traced {
-        Ok(out) => {
-            info!(team_id, flows = out.flows.len(), answers = out.raw.len(), traced = ?out.report, left = out.left.len(), cost = usage.cost_usd, "App map: journeys traced");
-            new = out.flows;
-            let failed: std::collections::BTreeSet<String> = out
-                .failed
-                .iter()
-                .map(|e| e["id"].as_str().unwrap_or("").to_string())
-                .collect();
-            let left: std::collections::BTreeSet<String> = out
-                .left
-                .iter()
-                .map(|e| e["id"].as_str().unwrap_or("").to_string())
-                .collect();
-            fallback["entries"] = json!(todo["entries"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|e| failed.contains(e["id"].as_str().unwrap_or("")))
-                .collect::<Vec<_>>());
-            // Entries no step reached are asked in the next one.
-            asked["entries"] = json!(todo["entries"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|e| !left.contains(e["id"].as_str().unwrap_or("")))
-                .collect::<Vec<_>>());
-            if !out.left.is_empty() {
-                let mut rest = todo.clone();
-                rest["entries"] = json!(out.left);
+        .ok_or("the map's state is gone")?;
+    let mut store: Value = fl::read_from_tgz(&tgz, fl::STORE)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({"schema": fl::SCHEMA, "flows": []}));
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let spend: Value = s3_get(state, &am::flows_spend_key(team_id))
+        .await
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let spent_before = tr::spent_today(&spend, &today);
+    let budget = tr::pass_budget(spent_before);
+    let mut rest = todo.clone();
+    let mut failed: Vec<Value> = Vec::new();
+    let mut spent = 0.0;
+    let mut by_time = false;
+    if !tr::enabled() {
+        failed = todo["entries"].as_array().cloned().unwrap_or_default();
+        rest["entries"] = json!([]);
+    } else if budget > 0.0 {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tr::Done>();
+        let trace = async {
+            let tx = tx;
+            let r = trace_journeys(
+                state,
+                team_id,
+                &provider,
+                &client,
+                &model,
+                &todo,
+                &mut usage,
+                budget,
+                Some(&tx),
+            )
+            .await;
+            drop(tx);
+            r
+        };
+        // Each journey kept as it finishes: the store, the queue and the
+        // day's spend written down together, so a pass that stops here
+        // resumes with the next entry.
+        let keep = async {
+            while let Some(d) = rx.recv().await {
+                spent += d.cost_usd;
+                if d.flows.is_empty() && !d.covered {
+                    failed.push(d.entry.clone());
+                    let id = d.entry["id"].clone();
+                    let left: Vec<Value> = rest["entries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|e| e["id"] != id)
+                        .cloned()
+                        .collect();
+                    rest["entries"] = json!(left);
+                } else {
+                    let (s, r) = tr::checkpoint(&store, &rest, &d);
+                    store = s;
+                    rest = r;
+                    if let Ok(t) = fl::replace_in_tgz(&tgz, fl::STORE, store.to_string().as_bytes())
+                    {
+                        tgz = t;
+                        s3_put(state, &am::state_key(team_id), tgz.clone()).await?;
+                    }
+                }
                 s3_put(
                     state,
                     &am::flows_todo_key(team_id),
                     am::gzip(rest.to_string().as_bytes()),
                 )
                 .await?;
-                let build = todo["build"].as_str().unwrap_or("");
-                if !queue(state, team_id, "flows", build, 0, 0).await {
-                    warn!(
-                        team_id,
-                        "App map: the rest of the journeys couldn't be queued"
-                    );
-                }
+                s3_put(
+                    state,
+                    &am::flows_spend_key(team_id),
+                    json!({"day": today, "usd": spent_before + spent})
+                        .to_string()
+                        .into_bytes(),
+                )
+                .await?;
+                s3_put(
+                    state,
+                    &am::flows_lease_key(team_id),
+                    json!({"until": chrono::Utc::now().timestamp() + 16 * 60})
+                        .to_string()
+                        .into_bytes(),
+                )
+                .await?;
+            }
+            Ok::<(), String>(())
+        };
+        let (traced, kept) = tokio::join!(trace, keep);
+        kept?;
+        match traced {
+            Ok(out) => {
+                by_time = out.report.over_budget == 0 && !out.left.is_empty();
+                info!(team_id, flows = out.flows.len(), failed = out.failed.len(), traced = ?out.report, left = out.left.len(), cost = spent, budget, "App map: journeys traced");
+            }
+            Err(e) => {
+                // The code couldn't be read: the candidates write them all.
+                warn!(team_id, error = %e, "App map: the journeys couldn't be traced; the candidates are used");
+                failed.extend(rest["entries"].as_array().cloned().unwrap_or_default());
+                rest["entries"] = json!([]);
             }
         }
-        Err(e) => {
-            info!(team_id, reason = %e, "App map: the journeys are picked from the candidates")
-        }
     }
-    if fallback["entries"]
-        .as_array()
-        .is_some_and(|e| !e.is_empty())
-    {
-        let ids: std::collections::BTreeSet<String> = fallback["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
+    // Entries the tracer couldn't do: picked from the candidates.
+    if !failed.is_empty() {
+        let ids: std::collections::BTreeSet<String> = failed
+            .iter()
             .map(|e| e["id"].as_str().unwrap_or("").to_string())
             .collect();
+        let mut fallback = todo.clone();
+        fallback["entries"] = json!(failed);
         fallback["groups"] = json!(fl::groups(&todo)
             .into_iter()
             .filter(|g| g["entries"]
@@ -1488,27 +1556,51 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
         match fl::ask(&client, &model, &fallback, &mut usage).await {
             Ok((picked, rep, _)) => {
                 info!(team_id, flows = picked.len(), checked = ?rep, "App map: journeys picked from the candidates");
-                new.extend(picked);
+                let pending = store["pending"].clone();
+                store = fl::merge(&store, &fallback, picked);
+                store["pending"] = pending;
             }
             Err(e) => warn!(team_id, error = %e, "App map: the journeys couldn't be written"),
         }
     }
-    info!(
-        team_id,
-        flows = new.len(),
-        cost = usage.cost_usd,
-        "App map: journeys written"
-    );
-    let todo = asked;
-    let tgz = s3_get(state, &am::state_key(team_id))
-        .await
-        .ok_or("the map's state is gone")?;
-    let store: Value = fl::read_from_tgz(&tgz, fl::STORE)
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_else(|| json!({"schema": fl::SCHEMA, "flows": []}));
-    let store = fl::merge(&store, &todo, new);
-    let tgz = fl::replace_in_tgz(&tgz, fl::STORE, store.to_string().as_bytes())?;
+    let left = rest["entries"].as_array().map(Vec::len).unwrap_or(0);
+    store["pending"] = json!(left);
+    tgz = fl::replace_in_tgz(&tgz, fl::STORE, store.to_string().as_bytes())?;
     s3_put(state, &am::state_key(team_id), tgz).await?;
+    if left == 0 {
+        let _ = state
+            .s3
+            .delete_object()
+            .bucket(&state.config.bucket_name)
+            .key(am::flows_todo_key(team_id))
+            .send()
+            .await;
+    } else {
+        s3_put(
+            state,
+            &am::flows_todo_key(team_id),
+            am::gzip(rest.to_string().as_bytes()),
+        )
+        .await?;
+        // The next pass: at once when this one ran out of time, soon when
+        // the day's budget still has room, else every 15 minutes until the
+        // next day's.
+        let day_left = tr::pass_budget(spent_before + spent) > 0.0;
+        let delay = if by_time {
+            0
+        } else if day_left {
+            60
+        } else {
+            900
+        };
+        if !queue(state, team_id, "flows", build, 0, delay).await {
+            warn!(
+                team_id,
+                "App map: the rest of the journeys couldn't be queued"
+            );
+        }
+    }
+    info!(team_id, left, cost = spent, "App map: journeys written");
     if fl::visible() {
         if let Some(b) = s3_get(state, &am::graph_key(team_id)).await {
             if let Some(mut g) = am::gunzip(&b, am::MAX_GRAPH_BYTES)
@@ -1532,7 +1624,9 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
 /// The journeys traced through the code at the heads the map was built
 /// from: the repositories read again (the step runs on its own, after the
 /// map), the map's graph for its lookups, the light model a few journeys
-/// at a time until the Lambda's time runs short.
+/// at a time until the Lambda's time or the pass's budget runs short; each
+/// finished entry is handed to `done`.
+#[allow(clippy::too_many_arguments)]
 async fn trace_journeys(
     state: &WorkerState,
     team_id: &str,
@@ -1541,6 +1635,8 @@ async fn trace_journeys(
     model: &str,
     todo: &Value,
     usage: &mut TokenUsage,
+    budget: f64,
+    done: Option<&tokio::sync::mpsc::UnboundedSender<super::app_map_trace::Done>>,
 ) -> Result<super::app_map_trace::TraceOut, String> {
     use super::app_map_trace as tr;
     let heads: BTreeMap<String, String> =
@@ -1557,13 +1653,13 @@ async fn trace_journeys(
     )
     .map_err(|e| e.to_string())?;
     let folders = am::folders(&repos);
-    let mut budget = MAX_SNAPSHOT_BYTES;
+    let mut room = MAX_SNAPSHOT_BYTES;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for (repo, sha) in &heads {
         let Some((owner, name)) = repo.split_once('/') else {
             continue;
         };
-        if budget == 0 {
+        if room == 0 {
             break;
         }
         let folder = folders
@@ -1574,7 +1670,7 @@ async fn trace_journeys(
             .download_tarball(owner, name, sha)
             .await
             .map_err(|e| format!("{repo} couldn't be read: {e}"))?;
-        let (got, _) = repo_entries(&tarball, &folder, &mut budget);
+        let (got, _) = repo_entries(&tarball, &folder, &mut room);
         files.extend(got);
     }
     let snapshot = Snapshot::take(files);
@@ -1596,7 +1692,7 @@ async fn trace_journeys(
             + t.saturating_sub(std::time::Duration::from_secs(tr::JOURNEY_SECS + 120))
     });
     Ok(tr::trace_all(
-        client, model, &gate, &tools, &snapshot, graph, todo, usage, true, stop,
+        client, model, &gate, &tools, &snapshot, graph, todo, usage, true, stop, budget, done,
     )
     .await)
 }
