@@ -61,7 +61,7 @@ fn finding(pkg: &str, version: &str, fixed: &[&str], parent: &str) -> (Finding, 
         scope: Scope::Runtime,
         status: Status::Open,
         path: vec![parent.to_string(), pkg.to_string()],
-        due_at: "2026-12-10T00:00:00Z".into(),
+        due_at: "2030-04-11T00:00:00Z".into(),
         advisory: sec::Advisory {
             primary: format!("GHSA-{pkg}"),
             ids: vec![format!("GHSA-{pkg}")],
@@ -121,7 +121,7 @@ fn a_bump_stays_inside_its_major_and_a_major_jump_is_its_own_pull_request() {
         "page-kit",
     ));
     let cfg = SecurityConfig::default();
-    let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T10:00:00Z")
+    let now = chrono::DateTime::parse_from_rfc3339("2030-03-13T10:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
     let units = sec::plan_units(&fs, &cfg, now);

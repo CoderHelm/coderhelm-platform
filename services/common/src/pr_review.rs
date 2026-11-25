@@ -338,10 +338,10 @@ mod tests {
 
     #[test]
     fn filler_goes_and_the_fact_beside_it_stays() {
-        let r = review("- Approach: decide whether this does what OPS-1 asks. CoderHelm's conclusion: nothing is out of the ordinary.");
+        let r = review("- Approach: decide whether this does what HARBOR-1 asks. CoderHelm's conclusion: nothing is out of the ordinary.");
         assert_eq!(
             r.body,
-            "- Approach: decide whether this does what OPS-1 asks."
+            "- Approach: decide whether this does what HARBOR-1 asks."
         );
         let r = review("Nothing is out of the ordinary.\nKept.");
         assert_eq!(r.body, "Kept.");

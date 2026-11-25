@@ -454,7 +454,7 @@
    "target": "production"
   },
   {
-   "step": "Confirm the charters hero subtitle is still unedited and over N characters, so the warning applies to it",
+   "step": "Confirm the charters listing summary is still unedited and over N characters, so the warning applies to it",
    "by": "coderhelm",
    "owner": "CoderHelm",
    "how": "query_content on production with the confirm query",
@@ -527,7 +527,7 @@
    "target": "staging"
   },
   {
-   "step": "Confirm the staging charters hero is still over the limit",
+   "step": "Confirm the staging charters listing is still over the limit",
    "by": "coderhelm",
    "owner": "CoderHelm",
    "how": "public staging GROQ query in verify",
@@ -814,7 +814,7 @@
    "target": "production"
   },
   {
-   "step": "Confirm the charters hero still exceeds the limit (so the warning shows), and post on the ticket, for information, the list of over-limit documents (id, _type, hero _key, length)",
+   "step": "Confirm the charters listing still exceeds the limit (so the warning shows), and post on the ticket, for information, the list of over-limit documents (id, _type, listing _key, length)",
    "by": "coderhelm",
    "owner": "CoderHelm",
    "how": "query_content on production",
@@ -876,7 +876,7 @@
   "Deploy the staging Studio after merge How: cd apps/studio && npm run deploy:staging. CoderHelm could not do it: not done: starting `Test Suite` (src/file.ts, started with workflow_dispatch) failed: HTTP status client error (N Forbidden) for url (https://site.example/page): {\"message\":\"Resource not accessible by integration\",\"documentation_url\":\"https://site.example/page\",\"status\":\"N\"}.",
   "Deploy the staging Studio after merge How: cd apps/studio && npm run deploy:staging. CoderHelm could not do it: not done: starting `Test Suite` (src/file.ts, started with workflow_dispatch) failed: HTTP status client error (N Forbidden) for url (https://site.example/page): {\"message\":\"Resource not accessible by integration\",\"documentation_url\":\"https://site.example/page\",\"status\":\"N\"}. (owner: CoderHelm)",
   "Deploy the staging Studio so editors see the warning: run `cd apps/studio && npm run deploy:staging (npm script, not a workflow dispatch)`. CoderHelm could not: the repository has no deploy workflow CoderHelm can start (it deploys with `cd apps/studio && npm run deploy:staging` or `cd apps/studio && npm run deploy` or `cd apps/studio && npm run deploy:product. To let it: add a deploy workflow with a manual start (`workflow_dispatch:` in its triggers). (a person on the team)",
-  "Look at Studio: /private-charters/charters document, hero Sub Title field. CoderHelm cannot: how a page looks is a judgement only a person can make. (the reviewer)",
+  "Look at Studio: /slips/charters document, listing Summary field. CoderHelm cannot: how a page looks is a judgement only a person can make. (the reviewer)",
   "Add PR labels E2E:slips and CI:E2E, sending the existing labels too (values: labels += E2E:slips, CI:E2E; at least: slip-booking.spec.ts runs on every path and passes, not skipped): GitHub labels API (workflow_dispatch returned N on #1; labels worked there). CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: give the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions), or run the command yourself. (a repository admin)",
   "Report the framing result. If the vendor refuses the frame, flag it on the ticket and stop (at least: Framing result for every page): Read the e2e framing assertion result. CoderHelm could not: ran `a page check find ['slip booking','Open booking in a new tab','portal-embed.js']`: the read API returned N Bad Request. (a person on the team)",
   "the vendor allows framing from site.example and the preview hosts (if refused) and publishes portal N (values: frame-ancestors include https://site.example/page https://site.example/page at least: Portal URL returns N and can be framed): the vendor portal settings / the vendor support. CoderHelm cannot: CoderHelm has only read access to the vendor's /v1/organization/N/listings API: no portal admin access, no channel to the vendor support. (the harbor vendor admin with the booking vendor)",
@@ -892,6 +892,6 @@
   "One paid registration in a private window on Chrome, desktop Safari, iOS Safari and Android Chrome (at least: one checkout per browser or a recorded failure): real devices on the preview or staging. CoderHelm cannot: No real devices or payment method.",
   "Look at /north-dock/slips/book. CoderHelm cannot: how a page looks is a judgement only a person can make.",
   "Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging (npm script in the sandbox; not a workflow dispatch)`. CoderHelm could not: the repository has no deploy workflow CoderHelm can start (it deploys with `cd apps/studio && npm run deploy:staging` or `cd apps/studio && npm run deploy` or `cd apps/studio && npm run deploy:product. To let it: add a deploy workflow with a manual start (`workflow_dispatch:` in its triggers). (a person on the team)",
-  "Look at Studio: charters page (abc1234-0000-N-0000-abc1234), hero Sub Title field. CoderHelm cannot: how a page looks is a judgement only a person can make."
+  "Look at Studio: charters page (abc1234-0000-N-0000-abc1234), listing Summary field. CoderHelm cannot: how a page looks is a judgement only a person can make."
  ]
 }

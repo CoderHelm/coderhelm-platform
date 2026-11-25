@@ -468,7 +468,7 @@ mod tests {
         }
         .with_text(
             "fix(api): retry payments",
-            "Source ticket: OPS-1\n\n<!-- coderhelm:ci -->**Summary** Retry once.\n\n- Keep the key",
+            "Source ticket: HARBOR-1\n\n<!-- coderhelm:ci -->**Summary** Retry once.\n\n- Keep the key",
         );
         assert_eq!(e.title, "fix(api): retry payments");
         assert_eq!(e.summary, "Retry once.\n\n- Keep the key");

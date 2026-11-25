@@ -236,7 +236,7 @@ fn stand_in_number(number: &str) -> bool {
     number.chars().all(|c| c == '0') || counting || number.chars().all(|c| c == '9')
 }
 
-/// Whether a key-shaped token (`KEY-1`, `ABC-XXXX`, `OPS-0000`) is an
+/// Whether a key-shaped token (`KEY-1`, `ABC-XXXX`, `HARBOR-0000`) is an
 /// example rather than a ticket: a stand-in project or a stand-in number.
 pub fn is_stand_in_key(key: &str) -> bool {
     let Some((project, number)) = key.split_once('-') else {
@@ -830,13 +830,17 @@ mod tests {
             c("a6", "fix ci"),
             c("a7", "tidy the docs"),
         ];
-        let g = super::squash_groups(&commits, "OPS-41: Add the export retry", Some("OPS-41"));
+        let g = super::squash_groups(
+            &commits,
+            "HARBOR-57: Add the export retry",
+            Some("HARBOR-57"),
+        );
         assert!(g.len() <= super::MAX_GROUPS, "{g:?}");
-        assert_eq!(g[0].message, "OPS-41: Add the export retry");
+        assert_eq!(g[0].message, "HARBOR-57: Add the export retry");
         assert_eq!(g[0].last_sha, "a1");
-        assert_eq!(g[1].message, "OPS-41: Fix failing checks");
+        assert_eq!(g[1].message, "HARBOR-57: Fix failing checks");
         assert_eq!(g[1].last_sha, "a3");
-        assert_eq!(g[2].message, "OPS-41: Address review feedback");
+        assert_eq!(g[2].message, "HARBOR-57: Address review feedback");
         // The rest folds into one, ending at the branch's tip.
         assert_eq!(g.last().unwrap().last_sha, "a7");
         assert_eq!(g.iter().map(|x| x.count).sum::<usize>(), 7);
@@ -1023,8 +1027,8 @@ mod tests {
         );
         // Another real ticket is named on purpose.
         assert_eq!(
-            c.commit_message(&t, "OPS-4411: bump the pool size"),
-            "OPS-4411: bump the pool size"
+            c.commit_message(&t, "HARBOR-2716: bump the pool size"),
+            "HARBOR-2716: bump the pool size"
         );
         // Prose with a dash is not a key.
         assert_eq!(

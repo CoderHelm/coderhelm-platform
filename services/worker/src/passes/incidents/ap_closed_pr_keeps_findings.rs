@@ -37,7 +37,7 @@ const TICKET: &str = "SEC-0A1B2C3D4E5F";
 const PR: u64 = 42;
 
 fn day_after() -> DateTime<Utc> {
-    at("2026-11-13T10:00:00Z")
+    at("2030-03-15T10:00:00Z")
 }
 
 fn cfg() -> SecurityConfig {
@@ -123,7 +123,7 @@ async fn the_sweep_puts_yesterdays_stale_records_right_with_no_step_by_a_person(
         ),
         (PR, "closed", Some("octo-admin"), true)
     );
-    assert_eq!(pr.closed_at.as_deref(), Some("2026-11-13T09:30:00Z"));
+    assert_eq!(pr.closed_at.as_deref(), Some("2030-03-15T09:30:00Z"));
     assert_eq!(st.ticket, None);
     let line = &github.event_texts()[0];
     assert!(

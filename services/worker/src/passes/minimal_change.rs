@@ -1211,18 +1211,35 @@ pub const WHOLE_PATH_LINES: usize = 40;
 /// Up to this many records named, a ticket is about those records.
 pub const FEW_RECORDS: usize = 12;
 
-/// Ticket words that ask for every record of a kind.
+/// Ticket words that ask for every record of a kind, beside "all" or
+/// "every" before a noun ([`names_every_of_a_kind`]).
 const EVERY_ASKS: &[&str] = &[
-    "all records",
-    "all camps",
-    "every record",
-    "every camp",
     "for all ",
     "for every ",
     "across all",
     "refactor",
     "rewrite",
 ];
+
+/// Whether a ticket asks for every record of a kind: "all" before a plural
+/// noun ("all records", "all listings") or "every" before a noun ("every
+/// record"), whatever the kind is called.
+pub fn names_every_of_a_kind(ticket: &str) -> bool {
+    let t = ticket.to_lowercase();
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.windows(2).any(|w| {
+        let noun = w[1];
+        let alpha = noun.chars().all(|c| c.is_alphabetic() || c == '-');
+        match w[0] {
+            "all" => alpha && noun.len() >= 4 && noun.ends_with('s') && !noun.ends_with("ss"),
+            "every" => alpha && noun.len() >= 3 && !matches!(noun, "time" | "other" | "one"),
+            _ => false,
+        }
+    })
+}
 
 /// A changed line that is an entry of a map or list, a bracket, or a
 /// comment: what a lookup fix adds without changing how records flow.
@@ -1250,7 +1267,11 @@ fn entry_line(line: &str) -> bool {
 /// ticket:` line keeps it, with the reason the narrower change can't work.
 pub fn whole_path(diff: &Diff, ticket: &str) -> Vec<Widening> {
     let named = common::repro_first::ticket_ids(ticket).len();
-    if named == 0 || named > FEW_RECORDS || ticket_asks(ticket, EVERY_ASKS) {
+    if named == 0
+        || named > FEW_RECORDS
+        || ticket_asks(ticket, EVERY_ASKS)
+        || names_every_of_a_kind(ticket)
+    {
         return Vec::new();
     }
     let mut lines = 0;
@@ -1669,5 +1690,38 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].1.name, "ACTIVITY_OVERRIDES");
         assert!(parallel_in_edit("a.py", old, old).is_empty());
+    }
+
+    #[test]
+    fn all_or_every_before_a_noun_asks_for_the_whole_kind() {
+        // "All" before a plural, or "every" before a noun, asks for the kind.
+        for t in [
+            "Fix all charters",
+            "Update every slip page",
+            "Backfill all records",
+            "every record",
+        ] {
+            assert!(names_every_of_a_kind(t), "{t}");
+        }
+        // Any kind does, whatever it is called.
+        for t in [
+            "Show the dock filter on all listings",
+            "Every charter needs a price",
+            "Recompute ALL invoices",
+            "Hide every slip without a photo",
+        ] {
+            assert!(names_every_of_a_kind(t), "{t}");
+        }
+        // A few named records, or "all"/"every" before no noun, never do.
+        for t in [
+            "Fix ABC-12 and ABC-14",
+            "Make sure all of it works",
+            "all is well",
+            "Retry every time it fails",
+            "every other row",
+            "Hide all access to the admin page",
+        ] {
+            assert!(!names_every_of_a_kind(t), "{t}");
+        }
     }
 }

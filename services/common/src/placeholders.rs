@@ -148,7 +148,10 @@ mod tests {
             found("Title: ABC-123: <summary>", &[]),
             vec!["ABC-123", "<summary>"]
         );
-        assert_eq!(found("Use OPS-XXXX in the subject", &[]), vec!["OPS-XXXX"]);
+        assert_eq!(
+            found("Use HARBOR-XXXX in the subject", &[]),
+            vec!["HARBOR-XXXX"]
+        );
         assert_eq!(found("{ticket}: {title}", &[]), vec!["{ticket}", "{title}"]);
         assert_eq!(found("TODO: say why", &[]), vec!["TODO"]);
         assert_eq!(found("ticket XXXX", &[]), vec!["XXXX"]);
@@ -157,8 +160,8 @@ mod tests {
     #[test]
     fn real_keys_and_ordinary_text_are_not() {
         // The first ticket of a real project exists.
-        assert!(found("OPS-1: Lower the log level", &["OPS-1".to_string()]).is_empty());
-        assert!(found("OPS-482: Lower the log level", &[]).is_empty());
+        assert!(found("HARBOR-1: Lower the log level", &["HARBOR-1".to_string()]).is_empty());
+        assert!(found("HARBOR-736: Lower the log level", &[]).is_empty());
         for t in [
             "Encode as UTF-8 and hash with SHA-1.",
             "Fixes CVE-2026-1 in `glob-walk`.",
@@ -169,6 +172,6 @@ mod tests {
             assert!(found(t, &[]).is_empty(), "{t}: {:?}", found(t, &[]));
         }
         // Not real: nothing says the key exists.
-        assert_eq!(found("OPS-1: x", &[]), vec!["OPS-1"]);
+        assert_eq!(found("HARBOR-1: x", &[]), vec!["HARBOR-1"]);
     }
 }

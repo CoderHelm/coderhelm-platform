@@ -307,15 +307,15 @@ class Lifecycle(unittest.TestCase):
         # Resolved after one burst, back 4 days later, acknowledged, then
         # quiet: it resolves 8 days after its last line, not 3.
         item = {"rec_id": "e1", "sk": "REC#e1", "status": "pending", "source_log_group": WEB,
-                "acknowledged_at": "2026-11-03T06:44:39.346874173+00:00",
-                "daily_lines": [{"day": "2026-10-31", "lines": 6296}],
-                "last_resolved_at": "2026-10-27T03:48:40.472966+00:00",
-                "reopened_at": "2026-10-31T03:48:51.255562+00:00",
-                "last_seen_at": "2026-10-31T03:38:10.248+00:00"}
+                "acknowledged_at": "2030-03-05T06:44:39.346874173+00:00",
+                "daily_lines": [{"day": "2030-03-02", "lines": 6296}],
+                "last_resolved_at": "2030-02-26T03:48:40.472966+00:00",
+                "reopened_at": "2030-03-02T03:48:51.255562+00:00",
+                "last_seen_at": "2030-03-02T03:38:10.248+00:00"}
         self.assertEqual(L.quiet_days_for(item), 8)
         at = lambda t: datetime.fromisoformat(t)
-        self.assertEqual(L.stale([item], set(), at("2026-11-08T03:00:00+00:00")), [])
-        self.assertEqual(L.stale([item], set(), at("2026-11-08T03:39:00+00:00")), [item])
+        self.assertEqual(L.stale([item], set(), at("2030-03-10T03:00:00+00:00")), [])
+        self.assertEqual(L.stale([item], set(), at("2030-03-10T03:39:00+00:00")), [item])
 
     def test_a_failed_query_holds_only_the_groups_it_covered(self):
         old = iso_ago(days=20)

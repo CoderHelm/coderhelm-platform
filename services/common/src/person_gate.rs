@@ -798,8 +798,6 @@ fn reason_named(t: &str) -> Option<Reason> {
             "physical device",
             "real device",
             "payment method",
-            "paid checkout",
-            "paid registration",
             "real payment",
             "vendor admin",
             "portal admin",
@@ -809,7 +807,8 @@ fn reason_named(t: &str) -> Option<Reason> {
             "call the vendor",
             "sign a contract",
         ],
-    ) {
+    ) || paid_action(t)
+    {
         return Some(Reason::OutsideReach);
     }
     match crate::handback::human_only_in(t) {
@@ -819,6 +818,43 @@ fn reason_named(t: &str) -> Option<Reason> {
         Some(HumanOnly::Approval) => Some(Reason::Approval),
         _ => None,
     }
+}
+
+/// A step that spends real money: "paid" before an action a customer
+/// takes (a paid checkout, registration, booking, order), or a purchase
+/// made for real. No sandbox or test card stands in for one.
+fn paid_action(t: &str) -> bool {
+    const ACTIONS: &[&str] = &[
+        "checkout",
+        "registration",
+        "signup",
+        "sign-up",
+        "booking",
+        "reservation",
+        "purchase",
+        "order",
+        "enrollment",
+        "enrolment",
+        "subscription",
+        "transaction",
+    ];
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.windows(2).any(|w| {
+        w[0] == "paid"
+            && ACTIONS
+                .iter()
+                .any(|a| w[1] == *a || w[1] == format!("{a}s"))
+    }) || [
+        "real purchase",
+        "make a purchase",
+        "complete a purchase",
+        "pay for it",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
 }
 
 fn who_for(reason: Reason, owner: &str) -> String {
@@ -1789,14 +1825,14 @@ mod tests {
     fn a_look_is_folded_into_the_review_and_owned_work_is_done() {
         let look = Ask {
             kind: Kind::Step,
-            text: "Look at Studio: the landing document, hero Sub Title field".into(),
+            text: "Look at Studio: the slip page document, listing Summary field".into(),
             why_not: "how a page looks is a judgement only a person can make".into(),
             ..Default::default()
         };
         assert_eq!(decide(&look, &Context::default()).class(), Class::Review);
         let own = Ask::new(
             Kind::OpenItem,
-            "Missing from the end-to-end checklist: no step lists the 23 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 23 over-limit documents. Only a person can settle this: a product decision.",
+            "Missing from the end-to-end checklist: no step lists the 17 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 17 over-limit documents. Only a person can settle this: a product decision.",
         );
         assert_eq!(decide(&own, &Context::default()).class(), Class::Do);
     }
@@ -1829,5 +1865,35 @@ mod tests {
         assert_eq!(g.human().len(), 1);
         g.demote(0, Outcome::Do(Work::Own("x".into())));
         assert!(g.human().is_empty());
+    }
+
+    #[test]
+    fn a_paid_action_is_outside_reach_whatever_it_is_called() {
+        // The phrases the list used to name still read as a paid step.
+        for t in [
+            "one paid checkout in a private window",
+            "complete a paid registration in safari",
+        ] {
+            assert!(paid_action(t), "{t}");
+            assert_eq!(reason_in(t), Some(Reason::OutsideReach), "{t}");
+        }
+        // Any paid action a customer takes does too.
+        for t in [
+            "make one paid booking on the preview",
+            "place a paid order with a live card",
+            "two paid signups in safari",
+            "a paid subscription renews",
+            "complete a purchase on the preview",
+        ] {
+            assert!(paid_action(t), "{t}");
+            assert_eq!(reason_in(t), Some(Reason::OutsideReach), "{t}");
+        }
+        // "Paid" that names no action a person takes is not one.
+        for t in [
+            "mark the unpaid invoices as overdue",
+            "list the paid plans in the table",
+        ] {
+            assert!(!paid_action(t), "{t}");
+        }
     }
 }

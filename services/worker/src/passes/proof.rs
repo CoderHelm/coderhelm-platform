@@ -2908,7 +2908,7 @@ mod tests {
         assert!(!top.contains("Run terraform"));
         // A green CI clears them, and the section with them, from the
         // bottom of the description.
-        let rest = "Source ticket: OPS-1\n\n**Problem** x";
+        let rest = "Source ticket: HARBOR-1\n\n**Problem** x";
         let body = crate::passes::completeness::assemble(
             rest,
             &crate::passes::completeness::Owned {
