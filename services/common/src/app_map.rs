@@ -674,6 +674,134 @@ pub fn stamp_cut(graph: &mut Value, cut: &[String]) {
     }
 }
 
+/// Past this many characters, or more than three repositories, a card that
+/// covers several repositories is titled by the first and how many more.
+const TITLE_MAX: usize = 32;
+
+/// Each map folder's repository name as GitHub has it, without the owner
+/// (`coderhelm.repos`; a map without it names its folders in `meta.repos`).
+fn repo_names(graph: &Value) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = arr(&graph["meta"], "repos")
+        .filter_map(|r| {
+            let folder = r["path"].as_str()?;
+            Some((
+                folder.to_string(),
+                r["name"].as_str().unwrap_or(folder).to_string(),
+            ))
+        })
+        .collect();
+    for (folder, repo) in repo_of_folder(graph) {
+        let name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+        out.insert(folder, name);
+    }
+    out
+}
+
+/// Whether a node is a card on the System board (`level: system`) or a
+/// top-level part (the Parts level's cards, and what the System board shows
+/// in place of the cloud resources folded into it).
+fn is_system(n: &Value) -> bool {
+    n["level"] == "system" || n["parent"].is_null()
+}
+
+/// The repositories a card's own paths are in: (folder, the path inside it,
+/// empty for the whole repository), in the paths' order.
+fn card_repos(n: &Value, names: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for p in arr(n, "paths").filter_map(Value::as_str) {
+        let p = p.trim_matches('/');
+        let (folder, rest) = p.split_once('/').unwrap_or((p, ""));
+        if names.contains_key(folder) && !out.iter().any(|x| x.0 == folder && x.1 == rest) {
+            out.push((folder.to_string(), rest.to_string()));
+        }
+    }
+    out
+}
+
+/// A card's title from its repositories' names (see [`name_by_repo`]).
+pub fn repo_title(names: &[String]) -> String {
+    let joined = names.join(", ");
+    if names.len() <= 3 && joined.chars().count() <= TITLE_MAX {
+        joined
+    } else {
+        format!("{} +{} more", names[0], names.len() - 1)
+    }
+}
+
+/// System cards titled by the repositories they are, the way people know
+/// them, instead of a role a model gave them:
+///
+/// - a card that is one repository: its name on GitHub, without the owner
+///   (`harbor-api`);
+/// - a card that covers several: their names joined, or the first and how
+///   many more when that is long ([`repo_title`]);
+/// - a card that is one of several cards in the same repository (a web app
+///   and a content studio in one repository): `repo / folder`, so they stay
+///   apart;
+/// - a card that is no repository (outside services, cloud resources, a
+///   cloud setup made from no repository's folder) keeps its name.
+///
+/// A renamed card keeps its old name as its `role` (unless it was already
+/// the repository's name) and lists every name in `repos`. Read from the paths the map already keeps, so a map built before
+/// this is named the same way; naming a map twice changes nothing.
+pub fn name_by_repo(graph: &mut Value) {
+    let names = repo_names(graph);
+    if names.is_empty() {
+        return;
+    }
+    let cards: Vec<(usize, Vec<(String, String)>)> = arr(graph, "nodes")
+        .enumerate()
+        .filter(|(_, n)| is_system(n) && n["kind"] != "external")
+        .map(|(i, n)| (i, card_repos(n, &names)))
+        .filter(|(_, r)| !r.is_empty())
+        .collect();
+    // How many cards each repository is split across.
+    let mut cards_in: HashMap<&str, usize> = HashMap::new();
+    for (_, rs) in &cards {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (folder, _) in rs {
+            if seen.insert(folder) {
+                *cards_in.entry(folder).or_default() += 1;
+            }
+        }
+    }
+    let mut titled: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, rs) in &cards {
+        let mut list: Vec<String> = Vec::new();
+        for (folder, rest) in rs {
+            let name = &names[folder];
+            let whole = rs.iter().any(|(f, r)| f == folder && r.is_empty());
+            let entry = if cards_in[folder.as_str()] > 1 && !whole {
+                format!("{name} / {rest}")
+            } else {
+                name.clone()
+            };
+            if !list.contains(&entry) {
+                list.push(entry);
+            }
+        }
+        titled.push((*i, list));
+    }
+    let Some(nodes) = graph["nodes"].as_array_mut() else {
+        return;
+    };
+    for (i, list) in titled {
+        let n = &mut nodes[i];
+        if n.get("repos").is_some() {
+            continue;
+        }
+        let title = repo_title(&list);
+        if n["label"]
+            .as_str()
+            .is_some_and(|l| !l.trim().is_empty() && l != title)
+        {
+            n["role"] = n["label"].clone();
+        }
+        n["label"] = json!(title);
+        n["repos"] = json!(list);
+    }
+}
+
 fn arr<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = &'a Value> {
     v[k].as_array().into_iter().flatten()
 }
@@ -739,7 +867,17 @@ pub struct MapIndex {
     /// card). Empty on an index written before it was counted.
     #[serde(default)]
     pub coverage: Coverage,
+    /// How the page's copy written with this index was made
+    /// ([`COPY_VERSION`]); 0 on one written before it was counted.
+    #[serde(default)]
+    pub copy: u32,
 }
+
+/// Raised when the page's copy of a map ([`viewer_copy`]) changes in a way
+/// the stored map already holds what it needs for, so the read API writes
+/// the copy again from the stored map instead of waiting for a build.
+/// 1: System cards titled by their repositories ([`name_by_repo`]).
+pub const COPY_VERSION: u32 = 1;
 
 /// What a map covers, for the Knowledge page: screens per app, outside
 /// services, cloud links and repositories.
@@ -846,6 +984,7 @@ impl MapIndex {
             issues,
             has_health: graph.get("health").is_some(),
             coverage: Coverage::of(graph),
+            copy: COPY_VERSION,
         }
     }
 
@@ -1141,7 +1280,9 @@ pub fn for_viewer(mut graph: Value, now: &str) -> Value {
 /// labelled, read-only, without the sandbox's folder. CoderHelm's overlays
 /// are laid over it on the page.
 pub fn viewer_copy(graph: &Value, now: &str) -> Value {
-    for_viewer(labelled(graph.clone()), now)
+    let mut g = labelled(graph.clone());
+    name_by_repo(&mut g);
+    for_viewer(g, now)
 }
 
 /// The page's copy and the index of a map, gzipped, as they are stored.
@@ -1237,8 +1378,8 @@ fn node_json(x: &Value) -> Value {
         &mut out,
         x,
         &[
-            "level", "vendor", "how", "inferred", "category", "env", "services", "resource",
-            "domains",
+            "level", "role", "repos", "vendor", "how", "inferred", "category", "env", "services",
+            "resource", "domains",
         ],
     );
     if x.get("evidence").is_some() {
@@ -1339,7 +1480,7 @@ fn link_json(graph: &Value, l: &Value) -> Value {
 pub fn overview(graph: &Value) -> Value {
     json!({
         "project": graph["project"],
-        "parts": arr(graph, "nodes").map(|n| json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]})).collect::<Vec<_>>(),
+        "parts": arr(graph, "nodes").map(|n| { let mut p = json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]}); keep(&mut p, n, &["role", "repos"]); p }).collect::<Vec<_>>(),
         "screens": screens_listed(graph).into_iter().take(80).map(screen_json).collect::<Vec<_>>(),
         "screen_count": screen_counts(graph),
         "journeys": arr(graph, "flows").take(60).map(|f| json!({"id": f["id"], "title": f["title"], "steps": f["steps"].as_array().map(|a| a.len()).unwrap_or(0)})).collect::<Vec<_>>(),
@@ -1571,7 +1712,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
         words.iter().all(|w| hay.contains(w))
     };
     json!({
-        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["summary"], &n["id"], &n["vendor"], &json!(arr(n, "env").chain(arr(n, "hosts")).chain(arr(n, "domains")).chain(arr(n, "services")).filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))])).take(20).map(|n| { let mut x = node_json(n); if let Some(o) = x.as_object_mut() { o.remove("evidence"); } x }).collect::<Vec<_>>(),
+        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["role"], &n["summary"], &n["id"], &n["vendor"], &json!(arr(n, "env").chain(arr(n, "repos")).chain(arr(n, "hosts")).chain(arr(n, "domains")).chain(arr(n, "services")).filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))])).take(20).map(|n| { let mut x = node_json(n); if let Some(o) = x.as_object_mut() { o.remove("evidence"); } x }).collect::<Vec<_>>(),
         "files": arr(graph, "files").filter(|f| hit(&[&f["p"], &f["name"], &f["d"]])).take(30).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"]})).collect::<Vec<_>>(),
         "endpoints": arr(graph, "routes").enumerate().filter(|(_, r)| hit(&[&r["m"], &r["p"], &r["name"], &r["d"]])).take(30).map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "file": r["f"]})).collect::<Vec<_>>(),
         "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"], &s["nav"]["type"], &s["nav"]["renderer"]])).take(20).map(screen_json).collect::<Vec<_>>(),
@@ -2204,7 +2345,10 @@ pub struct Lookups {
 }
 
 impl Lookups {
-    pub fn new(graph: Value) -> Self {
+    /// The lookups name System parts by their repositories, as the page
+    /// does ([`name_by_repo`]).
+    pub fn new(mut graph: Value) -> Self {
+        name_by_repo(&mut graph);
         Self {
             graph,
             ids: Vec::new(),
@@ -2808,6 +2952,8 @@ mod tests {
         ] {
             let o = overlays(&idx, r, f);
             let mut want = for_viewer(with_overlays(harbor(), r, f), now);
+            // the page's copy names System cards by their repositories
+            name_by_repo(&mut want);
             let mut got = apply_overlays(view.clone(), &o);
             // Recent work is stamped when it is made.
             for g in [&mut want, &mut got] {
@@ -3533,5 +3679,139 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(FLOORPLAN_VERSION.starts_with("floorplan--v"));
+    }
+
+    // ── System cards named by their repositories ───────────────────────────
+
+    fn card<'a>(g: &'a Value, id: &str) -> &'a Value {
+        arr(g, "nodes").find(|n| n["id"] == id).unwrap()
+    }
+
+    /// A map of the made-up harbor team's repositories with the cards given.
+    fn harbor_cards(nodes: Value) -> Value {
+        let mut g = json!({"schema": GRAPH_SCHEMA, "project": {"name": "Harbor"}, "nodes": nodes, "files": [], "links": []});
+        stamp_repos(
+            &mut g,
+            &folders(&[
+                "harbor/harbor-web".into(),
+                "harbor/harbor-api".into(),
+                "harbor/harbor-mobile".into(),
+                "harbor/harbor-infra".into(),
+                "harbor/harbor-jobs".into(),
+                "harbor/site".into(),
+            ]),
+        );
+        g
+    }
+
+    #[test]
+    fn a_card_that_is_one_repository_is_titled_by_its_name() {
+        let mut g = harbor();
+        name_by_repo(&mut g);
+        let api = card(&g, "api");
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        assert_eq!(api["repos"], json!(["harbor-api"]));
+        assert_eq!(api["summary"], "Takes bookings and charges for them.");
+        assert_eq!(card(&g, "web")["label"], "harbor-web");
+        assert_eq!(card(&g, "web")["role"], "Harbor website");
+        // the repository's own name, not the owner
+        assert!(!api["label"].as_str().unwrap().contains('/'));
+        // A cloud setup made from a repository's folder is that repository.
+        assert_eq!(card(&g, "cloud")["label"], "harbor-infra");
+        assert_eq!(card(&g, "cloud")["role"], "Cloud setup");
+    }
+
+    #[test]
+    fn a_card_over_several_repositories_names_them_all() {
+        let mut g = harbor_cards(json!([
+            {"id": "apps", "parent": null, "label": "Apps people use", "kind": "ui", "paths": ["harbor-web", "harbor-mobile"]},
+            {"id": "back", "parent": null, "label": "Back office", "kind": "service", "paths": ["harbor-api", "harbor-jobs", "harbor-infra", "site"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "apps")["label"], "harbor-web, harbor-mobile");
+        assert_eq!(card(&g, "apps")["role"], "Apps people use");
+        // Long: the first and how many more, every name still kept.
+        assert_eq!(card(&g, "back")["label"], "harbor-api +3 more");
+        assert_eq!(
+            card(&g, "back")["repos"],
+            json!(["harbor-api", "harbor-jobs", "harbor-infra", "site"])
+        );
+        assert_eq!(card(&g, "back")["role"], "Back office");
+        assert_eq!(
+            repo_title(&["harbor-api-gateway".into(), "harbor-mobile-app".into()]),
+            "harbor-api-gateway +1 more"
+        );
+    }
+
+    #[test]
+    fn cards_split_from_one_repository_say_which_folder() {
+        let mut g = harbor_cards(json!([
+            {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui", "paths": ["site/web"]},
+            {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/studio"]},
+            {"id": "api", "parent": null, "level": "system", "label": "Main server", "kind": "service", "paths": ["harbor-api"]},
+            {"id": "api-src", "parent": "api", "level": "part", "label": "Bookings", "kind": "service", "paths": ["harbor-api/src"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "web")["label"], "site / web");
+        assert_eq!(card(&g, "web")["role"], "Website");
+        assert_eq!(card(&g, "studio")["label"], "site / studio");
+        assert_eq!(card(&g, "studio")["role"], "Content studio");
+        assert_eq!(card(&g, "api")["label"], "harbor-api");
+        // A part inside a card keeps its own name.
+        assert_eq!(card(&g, "api-src")["label"], "Bookings");
+        assert!(card(&g, "api-src").get("role").is_none());
+    }
+
+    #[test]
+    fn a_card_that_is_no_repository_keeps_its_name() {
+        let mut g = harbor_cards(json!([
+            {"id": "coderhelm-outside", "parent": null, "label": "Outside services", "kind": "external", "paths": []},
+            {"id": "stripe", "parent": null, "label": "Stripe", "kind": "external", "paths": [], "stats": {"repos": ["harbor-api"]}},
+            {"id": "cloud", "parent": null, "label": "Cloud setup", "kind": "infra", "paths": []},
+            {"id": "elsewhere", "parent": null, "label": "Shared config", "kind": "config", "paths": ["not-a-repo/config"]},
+        ]));
+        let before = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, before);
+    }
+
+    #[test]
+    fn naming_a_map_twice_changes_nothing() {
+        let mut once = harbor();
+        name_by_repo(&mut once);
+        let mut twice = once.clone();
+        name_by_repo(&mut twice);
+        assert_eq!(once, twice);
+        // A map without CoderHelm's folders names its folders from Floorplan's own list.
+        let mut bare: Value = serde_json::from_str(include_str!(
+            "../../worker/floorplan/fixtures/harbor-graph.json"
+        ))
+        .unwrap();
+        name_by_repo(&mut bare);
+        assert_eq!(card(&bare, "api")["label"], "harbor-api");
+    }
+
+    #[test]
+    fn the_page_and_the_lookups_use_the_repository_names() {
+        let g = harbor();
+        let view = viewer_copy(&g, "now");
+        assert_eq!(card(&view, "api")["label"], "harbor-api");
+        assert_eq!(card(&view, "api")["role"], "Booking service");
+        assert_eq!(MapIndex::of(&g).copy, COPY_VERSION);
+        let mut l = Lookups::new(g);
+        let (o, _) = l.lookup("map_overview", &json!({}));
+        let api = arr(&o, "parts").find(|p| p["id"] == "api").unwrap();
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        assert_eq!(api["repos"], json!(["harbor-api"]));
+        let (p, _) = l.lookup("map_part", &json!({"id": "api"}));
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
+        // Found by its repository's name and by its role.
+        for q in ["harbor-api", "booking service"] {
+            let (f, _) = l.lookup("map_find", &json!({"query": q}));
+            assert!(arr(&f, "parts").any(|p| p["id"] == "api"), "{q}: {f}");
+        }
     }
 }
