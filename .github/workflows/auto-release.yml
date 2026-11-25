@@ -173,17 +173,40 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      # A new release ships only a commit CI passed on, on main: its push
+      # run, which tests the merged result (.github/scripts/main_ci.py). The
+      # deploy of the commit required it already; it is read again here, so
+      # a red main is never released, whatever started this run. Tonight's
+      # beta is skipped; a release by hand or from deploy.yml fails. A
+      # promotion signs nothing new: its beta passed this when it was cut.
+      - id: ci
+        name: CI passed on the commit
+        if: steps.guard.outputs.commit != ''
+        env:
+          MODE: ${{ steps.guard.outputs.mode }}
+          COMMIT: ${{ steps.guard.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python3 .github/scripts/main_ci.py "$COMMIT"; then exit 0; fi
+          if [ "$MODE" = nightly ]; then
+            echo "::warning::CI has not passed on $COMMIT on main: no beta tonight"
+            echo "red=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit 1
       - id: plan
         name: Versions, notes, or skip
         env:
           MODE: ${{ steps.guard.outputs.mode }}
           COMMIT: ${{ steps.guard.outputs.commit }}
+          CI_RED: ${{ steps.ci.outputs.red }}
           VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$MODE" = nightly ]; then
-            # Tonight's beta, once main's head is deployed (the guard waited).
-            if [ -z "$COMMIT" ]; then echo "count=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+            # Tonight's beta, once main's head is deployed (the guard waited)
+            # and CI passed on it.
+            if [ -z "$COMMIT" ] || [ "$CI_RED" = true ]; then echo "count=0" >> "$GITHUB_OUTPUT"; exit 0; fi
             MODE=beta
           fi
           git fetch --no-tags origin '+refs/tags/v*:refs/tags/v*' '+refs/heads/main:refs/remotes/origin/main'

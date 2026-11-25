@@ -1,12 +1,25 @@
 name: CI
 
+# Pull requests, and the merged result: every push to main, and each group
+# GitHub's merge queue tests before it lands (merge_group). A pull request's
+# run tests its head against the base as it was then, so two pull requests
+# can each pass and still break main together; the push run says whether
+# main itself builds and passes, and the hosted deploy and the self-host
+# releases ship a commit only when it did (.github/scripts/main_ci.py).
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
 
+# A new push to a pull request cancels the run on its old head. On main and
+# in the merge queue every commit keeps its own run to the end: the deploy
+# reads that commit's verdict, and a cancelled run never counts as green.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Pull requests (including from forks) get a read-only token and no secrets.
 permissions:
@@ -72,7 +85,8 @@ jobs:
           fetch-depth: 2
       # Skip the steps below when nothing the Rust build reads changed (a pin
       # bump in selfhost/versions.json): the job still reports, in seconds.
-      # The list and why: .github/scripts/rust_affected.py.
+      # The list and why: .github/scripts/rust_affected.py. On main and in
+      # the merge queue the commit is no merge commit, so everything runs.
       - name: Rust-affecting changes
         id: changes
         working-directory: .
@@ -127,7 +141,8 @@ jobs:
           fetch-depth: 2
       # Skip the steps below when nothing the Rust build reads changed (a pin
       # bump in selfhost/versions.json): the job still reports, in seconds.
-      # The list and why: .github/scripts/rust_affected.py.
+      # The list and why: .github/scripts/rust_affected.py. On main and in
+      # the merge queue the commit is no merge commit, so everything runs.
       - name: Rust-affecting changes
         id: changes
         working-directory: .

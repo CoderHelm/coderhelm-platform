@@ -4,7 +4,15 @@ name: Deploy
 # of back-to-back deploys when several PRs merge), a 10-min schedule coalesces all
 # merges in the window into ONE deploy. The gate job skips the run when main hasn't
 # changed since the last successful deploy, so idle windows cost nothing.
-# `workflow_dispatch` is the on-demand escape hatch (always deploys).
+# `workflow_dispatch` is the on-demand escape hatch (always deploys, once CI
+# passed on the commit).
+#
+# A commit of main ships only when CI passed on that very commit: its push
+# run on main, which tests the merged result (.github/scripts/main_ci.py).
+# The gate waits for that run while it is still going; a red main fails the
+# gate, so nothing is built or deployed, the run is not a successful deploy,
+# and the self-host releases (which ship only commits this workflow
+# deployed) refuse it too. The next merge to main that passes CI ships.
 #
 # The hosted deploy never waits on self-host releases, and cuts none by
 # itself: the nightly beta and its promotion to stable run on their own
@@ -37,6 +45,8 @@ jobs:
   gate:
     name: Gate (batch window)
     runs-on: ubuntu-latest
+    # CI on main takes about twenty minutes; the gate waits up to an hour.
+    timeout-minutes: 75
     permissions:
       actions: read
       contents: read
@@ -65,6 +75,19 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.g.outputs.changed == 'true'
+        with:
+          persist-credentials: false
+      # CI's push run on exactly this commit, the merged result, passed.
+      # Still running: wait for it. Red, or no verdict within the hour: the
+      # gate fails and nothing is built or deployed (main_ci.py).
+      - name: CI passed on this commit of main
+        if: steps.g.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+        run: python3 .github/scripts/main_ci.py "$COMMIT" --wait 3600
 
   # The Rust Lambdas, built once per change to what they're built from: a
   # deploy whose Rust inputs (scripts/rust-inputs.mjs) match an earlier

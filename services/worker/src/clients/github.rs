@@ -4603,6 +4603,31 @@ impl GitHubClient {
         if let Some(why) = common::customer_guard::merge_refusal(guard, guarded, head_age) {
             return Ok(MergeOutcome::NotMergeable(why.to_string()));
         }
+        // The head's checks ran on the base as it was then. When the base
+        // has commits the head lacks, those checks never saw the merged
+        // result (two pull requests can each pass and break the base
+        // together), so nothing is merged until the base is brought in and
+        // CI passes on that commit. GitHub's "branch must be up to date"
+        // rule does this only where a repository turned it on, and an admin
+        // merge skips it: this holds on every repository CoderHelm merges
+        // in. An unreadable comparison is an error, never a merge.
+        let base = pr["base"]["ref"]
+            .as_str()
+            .filter(|b| !b.is_empty())
+            .ok_or("the pull request has no base branch")?;
+        let compared = self.compare_status(owner, repo, base, sha).await?;
+        match common::merge_gate::base_standing(&compared) {
+            Some(common::merge_gate::BaseStanding::Current) => {}
+            Some(common::merge_gate::BaseStanding::Moved) => {
+                return Ok(MergeOutcome::BaseMoved(base.to_string()));
+            }
+            None => {
+                return Err(format!(
+                    "could not tell whether {sha} contains `{base}` (compare: {compared:?})"
+                )
+                .into());
+            }
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
         let headers = self.auth_headers().await?;
         let mut req = self.http.put(&url).json(&serde_json::json!({
@@ -6541,6 +6566,9 @@ pub enum MergeOutcome {
     NotMergeable(String),
     /// The head moved past the reviewed SHA (409); carries GitHub's message.
     HeadMoved(String),
+    /// The base branch (named) has commits the head lacks, so the head's
+    /// checks never ran on the merged result. Nothing was merged.
+    BaseMoved(String),
 }
 
 /// Did a person (not a bot) convert this PR back to draft after it was last

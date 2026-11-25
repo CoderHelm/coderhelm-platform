@@ -63,6 +63,30 @@ pub fn is_conflict(pr: &serde_json::Value) -> bool {
     pr["mergeable_state"].as_str() == Some("dirty") && pr["mergeable"].as_bool() != Some(true)
 }
 
+/// Where a pull request's head stands against its base branch's tip, right
+/// before CoderHelm merges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseStanding {
+    /// The head contains the base's tip: its checks ran on what lands.
+    Current,
+    /// The base has commits the head lacks. The head's green checks ran
+    /// against an older base, so they say nothing about the merged result:
+    /// two pull requests can each pass and still break the base together.
+    Moved,
+}
+
+/// Pure: GitHub's comparison status of the head against the base branch
+/// (`compare/{base}...{head}`). "ahead" and "identical" are current;
+/// "behind" and "diverged" mean the base moved. Anything else is unknown,
+/// and an unknown standing never merges.
+pub fn base_standing(compare_status: &str) -> Option<BaseStanding> {
+    match compare_status {
+        "ahead" | "identical" => Some(BaseStanding::Current),
+        "behind" | "diverged" => Some(BaseStanding::Moved),
+        _ => None,
+    }
+}
+
 /// Should a completed check suite on the gate's head re-arm it? Only while
 /// the gate is waiting on (or was stopped by) CI or GitHub's merge rules.
 pub fn wakes_on_ci(state: &str) -> bool {
@@ -742,6 +766,18 @@ mod tests {
         assert!(!is_conflict(&pr(serde_json::json!(true), "blocked")));
         assert!(!is_conflict(&pr(serde_json::json!(false), "blocked")));
         assert!(!is_conflict(&pr(serde_json::Value::Null, "unknown")));
+    }
+
+    /// A head that lacks commits of its base's tip is never merged on its
+    /// own green checks; an unreadable comparison never reads as current.
+    #[test]
+    fn the_base_standing_follows_githubs_comparison() {
+        assert_eq!(base_standing("ahead"), Some(BaseStanding::Current));
+        assert_eq!(base_standing("identical"), Some(BaseStanding::Current));
+        assert_eq!(base_standing("diverged"), Some(BaseStanding::Moved));
+        assert_eq!(base_standing("behind"), Some(BaseStanding::Moved));
+        assert_eq!(base_standing(""), None);
+        assert_eq!(base_standing("unknown"), None);
     }
 
     #[test]
