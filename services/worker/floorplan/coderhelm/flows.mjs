@@ -11,12 +11,17 @@
 //   the Next route-handler hop (a route that calls the backend), and
 //   services reached through dependency injection or a dynamic import.
 // - `revalidate` re-checks every stored journey against the code of this
-//   build: a step whose token moved is re-lined, a step whose token is gone
+//   build: a step whose token moved is re-lined, a step whose candidate was
+//   renamed or split by a new extractor is re-pointed to the one that cites
+//   its code (a screen by its renderer's lines), a step whose token is gone
 //   is dropped, and a journey whose entry is gone, that lost 30% or more of
 //   its steps, or has fewer than 3 left is dropped.
 // - `prepare` does both for the driver and says which entries the model
-//   must (re)write, with the candidates it may choose from. A rebuild where
-//   nothing a journey stands on changed asks for nothing.
+//   must (re)write, with the candidates it may choose from: new screens
+//   first, then changed code, then the rest. A rebuild where nothing a
+//   journey stands on changed asks for nothing, and so does a release that
+//   changed only the extractor (the code each entry stands on is kept by
+//   content in the store).
 //
 // The model (in the worker, passes/app_map_flows.rs) only names journeys
 // and picks and orders candidate ids; it never writes a citation.
@@ -1483,46 +1488,91 @@ export function shownFor(c, entryList, max = MAX_LIST, hops = 2) {
 
 // ── Stored journeys, re-checked on every build ────────────────────────────
 
+/** The candidate a stored step stands on in this build, when its key is not
+ * one any more (a new extractor renamed or split it), found by its code: a
+ * screen by the renderer whose lines hold the step's cited line (a catch-all
+ * screen split into one screen per type), else the one screen of its file;
+ * any other step by a candidate citing the same file and token. Null when
+ * nothing in this build stands on that code. */
+export function repoint(c, st, ev) {
+  const files = new Set(ev.map((e) => e.file));
+  const screenish = st.kind === 'screen' || String(st.key).startsWith('screen:') || String(st.key).startsWith('part:');
+  if (screenish) {
+    const file = String(st.view || '').replace(/^f:/, '') || ev[0]?.file;
+    const on = c.list.filter((x) => x.kind === 'screen' && x.file === file);
+    const inside = on.filter((x) => x.span && ev.some((e) => e.file === file && e.line >= x.span[0] && e.line <= x.span[1]));
+    if (inside.length) return inside.sort((a, b) => (a.span[1] - a.span[0]) - (b.span[1] - b.span[0]))[0];
+    const whole = on.filter((x) => !x.span);
+    if (whole.length === 1) return whole[0];
+    if (on.length === 1) return on[0];
+    return null;
+  }
+  return c.list.find((x) => x.kind !== 'screen' && x.evidence.some((e) => files.has(e.file) && ev.some((v) => v.file === e.file && v.token === e.token))) || null;
+}
+
 /** Re-checks stored journeys against this build's code and candidates.
- * Returns the journeys kept (re-lined), the ones dropped with why, and the
- * entries whose subgraph changed. */
+ * Returns the journeys kept (re-lined, and re-pointed where the candidates
+ * were renamed or split), the ones dropped with why, the entries a journey
+ * lost a step of (their code changed), the entry keys a journey moved to
+ * because its first screen was split (traced again: the entry is new), and
+ * how many steps were re-pointed. */
 export function revalidate(store, c, read) {
   const kept = [];
   const dropped = [];
   const changed = [];
+  const split = [];
+  let repointed = 0;
   for (const fl of store?.flows || []) {
     const steps = [];
     let gone = 0;
-    let moved = false;
-    for (const st of fl.steps || []) {
+    let entry = fl.entry;
+    for (const [i, st] of (fl.steps || []).entries()) {
       const ev = [];
       let ok = true;
       for (const e of st.evidence || []) {
         const l = findToken(read.lines(e.file), e.line, e.token);
         if (!l) { ok = false; break; }
-        if (l !== e.line) moved = true;
         ev.push({ ...e, line: l });
       }
+      if (!ok || !ev.length) { gone += 1; continue; }
+      let cand = c.byKey.get(st.key);
+      let key = st.key;
+      let kind = st.kind;
+      if (!cand && !String(st.key).startsWith('code:')) {
+        cand = repoint(c, st, ev);
+        if (cand) { key = cand.key; kind = cand.kind; repointed += 1; }
+        // A traced step the map has no node for any more stands on its
+        // cited line, as traced steps off the map do.
+        else if (fl.origin === 'trace' && i > 0 && st.kind !== 'screen') {
+          key = `code:${ev[0].file}#${ev[0].token}`;
+          cand = { view: 'f:' + ev[0].file };
+          repointed += 1;
+        }
+      }
       // A traced step the map has no node for stands on its cited line.
-      const cand = c.byKey.get(st.key) || (String(st.key).startsWith('code:') && ev.length ? { view: st.view } : null);
-      if (!ok || !ev.length || !cand) { gone += 1; continue; }
-      steps.push({ ...st, evidence: ev, view: cand.view });
+      if (!cand && String(st.key).startsWith('code:')) cand = { view: st.view };
+      if (!cand) { gone += 1; continue; }
+      if (i === 0 && st.key === fl.entry) entry = key;
+      steps.push({ ...st, key, kind, evidence: ev, view: cand.view });
     }
-    // A traced journey whose code moved or changed is traced again.
-    if (fl.origin === 'trace' && (moved || gone)) changed.push(fl.entry);
+    if (fl.origin === 'trace' && gone) changed.push(entry);
     const total = (fl.steps || []).length || 1;
-    const entryOk = c.byKey.has(fl.entry) && steps[0]?.key === fl.entry;
+    const entryOk = c.byKey.has(entry) && steps[0]?.key === entry;
     let why = null;
     if (!entryOk) why = 'its first screen is gone';
     else if (gone / total >= 0.3) why = `${gone} of ${total} steps are gone`;
     else if (steps.length < 3) why = 'fewer than 3 steps are left';
     if (why) { dropped.push({ id: fl.id, title: fl.title, entry: fl.entry, why }); continue; }
-    const entry = c.byKey.get(fl.entry);
-    const hash = hashOf(c, subgraph(c, entry));
-    if (hash !== fl.hash) changed.push(fl.entry);
-    kept.push({ ...fl, steps });
+    if (entry !== fl.entry) split.push(entry);
+    kept.push({ ...fl, entry, steps });
   }
-  return { kept, dropped, changed };
+  return { kept, dropped, changed, split, repointed };
+}
+
+/** The files the candidates `ids` cite, sorted. */
+export function filesOf(c, ids) {
+  const byId = byIdOf(c);
+  return [...new Set([...ids].flatMap((id) => (byId.get(id)?.evidence || []).map((e) => e.file)))].sort();
 }
 
 /** A stored journey as the viewer draws it (`graph.flows`). */
@@ -1585,22 +1635,59 @@ export function table(c, ids, read) {
 
 /** The driver's step: re-check what is stored, list the candidates, and
  * say what the model must write. Returns { store, flows (for the graph),
- * todo (null when the model need not run), report }. */
+ * todo (null when the model need not run), report }.
+ *
+ * An entry is asked again only when what it stands on changed: its
+ * candidates (`hashOf`, which a new extractor can change with no code
+ * change) and the code of the files they cite (`store.code`, by content)
+ * both differ from when it was asked, a journey of it lost a step, or it is
+ * new (a screen the last map didn't have, or one a split made). So a release
+ * that changes only the extractor keeps every journey and asks for nothing.
+ * The entries asked are in that order: new screens first, then changed
+ * code, then the rest. */
 export function prepare(root, graph, prev) {
   const read = reader(root);
   const c = candidates(graph, read);
-  const { kept, dropped, changed } = revalidate(prev, c, read);
+  const { kept, dropped, changed, split, repointed } = revalidate(prev, c, read);
   const asked = { ...(prev?.asked || {}) };
   const ent = entries(c);
-  const hashes = new Map(ent.map((e) => [e.key, hashOf(c, subgraph(c, e))]));
-  // Entries the model has not seen in this shape: new ones, ones whose
-  // subgraph changed, and the entries of dropped journeys.
-  const redo = new Set(changed);
+  const subs = new Map(ent.map((e) => [e.key, subgraph(c, e)]));
+  const hashes = new Map(ent.map((e) => [e.key, hashOf(c, subs.get(e.key))]));
+  const files = new Map(ent.map((e) => [e.key, filesOf(c, subs.get(e.key))]));
+  const shas = new Map();
+  const codeNow = (f) => {
+    if (!shas.has(f)) { const t = read.text(f); shas.set(f, t == null ? null : sha(t)); }
+    return shas.get(f);
+  };
+  const before = prev?.code || {};
+  /** What the entry stands on is as it was when it was asked. */
+  const same = (key) => {
+    const a = asked[key];
+    if (a == null) return false;
+    if (typeof a === 'string') return a === hashes.get(key);
+    if (a.hash === hashes.get(key)) return true;
+    return Array.isArray(a.files) && a.files.length > 0 && a.files.every((f) => before[f] != null && before[f] === codeNow(f));
+  };
+  // Screens the last map had (an older store: the entries it asked about and
+  // the screens its journeys stood on).
+  const known = new Set(prev?.screens || [...Object.keys(asked), ...(prev?.flows || []).flatMap((f) => (f.steps || []).map((s) => s.key))]);
+  const isNew = (key) => prev != null && !known.has(key);
+  // Entries the model has not seen in this shape.
+  const redo = new Set([...changed, ...split]);
   for (const d of dropped) if (hashes.has(d.entry)) redo.add(d.entry);
-  for (const e of ent) if (asked[e.key] !== hashes.get(e.key)) redo.add(e.key);
-  // Every kind of journey gets its share of the list: entries taken in
-  // turn across families, routed screens before forms.
-  const todoEntries = rankEntries(c, ent.filter((e) => redo.has(e.key)));
+  for (const e of ent) if (!same(e.key)) redo.add(e.key);
+  // Entries still as they were are stamped with this build's hash and files,
+  // so the next build compares like with like.
+  for (const e of ent) {
+    if (redo.has(e.key) || asked[e.key] == null) continue;
+    asked[e.key] = { hash: hashes.get(e.key), files: files.get(e.key) };
+  }
+  for (const f of kept) if (!redo.has(f.entry) && hashes.has(f.entry)) f.hash = hashes.get(f.entry);
+  const why = (key) => (isNew(key) || split.includes(key) ? 'new' : asked[key] != null || changed.includes(key) ? 'changed' : 'missing');
+  // New screens first, then changed code, then the rest; within each, every
+  // kind of journey gets its share (entries taken in turn across families,
+  // routed screens before forms).
+  const todoEntries = ['new', 'changed', 'missing'].flatMap((w) => rankEntries(c, ent.filter((e) => redo.has(e.key) && why(e.key) === w)));
   let todo = null;
   if (todoEntries.length) {
     // One model call per journey family per app, each with only the
@@ -1626,15 +1713,23 @@ export function prepare(root, graph, prev) {
     todo = {
       groups: out,
       table: table(c, all, read),
-      entries: todoEntries.filter((e) => all.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key), family: fam(e), app: appOf(e) })),
+      entries: todoEntries.filter((e) => all.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key), files: files.get(e.key), why: why(e.key), family: fam(e), app: appOf(e) })),
       keep: kept.filter((f) => !redo.has(f.entry)).map((f) => ({ id: f.id, title: f.title })),
     };
   }
-  const store = { schema: SCHEMA, flows: kept, asked: Object.fromEntries([...Object.entries(asked)].filter(([k]) => hashes.has(k))) };
+  const askedNow = Object.fromEntries([...Object.entries(asked)].filter(([k]) => hashes.has(k)));
+  // The code each remembered or asked entry stands on, by content, for the
+  // next build to compare with.
+  const code = {};
+  for (const a of Object.values(askedNow)) for (const f of a?.files || []) if (codeNow(f) != null) code[f] = codeNow(f);
+  for (const e of todo?.entries || []) for (const f of e.files) if (codeNow(f) != null) code[f] = codeNow(f);
+  const screens = c.list.filter((x) => x.kind === 'screen').map((x) => x.key).sort();
+  const store = { schema: SCHEMA, flows: kept, asked: askedNow, screens, code };
+  const count = (w) => todoEntries.filter((e) => why(e.key) === w).length;
   return {
     store,
     flows: kept.map(forViewer),
     todo,
-    report: { candidates: c.list.length, entries: ent.length, kept: kept.length, dropped, redo: todoEntries.length },
+    report: { candidates: c.list.length, entries: ent.length, kept: kept.length, dropped, redo: todoEntries.length, new: count('new'), changed: count('changed'), missing: count('missing'), repointed },
   };
 }

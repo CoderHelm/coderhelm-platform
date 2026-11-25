@@ -179,6 +179,10 @@ pub fn status_view(st: Option<&am::Status>, map: MapFacts, team_repos: u32, now:
         // `release` while the map is built again because this release
         // extracts more than the one that made it; the page says so.
         "reason": if st.is_some_and(|s| am::rebuilding_for_release(s, now)) { "release" } else { "" },
+        // A repository the journeys couldn't read, in one plain line (empty
+        // once it can be read again).
+        "unread": s.unread,
+        "journeys_note": am::unread_line(&s.unread),
     })
 }
 
@@ -1297,7 +1301,7 @@ mod tests {
                 "last_build": "building", "note": "", "started_at": now - 120, "repos": 12,
                 "estimate": {"low_secs": 15 * 60, "high_secs": 30 * 60},
                 "built_at": 0, "built_repos": 0, "now": now, "floorplan": am::FLOORPLAN_VERSION.trim(),
-                "reason": "",
+                "reason": "", "unread": [], "journeys_note": "",
             })
         );
         // Built: when, and from how many repositories; nothing running.
@@ -1319,6 +1323,23 @@ mod tests {
         assert_eq!(
             (v["started_at"].as_i64(), v["estimate"].is_null()),
             (Some(0), true)
+        );
+        // A repository the journeys couldn't read: one plain line, gone
+        // once it can be read again.
+        let mut waiting = done.clone();
+        waiting.unread = vec!["harbor/harbor-etl".into()];
+        let v = status_view(Some(&waiting), facts, 0, now);
+        assert_eq!(v["state"], "ready");
+        let line = v["journeys_note"].as_str().unwrap();
+        assert!(
+            line.starts_with("harbor-etl couldn't be read from GitHub just now"),
+            "{line}"
+        );
+        assert!(line.contains("every other journey goes on"));
+        waiting.unread.clear();
+        assert_eq!(
+            status_view(Some(&waiting), facts, 0, now)["journeys_note"],
+            ""
         );
         // A map from before the status kept these: the map's own date and repositories.
         let v = status_view(

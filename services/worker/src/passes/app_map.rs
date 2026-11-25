@@ -756,7 +756,7 @@ pub async fn run(state: &WorkerState, msg: AppMapMessage) {
     if msg.step == "flows" {
         // The journeys come after the map is ready, outside the build's
         // turns; the step runs once (it takes its input before asking).
-        let call = flows_step(state, &team_id);
+        let call = flows_step(state, &team_id, msg.turn);
         if let Err(e) = common::usage::with_feature(common::usage::feature::APP_MAP, call).await {
             warn!(team_id, error = %e, "App map: the journeys step failed");
         }
@@ -1264,7 +1264,20 @@ async fn step(
                     am::gzip(todo.to_string().as_bytes()),
                 )
                 .await?;
-                if !queue(state, team_id, "flows", build, 0, 0).await {
+                // A new todo starts the one resume chain again: any message
+                // of an older one is dropped (`app_map_trace::take_message`).
+                let next = super::app_map_trace::reschedule(
+                    &read_json(state, &am::flows_next_key(team_id)).await,
+                    chrono::Utc::now().timestamp(),
+                );
+                s3_put(
+                    state,
+                    &am::flows_next_key(team_id),
+                    next.to_string().into_bytes(),
+                )
+                .await?;
+                let turn = super::app_map_trace::turn_of(&next);
+                if !queue(state, team_id, "flows", build, turn, 0).await {
                     warn!(team_id, "App map: the journeys step couldn't be queued");
                 }
             }
@@ -1363,10 +1376,23 @@ async fn describe(
     next_step(state, team_id, &job, build, turn).await
 }
 
-/// The journeys step: the light model names journeys and picks and orders
-/// the sandbox's candidates; the checker keeps only cited steps. The result
-/// goes into the map's state (`flows.json`) and, when shown, the map.
-async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
+/// A small JSON file of the map's (`Null` when there is none).
+async fn read_json(state: &WorkerState, key: &str) -> Value {
+    s3_get(state, key)
+        .await
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The journeys step: the light model traces each entry's journey through
+/// the code (the candidates are the fallback). The result goes into the
+/// map's state (`flows.json`) and, when shown, the map.
+///
+/// One resume at a time (`flows_next_key`): only the message the schedule
+/// names runs, and not before its time; any other (a message delivered
+/// twice, an older watchdog) is dropped, so passes never pile up.
+async fn flows_step(state: &WorkerState, team_id: &str, turn: u32) -> Result<(), String> {
+    use super::app_map_trace as tr;
     let Some(todo) = s3_get(state, &am::flows_todo_key(team_id))
         .await
         .and_then(|b| am::gunzip(&b, 64 * 1024 * 1024))
@@ -1383,22 +1409,55 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
         info!(team_id, "App map: journeys are for an older build, skipped");
         return Ok(());
     }
-    // One step at a time: a message delivered twice, or a watchdog that
-    // fires while a pass runs, leaves it to the pass that holds the lease.
+    let build = todo["build"].as_str().unwrap_or("").to_string();
     let now = chrono::Utc::now().timestamp();
-    let held = s3_get(state, &am::flows_lease_key(team_id))
-        .await
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-    if held.is_some_and(|l| l["until"].as_i64().unwrap_or(0) > now) {
-        info!(team_id, "App map: another step is tracing the journeys");
+    let next = read_json(state, &am::flows_next_key(team_id)).await;
+    match tr::take_message(turn, &next, now) {
+        tr::Take::Stale => {
+            info!(team_id, turn, "App map: an older journeys resume, dropped");
+            return Ok(());
+        }
+        tr::Take::Hop(secs) => {
+            let _ = queue(state, team_id, "flows", &build, turn, secs as i32).await;
+            return Ok(());
+        }
+        tr::Take::Run => {}
+    }
+    // One pass at a time: while another holds the lease, this message waits
+    // for it to end (and is dropped then, the pass having rescheduled).
+    let held = read_json(state, &am::flows_lease_key(team_id)).await["until"]
+        .as_i64()
+        .unwrap_or(0);
+    if held > now {
+        info!(
+            team_id,
+            "App map: another step is tracing the journeys; this one waits for it"
+        );
+        let secs = (held - now).min(tr::MAX_DELAY_SECS) as i32;
+        let _ = queue(state, team_id, "flows", &build, turn, secs).await;
         return Ok(());
     }
     let lease = |until: i64| json!({ "until": until }).to_string().into_bytes();
     s3_put(state, &am::flows_lease_key(team_id), lease(now + 16 * 60)).await?;
-    let build = todo["build"].as_str().unwrap_or("").to_string();
-    // If this Lambda stops for good, the queue is picked up again.
-    let _ = queue(state, team_id, "flows", &build, 0, 900).await;
-    let result = flows_pass(state, team_id, todo, &build).await;
+    // If this Lambda stops for good, one resume picks the queue up again;
+    // the pass replaces it with its own when it ends.
+    let watch = tr::reschedule(&next, now + tr::MAX_DELAY_SECS);
+    s3_put(
+        state,
+        &am::flows_next_key(team_id),
+        watch.to_string().into_bytes(),
+    )
+    .await?;
+    let _ = queue(
+        state,
+        team_id,
+        "flows",
+        &build,
+        tr::turn_of(&watch),
+        tr::MAX_DELAY_SECS as i32,
+    )
+    .await;
+    let result = flows_pass(state, team_id, todo, &build, &watch).await;
     let _ = state
         .s3
         .delete_object()
@@ -1411,12 +1470,16 @@ async fn flows_step(state: &WorkerState, team_id: &str) -> Result<(), String> {
 
 /// One pass over the journeys still to trace: as many as the pass's budget
 /// (within the day's) holds, each kept as it finishes, the rest left queued
-/// for a later pass.
+/// for a later pass. Entries that need a repository GitHub wouldn't give
+/// wait for it; every other entry goes on. The pass ends by scheduling
+/// exactly one resume (`app_map_trace::next_resume`), or none when nothing
+/// is left.
 async fn flows_pass(
     state: &WorkerState,
     team_id: &str,
     todo: Value,
     build: &str,
+    watch: &Value,
 ) -> Result<(), String> {
     use super::app_map_flows as fl;
     use super::app_map_trace as tr;
@@ -1444,14 +1507,22 @@ async fn flows_pass(
         .unwrap_or_default();
     let spent_before = tr::spent_today(&spend, &today);
     let budget = tr::pass_budget(spent_before);
+    let repos = super::plan::fetch_team_repos(state, team_id).await;
+    let folders = am::folders(&repos);
+    let repo_of: BTreeMap<String, String> = folders
+        .iter()
+        .map(|(r, f)| (f.clone(), r.clone()))
+        .collect();
+    let before = todo["entries"].as_array().map(Vec::len).unwrap_or(0);
     let mut rest = todo.clone();
+    let mut unread = todo["unread"].clone();
     let mut failed: Vec<Value> = Vec::new();
     let mut spent = 0.0;
     let mut by_time = false;
     if !tr::enabled() {
         failed = todo["entries"].as_array().cloned().unwrap_or_default();
         rest["entries"] = json!([]);
-    } else if budget > 0.0 {
+    } else if tr::can_start(budget) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tr::Done>();
         let trace = async {
             let tx = tx;
@@ -1462,6 +1533,7 @@ async fn flows_pass(
                 &client,
                 &model,
                 &todo,
+                &folders,
                 &mut usage,
                 budget,
                 Some(&tx),
@@ -1525,12 +1597,14 @@ async fn flows_pass(
         let (traced, kept) = tokio::join!(trace, keep);
         kept?;
         match traced {
-            Ok(out) => {
+            Ok((out, now_unread)) => {
                 by_time = out.report.over_budget == 0 && !out.left.is_empty();
+                unread = now_unread;
                 info!(team_id, flows = out.flows.len(), failed = out.failed.len(), traced = ?out.report, left = out.left.len(), cost = spent, budget, "App map: journeys traced");
             }
             Err(e) => {
-                // The code couldn't be read: the candidates write them all.
+                // Not a repository (each of those waits on its own): the
+                // candidates write the entries left.
                 warn!(team_id, error = %e, "App map: the journeys couldn't be traced; the candidates are used");
                 failed.extend(rest["entries"].as_array().cloned().unwrap_or_default());
                 rest["entries"] = json!([]);
@@ -1564,9 +1638,15 @@ async fn flows_pass(
         }
     }
     let left = rest["entries"].as_array().map(Vec::len).unwrap_or(0);
+    // Repositories no head names any more are not waited on.
+    if let Some(o) = unread.as_object_mut() {
+        o.retain(|r, _| todo["heads"].get(r).is_some());
+    }
+    rest["unread"] = unread.clone();
     store["pending"] = json!(left);
     tgz = fl::replace_in_tgz(&tgz, fl::STORE, store.to_string().as_bytes())?;
     s3_put(state, &am::state_key(team_id), tgz).await?;
+    let now = chrono::Utc::now().timestamp();
     if left == 0 {
         let _ = state
             .s3
@@ -1582,24 +1662,69 @@ async fn flows_pass(
             am::gzip(rest.to_string().as_bytes()),
         )
         .await?;
-        // The next pass: at once when this one ran out of time, soon when
-        // the day's budget still has room, else every 15 minutes until the
-        // next day's.
-        let day_left = tr::pass_budget(spent_before + spent) > 0.0;
-        let delay = if by_time {
-            0
-        } else if day_left {
-            60
-        } else {
-            900
-        };
-        if !queue(state, team_id, "flows", build, 0, delay).await {
+    }
+    // Exactly one resume, never sooner than something can go on.
+    let (ready, waiting) = tr::split_ready(&rest, &repo_of, &unread, now);
+    let waits = tr::waiting_repos(&unread, now);
+    let end = tr::PassEnd {
+        progressed: left < before,
+        by_time,
+        runnable: if left == 0 { 0 } else { ready.len() },
+        retry_at: waiting
+            .iter()
+            .filter_map(|(_, r)| waits.get(r).copied())
+            .collect(),
+        day_spent: spent_before + spent,
+    };
+    let at = tr::next_resume(&end, now);
+    let next = tr::reschedule(watch, at.unwrap_or(i64::MAX));
+    s3_put(
+        state,
+        &am::flows_next_key(team_id),
+        next.to_string().into_bytes(),
+    )
+    .await?;
+    if let Some(at) = at {
+        let delay = (at - now).clamp(0, tr::MAX_DELAY_SECS) as i32;
+        if !queue(state, team_id, "flows", build, tr::turn_of(&next), delay).await {
             warn!(
                 team_id,
                 "App map: the rest of the journeys couldn't be queued"
             );
         }
+        if !end.progressed {
+            info!(
+                team_id,
+                left,
+                waiting = waiting.len(),
+                resume_in = at - now,
+                "App map: no journey can go on now; one resume is queued for when one can"
+            );
+        }
     }
+    // The status names the repositories the journeys wait on (and clears
+    // them once each is read, or nothing is left to trace).
+    let names: Vec<String> = if left == 0 {
+        Vec::new()
+    } else {
+        unread
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let _ = am::update_status(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        |cur| {
+            let c = cur?;
+            (c.unread != names).then(|| am::Status {
+                unread: names.clone(),
+                ..c.clone()
+            })
+        },
+    )
+    .await;
     info!(team_id, left, cost = spent, "App map: journeys written");
     if fl::visible() {
         if let Some(b) = s3_get(state, &am::graph_key(team_id)).await {
@@ -1623,9 +1748,13 @@ async fn flows_pass(
 
 /// The journeys traced through the code at the heads the map was built
 /// from: the repositories read again (the step runs on its own, after the
-/// map), the map's graph for its lookups, the light model a few journeys
-/// at a time until the Lambda's time or the pass's budget runs short; each
-/// finished entry is handed to `done`.
+/// map), each tried again with backoff when GitHub refuses it; the entries
+/// that need a repository still unread wait (in the todo's `unread`, with
+/// when it is tried again), and every other entry is traced: the map's
+/// graph for its lookups, the light model a few journeys at a time until
+/// the Lambda's time or the pass's budget runs short; each finished entry
+/// is handed to `done`. Returns what was traced and the repositories still
+/// unread.
 #[allow(clippy::too_many_arguments)]
 async fn trace_journeys(
     state: &WorkerState,
@@ -1634,14 +1763,14 @@ async fn trace_journeys(
     client: &crate::agent::anthropic::AnthropicClient,
     model: &str,
     todo: &Value,
+    folders: &BTreeMap<String, String>,
     usage: &mut TokenUsage,
     budget: f64,
     done: Option<&tokio::sync::mpsc::UnboundedSender<super::app_map_trace::Done>>,
-) -> Result<super::app_map_trace::TraceOut, String> {
+) -> Result<(super::app_map_trace::TraceOut, Value), String> {
     use super::app_map_trace as tr;
     let heads: BTreeMap<String, String> =
         serde_json::from_value(todo["heads"].clone()).map_err(|e| e.to_string())?;
-    let repos = super::plan::fetch_team_repos(state, team_id).await;
     let installation = super::code_graph::team_installation_id(state, team_id)
         .await
         .ok_or("no GitHub installation for the team")?;
@@ -1652,7 +1781,10 @@ async fn trace_journeys(
         &state.http,
     )
     .map_err(|e| e.to_string())?;
-    let folders = am::folders(&repos);
+    let mut unread = match &todo["unread"] {
+        Value::Object(o) => Value::Object(o.clone()),
+        _ => json!({}),
+    };
     let mut room = MAX_SNAPSHOT_BYTES;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for (repo, sha) in &heads {
@@ -1662,16 +1794,51 @@ async fn trace_journeys(
         if room == 0 {
             break;
         }
+        // Still waiting for its retry time: not asked again yet.
+        if !tr::readable_now(&unread, repo, chrono::Utc::now().timestamp()) {
+            continue;
+        }
         let folder = folders
             .get(repo)
             .cloned()
             .unwrap_or_else(|| name.to_string());
-        let tarball = github
-            .download_tarball(owner, name, sha)
-            .await
-            .map_err(|e| format!("{repo} couldn't be read: {e}"))?;
-        let (got, _) = repo_entries(&tarball, &folder, &mut room);
-        files.extend(got);
+        let read = tr::read_repo(
+            || github.download_tarball(owner, name, sha),
+            |secs| tokio::time::sleep(std::time::Duration::from_secs(secs)),
+            &tr::READ_RETRY_SECS,
+        )
+        .await;
+        match read {
+            Ok(tarball) => {
+                if let Some(o) = unread.as_object_mut() {
+                    o.remove(repo);
+                }
+                let (got, _) = repo_entries(&tarball, &folder, &mut room);
+                files.extend(got);
+            }
+            Err(fail) => {
+                warn!(team_id, repo = %repo, fail = ?fail, "App map: a repository couldn't be read; the journeys through it wait, every other one goes on");
+                tr::note_unread(&mut unread, repo, &fail, chrono::Utc::now().timestamp());
+            }
+        }
+    }
+    let repo_of: BTreeMap<String, String> = folders
+        .iter()
+        .map(|(r, f)| (f.clone(), r.clone()))
+        .collect();
+    let (ready, waiting) = tr::split_ready(todo, &repo_of, &unread, chrono::Utc::now().timestamp());
+    if !waiting.is_empty() {
+        info!(
+            team_id,
+            waiting = waiting.len(),
+            ready = ready.len(),
+            "App map: some journeys wait for a repository; the rest are traced"
+        );
+    }
+    let mut ready_todo = todo.clone();
+    ready_todo["entries"] = json!(ready);
+    if ready.is_empty() {
+        return Ok((tr::TraceOut::empty(), unread));
     }
     let snapshot = Snapshot::take(files);
     let graph = s3_get(state, &am::graph_key(team_id))
@@ -1691,10 +1858,22 @@ async fn trace_journeys(
         std::time::Instant::now()
             + t.saturating_sub(std::time::Duration::from_secs(tr::JOURNEY_SECS + 120))
     });
-    Ok(tr::trace_all(
-        client, model, &gate, &tools, &snapshot, graph, todo, usage, true, stop, budget, done,
+    let out = tr::trace_all(
+        client,
+        model,
+        &gate,
+        &tools,
+        &snapshot,
+        graph,
+        &ready_todo,
+        usage,
+        true,
+        stop,
+        budget,
+        done,
     )
-    .await)
+    .await;
+    Ok((out, unread))
 }
 
 async fn next_step(

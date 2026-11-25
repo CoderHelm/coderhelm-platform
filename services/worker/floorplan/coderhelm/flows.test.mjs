@@ -7,7 +7,9 @@
 // - every candidate cites a line that holds its token;
 // - stored journeys are re-lined when code moves, lose steps whose code is
 //   gone, and are dropped by the rules; a rebuild that changed nothing a
-//   journey stands on asks the model for nothing.
+//   journey stands on asks the model for nothing, and so does a release
+//   that changed only the extractor (renamed and split screens re-pointed);
+// - new screens are asked for first, then changed code, then the rest.
 //
 //   node --test services/worker/floorplan/coderhelm/flows.test.mjs
 import test from 'node:test';
@@ -318,6 +320,142 @@ test('steps whose code is gone are dropped, and a journey is dropped by the rule
   const three = F.prepare(dir, g4, store);
   assert.equal(three.store.flows.length, 0);
   assert.equal(three.report.dropped[0].why, 'its first screen is gone');
+});
+
+/** What the worker's trace step leaves in the store after a first map, by
+ * hand: a traced sign-in journey, and every entry asked about remembered
+ * with its hash and the files it stands on (as `app_map_flows::merge`
+ * writes them). */
+function traced(first, c) {
+  const step = (key, note) => {
+    const x = by(c, key);
+    return { key, kind: x.kind, view: x.view, note, evidence: x.evidence, linked: true };
+  };
+  const entry = first.todo.entries.find((e) => e.key === 'screen:web:/login');
+  const store = structuredClone(first.store);
+  store.flows = [{
+    id: 'sign-in', title: 'Sign in', entry: 'screen:web:/login', hash: entry.hash, origin: 'trace',
+    steps: [
+      step('screen:web:/login', 'The boater opens the sign-in drawer.'),
+      step('part:harbor-web/components/LoginForm.tsx#LoginForm', 'They type their email and password.'),
+      step('req:POST /api/session', 'The site starts a session.'),
+      step('req:POST /auth/login', 'The session route asks the API to sign them in.'),
+      step('n:okta', 'Okta checks the password.'),
+      step('screen:web:/slips', 'They land on their slips.'),
+    ],
+  }];
+  store.asked = Object.fromEntries(first.todo.entries.map((e) => [e.key, { hash: e.hash, files: e.files }]));
+  return store;
+}
+
+test('a release that changed only the extractor traces nothing, spends nothing and keeps every journey', () => {
+  const dir = root();
+  const first = F.prepare(dir, GRAPH, null);
+  const store = traced(first, F.candidates(GRAPH, F.reader(dir)));
+  // The same code, read by an extractor that names one screen differently
+  // and finds one more link: every entry's candidates hash differently.
+  const g2 = structuredClone(GRAPH);
+  g2.screens.find((x) => x.id === 'screen:web:/slips').id = 'screen:web:slips';
+  g2.links.push({ a: 'f:harbor-web/app/slips/page.tsx', b: 'f:harbor-web/lib/session.tsx', k: 'import', names: ['useSession'] });
+  const bumped = F.prepare(root(), g2, store);
+  const hashes = new Map(F.prepare(root(), g2, null).todo.entries.map((e) => [e.key, e.hash]));
+  assert.ok(first.todo.entries.some((e) => hashes.has(e.key) && hashes.get(e.key) !== e.hash), 'the new extractor changes what the hashes stand on');
+  assert.equal(bumped.todo, null, JSON.stringify(bumped.report));
+  assert.equal(bumped.report.redo, 0);
+  assert.equal(bumped.store.flows.length, 1);
+  const fl = bumped.store.flows[0];
+  assert.equal(fl.steps.length, 6, 'no step is lost');
+  assert.equal(fl.steps[5].key, 'screen:web:slips', 'the renamed screen is re-pointed by its code');
+  assert.equal(bumped.report.repointed, 1);
+  // Stamped with the new extractor's hashes: the next build with this
+  // extractor compares like with like.
+  for (const [k, a] of Object.entries(bumped.store.asked)) assert.equal(a.hash, hashes.get(k) ?? a.hash);
+  const again = F.prepare(root(), g2, bumped.store);
+  assert.equal(again.todo, null);
+  // The code changed under the journey: it is traced again.
+  const edited = { ...FILES, 'harbor-api/src/auth.service.ts': FILES['harbor-api/src/auth.service.ts'].replace("import { OktaAuth } from '@okta/okta-auth-js';", "import { Auth } from './auth';") };
+  const g3 = structuredClone(g2);
+  g3.links = g3.links.filter((l) => l.b !== 'n:okta');
+  const moved = F.prepare(root(edited), g3, bumped.store);
+  assert.ok(moved.todo?.entries.some((e) => e.key === 'screen:web:/login' && e.why === 'changed'), JSON.stringify(moved.report));
+});
+
+test('a step on a catch-all screen now split by type is re-pointed to its type\'s screen by its lines', () => {
+  const dir = root({
+    'harbor-web/app/login/page.tsx': FILES['harbor-web/app/login/page.tsx'],
+    'harbor-web/app/[...slug]/page.tsx': `export default function Page({ type }) {
+  if (type === 'slip') return <SlipPage />;
+  return <EventPage />;
+}
+function SlipPage() {
+  const book = () => fetch('/api/book');
+  return <form onSubmit={book} />;
+}
+function EventPage() {
+  const join = () => fetch('/api/join');
+  return <div onClick={join} />;
+}
+`,
+  });
+  const read = F.reader(dir);
+  const ev = (file, line, token) => ({ file, line, token });
+  const screen = (key, file, line, token, span) => ({ id: key, kind: 'screen', key, view: 'f:' + file, file, evidence: [ev(file, line, token)], ...(span ? { span } : {}) });
+  const slug = 'harbor-web/app/[...slug]/page.tsx';
+  const list = [
+    screen('screen:web:/login', 'harbor-web/app/login/page.tsx', 3, 'LoginPage'),
+    screen('screen:web:/slips/slip', slug, 5, 'SlipPage', [5, 8]),
+    screen('screen:web:/slips/event', slug, 9, 'EventPage', [9, 12]),
+    { id: 'R1', kind: 'request', key: 'req:POST /api/book', view: 'r:1', evidence: [ev(slug, 6, "fetch('/api/book')")] },
+  ];
+  const c = { list, byKey: new Map(list.map((x) => [x.key, x])), edges: new Map() };
+  const st = (key, kind, view, e, note) => ({ key, kind, view, note, evidence: [e], linked: true });
+  const store = { flows: [{
+    id: 'book-a-slip', title: 'Book a slip', entry: 'screen:web:/login', origin: 'trace', steps: [
+      st('screen:web:/login', 'screen', 'f:harbor-web/app/login/page.tsx', ev('harbor-web/app/login/page.tsx', 3, 'LoginPage'), 'They sign in.'),
+      st('screen:web:/[...slug]', 'screen', 'f:' + slug, ev(slug, 7, '<form onSubmit={book}'), 'They open a slip and press Book.'),
+      st('req:POST /api/book', 'request', 'r:1', ev(slug, 6, "fetch('/api/book')"), 'The page asks to book it.'),
+    ],
+  }] };
+  const out = F.revalidate(store, c, read);
+  assert.equal(out.kept.length, 1, JSON.stringify(out.dropped));
+  assert.equal(out.kept[0].steps[1].key, 'screen:web:/slips/slip', 'the renderer whose lines hold the step');
+  assert.equal(out.repointed, 1);
+  assert.deepEqual(out.changed, [], 'the code is as it was: nothing to trace again');
+  // The same step cited inside the other renderer lands there instead.
+  store.flows[0].steps[1].evidence = [ev(slug, 11, '<div onClick={join}')];
+  assert.equal(F.revalidate(store, c, read).kept[0].steps[1].key, 'screen:web:/slips/event');
+  // A journey whose own first screen was split moves to the renderer it
+  // starts in, and that entry is traced again as a new one.
+  const fromSplit = { flows: [{ ...structuredClone(store.flows[0]), entry: 'screen:web:/[...slug]', steps: structuredClone(store.flows[0].steps).slice(1).concat([st('req:POST /api/book', 'request', 'r:1', ev(slug, 6, "fetch('/api/book')"), 'Again.')]) }] };
+  fromSplit.flows[0].steps[0].key = 'screen:web:/[...slug]';
+  fromSplit.flows[0].steps[0].evidence = [ev(slug, 6, "fetch('/api/book')")];
+  const moved = F.revalidate(fromSplit, c, read);
+  assert.equal(moved.kept[0]?.entry, 'screen:web:/slips/slip', JSON.stringify(moved));
+  assert.deepEqual(moved.split, ['screen:web:/slips/slip']);
+});
+
+test('new screens are traced first, then changed code, then the rest', () => {
+  const files = { ...FILES, 'harbor-web/app/signup/page.tsx': 'export default function SignUpPage() {\n  return <form />;\n}\n' };
+  const first = F.prepare(root(), GRAPH, null);
+  // Only the sign-in screen was traced; the rest are still waiting.
+  const store = structuredClone(first.store);
+  const login = first.todo.entries.find((e) => e.key === 'screen:web:/login');
+  store.asked = { [login.key]: { hash: login.hash, files: login.files } };
+  // The next build: a new sign-up screen, and the sign-in code changed.
+  const edited = { ...files, 'harbor-api/src/auth.service.ts': files['harbor-api/src/auth.service.ts'].replace("import { OktaAuth } from '@okta/okta-auth-js';", "import { Auth } from './auth';") };
+  const g2 = structuredClone(GRAPH);
+  g2.files.push({ p: 'harbor-web/app/signup/page.tsx', s: [sym('SignUpPage', 'default', 1)] });
+  g2.screens.push({ id: 'screen:web:/signup', url: '/signup', file: 'harbor-web/app/signup/page.tsx', app: 'web', name: 'Sign up' });
+  g2.links = g2.links.filter((l) => l.b !== 'n:okta');
+  const next = F.prepare(root(edited), g2, store);
+  const whys = next.todo.entries.map((e) => e.why);
+  assert.equal(next.todo.entries[0].key, 'screen:web:/signup', JSON.stringify(next.todo.entries));
+  assert.equal(whys[0], 'new');
+  assert.ok(whys.indexOf('changed') > 0 && whys.includes('missing'), JSON.stringify(whys));
+  const rank = { new: 0, changed: 1, missing: 2 };
+  assert.deepEqual(whys, [...whys].sort((a, b) => rank[a] - rank[b]));
+  assert.equal(next.todo.entries.find((e) => e.key === 'screen:web:/login').why, 'changed');
+  assert.deepEqual([next.report.new, next.report.changed], [1, 1]);
 });
 
 // The second round of gap closers, on a made-up marina app: an outside

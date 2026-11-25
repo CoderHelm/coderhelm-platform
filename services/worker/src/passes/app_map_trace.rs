@@ -100,6 +100,274 @@ pub fn pass_budget(spent_today: f64) -> f64 {
     BUDGET_USD.min((DAILY_BUDGET_USD - spent_today).max(0.0))
 }
 
+/// Waits, in seconds, before reading a repository again within one pass
+/// after GitHub refused it (a 403, a 404, a 5xx, no answer).
+pub const READ_RETRY_SECS: [u64; 3] = [2, 6, 18];
+/// A rate limit that resets within this many seconds is waited out within
+/// the pass; a longer one is read again after its reset, on a later pass.
+pub const READ_LIMIT_WAIT_SECS: u64 = 20;
+/// A repository that still couldn't be read is tried again on a later pass
+/// after this, doubled on each failure in a row up to [`REPO_RETRY_MAX_SECS`].
+pub const REPO_RETRY_SECS: i64 = 5 * 60;
+pub const REPO_RETRY_MAX_SECS: i64 = 60 * 60;
+/// A pass that made no progress never queues the next one sooner than this.
+pub const IDLE_SECS: i64 = 5 * 60;
+/// The longest an SQS message can be held back (a later resume hops).
+pub const MAX_DELAY_SECS: i64 = 900;
+
+/// Why a repository couldn't be read in this pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepoFail {
+    /// GitHub's rate limit, which resets in this many seconds.
+    Limited { wait_secs: u64, why: String },
+    /// Anything else, after every retry in the pass.
+    Failed { why: String },
+}
+
+/// Reads one repository, trying again with backoff within the pass:
+/// `delays` between attempts after a refusal, and a rate limit's own wait
+/// when it resets within [`READ_LIMIT_WAIT_SECS`]. `sleep` waits that many
+/// seconds (the tests' doesn't).
+pub async fn read_repo<F, Fut, S, SFut>(
+    mut fetch: F,
+    mut sleep: S,
+    delays: &[u64],
+) -> Result<Vec<u8>, RepoFail>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>>,
+    S: FnMut(u64) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let mut attempt = 0;
+    loop {
+        let e = match fetch().await {
+            Ok(b) => return Ok(b),
+            Err(e) => e,
+        };
+        let why = common::truncate_str(&e.to_string(), 300).to_string();
+        if let Some(wait_secs) = crate::clients::github::rate_limited(&*e) {
+            if wait_secs <= READ_LIMIT_WAIT_SECS && attempt < delays.len() {
+                sleep(wait_secs).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(RepoFail::Limited { wait_secs, why });
+        }
+        let Some(d) = delays.get(attempt) else {
+            return Err(RepoFail::Failed { why });
+        };
+        sleep(*d).await;
+        attempt += 1;
+    }
+}
+
+/// Notes a repository that couldn't be read in the todo's `unread`
+/// (`{repo: {until, fails, why}}`): a rate limit is read again after
+/// GitHub's reset, anything else after a backoff that doubles with each
+/// failure in a row.
+pub fn note_unread(unread: &mut Value, repo: &str, fail: &RepoFail, now: i64) {
+    let fails = unread[repo]["fails"].as_u64().unwrap_or(0) + 1;
+    let (until, why) = match fail {
+        RepoFail::Limited { wait_secs, why } => (now + *wait_secs as i64 + 5, why),
+        RepoFail::Failed { why } => {
+            let shift = (fails - 1).min(8) as u32;
+            (
+                now + (REPO_RETRY_SECS << shift).min(REPO_RETRY_MAX_SECS),
+                why,
+            )
+        }
+    };
+    unread[repo] = json!({"until": until, "fails": fails, "why": why});
+}
+
+/// Whether a repository may be read in this pass: never refused, or its
+/// retry time has come.
+pub fn readable_now(unread: &Value, repo: &str, now: i64) -> bool {
+    unread[repo]["until"].as_i64().is_none_or(|u| u <= now)
+}
+
+/// The repositories still waiting for their retry time, with it.
+pub fn waiting_repos(unread: &Value, now: i64) -> BTreeMap<String, i64> {
+    unread
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(r, v)| Some((r.clone(), v["until"].as_i64()?)))
+        .filter(|(_, u)| *u > now)
+        .collect()
+}
+
+/// The repositories (`owner/name`) an entry's journey reads: the folders of
+/// the files its candidates cite (`files`, from the sandbox), or of the
+/// table's candidates its row leads to (an older todo).
+pub fn entry_repos(
+    todo: &Value,
+    entry: &Value,
+    repo_of: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut files: Vec<String> = entry["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.as_str().map(str::to_string))
+        .collect();
+    if entry["files"].as_array().is_none() {
+        let table = &todo["table"];
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<String> = entry["id"]
+            .as_str()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let row = &table[&id];
+            for e in row["evidence"].as_array().into_iter().flatten() {
+                if let Some(f) = e["file"].as_str() {
+                    files.push(f.to_string());
+                }
+            }
+            for n in row["next"].as_array().into_iter().flatten() {
+                if let Some(n) = n.as_str() {
+                    stack.push(n.to_string());
+                }
+            }
+        }
+    }
+    files
+        .iter()
+        .filter_map(|f| repo_of.get(f.split('/').next()?))
+        .cloned()
+        .collect()
+}
+
+/// The todo's entries split by whether their repositories can be read now:
+/// those to trace in this pass, and those that wait (with the repository
+/// each waits on).
+pub fn split_ready(
+    todo: &Value,
+    repo_of: &BTreeMap<String, String>,
+    unread: &Value,
+    now: i64,
+) -> (Vec<Value>, Vec<(Value, String)>) {
+    let waiting = waiting_repos(unread, now);
+    let mut ready = Vec::new();
+    let mut wait = Vec::new();
+    for e in todo["entries"].as_array().into_iter().flatten() {
+        match entry_repos(todo, e, repo_of)
+            .into_iter()
+            .find(|r| waiting.contains_key(r))
+        {
+            Some(r) => wait.push((e.clone(), r)),
+            None => ready.push(e.clone()),
+        }
+    }
+    (ready, wait)
+}
+
+/// When the day's tracing budget is next whole again: the next UTC
+/// midnight (`spent_today` keys the spend by UTC day).
+pub fn budget_reset(now: i64) -> i64 {
+    (now.div_euclid(86_400) + 1) * 86_400
+}
+
+/// Whether a pass with this budget can start even one entry.
+pub fn can_start(budget: f64) -> bool {
+    fits_budget(0.0, 0.0, 0, budget)
+}
+
+/// How a journeys pass ended, for when the next one may run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PassEnd {
+    /// Entries left the queue in this pass (traced, picked from the
+    /// candidates, or covered by another journey).
+    pub progressed: bool,
+    /// The pass stopped for the Lambda's time, not the budget.
+    pub by_time: bool,
+    /// Entries left whose repositories can be read.
+    pub runnable: usize,
+    /// When each repository an entry waits on is tried again.
+    pub retry_at: Vec<i64>,
+    /// What today's tracing has cost, this pass included.
+    pub day_spent: f64,
+}
+
+/// When the next pass runs, or `None` when nothing is left. Something left
+/// that can be traced: at once after a pass that ran out of time, a minute
+/// after one that made progress, at the day's budget reset when not even
+/// one entry fits what is left of it. Entries waiting on a repository: at
+/// its retry time. The guard: a pass that made no progress never queues
+/// the next one sooner than [`IDLE_SECS`], so nothing is re-run within
+/// seconds while nothing can go on.
+pub fn next_resume(p: &PassEnd, now: i64) -> Option<i64> {
+    if p.runnable == 0 && p.retry_at.is_empty() {
+        return None;
+    }
+    let mut at: Vec<i64> = p.retry_at.clone();
+    if p.runnable > 0 {
+        at.push(if !can_start(pass_budget(p.day_spent)) {
+            budget_reset(now)
+        } else if p.progressed && p.by_time {
+            now
+        } else if p.progressed {
+            now + 60
+        } else {
+            now + IDLE_SECS
+        });
+    }
+    let at = at.into_iter().min()?;
+    Some(if p.progressed {
+        at
+    } else {
+        at.max(now + IDLE_SECS)
+    })
+}
+
+/// What a journeys message does, from the team's schedule (`{seq, at}`,
+/// [`common::app_map::flows_next_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Its time has come: run a pass.
+    Run,
+    /// Early: queued again (same turn) for this many seconds.
+    Hop(i64),
+    /// An older resume another one replaced: dropped.
+    Stale,
+}
+
+/// One resume at a time: only the message whose turn is the schedule's
+/// `seq` runs, and not before `at`; with no schedule yet (a team from
+/// before it), the message runs.
+pub fn take_message(turn: u32, next: &Value, now: i64) -> Take {
+    let Some(seq) = next["seq"].as_u64() else {
+        return Take::Run;
+    };
+    if u64::from(turn) != seq {
+        return Take::Stale;
+    }
+    let at = next["at"].as_i64().unwrap_or(0);
+    if at > now {
+        Take::Hop((at - now).min(MAX_DELAY_SECS))
+    } else {
+        Take::Run
+    }
+}
+
+/// The schedule after this one, for one resume at `at`: every message of
+/// an earlier one is stale from here on.
+pub fn reschedule(next: &Value, at: i64) -> Value {
+    let seq = next["seq"].as_u64().unwrap_or(0) + 1;
+    json!({"seq": seq % u64::from(u32::MAX), "at": at})
+}
+
+/// The message's turn for a schedule.
+pub fn turn_of(next: &Value) -> u32 {
+    next["seq"].as_u64().unwrap_or(0) as u32
+}
+
 /// Where a journey of this kind is done: the end state its last steps must
 /// show (sign in and sign up: the signed-in screen; password reset: the
 /// password set and the screen after; checkout and booking: the
@@ -1937,6 +2205,19 @@ pub struct TraceOut {
     pub raw: Vec<Value>,
 }
 
+impl TraceOut {
+    /// Nothing traced (every entry waits on a repository).
+    pub fn empty() -> Self {
+        Self {
+            flows: Vec::new(),
+            report: Traced::default(),
+            failed: Vec::new(),
+            left: Vec::new(),
+            raw: Vec::new(),
+        }
+    }
+}
+
 /// Traces the todo's entries, a few at a time, with `tools` (as the
 /// policy offers them). An entry that is already a step of a journey traced
 /// in the same family and app is not traced again; none is started after
@@ -2796,5 +3077,190 @@ mod tests {
         // a citation near a screen's own line still wins
         assert_eq!(at(25).as_deref(), Some("S2"));
         assert_eq!(at(40), None);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_waits_out_a_short_reset_and_defers_a_long_one_past_it() {
+        use crate::clients::github::RateLimited;
+        let now = 1_000_000;
+        // A reset within the pass: waited out, then read.
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let slept = Mutex::new(Vec::new());
+        let got = read_repo(
+            || {
+                let n = tries.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if n == 0 {
+                        Err::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(Box::new(
+                            RateLimited::for_test(10),
+                        ))
+                    } else {
+                        Ok(vec![7])
+                    }
+                }
+            },
+            |s| {
+                slept.lock().unwrap().push(s);
+                async {}
+            },
+            &READ_RETRY_SECS,
+        )
+        .await;
+        assert_eq!(got, Ok(vec![7]));
+        assert_eq!(*slept.lock().unwrap(), vec![10]);
+        // A reset half an hour away: not slept on; read again after it.
+        let slept = Mutex::new(Vec::new());
+        let got = read_repo(
+            || async {
+                Err::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(Box::new(
+                    RateLimited::for_test(1_800),
+                ))
+            },
+            |s| {
+                slept.lock().unwrap().push(s);
+                async {}
+            },
+            &READ_RETRY_SECS,
+        )
+        .await;
+        assert!(slept.lock().unwrap().is_empty());
+        let fail = got.unwrap_err();
+        assert!(matches!(
+            fail,
+            RepoFail::Limited {
+                wait_secs: 1_800,
+                ..
+            }
+        ));
+        let mut unread = json!({});
+        note_unread(&mut unread, "harbor/harbor-etl", &fail, now);
+        let until = unread["harbor/harbor-etl"]["until"].as_i64().unwrap();
+        assert!(until > now + 1_800, "after GitHub's reset");
+        assert!(!readable_now(&unread, "harbor/harbor-etl", now + 1_800));
+        assert!(readable_now(&unread, "harbor/harbor-etl", until));
+        // The resume for the entries waiting on it is at that time, not sooner.
+        let p = PassEnd {
+            retry_at: vec![until],
+            ..Default::default()
+        };
+        assert_eq!(next_resume(&p, now), Some(until));
+        // Other refusals back off, doubling, up to the most.
+        let other = RepoFail::Failed { why: "403".into() };
+        let mut u = json!({});
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            note_unread(&mut u, "r", &other, now);
+            waits.push(u["r"]["until"].as_i64().unwrap() - now);
+        }
+        assert_eq!(waits, [300, 600, 1_200, 2_400, 3_600, 3_600]);
+    }
+
+    #[test]
+    fn an_over_budget_pass_queues_one_resume_at_the_reset_and_nothing_sooner() {
+        let now = 1_800_000_000 / 86_400 * 86_400 + 15 * 3_600;
+        let reset = budget_reset(now);
+        assert_eq!(reset - now, 9 * 3_600);
+        // Less left of the day than one entry costs: the reset, nothing sooner.
+        let spent = PassEnd {
+            runnable: 158,
+            day_spent: DAILY_BUDGET_USD - 0.1,
+            ..Default::default()
+        };
+        assert!(!can_start(pass_budget(spent.day_spent)));
+        assert_eq!(next_resume(&spent, now), Some(reset));
+        // Even when a pass made progress before the budget ran out.
+        let some = PassEnd {
+            progressed: true,
+            ..spent.clone()
+        };
+        assert_eq!(next_resume(&some, now), Some(reset));
+        // Room left and progress: soon; out of time: at once.
+        let room = PassEnd {
+            progressed: true,
+            runnable: 5,
+            day_spent: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(next_resume(&room, now), Some(now + 60));
+        let timed = PassEnd {
+            by_time: true,
+            ..room.clone()
+        };
+        assert_eq!(next_resume(&timed, now), Some(now));
+        // No progress though something could run: never within seconds.
+        let stuck = PassEnd {
+            runnable: 5,
+            day_spent: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(next_resume(&stuck, now), Some(now + IDLE_SECS));
+        let soon = PassEnd {
+            retry_at: vec![now + 30],
+            ..Default::default()
+        };
+        assert_eq!(next_resume(&soon, now), Some(now + IDLE_SECS));
+        // Nothing left: nothing queued.
+        assert_eq!(next_resume(&PassEnd::default(), now), None);
+        // The schedule: one message runs, at its time; every other is dropped.
+        let first = reschedule(&Value::Null, reset);
+        let turn = turn_of(&first);
+        assert_eq!(
+            take_message(turn, &Value::Null, now),
+            Take::Run,
+            "a team from before the schedule"
+        );
+        assert_eq!(take_message(turn, &first, now), Take::Hop(MAX_DELAY_SECS));
+        assert_eq!(take_message(turn, &first, reset - 100), Take::Hop(100));
+        assert_eq!(take_message(turn, &first, reset), Take::Run);
+        assert_eq!(take_message(turn + 1, &first, reset), Take::Stale);
+        assert_eq!(
+            take_message(0, &first, reset),
+            Take::Stale,
+            "the old step's messages"
+        );
+        let after = reschedule(&first, now);
+        assert_eq!(take_message(turn, &after, reset), Take::Stale);
+    }
+
+    #[test]
+    fn an_entry_waits_only_on_the_repositories_its_journey_reads() {
+        let repo_of: BTreeMap<String, String> = [
+            ("harbor-web", "o/harbor-web"),
+            ("harbor-api", "o/harbor-api"),
+            ("harbor-etl", "o/harbor-etl"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        // An older todo with no files: the table's rows the entry leads to.
+        let todo = json!({
+            "entries": [{"id": "S1", "key": "screen:web:/login"}, {"id": "S2", "key": "screen:web:/export", "files": ["harbor-web/app/export.tsx", "harbor-etl/jobs/export.py"]}],
+            "table": {"S1": {"evidence": [{"file": "harbor-web/app/login.tsx"}], "next": ["R1"]}, "R1": {"evidence": [{"file": "harbor-api/src/auth.ts"}], "next": ["S1"]}},
+        });
+        let e = |i: usize| todo["entries"][i].clone();
+        assert_eq!(
+            entry_repos(&todo, &e(0), &repo_of)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["o/harbor-api", "o/harbor-web"]
+        );
+        assert_eq!(
+            entry_repos(&todo, &e(1), &repo_of)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["o/harbor-etl", "o/harbor-web"]
+        );
+        let mut unread = json!({});
+        note_unread(
+            &mut unread,
+            "o/harbor-etl",
+            &RepoFail::Failed { why: "404".into() },
+            100,
+        );
+        let (ready, wait) = split_ready(&todo, &repo_of, &unread, 100);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(wait[0].1, "o/harbor-etl");
+        assert_eq!(waiting_repos(&unread, 100).len(), 1);
+        assert!(waiting_repos(&unread, 100 + REPO_RETRY_SECS).is_empty());
     }
 }
