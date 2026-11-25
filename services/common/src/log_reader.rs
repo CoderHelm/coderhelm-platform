@@ -120,11 +120,13 @@ pub const ABILITIES: &[Ability] = &[
     Ability {
         key: "waf",
         name: "AWS WAF requests",
-        why: "When an AWS WAF alarm fires, finds the web ACL it watches, reads the requests its rule matched (WAF's sampled requests) and where the web ACL logs, so a fix to the rule is based on what clients actually sent. Keeps only user agents, accept languages, header names, paths and countries; never client addresses, cookies or other header values. Nothing is changed.",
+        why: "When an AWS WAF alarm fires, finds the web ACL it watches, reads the requests its rule matched (WAF's sampled requests) and where the web ACL logs, and the CloudFront distributions in front of it, so a fix to the rule is based on what clients actually sent. Keeps only user agents, accept languages, header names, paths and countries; never client addresses, cookies or other header values. Nothing is changed.",
         actions: &[
             "wafv2:ListWebACLs",
             "wafv2:GetSampledRequests",
             "wafv2:GetLoggingConfiguration",
+            "cloudfront:ListDistributions",
+            "cloudfront:GetDistribution",
         ],
         chosen: false,
     },

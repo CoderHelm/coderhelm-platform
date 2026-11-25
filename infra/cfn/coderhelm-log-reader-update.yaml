@@ -255,6 +255,14 @@ Resources:
               - "wafv2:GetSampledRequests"
               - "wafv2:GetLoggingConfiguration"
             Resource: "*"
+          # The CloudFront distributions in front of a web ACL: their domains,
+          # origins and where they log. Nothing is changed.
+          - Sid: ReadCloudFrontDistributions
+            Effect: Allow
+            Action:
+              - "cloudfront:ListDistributions"
+              - "cloudfront:GetDistribution"
+            Resource: "*"
           # Settings only, so a review can check a fact instead of asking: a
           # bucket's default encryption, its bucket policy and whether that
           # policy makes it public; a KMS key's description and key policy.

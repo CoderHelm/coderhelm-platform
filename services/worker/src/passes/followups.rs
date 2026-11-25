@@ -47,17 +47,17 @@ const CALL: Duration = Duration::from_secs(30);
 
 /// The team's Jira app, as far as follow-ups care.
 #[derive(Clone, Default)]
-struct Jira {
-    connected: bool,
-    create_url: String,
-    secret: String,
-    site: String,
+pub(crate) struct Jira {
+    pub(crate) connected: bool,
+    pub(crate) create_url: String,
+    pub(crate) secret: String,
+    pub(crate) site: String,
     /// The team's Jira trigger label (`coderhelm` unless it set another): a
     /// follow-up never carries it.
-    trigger_label: String,
+    pub(crate) trigger_label: String,
 }
 
-async fn jira(state: &WorkerState, team_id: &str) -> Jira {
+pub(crate) async fn jira(state: &WorkerState, team_id: &str) -> Jira {
     let item: Option<HashMap<String, AttributeValue>> = state
         .dynamo
         .get_item()

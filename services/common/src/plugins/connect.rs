@@ -21,13 +21,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A tool a connection offers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ToolDef {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub input_schema: Value,
+    /// The server's `annotations.readOnlyHint`, when it gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// The server's `annotations.destructiveHint`, when it gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<bool>,
+}
+
+impl ToolDef {
+    /// A tool from an MCP `tools/list` entry, with its annotations.
+    pub fn from_mcp(t: &Value) -> Option<ToolDef> {
+        Some(ToolDef {
+            name: t["name"].as_str()?.to_string(),
+            description: t["description"].as_str().unwrap_or("").to_string(),
+            input_schema: t
+                .get("inputSchema")
+                .or_else(|| t.get("input_schema"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            read_only: t["annotations"]["readOnlyHint"].as_bool(),
+            destructive: t["annotations"]["destructiveHint"].as_bool(),
+        })
+    }
 }
 
 /// A team's MCP servers.
@@ -220,6 +243,7 @@ pub(crate) mod tests {
                             name: n.clone(),
                             description: format!("{n} on {server}"),
                             input_schema: serde_json::json!({"type": "object"}),
+                            ..Default::default()
                         })
                         .collect()
                 })

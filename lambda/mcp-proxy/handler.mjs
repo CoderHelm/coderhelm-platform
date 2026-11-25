@@ -98,6 +98,9 @@ export async function handler(event) {
         name: t.name,
         description: t.description || "",
         inputSchema: t.inputSchema || { type: "object", properties: {} },
+        // The server's read-only and destructive hints decide a tool's risk
+        // in a skill run; a server that gives none is read by a model.
+        ...(t.annotations ? { annotations: t.annotations } : {}),
       }));
 
       // Cache to S3

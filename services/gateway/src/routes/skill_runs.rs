@@ -17,7 +17,7 @@ use axum::{
 };
 use common::plugins::kv::{Expect, KvError};
 use common::plugins::schedule::{EventBridge, Scheduler};
-use common::skill_runs::{self as sr, cron, RunEntry, Schedule, SkillRunMessage};
+use common::skill_runs::{self as sr, cron, stdio, Draft, RunEntry, Schedule, SkillRunMessage};
 use common::skills::{Kind, SkillStore};
 use serde_json::{json, Value};
 use tracing::{error, info};
@@ -101,9 +101,43 @@ fn from_body(body: &Value, base: Schedule) -> Result<Schedule, String> {
     s.created_at = base.created_at;
     s.running = base.running;
     s.last_run = base.last_run;
+    s.resolution = base.resolution.or(s.resolution);
     s.updated_at = chrono::Utc::now().to_rfc3339();
     sr::validate(&mut s)?;
     Ok(s)
+}
+
+/// The team's connected repositories (owner/name).
+async fn team_repos(state: &AppState, team: &str) -> Vec<String> {
+    let Ok(out) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.repos_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":pk", A::S(team.to_string()))
+        .expression_attribute_values(":p", A::S("REPO#".into()))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    out.items()
+        .iter()
+        .filter_map(|i| i.get("repo_name")?.as_s().ok().cloned())
+        .collect()
+}
+
+/// Every sandbox server a schedule runs, against the allow-list.
+async fn check_servers(state: &AppState, team: &str, s: &Schedule) -> Result<(), String> {
+    if s.stdio.is_empty() {
+        return Ok(());
+    }
+    let repos = team_repos(state, team).await;
+    let catalog = stdio::catalog_packages();
+    for srv in &s.stdio {
+        stdio::validate(srv, &repos, &catalog)?;
+    }
+    Ok(())
 }
 
 /// GET /api/skill-runs — the team's schedules.
@@ -234,6 +268,9 @@ pub async fn create(
         },
     )
     .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    check_servers(&state, &claims.team_id, &s)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
     sync_schedule(&scheduler(&state), &claims.team_id, &s)
         .await
         .map_err(|e| internal("create the skill schedule", e))?;
@@ -260,6 +297,9 @@ pub async fn update(
         return Err(fail(StatusCode::NOT_FOUND, "That schedule doesn't exist."));
     };
     let s = from_body(&body, old).map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    check_servers(&state, &claims.team_id, &s)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
     sync_schedule(&scheduler(&state), &claims.team_id, &s)
         .await
         .map_err(|e| internal("update the skill schedule", e))?;
@@ -381,11 +421,74 @@ pub async fn run_now(
         run_id: run_id.clone(),
         trigger: "manual".into(),
         requested_by: claims.email.clone(),
+        ..Default::default()
     });
     crate::routes::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &msg)
         .await
         .map_err(|e| internal("queue the skill run", e.as_u16()))?;
     Ok(Json(json!({ "run_id": run_id })))
+}
+
+/// POST /api/skill-runs/resolve — read a skill's tools for the schedule
+/// form: what it names, mapped to the team's servers (stdio servers found in
+/// its repositories included), each with its risk. The worker answers on
+/// the draft (`GET /api/skill-runs/resolve/:id`).
+pub async fn resolve(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let text = |k: &str| body[k].as_str().unwrap_or("").trim().to_string();
+    if text("skill_repo").is_empty() || !text("skill_path").ends_with("SKILL.md") {
+        return Err(fail(StatusCode::BAD_REQUEST, "Pick a skill."));
+    }
+    let d = Draft {
+        id: ulid::Ulid::new().to_string(),
+        skill_repo: text("skill_repo"),
+        skill_path: text("skill_path"),
+        skill_name: text("skill_name"),
+        aws: serde_json::from_value(body["aws"].clone()).ok().flatten(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    common::plugins::kv::put_as(
+        &kv(&state),
+        &claims.team_id,
+        &sr::resolve_sk(&d.id),
+        &d,
+        Expect::Any,
+    )
+    .await
+    .map_err(|e| internal("save skill draft", e))?;
+    let msg = WorkerMessage::SkillRun(SkillRunMessage {
+        team_id: claims.team_id.clone(),
+        schedule_id: d.id.clone(),
+        trigger: "manual".into(),
+        requested_by: claims.email.clone(),
+        mode: "resolve".into(),
+        ..Default::default()
+    });
+    crate::routes::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &msg)
+        .await
+        .map_err(|e| internal("queue the skill tools reading", e.as_u16()))?;
+    Ok(Json(json!({ "id": d.id })))
+}
+
+/// GET /api/skill-runs/resolve/:id — what reading a skill's tools found.
+pub async fn resolved(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Reply {
+    let d: Option<(Draft, u64)> =
+        common::plugins::kv::get_as(&kv(&state), &claims.team_id, &sr::resolve_sk(&id))
+            .await
+            .map_err(|e| internal("get skill draft", e))?;
+    match d {
+        Some((d, _)) => Ok(Json(json!({ "draft": d }))),
+        None => Err(fail(StatusCode::NOT_FOUND, "That reading doesn't exist.")),
+    }
 }
 
 /// GET /api/skill-runs/:id/runs — the schedule's runs, newest first.

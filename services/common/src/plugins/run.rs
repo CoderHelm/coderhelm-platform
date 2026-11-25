@@ -144,6 +144,11 @@ pub trait ToolExec: Send + Sync {
     fn stop(&self) -> bool {
         false
     }
+    /// True when this worker step's time is up and the run goes on in its
+    /// next step (a skill run): no more calls run in this one.
+    fn step_over(&self) -> bool {
+        false
+    }
 }
 
 /// Knowledge bases attached to a plugin (the brain's knowledge search,
@@ -503,6 +508,7 @@ pub async fn offered_tools(
             name: "read_plugin_skill".into(),
             description: "Read one of this plugin's skills (brand voice, tone, banned claims) in full. Read the ones that fit before you write.".into(),
             input_schema: json!({ "type": "object", "properties": { "name": { "type": "string", "enum": skills } }, "required": ["name"] }),
+            ..Default::default()
         },
         ToolDef {
             name: "save_draft".into(),
@@ -514,6 +520,7 @@ pub async fn offered_tools(
                 "channel": { "type": "string", "description": "where it goes, e.g. linkedin, blog, email" },
                 "publish": { "type": "boolean", "description": format!("true when it should be published by the plugin ({}) once approved", publish_via.join(", ")) }
             }, "required": ["kind", "title", "content"] }),
+            ..Default::default()
         },
     ];
     for t in &m.tools {
@@ -537,6 +544,7 @@ pub async fn offered_tools(
                     ),
                     name,
                     input_schema: x.input_schema,
+                    ..Default::default()
                 });
             }
         } else if let Some(n) = &t.name {
@@ -550,11 +558,13 @@ pub async fn offered_tools(
                         format!("[{}] {} Calling this asks for approval: the request is saved as a draft and only sent after a person approves it.", risk.as_str(), t.description)
                     },
                     input_schema: json!({ "type": "object", "properties": { "title": { "type": "string" }, "content": { "type": "string" } } }),
+                    ..Default::default()
                 }),
                 Some("builtin") if n == "search_knowledge" => tools.push(ToolDef {
                     name: n.clone(),
                     description: "Search the knowledge bases attached to this plugin. Returns passages to quote from.".into(),
                     input_schema: json!({ "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }),
+                    ..Default::default()
                 }),
                 _ => {}
             }

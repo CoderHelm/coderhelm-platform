@@ -228,6 +228,24 @@ pub const TEMPLATES: &[Template] = &[
         install_may_send: true,
     },
     Template {
+        id: "skill_run_result",
+        subject: "a scheduled skill run ended",
+        subject_by: "",
+        subjects: &[],
+        params: &[
+            p("skill", Kind::Line(120)),
+            p("outcome", Kind::Text(1500)),
+            p("run_link", Kind::Link),
+        ],
+        body: &[
+            Part::Para("The scheduled run of the {skill} skill ended."),
+            Part::Quote("How it went", "outcome"),
+            Part::Para("Its report and every file it made are on the run's page."),
+            Part::Button("Open the run", "run_link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
         id: "knowledge_signin",
         subject: "a knowledge source needs signing in again",
         subject_by: "",

@@ -1016,10 +1016,16 @@ pub async fn converse_tool_loop(
         // 5xx): the calls after it in this turn aren't run, and the loop
         // ends after this turn so the run can wait (`common::github_wait`).
         let mut paused: Option<crate::clients::github::GitHubPaused> = None;
+        // Set once the executor says this worker step is over (a skill run
+        // goes on in its next step): the calls after it wait for that step.
+        let mut step_ended = false;
         for (tool_id, tool_name, tool_input) in &tool_uses {
             let started_at = common::agent_log::now();
-            if let Some(p) = &paused {
-                let content = common::github_wait::not_run(p.cause, p.until);
+            if paused.is_some() || step_ended {
+                let content = match &paused {
+                    Some(p) => common::github_wait::not_run(p.cause, p.until),
+                    None => super::llm::STEP_ENDS_NOTE.to_string(),
+                };
                 let outcome = common::agent_log::ToolOutcome::refused("not run: GitHub is paused");
                 logged.push(logged_result(
                     tool_id,
@@ -1154,6 +1160,10 @@ pub async fn converse_tool_loop(
                     info!(tool = %tool_name, duration_ms, "Tool completed");
                     (serde_json::to_string(&result)?, false)
                 }
+                Err(e) if e.downcast_ref::<super::llm::StepEnds>().is_some() => {
+                    step_ended = true;
+                    (super::llm::STEP_ENDS_NOTE.to_string(), true)
+                }
                 Err(e) => {
                     warn!(tool = %tool_name, error = %e, duration_ms, "Tool execution failed");
                     // GitHub refusing for a while is not an answer to retry:
@@ -1256,6 +1266,9 @@ pub async fn converse_tool_loop(
         messages.push(("user".to_string(), tool_results));
         if let Some(p) = paused {
             return Err(Box::new(p));
+        }
+        if step_ended {
+            return Err(Box::new(super::llm::StepEnds));
         }
     }
 }
