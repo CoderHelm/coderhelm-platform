@@ -102,18 +102,35 @@ pub fn sources(
     out
 }
 
-/// Pure: the verdict for a pull request: skipped (without reading a word
-/// of it) unless [`guard::trusted`], else from its hits.
+/// Pure: the verdict for a pull request from where it came from: skipped
+/// (without reading a word of it) unless [`guard::trusted`], else from its
+/// hits.
 pub fn decide(
-    pr: &serde_json::Value,
+    origin: &guard::Origin,
     read: impl FnOnce() -> Vec<Source>,
     terms: &guard::TermSet,
 ) -> (Verdict, Vec<guard::Hit>) {
-    if !guard::trusted(&guard::Origin::from_pr(pr)) {
+    if !guard::trusted(origin) {
         return (guard::skipped(), Vec::new());
     }
     let hits = guard::scan(&read(), terms);
     (guard::verdict(&hits), hits)
+}
+
+/// Where a pull request came from, with the author's write access read from
+/// GitHub (only for a branch of the repository itself: a fork is never
+/// trusted, so it costs no request).
+async fn origin(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr: &serde_json::Value,
+) -> guard::Origin {
+    let mut o = guard::Origin::from_pr(pr);
+    if guard::same_repo(&o) {
+        o.author_can_write = github.has_write_access(owner, repo, &o.author_login).await;
+    }
+    o
 }
 
 /// Pure: has the pull request's text or head changed between two reads.
@@ -184,7 +201,8 @@ pub async fn run(state: &WorkerState, msg: &CustomerGuardMessage) -> Result<(), 
         if head.is_empty() {
             return Ok(());
         }
-        let (verdict, hits) = if guard::trusted(&guard::Origin::from_pr(&pr)) {
+        let from = origin(&github, owner, repo, &pr).await;
+        let (verdict, hits) = if guard::trusted(&from) {
             let records = install_records(state).await?;
             let author = pr["user"]["login"].as_str().unwrap_or("");
             let terms = guard::derive(&records, &[owner.as_str(), author]);
@@ -206,9 +224,9 @@ pub async fn run(state: &WorkerState, msg: &CustomerGuardMessage) -> Result<(), 
                 }
             }
             let full = |p: &str| large.get(p).cloned();
-            decide(&pr, || sources(&pr, &commits, &files, &full), &terms)
+            decide(&from, || sources(&pr, &commits, &files, &full), &terms)
         } else {
-            decide(&pr, Vec::new, &guard::TermSet::default())
+            decide(&from, Vec::new, &guard::TermSet::default())
         };
         let again = github.get_pull_request(owner, repo, n).await?;
         if moved(&pr, &again) {
@@ -279,8 +297,18 @@ mod tests {
         let terms = guard::derive(&install(), &["example-oss"]);
         let with = pr("Fixes the sync for Quorvex Labs", "stranger/tool", "NONE");
         let without = pr("Fixes the sync", "stranger/tool", "NONE");
-        let a = decide(&with, || panic!("a fork's text is never read"), &terms).0;
-        let b = decide(&without, || panic!("a fork's text is never read"), &terms).0;
+        let a = decide(
+            &guard::Origin::from_pr(&with),
+            || panic!("a fork's text is never read"),
+            &terms,
+        )
+        .0;
+        let b = decide(
+            &guard::Origin::from_pr(&without),
+            || panic!("a fork's text is never read"),
+            &terms,
+        )
+        .0;
         assert_eq!(a, b);
         assert_eq!(
             guard::check_body("abc1234def", &a),
@@ -294,14 +322,22 @@ mod tests {
             "MEMBER",
         );
         let read = || sources(&member, &[], &[], &|_| None);
-        assert_eq!(decide(&member, read, &terms).0.conclusion, "failure");
+        assert_eq!(
+            decide(&guard::Origin::from_pr(&member), read, &terms)
+                .0
+                .conclusion,
+            "failure"
+        );
     }
 
     #[test]
     fn an_outside_author_on_a_branch_of_the_repo_is_skipped() {
         let terms = guard::derive(&install(), &["example-oss"]);
         let p = pr("For Quorvex Labs", "example-oss/tool", "CONTRIBUTOR");
-        assert_eq!(decide(&p, Vec::new, &terms).0, guard::skipped());
+        assert_eq!(
+            decide(&guard::Origin::from_pr(&p), Vec::new, &terms).0,
+            guard::skipped()
+        );
     }
 
     #[test]

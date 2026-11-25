@@ -4595,7 +4595,12 @@ impl GitHubClient {
         let guarded = public && self.customer_guard_checks(owner).await?;
         let runs = self.customer_guard_runs(owner, repo, sha).await?;
         let guard = common::customer_guard::guard_state(&runs);
-        if let Some(why) = common::customer_guard::merge_refusal(guard, guarded) {
+        let head_age = if guarded && guard == common::customer_guard::GuardState::Missing {
+            self.commit_age_secs(owner, repo, sha).await?
+        } else {
+            None
+        };
+        if let Some(why) = common::customer_guard::merge_refusal(guard, guarded, head_age) {
             return Ok(MergeOutcome::NotMergeable(why.to_string()));
         }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
@@ -4622,6 +4627,23 @@ impl GitHubClient {
             409 => Ok(MergeOutcome::HeadMoved(reason)),
             _ => Err(format!("merge failed ({status}): {text}").into()),
         }
+    }
+
+    /// Seconds since `sha` was committed (its committer date); None when
+    /// GitHub gives no date.
+    pub async fn commit_age_secs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        let c = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
+            .await?;
+        Ok(c["commit"]["committer"]["date"]
+            .as_str()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| chrono::Utc::now().timestamp() - d.timestamp()))
     }
 
     /// Whether the customer details guard checks `owner`'s public

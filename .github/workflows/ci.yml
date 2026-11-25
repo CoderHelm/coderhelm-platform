@@ -335,8 +335,8 @@ jobs:
 
   # Last: CoderHelm's "Customer details guard" check run on the PR's head
   # (customer names, hosts and keys from its own records, never listed
-  # here) passed or was skipped; failing or missing after five minutes
-  # fails. An edit to the PR's text after this ran sets the guard again,
+  # here) passed or was skipped; failing fails. Missing after five minutes:
+  # CI's own rules (ids, keys, emails) decide instead, and it says so. An edit to the PR's text after this ran sets the guard again,
   # and the Customer details guard rerun workflow runs this job again.
   # Prints only pass or fail (.github/scripts/customer_guard_gate.py).
   customer-guard:
@@ -353,8 +353,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Every commit of the PR, for the fallback to CI's own rules.
+          fetch-depth: 0
       - name: Gate tests
-        run: python3 -m unittest discover -s .github/scripts -p test_customer_guard_gate.py
+        run: python3 -m unittest discover -s .github/scripts -p "test_*guard*.py"
       - name: The guard passed on this commit
         env:
           GH_TOKEN: ${{ github.token }}
