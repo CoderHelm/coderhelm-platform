@@ -1,6 +1,6 @@
 //! The customer details guard on one pull request of a public repository
-//! (`common::customer_guard`): reads its title, body, commit messages and
-//! the lines it adds under `docs/` and in test and incident fixtures, and
+//! (`common::customer_guard`): reads its title, head branch name, body,
+//! commit messages and the lines it adds under `docs/` and in test and incident fixtures, and
 //! sets the "Customer details guard" check run on its head.
 //!
 //! The terms are read from the install's own records and kept in this
@@ -67,6 +67,7 @@ pub fn sources(
 ) -> Vec<Source> {
     let mut out = vec![
         Source::Title(pr["title"].as_str().unwrap_or("").to_string()),
+        Source::Branch(pr["head"]["ref"].as_str().unwrap_or("").to_string()),
         Source::Body(pr["body"].as_str().unwrap_or("").to_string()),
     ];
     for c in commits {
@@ -136,6 +137,7 @@ async fn origin(
 /// Pure: has the pull request's text or head changed between two reads.
 fn moved(before: &serde_json::Value, after: &serde_json::Value) -> bool {
     before["head"]["sha"] != after["head"]["sha"]
+        || before["head"]["ref"] != after["head"]["ref"]
         || before["title"] != after["title"]
         || before["body"] != after["body"]
 }
@@ -287,7 +289,7 @@ mod tests {
             "state": "open",
             "author_association": assoc,
             "user": {"login": "someone", "type": "User"},
-            "head": {"sha": "abc1234def", "repo": {"full_name": head_repo}},
+            "head": {"sha": "abc1234def", "ref": "fix/sync-retry", "repo": {"full_name": head_repo}},
             "base": {"repo": {"full_name": "example-oss/tool", "private": false}},
         })
     }
@@ -341,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sources_are_the_title_body_commits_and_docs_and_fixture_additions() {
+    fn the_sources_are_the_title_branch_body_commits_and_docs_and_fixture_additions() {
         let p = pr("body", "example-oss/tool", "MEMBER");
         let commits = vec![json!({"sha": "c0ffee1234", "commit": {"message": "one\ntwo"}})];
         let files = vec![
@@ -353,7 +355,8 @@ mod tests {
         let s = sources(&p, &commits, &files, &|path| {
             (path == "services/worker/src/passes/incidents/zz_case.rs").then(|| "x\ny".to_string())
         });
-        assert_eq!(s.len(), 5, "{s:?}");
+        assert_eq!(s.len(), 6, "{s:?}");
+        assert!(s.contains(&Source::Branch("fix/sync-retry".into())));
         assert!(s.contains(&Source::Added {
             path: "docs/a.md".into(),
             lines: vec![(4, "added".into())]
@@ -374,6 +377,9 @@ mod tests {
         assert!(!moved(&a, &b));
         b["body"] = json!("two");
         assert!(moved(&a, &b));
+        let mut c = a.clone();
+        c["head"]["ref"] = json!("fix/other");
+        assert!(moved(&a, &c));
     }
 
     #[test]

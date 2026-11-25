@@ -1,6 +1,6 @@
 name: Public text guard
 
-# The words a pull request publishes (title, body, commit messages, added
+# The words a pull request publishes (title, branch name, body, commit messages, added
 # lines under docs/) carry no ids from an install: AWS account ids, TEAM#
 # ids, ULID run ids, Jira keys or email addresses
 # (.github/scripts/text_guard.py). Customer names and hosts are CoderHelm's

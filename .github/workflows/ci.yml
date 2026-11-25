@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
           # Every commit of the PR, for the Public text guard step.
           fetch-depth: 0
-      # The PR's title, body, commits and docs/ additions carry no details
+      # The PR's title, branch name, body, commits and docs/ additions carry no details
       # from a customer install (.github/scripts/text_guard.py); the Public
       # text guard workflow reruns it when the PR's text is edited. Title and
       # body come from the event file, never from a script.
