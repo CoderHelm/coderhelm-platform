@@ -977,7 +977,24 @@ async fn save(
         .item("write_id", AttributeValue::S(ulid::Ulid::new().to_string()))
         .send()
         .await?;
+    index_team(state, team).await;
     Ok(())
+}
+
+/// Names the team in the release index ([`index_spec`]), so the sweep reads
+/// its records by key. A failed add only waits for the index's daily
+/// rebuild; the record itself is saved.
+async fn index_team(state: &WorkerState, team: &str) {
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        INDEX,
+        team,
+    )
+    .await
+    {
+        warn!(team, error = %e, "release: could not add the team to the release index");
+    }
 }
 
 /// A failed tick: its error and when the next tick is due (0 when none is
@@ -1030,10 +1047,156 @@ const STALL_GRACE_SECS: i64 = 30 * 60;
 pub const MAX_RESUMES: u32 = 3;
 /// Counted GitHub requests a resumed tick makes, asked of the budget first.
 const TICK_REQUESTS: u64 = 6;
-/// Pages of the settings table one sweep reads.
-const RESUME_MAX_PAGES: usize = 50;
 /// The sort key every release record starts with.
 const RECORD_PREFIX: &str = "RELEASE#";
+/// `INDEX#RELEASE_RUN`: the teams with a per-PR release record.
+pub const INDEX: &str = "RELEASE_RUN";
+
+/// The team a settings item stands for in the release index: its partition
+/// key, when the item is a per-PR release record. A release tag's record
+/// (`RELEASE#{owner}/{repo}#{tag}`) shares the prefix and is not a member.
+pub fn index_member(item: &Item) -> Option<String> {
+    let sk = item.get("sk")?.as_s().ok()?;
+    parse_sk(sk)?;
+    let pk = item.get("pk")?.as_s().ok()?;
+    (!pk.is_empty() && !pk.starts_with("INDEX#")).then(|| pk.clone())
+}
+
+/// How the index's rebuild finds every release record: a full scan for the
+/// prefix, so records saved before the index existed are found too.
+pub fn index_spec() -> common::settings_index::Spec<'static> {
+    common::settings_index::Spec {
+        name: INDEX,
+        filter: "begins_with(sk, :p)",
+        values: vec![(":p", AttributeValue::S(RECORD_PREFIX.to_string()))],
+        member_of: index_member,
+    }
+}
+
+/// Where the sweep reads release records: the settings table, or a fake in
+/// tests.
+pub trait ReleaseStore {
+    /// The teams in the release index.
+    fn teams(&self) -> impl std::future::Future<Output = Result<Vec<String>, String>> + Send;
+    /// One page of a team's `RELEASE#` items, from `start`, and where the
+    /// next page starts (`None` at the end).
+    fn page(
+        &self,
+        team: &str,
+        start: Option<Item>,
+    ) -> impl std::future::Future<Output = Result<(Vec<Item>, Option<Item>), String>> + Send;
+    /// Drops a team with no release record left from the index.
+    fn drop_team(&self, team: &str) -> impl std::future::Future<Output = ()> + Send;
+}
+
+struct TableStore<'a>(&'a WorkerState);
+
+impl ReleaseStore for TableStore<'_> {
+    async fn teams(&self) -> Result<Vec<String>, String> {
+        common::settings_index::members(
+            &self.0.dynamo,
+            &self.0.config.settings_table_name,
+            &index_spec(),
+        )
+        .await
+    }
+
+    async fn page(
+        &self,
+        team: &str,
+        start: Option<Item>,
+    ) -> Result<(Vec<Item>, Option<Item>), String> {
+        let page = self
+            .0
+            .dynamo
+            .query()
+            .table_name(&self.0.config.settings_table_name)
+            .key_condition_expression("pk = :t AND begins_with(sk, :p)")
+            .expression_attribute_values(":t", AttributeValue::S(team.to_string()))
+            .expression_attribute_values(":p", AttributeValue::S(RECORD_PREFIX.to_string()))
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())?;
+        let next = page.last_evaluated_key().filter(|k| !k.is_empty()).cloned();
+        Ok((page.items().to_vec(), next))
+    }
+
+    async fn drop_team(&self, team: &str) {
+        common::settings_index::remove(
+            &self.0.dynamo,
+            &self.0.config.settings_table_name,
+            INDEX,
+            team,
+        )
+        .await
+    }
+}
+
+/// Every per-PR release record of a team, as `(sk, item)`: each page is
+/// read to the end, so no record is left behind however many the team has.
+pub async fn team_records(
+    store: &impl ReleaseStore,
+    team: &str,
+) -> Result<Vec<(String, Item)>, String> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    loop {
+        let (items, next) = store.page(team, start.take()).await?;
+        out.extend(items.into_iter().filter_map(|i| {
+            let sk = i.get("sk")?.as_s().ok()?.clone();
+            parse_sk(&sk)?;
+            Some((sk, i))
+        }));
+        match next {
+            Some(k) => start = Some(k),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// What the sweep found among the indexed teams' release records.
+#[derive(Debug, Default)]
+pub struct Found {
+    /// `(team, sk, record, bookkeeping)` of each record to resume.
+    pub stalled: Vec<(String, String, Record, Meta)>,
+    pub gave_up: usize,
+    /// Teams dropped from the index: no per-PR release record left.
+    pub dropped: Vec<String>,
+}
+
+/// Reads every indexed team's release records and sorts out the stalled
+/// ones. A team whose read failed is left for the next sweep (never
+/// dropped); a team with no per-PR record left is dropped from the index.
+pub async fn find_stalled(store: &impl ReleaseStore, now: i64) -> Result<Found, String> {
+    let mut out = Found::default();
+    for team in store.teams().await? {
+        let records = match team_records(store, &team).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(team, error = %e, "Stalled releases: could not read the team's releases");
+                continue;
+            }
+        };
+        if records.is_empty() {
+            store.drop_team(&team).await;
+            out.dropped.push(team);
+            continue;
+        }
+        for (sk, item) in records {
+            let Some((rec, meta)) = of_item(&item) else {
+                continue;
+            };
+            match stall(&rec, &meta, now) {
+                Stall::Live => {}
+                Stall::GaveUp => out.gave_up += 1,
+                Stall::Resume => out.stalled.push((team.clone(), sk, rec, meta)),
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// A release item's tick bookkeeping, next to the record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1173,46 +1336,18 @@ pub struct Resumed {
 pub async fn resume_stalled(state: &WorkerState) -> Resumed {
     let now = now();
     let mut out = Resumed::default();
-    let mut found: Vec<(String, String, Record, Meta)> = Vec::new();
-    let mut start: Option<Item> = None;
-    for _ in 0..RESUME_MAX_PAGES {
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("begins_with(sk, :p)")
-            .expression_attribute_values(":p", AttributeValue::S(RECORD_PREFIX.to_string()))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Stalled releases: scan failed");
-                break;
-            }
-        };
-        for item in page.items() {
-            let (Some(pk), Some(sk)) = (
-                item.get("pk").and_then(|v| v.as_s().ok()),
-                item.get("sk").and_then(|v| v.as_s().ok()),
-            ) else {
-                continue;
-            };
-            let Some((rec, meta)) = of_item(item) else {
-                continue;
-            };
-            match stall(&rec, &meta, now) {
-                Stall::Live => {}
-                Stall::GaveUp => out.gave_up += 1,
-                Stall::Resume => found.push((pk.clone(), sk.clone(), rec, meta)),
-            }
+    // The teams come from the release index and each team's records from
+    // its own partition, read to the end: the settings table is never
+    // scanned (a capped scan of it stopped before reaching the records).
+    let found = match find_stalled(&TableStore(state), now).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "Stalled releases: could not read the release index");
+            return out;
         }
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
-        }
-    }
+    };
+    out.gave_up = found.gave_up;
+    let found = found.stalled;
     let mut budget = crate::clients::github_budget::SweepGate::new(
         common::github_budget::caller::SWEEP_PR_WATCH,
     );
@@ -1329,7 +1464,10 @@ async fn claim(
         put = put.expression_attribute_values(k, v);
     }
     match put.send().await {
-        Ok(_) => true,
+        Ok(_) => {
+            index_team(state, team_id).await;
+            true
+        }
         Err(e) => {
             let lost = e
                 .as_service_error()
@@ -1968,6 +2106,139 @@ async fn check(
     }
 }
 
+/// An in-memory settings table for the sweep's tests: items kept in key
+/// order and read a page at a time, as the table pages them.
+#[cfg(test)]
+pub mod fake {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
+
+    use super::{index_spec, Item, Meta, Record, ReleaseStore, RECORD_PREFIX};
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    pub struct Table {
+        items: Mutex<BTreeMap<(String, String), Item>>,
+        index: Mutex<BTreeSet<String>>,
+        page_size: usize,
+        /// Pages the team reads returned.
+        pub pages_read: Mutex<usize>,
+    }
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_string())
+    }
+
+    pub fn item(pk: &str, sk: &str) -> Item {
+        Item::from([("pk".to_string(), s(pk)), ("sk".to_string(), s(sk))])
+    }
+
+    /// A release record as `save` writes it.
+    pub fn release_item(team: &str, sk: &str, rec: &Record, meta: &Meta) -> Item {
+        let mut i = item(team, sk);
+        i.insert("data".into(), s(&serde_json::to_string(rec).unwrap()));
+        if let Some(u) = meta.updated_at {
+            i.insert("updated_at".into(), AttributeValue::N(u.to_string()));
+        }
+        if let Some(t) = meta.next_tick_at {
+            i.insert("next_tick_at".into(), AttributeValue::N(t.to_string()));
+        }
+        if !meta.write_id.is_empty() {
+            i.insert("write_id".into(), s(&meta.write_id));
+        }
+        i
+    }
+
+    fn key(i: &Item) -> (String, String) {
+        let g = |k: &str| {
+            i.get(k)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        (g("pk"), g("sk"))
+    }
+
+    impl Table {
+        pub fn new(page_size: usize) -> Table {
+            Table {
+                items: Mutex::new(BTreeMap::new()),
+                index: Mutex::new(BTreeSet::new()),
+                page_size,
+                pages_read: Mutex::new(0),
+            }
+        }
+
+        pub fn put(&self, i: Item) {
+            self.items.lock().unwrap().insert(key(&i), i);
+        }
+
+        /// What a writer's `settings_index::add` does.
+        pub fn add_member(&self, team: &str) {
+            self.index.lock().unwrap().insert(team.to_string());
+        }
+
+        pub fn members(&self) -> Vec<String> {
+            self.index.lock().unwrap().iter().cloned().collect()
+        }
+
+        /// The table's scan pages: every item in key order, a page at a
+        /// time (a scan's filter applies after the page is read).
+        pub fn scan_pages(&self) -> Vec<Vec<Item>> {
+            let all: Vec<Item> = self.items.lock().unwrap().values().cloned().collect();
+            all.chunks(self.page_size).map(|c| c.to_vec()).collect()
+        }
+
+        /// The index's rebuild: one full scan for the spec's prefix, every
+        /// page, each match's member added.
+        pub fn rebuild_index(&self) {
+            let spec = index_spec();
+            assert_eq!(spec.filter, "begins_with(sk, :p)");
+            let found: Vec<String> = self
+                .scan_pages()
+                .iter()
+                .flatten()
+                .filter(|i| key(i).1.starts_with(RECORD_PREFIX))
+                .filter_map(spec.member_of)
+                .collect();
+            self.index.lock().unwrap().extend(found);
+        }
+    }
+
+    impl ReleaseStore for Table {
+        async fn teams(&self) -> Result<Vec<String>, String> {
+            Ok(self.members())
+        }
+
+        async fn page(
+            &self,
+            team: &str,
+            start: Option<Item>,
+        ) -> Result<(Vec<Item>, Option<Item>), String> {
+            *self.pages_read.lock().unwrap() += 1;
+            let after = start.as_ref().map(key);
+            let items = self.items.lock().unwrap();
+            let matching: Vec<Item> = items
+                .iter()
+                .filter(|((pk, sk), _)| pk == team && sk.starts_with(RECORD_PREFIX))
+                .filter(|(k, _)| after.as_ref().is_none_or(|a| *k > a))
+                .map(|(_, i)| i.clone())
+                .take(self.page_size + 1)
+                .collect();
+            if matching.len() > self.page_size {
+                let page = matching[..self.page_size].to_vec();
+                let last = key(&page[self.page_size - 1]);
+                Ok((page, Some(item(&last.0, &last.1))))
+            } else {
+                Ok((matching, None))
+            }
+        }
+
+        async fn drop_team(&self, team: &str) {
+            self.index.lock().unwrap().remove(team);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2337,6 +2608,145 @@ mod tests {
         assert!(retry_after_failure(10, 1, Some(60)));
         assert!(retry_after_failure(10, 0, None));
         assert!(!retry_after_failure(MAX_AGE_SECS + 1, 0, None));
+    }
+
+    #[test]
+    fn only_per_pr_release_records_are_index_members() {
+        use fake::item;
+        assert_eq!(
+            index_member(&item("TEAM#a", "RELEASE#acme/web#000042")).as_deref(),
+            Some("TEAM#a")
+        );
+        // A release tag's record shares the prefix.
+        assert_eq!(
+            index_member(&item("TEAM#a", "RELEASE#acme/web#v1.2.0")),
+            None
+        );
+        assert_eq!(index_member(&item("TEAM#a", "RELEASE#acme/web#")), None);
+        assert_eq!(index_member(&item("TEAM#a", "ANALYTICS#deploys")), None);
+        assert_eq!(index_member(&item("", "RELEASE#acme/web#000042")), None);
+        assert_eq!(
+            index_member(&item("INDEX#RELEASE_RUN", "RELEASE#acme/web#000042")),
+            None
+        );
+        let spec = index_spec();
+        assert_eq!(spec.name, INDEX);
+        assert_eq!(
+            common::settings_index::partition(spec.name),
+            "INDEX#RELEASE_RUN"
+        );
+        assert_eq!(spec.values[0].1, AttributeValue::S("RELEASE#".into()));
+    }
+
+    fn stalled_meta() -> Meta {
+        Meta {
+            write_id: "w".into(),
+            updated_at: Some(1_000),
+            next_tick_at: Some(1_000),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_teams_records_are_read_to_the_last_page() {
+        let t = fake::Table::new(4);
+        let rec = record(plan());
+        for pr in 1..=9u64 {
+            t.put(fake::release_item(
+                "TEAM#a",
+                &record_sk("acme", "web", pr),
+                &rec,
+                &stalled_meta(),
+            ));
+        }
+        // Tag records of the same team, in between and after.
+        for v in 0..25 {
+            t.put(fake::item("TEAM#a", &format!("RELEASE#acme/api#v1.{v}.0")));
+            t.put(fake::item("TEAM#a", &format!("RELEASE#acme/zz#v2.{v}.0")));
+        }
+        t.put(fake::item("TEAM#b", "RELEASE#acme/web#000001"));
+        let got = team_records(&t, "TEAM#a").await.unwrap();
+        assert_eq!(got.len(), 9);
+        assert!(got.iter().all(|(sk, _)| parse_sk(sk).is_some()));
+        // 59 items at 4 a page: every page was read.
+        assert_eq!(*t.pages_read.lock().unwrap(), 15);
+    }
+
+    #[tokio::test]
+    async fn a_team_with_no_release_record_left_is_dropped() {
+        let t = fake::Table::new(3);
+        t.put(fake::item("TEAM#tags", "RELEASE#acme/web#v1.0.0"));
+        t.put(fake::release_item(
+            "TEAM#live",
+            &record_sk("acme", "web", 3),
+            &record(plan()),
+            &stalled_meta(),
+        ));
+        for team in ["TEAM#gone", "TEAM#tags", "TEAM#live"] {
+            t.add_member(team);
+        }
+        let found = find_stalled(&t, 100_000).await.unwrap();
+        assert_eq!(found.dropped, vec!["TEAM#gone", "TEAM#tags"]);
+        assert_eq!(t.members(), vec!["TEAM#live"]);
+        assert_eq!(found.stalled.len(), 1);
+        assert_eq!(found.stalled[0].0, "TEAM#live");
+        assert_eq!(found.stalled[0].1, "RELEASE#acme/web#000003");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_record_after_many_pages_of_other_items_is_resumed() {
+        let t = fake::Table::new(10);
+        // Many pages of other teams' settings, analytics and markers.
+        for n in 0..700 {
+            t.put(fake::item(
+                &format!("TEAM#busy{:03}", n / 7),
+                &format!("ANALYTICS#day#{n:04}"),
+            ));
+        }
+        let sk = record_sk("acme", "web", 77);
+        t.put(fake::release_item(
+            "TEAM#zz-late",
+            &sk,
+            &record(plan()),
+            &stalled_meta(),
+        ));
+        // A capped scan of 50 pages never reaches it: it sits past them.
+        let pages = t.scan_pages();
+        let at = pages
+            .iter()
+            .position(|p| {
+                p.iter()
+                    .any(|i| i.get("sk") == Some(&AttributeValue::S(sk.clone())))
+            })
+            .unwrap();
+        assert!(at >= 50, "the record is on page {at}");
+        // The record was saved before the index existed: the rebuild's full
+        // scan finds its team, and the sweep reads it by key.
+        t.rebuild_index();
+        assert_eq!(t.members(), vec!["TEAM#zz-late"]);
+        let found = find_stalled(&t, 100_000).await.unwrap();
+        assert_eq!(found.stalled.len(), 1);
+        assert_eq!(
+            (found.stalled[0].0.as_str(), found.stalled[0].1.as_str()),
+            ("TEAM#zz-late", sk.as_str())
+        );
+        assert!(found.dropped.is_empty());
+    }
+
+    #[test]
+    fn the_sweep_never_scans_and_every_save_indexes_the_team() {
+        let src = include_str!("release_run.rs");
+        let body = |name: &str| {
+            let at = src.find(name).unwrap();
+            let rest = &src[at..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let sweep = body("pub async fn resume_stalled(");
+        assert!(sweep.contains("find_stalled(&TableStore(state), now)"));
+        assert!(!sweep.contains(".scan()"));
+        assert!(!src.contains(concat!("RESUME_", "MAX_PAGES")));
+        assert!(body("async fn save(").contains("index_team(state, team).await"));
+        assert!(body("async fn claim(").contains("index_team(state, team_id).await"));
     }
 
     #[test]

@@ -21,11 +21,17 @@
 //! its outcome once, at the time it went out; it never cuts a tag or asks a
 //! card, and a card asked before it shipped expires. A merge no tag holds
 //! yet goes the normal way.
+//!
+//! The first sweep found the records with a filtered scan of the settings
+//! table capped at a number of pages; on a large settings table it never
+//! reached them. The sweep now reads a settings index of the teams with a
+//! per-PR release record (each save adds the team; a daily full scan
+//! rebuilds it), then each team's records by key, every page to the end.
 
 use serde_json::json;
 
 use crate::passes::release_plan::{self, On, Status, Step};
-use crate::passes::release_run::{self, Meta, Next, Record, Stall};
+use crate::passes::release_run::{self, fake, Meta, Next, Record, Stall};
 
 const MERGE: &str = "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f";
 const NOW: i64 = 1_900_000_000;
@@ -218,4 +224,61 @@ fn the_sweep_runs_after_the_release_catch_up() {
         .find("passes::release_run::resume_stalled(&state)")
         .unwrap();
     assert!(catch_up < resume);
+}
+
+#[tokio::test]
+async fn a_record_on_a_large_settings_table_is_found_and_resumed() {
+    // Synthetic: many pages of other teams' items, then one team with a
+    // release record left at approval and many release tag records.
+    let table = fake::Table::new(25);
+    for n in 0..2_000 {
+        table.put(fake::item(
+            &format!("TEAM#crowd{:04}", n / 4),
+            &format!("ANALYTICS#runs#{n:05}"),
+        ));
+    }
+    let (rec, meta) = left_behind(Status::Approval);
+    let sk = "RELEASE#harbor/dock-api#000007";
+    table.put(fake::release_item("TEAM#harbor", sk, &rec, &meta));
+    for v in 0..120 {
+        table.put(fake::item(
+            "TEAM#harbor",
+            &format!("RELEASE#harbor/dock-api#v2.{v}.0"),
+        ));
+    }
+    // Far past any page cap the old scan had.
+    let pages = table.scan_pages();
+    let page_of_record = pages
+        .iter()
+        .position(|p| {
+            p.iter()
+                .any(|i| i.get("sk").and_then(|v| v.as_s().ok()).map(String::as_str) == Some(sk))
+        })
+        .unwrap();
+    assert!(page_of_record >= 50);
+
+    // Saved before the index existed: the rebuild's full scan finds it. A
+    // tag record never makes a team a member on its own.
+    table.rebuild_index();
+    assert_eq!(table.members(), vec!["TEAM#harbor".to_string()]);
+    let found = release_run::find_stalled(&table, NOW).await.unwrap();
+    assert_eq!(found.stalled.len(), 1);
+    let (team, got_sk, got, got_meta) = &found.stalled[0];
+    assert_eq!((team.as_str(), got_sk.as_str()), ("TEAM#harbor", sk));
+    assert_eq!(release_run::stall(got, got_meta, NOW), Stall::Resume);
+    // The team's partition is read to its last page, past the tag records.
+    assert!(*table.pages_read.lock().unwrap() >= 5);
+
+    // Once the record is gone, the team leaves the index.
+    let empty = fake::Table::new(25);
+    empty.add_member("TEAM#harbor");
+    empty.put(fake::item("TEAM#harbor", "RELEASE#harbor/dock-api#v2.0.0"));
+    let found = release_run::find_stalled(&empty, NOW).await.unwrap();
+    assert_eq!(found.dropped, vec!["TEAM#harbor".to_string()]);
+    assert!(empty.members().is_empty());
+
+    let src = include_str!("../release_run.rs");
+    let sweep = &src[src.find("pub async fn resume_stalled(").unwrap()..];
+    let sweep = &sweep[..sweep.find("\n}\n").unwrap()];
+    assert!(!sweep.contains(".scan()"));
 }

@@ -31,6 +31,40 @@ pub const BACKFILL_QUEUED_SK: &str = "ANALYTICS#deploy-runs-backfill-queued";
 /// (`repos_read`, `repos_total`), and the lease of the one pass reading
 /// (`lease`, `lease_until`), so a page load never starts a second chain.
 pub const BACKFILL_PROGRESS_SK: &str = "ANALYTICS#deploy-runs-backfill-progress";
+/// `INDEX#DEPLOY_STATS` ([`crate::settings_index`]): the teams with a
+/// backfill progress item or a deploy health item, so the 15-minute sweep
+/// reads those items by key instead of scanning the settings table (a
+/// capped scan of it stopped before reaching them). Writers add the team
+/// when they write either item; the daily rebuild finds the rest.
+pub const INDEX: &str = "DEPLOY_STATS";
+
+/// The team an item stands for in [`INDEX`]: its partition key, when the
+/// item is a backfill progress or a deploy health item.
+pub fn index_member(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Option<String> {
+    let sk = item.get("sk")?.as_s().ok()?;
+    if sk != BACKFILL_PROGRESS_SK && sk != health::SK {
+        return None;
+    }
+    let pk = item.get("pk")?.as_s().ok()?;
+    (!pk.is_empty() && !pk.starts_with("INDEX#")).then(|| pk.clone())
+}
+
+/// How the index's rebuild finds the items.
+pub fn index_spec() -> crate::settings_index::Spec<'static> {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    crate::settings_index::Spec {
+        name: INDEX,
+        filter: "sk = :sk OR sk = :h",
+        values: vec![
+            (":sk", AttributeValue::S(BACKFILL_PROGRESS_SK.to_string())),
+            (":h", AttributeValue::S(health::SK.to_string())),
+        ],
+        member_of: index_member,
+    }
+}
+
 /// How far back the backfill reads: the longest period the page shows (90
 /// days) and the one before it.
 pub const BACKFILL_DAYS: i64 = 182;
@@ -786,6 +820,32 @@ pub mod health {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sweep_index_names_teams_with_a_progress_or_health_item() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let it = |pk: &str, sk: &str| {
+            std::collections::HashMap::from([
+                ("pk".to_string(), AttributeValue::S(pk.into())),
+                ("sk".to_string(), AttributeValue::S(sk.into())),
+            ])
+        };
+        assert_eq!(
+            index_member(&it("TEAM#a", BACKFILL_PROGRESS_SK)).as_deref(),
+            Some("TEAM#a")
+        );
+        assert_eq!(
+            index_member(&it("TEAM#b", health::SK)).as_deref(),
+            Some("TEAM#b")
+        );
+        assert_eq!(index_member(&it("TEAM#a", BACKFILL_QUEUED_SK)), None);
+        assert_eq!(index_member(&it("INDEX#DEPLOY_STATS", health::SK)), None);
+        assert_eq!(index_member(&it("", health::SK)), None);
+        assert_eq!(
+            crate::settings_index::partition(index_spec().name),
+            "INDEX#DEPLOY_STATS"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

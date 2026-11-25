@@ -2267,7 +2267,8 @@ pub async fn run(state: &WorkerState) -> Result<(), BoxErr> {
     let now = Utc::now();
     let mut start: Option<Item> = None;
     let (mut teams, mut emails) = (0usize, 0usize);
-    for _ in 0..MAX_PAGES {
+    // Every page: a cap would leave the later teams without their summary.
+    loop {
         let resp = state
             .dynamo
             .scan()
@@ -2291,8 +2292,8 @@ pub async fn run(state: &WorkerState) -> Result<(), BoxErr> {
             }
         }
         match resp.last_evaluated_key() {
-            Some(k) => start = Some(k.clone()),
-            None => break,
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
         }
     }
     info!(teams, emails, "Weekly summaries sent");

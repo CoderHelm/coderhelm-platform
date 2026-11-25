@@ -1195,40 +1195,28 @@ pub const SWEEP_FILTER: &str = "pr_number > :zero AND updated_at >= :cut AND \
 pub async fn sweep(state: &WorkerState) -> SweepReport {
     let mut report = SweepReport::default();
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(WATCH_DAYS)).to_rfc3339();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    let mut all = Vec::new();
-    for _ in 0..200 {
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.runs_table_name)
-            .filter_expression(SWEEP_FILTER)
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_names("#wd", Marks::DEPLOY)
-            .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))
-            .expression_attribute_values(":old_done", attr_s(common::run_status::SUCCESS))
-            .expression_attribute_values(":merged", attr_s("merged"))
-            .expression_attribute_values(":closed", attr_s(common::run_status::CLOSED))
-            .expression_attribute_values(":cancelled", attr_s(common::run_status::CANCELLED))
-            .expression_attribute_values(":failed", attr_s(common::run_status::FAILED))
-            .expression_attribute_values(":zero", attr_n(0))
-            .expression_attribute_values(":cut", attr_s(&cutoff))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "PR watch: scan failed");
-                break;
-            }
-        };
-        all.extend(page.items().iter().filter_map(candidate_of));
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
-        }
-    }
+    // Each team's runs, read by key to the last page: a capped scan of the
+    // runs table stopped before the later runs.
+    let filter = super::team_runs::Filter {
+        expr: SWEEP_FILTER,
+        names: vec![("#s", "status"), ("#wd", Marks::DEPLOY)],
+        values: vec![
+            (":done", attr_s(common::run_status::COMPLETED)),
+            (":old_done", attr_s(common::run_status::SUCCESS)),
+            (":merged", attr_s("merged")),
+            (":closed", attr_s(common::run_status::CLOSED)),
+            (":cancelled", attr_s(common::run_status::CANCELLED)),
+            (":failed", attr_s(common::run_status::FAILED)),
+            (":zero", attr_n(0)),
+            (":cut", attr_s(&cutoff)),
+        ],
+        projection: None,
+    };
+    let mut all: Vec<_> = super::team_runs::matching(state, "PR watch", &filter)
+        .await
+        .iter()
+        .filter_map(candidate_of)
+        .collect();
     // A merged pull request whose deploy is already watched needs no look.
     all.retain(|c| c.status != "merged" || c.marks.deploy_sha.is_empty());
     // A run a person ended is looked at only for its merge (the scan reads
@@ -1295,36 +1283,19 @@ async fn catch_up(
     budget: &mut crate::clients::github_budget::SweepGate,
     clients: &mut HashMap<u64, GitHubClient>,
 ) -> Vec<String> {
-    let mut all = Vec::new();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    for _ in 0..200 {
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.runs_table_name)
-            .filter_expression(
-                "pr_number > :zero AND attribute_not_exists(pr_outcome) \
-                 AND (attribute_not_exists(#w) OR #w <> :w)",
-            )
-            .expression_attribute_names("#w", DESCRIPTION_WRITER)
-            .expression_attribute_values(":zero", attr_n(0))
-            .expression_attribute_values(":w", attr_s(&super::description::WRITER.to_string()))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Description catch-up: scan failed");
-                break;
-            }
-        };
-        all.extend(page.items().iter().filter_map(candidate_of));
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
-        }
-    }
+    let writer = super::description::WRITER.to_string();
+    let filter = super::team_runs::Filter {
+        expr: "pr_number > :zero AND attribute_not_exists(pr_outcome) \
+               AND (attribute_not_exists(#w) OR #w <> :w)",
+        names: vec![("#w", DESCRIPTION_WRITER)],
+        values: vec![(":zero", attr_n(0)), (":w", attr_s(&writer))],
+        projection: None,
+    };
+    let all: Vec<_> = super::team_runs::matching(state, "Description catch-up", &filter)
+        .await
+        .iter()
+        .filter_map(candidate_of)
+        .collect();
     let mut rebuilt = Vec::new();
     for c in catch_up_picks(all, CATCH_UP_PER_TEAM, CATCH_UP_MAX) {
         if !budget
