@@ -340,9 +340,9 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_SCREEN,
         title: "Follow a screen on the app map",
-        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. Give the screen's id or its address, like /slips/:id.",
+        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. A page one route picks by type (a catch-all that renders a different component for each kind of page) is a screen of its own, with the type, its renderer's file:line and the route that picks it. Give the screen's id, its address (like /slips/:id) or its name.",
         scopes: &[CODE_SCOPE],
-        schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id or address, from map_overview." } }), &["screen"]),
+        schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id, address or name, from map_overview or map_find." } }), &["screen"]),
         output: None,
     },
     Tool {
@@ -2504,5 +2504,164 @@ mod tests {
         };
         let rendered = reg.render_with("S1", "1 | fn a() {}\n2 | }");
         assert_eq!(body_of(&rendered), "1 | fn a() {}\n2 | }\n");
+    }
+
+    /// The marina map: one website whose catch-all route dispatches its
+    /// pages by type (services/worker/floorplan/fixtures/marina), with a
+    /// journey through two of the dispatched pages as the worker stores it.
+    fn marina() -> Value {
+        let mut g: Value = serde_json::from_str(include_str!(
+            "../../worker/floorplan/fixtures/marina-graph.json"
+        ))
+        .unwrap();
+        common::app_map::stamp_repos(
+            &mut g,
+            &common::app_map::folders(&["marina/marina-web".to_string()]),
+        );
+        g["flows"] = json!([{
+            "id": "join-the-marina", "title": "Join the marina", "custom": true,
+            "coderhelm": {"entry": "screen:site:/members/join", "linked": [true, true, true]},
+            "steps": [
+                {"ref": "f:marina-web/lib/renderers.tsx", "screen": "screen:site:/members/join", "note": "The boater fills in the sign-up form.", "evidence": [{"file": "marina-web/lib/renderers.tsx", "line": 19}]},
+                {"ref": "r:1", "note": "The form saves the new member.", "evidence": [{"file": "marina-web/components/SignupForm.tsx", "line": 7}, {"file": "marina-web/app/api/members/route.ts", "line": 1}]},
+                {"ref": "f:marina-web/lib/renderers.tsx", "screen": "screen:site:/members/checkout", "note": "The boater pays for the season.", "evidence": [{"file": "marina-web/lib/renderers.tsx", "line": 24}]},
+            ],
+        }]);
+        g
+    }
+
+    /// One map tool on /mcp over the marina map, as the model reads it.
+    fn marina_tool(name: &str, input: Value) -> Value {
+        let read = read_of(name, &input).unwrap();
+        let (text, _) = map_read(Some(marina()), &mut Registry::default(), &read).unwrap();
+        let body = text.split_once("] ").map(|(_, b)| b).unwrap_or(&text);
+        serde_json::from_str(body).unwrap()
+    }
+
+    /// The pages a catch-all route dispatches to by type come through every
+    /// map tool on /mcp: listed, found, followed with their URL pattern and
+    /// renderer, named for their renderer file, and walked in a journey.
+    #[test]
+    fn dispatched_screens_come_through_the_map_tools() {
+        let o = marina_tool(MAP_OVERVIEW, json!({}));
+        let listed: Vec<&str> = o["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        for n in [
+            "Member signup",
+            "Member checkout",
+            "Berth page",
+            "Berth list",
+            "Notice page",
+        ] {
+            assert!(listed.contains(&n), "{n} in {listed:?}");
+        }
+        // every screen is counted: the route files under the app's part, the
+        // dispatched pages under its repository, as the detectors' screens are
+        let counted: u64 = o["screen_count"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert_eq!(counted, 7);
+        assert_eq!(o["screen_count"]["marina-web"], 5);
+
+        let f = marina_tool(MAP_FIND, json!({ "query": "member checkout" }));
+        assert_eq!(f["screens"][0]["url"], "/members/checkout");
+        assert_eq!(
+            f["screens"][0]["dispatch"]["renderer"],
+            "MemberCheckoutRenderer"
+        );
+        // by the type the route dispatches on, too
+        let f = marina_tool(MAP_FIND, json!({ "query": "berth-index" }));
+        assert_eq!(f["screens"][0]["name"], "Berth list");
+
+        for q in [
+            "/members/join",
+            "screen:site:/members/join",
+            "Member signup",
+        ] {
+            let v = marina_tool(MAP_SCREEN, json!({ "screen": q }));
+            let s = &v["screen"];
+            assert_eq!(s["url"], "/members/join", "{q}");
+            assert_eq!(s["file"], "marina-web/lib/renderers.tsx");
+            assert_eq!(s["dispatch"]["type"], "member-signup");
+            assert_eq!(
+                s["dispatch"]["renderer_at"],
+                "marina-web/lib/renderers.tsx:19"
+            );
+            assert_eq!(
+                s["dispatch"]["route_file"],
+                "marina-web/app/[...slug]/page.tsx"
+            );
+            assert_eq!(s["dispatch"]["url_from"], "resolver");
+            assert_eq!(s["evidence"][0]["at"], "marina-web/lib/renderers.tsx:19");
+            assert_eq!(s["evidence"][2]["at"], "marina-web/lib/resolve.ts:13");
+            let behind: Vec<&str> = v["behind"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|b| b["id"].as_str())
+                .collect();
+            assert!(behind.contains(&"f:marina-web/components/SignupForm.tsx"));
+            assert!(!behind.contains(&"f:marina-web/components/CheckoutForm.tsx"));
+        }
+        // a pattern only the route gives says so
+        let v = marina_tool(MAP_SCREEN, json!({ "screen": "/(notice)/*" }));
+        assert_eq!(v["screen"]["dispatch"]["url_from"], "route");
+
+        let names = |v: &Value| -> Vec<String> {
+            v["screens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let file = marina_tool(MAP_FILE, json!({ "path": "marina-web/lib/renderers.tsx" }));
+        let on_file = names(&file);
+        for n in ["Member signup", "Member checkout", "Berth page"] {
+            assert!(on_file.iter().any(|x| x == n), "{n} in {on_file:?}");
+        }
+        let imp = marina_tool(
+            MAP_IMPACT,
+            json!({ "target": "marina-web/lib/renderers.tsx" }),
+        );
+        let hit = names(&imp);
+        for n in ["Member signup", "Member checkout", "Notice page"] {
+            assert!(hit.iter().any(|x| x == n), "{n} in {hit:?}");
+        }
+        let at: Vec<&str> = imp["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["at"].as_str())
+            .collect();
+        assert!(at.contains(&"marina-web/lib/renderers.tsx:24"), "{at:?}");
+        assert_eq!(imp["journeys"][0]["id"], "join-the-marina");
+        // the form one screen uses reaches that screen only
+        let imp = marina_tool(
+            MAP_IMPACT,
+            json!({ "target": "marina-web/components/CheckoutForm.tsx" }),
+        );
+        let mut reached = names(&imp);
+        reached.sort();
+        assert_eq!(reached, ["Member checkout", "Page"]);
+
+        let j = marina_tool(MAP_FLOW, json!({ "journey": "join the marina" }));
+        assert_eq!(j["journey"]["id"], "join-the-marina");
+        let on: Vec<&str> = j["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["screen"]["name"].as_str().unwrap_or("-"))
+            .collect();
+        assert_eq!(on, vec!["Member signup", "-", "Member checkout"]);
+        assert_eq!(j["steps"][2]["screen"]["url"], "/members/checkout");
+        assert_eq!(j["steps"][2]["cites"][0], "marina-web/lib/renderers.tsx:24");
     }
 }

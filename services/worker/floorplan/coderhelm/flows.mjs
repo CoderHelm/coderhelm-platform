@@ -366,8 +366,9 @@ export function runOrder(a, b) {
 /** The files a start file reaches, symbol-aware: file to the names used
  * from it (null: all of it), how deep, and the chain of lines (`at`) where
  * each file on the way runs the next. */
-export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = null } = {}) {
-  const seen = new Map([[start, { d: 0, names: null, at: [], via: null }]]);
+export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = null, names: startNames = null } = {}) {
+  // `names`: only these symbols of the start file (one renderer of a file that holds several)
+  const seen = new Map([[start, { d: 0, names: startNames, at: [], via: null }]]);
   const queue = [start];
   while (queue.length) {
     const f = queue.shift();
@@ -679,11 +680,35 @@ export function navSites(text) {
   return out;
 }
 
-const urlMatch = (u, pat) => {
-  const a = segs(u);
-  const b = segs(pat);
-  return a.length === b.length && a.every((x, i) => x === b[i] || /^[:[]/.test(b[i]) || x.startsWith(':'));
-};
+/** How well a path fits a screen's URL pattern: -1 when it does not. Exact segments beat
+ * parameters, a parameter beats a splat; `(group)` segments are not in the URL. */
+export function urlScore(u, pat) {
+  const a = segs(String(u).split(/[?#]/)[0]);
+  const b = segs(String(pat)).filter((x) => !/^\(.*\)$/.test(x));
+  let sc = 0;
+  for (let i = 0; i < b.length; i++) {
+    const p = b[i];
+    if (p === '*' || /^\[\[?\.\.\./.test(p)) return i < a.length || /^\[\[/.test(p) ? sc + 0.5 : -1;
+    if (i >= a.length) return -1;
+    if (a[i] === p) sc += 3;
+    else if (/^[:[]/.test(p) || a[i].startsWith(':')) sc += 1;
+    else return -1;
+  }
+  return a.length === b.length ? sc : -1;
+}
+
+/** The one screen a path reaches: the best fit, and none when two screens fit it equally well
+ * (the screens a catch-all dispatches to by a type the URL does not show). */
+export function screenForUrl(screens, u) {
+  let best = null, score = -1, tie = false;
+  for (const x of screens) {
+    if (!x.url) continue;
+    const sc = urlScore(u, x.url);
+    if (sc < 0) continue;
+    if (sc > score) { best = x; score = sc; tie = false; } else if (sc === score && x !== best) tie = true;
+  }
+  return tie ? null : best;
+}
 
 // ── Candidates ────────────────────────────────────────────────────────────
 
@@ -1100,7 +1125,11 @@ export function candidates(graph, read) {
     if (!ev) return null;
     const gate = s.nav?.gate ? `, ${s.nav.gate.replace('_', ' ')}` : '';
     const where = s.nav?.navigator ? `, ${s.nav.navigator}` : '';
-    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev] });
+    // a screen a route dispatches to is one renderer of its file: its journeys start from that code only
+    const focus = s.nav?.renderer && s.fw === 'dispatch' ? [s.nav.renderer] : null;
+    // the lines its renderer spans, so a traced step inside them lands on this screen and not a neighbour
+    const span = focus ? ranges(ix, r, file).get(focus[0]) : null;
+    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}) });
     if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
     return c;
   };
@@ -1168,7 +1197,9 @@ export function candidates(graph, read) {
   const visit = (s) => {
     if (done.has(s.id)) return;
     done.add(s.id);
-    const files = closure(ix, r, classes, s.file);
+    // (a renderer the map lists no symbol for is read as its whole file)
+    const focus = s.focus && s.focus.some((n) => ranges(ix, r, s.file).has(n)) ? { names: new Set(s.focus) } : {};
+    const files = closure(ix, r, classes, s.file, focus);
     for (const [f, v] of files) {
       for (const x of callsByFile.get(f) || []) if (made(x) && (x.line == null || inUse(ix, r, f, v.names, x.line))) link(s, x.c, 'the screen makes this request', at(v, x.line));
       for (const x of ix.ext.get(f) || []) {
@@ -1194,7 +1225,7 @@ export function candidates(graph, read) {
         return own;
       };
       let prev = null;
-      for (const st of steps) {
+      for (const st of steps.filter((x) => inUse(ix, r, f, v.names, x.line))) {
         if (!st.comp) {
           const target = [...stepScreens.values()].find((x) => x.step === st.step && x.parentFile === f);
           if (target) link(prev || s, target.c, 'goes to this step');
@@ -1222,8 +1253,10 @@ export function candidates(graph, read) {
         visit(c);
       }
       // Forms the screen renders that no router registers.
+      const usedText = v.names ? slice(r, f, v.names, ix) : null;
       for (const e of ix.imports.get(f) || []) {
         if (!/\.(tsx|jsx)$/.test(e.to) || isTest(e.to) || screenOf.has(e.to)) continue;
+        if (usedText != null && !(e.names || []).some((n) => new RegExp('\\b' + esc(n) + '\\b').test(usedText))) continue;
         const base = path.posix.basename(e.to).replace(/\.\w+$/, '');
         const comp = (e.names || []).find((n) => /^[A-Z]/.test(n)) || base;
         if (!/(Form|Step\w*|Modal|Drawer|Sheet|Page|View|Screen)$/.test(comp) && !/(form|step)/i.test(base)) continue;
@@ -1239,7 +1272,8 @@ export function candidates(graph, read) {
     for (const [f, v] of files) {
       if (v.d > 1) continue;
       for (const n of r.once('nav', f, () => navSites(r.text(f)))) {
-        const t = screens.find((x) => x !== s && !x.part && (n.kind === 'name' ? x.name === n.target || segs(x.url || '').pop() === n.target : x.url && urlMatch(n.target, x.url)));
+        if (!inUse(ix, r, f, v.names, n.line)) continue;
+        const t = n.kind === 'name' ? screens.find((x) => x !== s && !x.part && (x.name === n.target || segs(x.url || '').pop() === n.target)) : screenForUrl(screens.filter((x) => x !== s && !x.part), n.target);
         if (t) link(s, t, 'goes to this screen');
       }
     }
@@ -1498,13 +1532,15 @@ export function forViewer(fl) {
   for (const s of fl.steps) {
     if (!s.view) continue;
     const evidence = (s.evidence || []).map((e) => ({ file: e.file, line: e.line }));
-    if (steps.length && steps[steps.length - 1].ref === s.view) {
+    // the screen a step stands on, when its file holds several (the screens a route dispatches to)
+    const screen = typeof s.key === 'string' && s.key.startsWith('screen:') ? s.key : undefined;
+    if (steps.length && steps[steps.length - 1].ref === s.view && steps[steps.length - 1].screen === screen) {
       const last = steps[steps.length - 1];
       last.note += ` Then ${s.note.charAt(0).toLowerCase()}${s.note.slice(1)}`;
       last.evidence.push(...evidence);
       continue;
     }
-    steps.push({ ref: s.view, note: s.note, evidence });
+    steps.push({ ref: s.view, note: s.note, evidence, ...(screen ? { screen } : {}) });
     linked.push(s.linked !== false);
   }
   return { id: fl.id, title: fl.title, description: fl.description || '', steps, custom: true, coderhelm: { entry: fl.entry, linked } };
@@ -1537,6 +1573,8 @@ export function table(c, ids, read) {
       // file that forwards them (the requests through it all reach what it
       // forwards to).
       ...(x.kind === 'request' && x.all ? { all: x.all, pattern: x.pattern } : {}),
+      // A screen that is one renderer of a file holding several: the lines it spans.
+      ...(x.kind === 'screen' && x.span ? { span: x.span } : {}),
       // Requests a step has only because its page makes them: they don't
       // place the request under this step.
       weak: [...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.why === 'the page makes this request for the step').map(([b]) => b),

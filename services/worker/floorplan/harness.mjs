@@ -18,13 +18,23 @@ export const read = (f) => JSON.parse(fs.readFileSync(path.join(HERE, f), 'utf8'
 /** The answers the worker's model jobs would send for the harbor fixture. */
 export const harborAnswers = () => ({ 'floorplan/architecture.json': read('architecture.harbor.json'), ...read('descriptions.harbor.json') });
 
-export function workdir(answers, mode, extra = {}) {
+/** The answers for the marina fixture: one website whose pages one catch-all route dispatches by type. */
+export const marinaAnswers = () => ({
+  'floorplan/architecture.json': {
+    $schema: 'floorplan/architecture@1',
+    project: { name: 'Marina', summary: 'A website where boaters find a berth and join the marina.' },
+    nodes: [{ id: 'site', label: 'Marina website', kind: 'ui', summary: 'Where boaters find a berth, sign up and pay for the season.', paths: ['marina-web'] }],
+  },
+});
+
+export function workdir(answers, mode, extra = {}, fixture = 'harbor') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'app-map-'));
-  fs.cpSync(path.join(HERE, 'fixtures', 'harbor'), path.join(dir, 'root'), { recursive: true });
+  fs.cpSync(path.join(HERE, 'fixtures', fixture), path.join(dir, 'root'), { recursive: true });
   fs.cpSync(VENDOR, path.join(dir, 'fp'), { recursive: true });
   fs.copyFileSync(path.join(HERE, 'driver.mjs'), path.join(dir, 'driver.mjs'));
   fs.cpSync(path.join(HERE, 'coderhelm'), path.join(dir, 'coderhelm'), { recursive: true, filter: (p) => !/\.test\.mjs$/.test(p) });
-  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ mode, answers, heads: { 'harbor-web': 'a1', 'harbor-api': 'b2' }, ...extra }));
+  const heads = fixture === 'harbor' ? { 'harbor-web': 'a1', 'harbor-api': 'b2' } : { [`${fixture}-web`]: 'c3' };
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ mode, answers, heads, ...extra }));
   return dir;
 }
 

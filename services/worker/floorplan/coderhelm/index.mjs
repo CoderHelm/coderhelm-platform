@@ -93,7 +93,7 @@ export async function enrich({ root, skill, graph, scan }) {
   const inf = run('infra', () => infra.analyse(root), out) || { units: {}, ecs: {}, edges: [], deploys: [] };
 
   // ---------- screens (detection; merged after the services so `behind` reaches them) ----------
-  const found = run('screens', () => screens.detect(root, repos), out) || { hints: [], edges: [], expoRoots: new Map(), rnRepos: new Set(), notes: [], ms: {} };
+  const found = run('screens', () => screens.detect(root, repos, { screens: graph.screens || [] }), out) || { hints: [], edges: [], expoRoots: new Map(), rnRepos: new Set(), notes: [], ms: {} };
   out.notes.push(...found.notes);
   Object.assign(out.ms, Object.fromEntries(Object.entries(found.ms).map(([k, v]) => [`screens:${k}`, v])));
   const tools = found.hints.filter((h) => h.kind === 'tool').map((h) => h.name);

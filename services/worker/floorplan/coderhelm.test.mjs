@@ -1,7 +1,7 @@
 // CoderHelm's detectors (coderhelm/) on small made-up sources, one folder per case:
 // outside services, calls through wrappers and GraphQL, infra to code (Terraform,
 // CloudFormation/SAM, Serverless, CDK, deploy workflows), webhooks, data links and screens
-// (React Navigation, Expo Router at its real root, Sanity, CMS page kinds, Flutter, Android,
+// (React Navigation, Expo Router at its real root, Sanity, screens a dynamic route dispatches to, Flutter, Android,
 // iOS). The driver test (driver.test.mjs) runs them all on the harbor fixture.
 //
 //   node --test services/worker/floorplan/coderhelm.test.mjs
@@ -20,7 +20,7 @@ import * as screens from './coderhelm/screens.mjs';
 import * as EXPO from './coderhelm/screens/expo-router.mjs';
 import * as RN from './coderhelm/screens/react-navigation.mjs';
 import * as SANITY from './coderhelm/screens/sanity.mjs';
-import * as CMS from './coderhelm/screens/cms-routes.mjs';
+import * as DISPATCH from './coderhelm/screens/dispatch.mjs';
 import * as FLUTTER from './coderhelm/screens/flutter.mjs';
 import * as ANDROID from './coderhelm/screens/android.mjs';
 import * as IOS from './coderhelm/screens/ios.mjs';
@@ -144,7 +144,7 @@ test('webhooks are named from the vendor beside the hook word; data links join E
   assert.deepEqual(d.links.map((l) => [l.file, l.entity, l.mode, l.table]), [['etl/dags/load.py', 'api/src/slip.entity.ts', 'write', 'slip']]);
 });
 
-test('screens: React Navigation gates, Expo Router at its real root, Sanity, CMS page kinds, Flutter, Android, iOS', () => {
+test('screens: React Navigation gates, Expo Router at its real root, Sanity, dispatched screens, Flutter, Android, iOS', () => {
   const root = tree({
     'rn/package.json': JSON.stringify({ dependencies: { 'react-native': '0.76.0', '@react-navigation/native-stack': '7.0.0' } }),
     'rn/app/Root.tsx': "import { createNativeStackNavigator } from '@react-navigation/native-stack';\nimport Home from './Home';\nimport Login from './Login';\nconst Stack = createNativeStackNavigator();\nexport default function Root({ token }) {\n  return (\n    <Stack.Navigator>\n      {token ? (\n        <Stack.Screen name=\"Home\" component={Home} />\n      ) : (\n        <Stack.Screen name=\"Login\" component={Login} />\n      )}\n    </Stack.Navigator>\n  );\n}\n",
@@ -174,7 +174,7 @@ test('screens: React Navigation gates, Expo Router at its real root, Sanity, CMS
   assert.deepEqual(ex.screens.map((s) => [s.route, s.gate]).sort(), [['/', 'signed-in'], ['/sign-in', null]]);
   const st = SANITY.detect(path.join(root, 'studio')).studios[0];
   assert.deepEqual([st.tools.map((t) => t.name), st.pageKinds.map((k) => k.name)], [['structure'], ['post']]);
-  assert.deepEqual(CMS.detect(path.join(root, 'site')).catchAlls[0].pageKinds.map((k) => k.name), ['post', 'venue', 'club']);
+  assert.deepEqual(DISPATCH.detect(path.join(root, 'site')).dispatchers[0].screens.map((k) => k.type), ['post', 'venue', 'club']);
   assert.deepEqual(FLUTTER.detect(path.join(root, 'fl')).screens.map((s) => s.route), ['/', '/settings']);
   const droid = ANDROID.detect(path.join(root, 'droid'));
   assert.deepEqual(droid.screens.map((s) => s.name).sort(), ['MainActivity', 'detail', 'list']);
@@ -186,7 +186,7 @@ test('screens: React Navigation gates, Expo Router at its real root, Sanity, CMS
   assert.deepEqual(fw('react-navigation'), ['/(Stack)/Home', '/(Stack)/Login']);
   assert.deepEqual(fw('expo-router'), ['/', '/sign-in']);
   assert.deepEqual(fw('sanity-tool'), ['/studio/structure']);
-  assert.deepEqual(fw('cms-page-kind'), ['/(club)', '/(post)', '/(venue)']);
+  assert.deepEqual(fw('dispatch'), ['/(club)/*', '/(post)/*', '/(venue)/*']);
   assert.deepEqual(found.expoRoots.get('ex'), ['ex/app/routes']);
   assert.ok(found.rnRepos.has('rn'));
   assert.ok(found.hints.every((h) => !h.url.includes('#')), 'pseudo URLs survive Floorplan\'s normalizeUrl');
@@ -200,4 +200,202 @@ test("each detector stops reading at its time limit and says so", async () => {
   assert.deepEqual(text.listFiles(root), []);
   assert.equal(text.stopClock(), true);
   assert.equal(text.read(root, 'a/x.ts'), 'x');
+});
+
+// ── Screens a dynamic route dispatches to by type ─────────────────────────
+
+const only = (r, file) => r.dispatchers.find((d) => d.file === file) || assert.fail(`no dispatcher in ${file}: ${r.dispatchers.map((d) => d.file)}`);
+const byType = (d) => Object.fromEntries(d.screens.map((s) => [s.type, s]));
+
+test('dispatch: an object map in a catch-all, its renderers followed through imports, barrels, namespaces and lazy imports', () => {
+  const root = tree({
+    'app/[...path]/page.tsx': [
+      "import { resolveAddress } from '../../lib/resolve';",
+      "import { TideRenderer } from '../../lib/renderers';",
+      "import * as R from '../../lib/more';",
+      "import dynamic from 'next/dynamic';",
+      "const Gallery = dynamic(() => import('../../components/Gallery'));",
+      "const views = {",
+      "  tide: TideRenderer,",
+      "  'harbour-office': R.HarbourOfficeView,",
+      "  gallery: Gallery,",
+      "  notice: (p) => <Notice {...p} />,",
+      "} satisfies Record<ViewType, unknown>;",
+      "function Notice() { return null; }",
+      "export default async function Page({ params }) {",
+      "  const hit = await resolveAddress(params.path);",
+      "  const View = views[hit.type];",
+      "  return <View hit={hit} />;",
+      "}",
+    ].join('\n'),
+    'lib/resolve.ts': "export async function resolveAddress(parts) { return { type: 'tide' }; }\n",
+    'lib/renderers.ts': "export { TideRenderer } from './tide/TideRenderer';\nexport * from './office';\n",
+    'lib/tide/TideRenderer.tsx': "\n\nexport function TideRenderer() {\n  return <p>tide</p>;\n}\n",
+    'lib/office.tsx': 'export const HarbourOfficeView = () => null;\n',
+    'lib/more.ts': "export { HarbourOfficeView } from './office';\n",
+    'components/Gallery.tsx': '\nexport default function Gallery() { return null; }\n',
+  });
+  const d = only(DISPATCH.detect(root), 'app/[...path]/page.tsx');
+  assert.equal(d.route, '/*');
+  const t = byType(d);
+  assert.deepEqual(Object.keys(t).sort(), ['gallery', 'harbour-office', 'notice', 'tide']);
+  assert.deepEqual([t.tide.file, t.tide.line, t.tide.renderer, t.tide.name], ['lib/tide/TideRenderer.tsx', 3, 'TideRenderer', 'Tide page']);
+  assert.deepEqual([t['harbour-office'].file, t['harbour-office'].renderer, t['harbour-office'].name], ['lib/office.tsx', 'HarbourOfficeView', 'Harbour office']);
+  assert.deepEqual([t.gallery.file, t.gallery.line, t.gallery.renderer], ['components/Gallery.tsx', 2, 'Gallery']);
+  assert.deepEqual([t.notice.file, t.notice.renderer], ['app/[...path]/page.tsx', 'Notice']);
+  // with no URL in the code, the catch-all's own pattern with the type named
+  assert.equal(t.tide.url, '/(tide)/*');
+  assert.equal(t.tide.urlFrom, null);
+  assert.deepEqual([t.tide.table.file, t.tide.table.how], ['app/[...path]/page.tsx', 'object']);
+});
+
+test('dispatch: a switch on the type (with fall-through cases) and an if chain, in a component the route renders', () => {
+  const root = tree({
+    'pages/[...slug].tsx': "import { Router } from '../components/Router';\nexport default function P(props) { return <Router {...props} />; }\n",
+    'components/Router.tsx': [
+      "import { Dock } from './Dock';",
+      "import { Crew, CrewList } from './Crew';",
+      "export function Router({ entry }) {",
+      "  switch (entry.kind) {",
+      "    case 'dock':",
+      "      return <Dock entry={entry} />;",
+      "    case 'crew':",
+      "    case 'skipper':",
+      "      return <Crew entry={entry} />;",
+      "    case KINDS.CREW_LIST: {",
+      "      return <CrewList />;",
+      "    }",
+      "    default:",
+      "      return null;",
+      "  }",
+      "}",
+      "const KINDS = { CREW_LIST: 'crew-list' };",
+    ].join('\n'),
+    'components/Dock.tsx': 'export function Dock() { return null; }\n',
+    'components/Crew.tsx': 'export function Crew() { return null; }\nexport function CrewList() { return null; }\n',
+    'routes/$.tsx': "import { Buoy } from '../ui/Buoy';\nimport { Mooring } from '../ui/Mooring';\nexport default function Splat({ data }) {\n  if (data.template === 'buoy') return <Buoy />;\n  if (data.template === 'mooring') {\n    return <Mooring />;\n  }\n  return null;\n}\n",
+    'ui/Buoy.tsx': 'export function Buoy() { return null; }\n',
+    'ui/Mooring.tsx': 'export function Mooring() { return null; }\n',
+    'src/routes/charts/[...rest]/+page.svelte': "<script>\n  import Chart from '$lib/Chart.svelte';\n  import Legend from '$lib/Legend.svelte';\n  export let data;\n  const parts = { chart: Chart, legend: Legend, key: Legend };\n</script>\n<svelte:component this={parts[data.type]} />\n",
+  });
+  const r = DISPATCH.detect(root);
+  const sw = byType(only(r, 'pages/[...slug].tsx'));
+  assert.deepEqual(Object.keys(sw).sort(), ['crew', 'crew-list', 'dock', 'skipper']);
+  assert.deepEqual([sw.dock.file, sw.dock.renderer, sw.dock.table.how], ['components/Dock.tsx', 'Dock', 'switch']);
+  // two types one renderer draws are named by their types
+  assert.deepEqual([sw.crew.name, sw.skipper.name, sw.crew.renderer], ['Crew page', 'Skipper page', 'Crew']);
+  assert.equal(sw['crew-list'].name, 'Crew list');
+  // Remix / React Router flat routes: the splat
+  const ifs = only(r, 'routes/$.tsx');
+  assert.equal(ifs.route, '/*');
+  assert.deepEqual(ifs.screens.map((s) => [s.type, s.file, s.table.how]), [['buoy', 'ui/Buoy.tsx', 'if'], ['mooring', 'ui/Mooring.tsx', 'if']]);
+  // SvelteKit: the route's own base stays in front of the type
+  const sk = only(r, 'src/routes/charts/[...rest]/+page.svelte');
+  assert.equal(sk.route, '/charts/*');
+  assert.deepEqual(sk.screens.map((s) => s.url).sort(), ['/charts/(chart)/*', '/charts/(key)/*', '/charts/(legend)/*']);
+});
+
+test('dispatch: the URL each type gets, read from the resolver, a path table, a slug builder and a prefix table', () => {
+  const root = tree({
+    'app/[[...slug]]/page.tsx': "import { find } from '../../lib/find';\nimport { Berth, Club, Event, Join, Pay, Story } from '../../lib/views';\nconst views = { berth: Berth, club: Club, event: Event, join: Join, pay: Pay, story: Story };\nexport default async function P({ params }) { const m = await find(params.slug); const V = views[m.type]; return <V />; }\n",
+    'lib/views.tsx': ['Berth', 'Club', 'Event', 'Join', 'Pay', 'Story'].map((n) => `export function ${n}() { return null; }`).join('\n') + '\n',
+    'lib/find.ts': [
+      "import { pathFor } from './paths';",
+      "import { PREFIXES } from './prefixes';",
+      "const CLUBS = ['north', 'south'];",
+      "export async function find(parts) {",
+      "  if (parts.length === 2 && parts[0] === 'members' && parts[1] === 'join') {",
+      "    return { type: 'join' };",
+      "  }",
+      "  if (parts.length === 3 && CLUBS.includes(parts[0]) && parts[1] === 'pay') {",
+      "    if (await open(parts[2])) return 'pay';",
+      "  }",
+      "  return lookup(parts);",
+      "}",
+    ].join('\n'),
+    'lib/paths.ts': "export function pathFor(doc) {\n  switch (doc.type) {\n    case 'berth':\n      return `/berths/${doc.number}`;\n    case 'event':\n      return `/events/${doc.slug}`;\n  }\n}\n",
+    'lib/prefixes.ts': "export const PREFIXES = {\n  story: '/stories',\n  club: '/clubs',\n};\n",
+  });
+  const t = byType(only(DISPATCH.detect(root), 'app/[[...slug]]/page.tsx'));
+  assert.deepEqual([t.join.url, t.join.urlFrom.how, t.join.urlFrom.file, t.join.urlFrom.line], ['/members/join', 'resolver', 'lib/find.ts', 5]);
+  assert.equal(t.pay.url, '/:club/pay/:segment3');
+  assert.deepEqual([t.berth.url, t.berth.urlFrom.how], ['/berths/:number', 'path builder']);
+  assert.equal(t.event.url, '/events/:slug');
+  assert.deepEqual([t.story.url, t.story.urlFrom.how], ['/stories/*', 'prefix']);
+  assert.equal(t.club.url, '/clubs/*');
+});
+
+test('dispatch: the pieces on their own (route files, plain names, URL rules)', () => {
+  assert.deepEqual(DISPATCH.routeOf('web/app/[locale]/[...slug]/page.tsx'), { url: '/:locale/*', base: '/:locale', last: '*' });
+  assert.deepEqual(DISPATCH.routeOf('web/app/(site)/docs/[slug]/page.mdx'), { url: '/docs/:slug', base: '/docs', last: ':slug' });
+  assert.deepEqual(DISPATCH.routeOf('web/pages/guides/[...slug].vue'), { url: '/guides/*', base: '/guides', last: '*' });
+  assert.deepEqual(DISPATCH.routeOf('src/pages/[...path].astro'), { url: '/*', base: '', last: '*' });
+  assert.deepEqual(DISPATCH.routeOf('app/routes/docs.$.tsx'), { url: '/docs/*', base: '/docs', last: '*' });
+  assert.deepEqual(DISPATCH.routeOf('app/routes/boats.$boatId.tsx'), { url: '/boats/:boatId', base: '/boats', last: ':boatId' });
+  assert.equal(DISPATCH.routeOf('web/app/about/page.tsx'), null, 'a static route dispatches nothing');
+  assert.equal(DISPATCH.routeOf('web/app/[...slug]/layout.tsx'), null);
+  assert.equal(DISPATCH.routeOf('web/app/api/[...route]/route.ts'), null);
+  assert.equal(DISPATCH.plainName('BoatCheckoutRenderer'), 'Boat checkout');
+  assert.equal(DISPATCH.plainName('DockRenderer'), 'Dock page');
+  assert.equal(DISPATCH.plainName('DocksIndexRenderer'), 'Docks list');
+  assert.equal(DISPATCH.plainName('PageRenderer'), 'Content page');
+  assert.equal(DISPATCH.plainName('sailing-course-index', { fromType: true }), 'Sailing course list');
+  assert.equal(DISPATCH.segPattern(["slug.startsWith('/news/')"]), '/news/*');
+  assert.equal(DISPATCH.segPattern(["parts[0] === 'a' && parts.length >= 2"]), '/a/:segment2/*');
+  assert.equal(DISPATCH.segPattern(['user.isAdmin']), null);
+  assert.equal(DISPATCH.pathPattern('/clubs/${club.slug}/events/${id}', false), '/clubs/:slug/events/:id');
+});
+
+test('dispatch: a route the map already has from a router config (React Router, Vue Router) dispatches too, and blocks are not screens', () => {
+  const root = tree({
+    'src/AppRoutes.tsx': "import { ContentPage } from './ContentPage';\nexport const routes = [{ path: '/help/*', element: <ContentPage /> }];\n",
+    'src/ContentPage.tsx': "import { Faq } from './Faq';\nimport { Guide } from './Guide';\nimport { Hero, Banner, Cards } from './blocks';\nconst pageTypes = { faq: Faq, guide: Guide };\nconst blockMap = { hero: Hero, banner: Banner, cards: Cards };\nexport function ContentPage({ doc }) {\n  const P = pageTypes[doc.type];\n  return <P>{doc.blocks.map((b) => { const B = blockMap[b.blockType]; return <B />; })}</P>;\n}\n",
+    'src/Faq.tsx': 'export const Faq = () => null;\n',
+    'src/Guide.tsx': 'export const Guide = () => null;\n',
+    'src/blocks.tsx': 'export const Hero = () => null;\nexport const Banner = () => null;\nexport const Cards = () => null;\n',
+  });
+  assert.deepEqual(DISPATCH.detect(root).dispatchers, [], 'no file-based route here');
+  const d = only(DISPATCH.detect(root, { routes: [{ file: 'src/ContentPage.tsx', url: '/help/*' }] }), 'src/ContentPage.tsx');
+  assert.deepEqual(d.screens.map((s) => [s.type, s.url, s.file]), [['faq', '/help/(faq)/*', 'src/Faq.tsx'], ['guide', '/help/(guide)/*', 'src/Guide.tsx']]);
+  assert.deepEqual(d.sections.map((s) => s.type), ['hero', 'banner', 'cards']);
+});
+
+test('dispatch: a catch-all over 32 types is 32 screens on the map, each its own renderer, URL and parts', () => {
+  const types = Array.from({ length: 32 }, (_, i) => `kind-${String.fromCharCode(97 + (i % 26))}${i >= 26 ? i : ''}`);
+  const comp = (t) => t.replace(/(^|-)(\w)/g, (_, __, c) => c.toUpperCase()) + 'Renderer';
+  const files = {
+    'web/package.json': JSON.stringify({ dependencies: { next: '14.2.5', react: '18.3.1' } }),
+    'web/app/[...slug]/page.tsx': `import { resolve } from '../../lib/resolve';\nimport { ${types.map(comp).join(', ')} } from '../../lib/renderers';\nconst renderers = {\n${types.map((t) => `  '${t}': ${comp(t)},`).join('\n')}\n};\nexport default async function P({ params }) { const m = await resolve(params.slug); const R = renderers[m.type]; return <R />; }\n`,
+    'web/lib/resolve.ts': "export async function resolve(parts) {\n  if (parts.length === 1 && parts[0] === 'first') return 'kind-a';\n  return null;\n}\n",
+    'web/lib/renderers.tsx': types.map((t, i) => `import { Part${i} } from '../components/Part${i}';\nexport function ${comp(t)}() {\n  return <Part${i} />;\n}\n`).join(''),
+  };
+  types.forEach((_, i) => { files[`web/components/Part${i}.tsx`] = `export function Part${i}() { return null; }\n`; });
+  const root = tree(files);
+  const found = screens.detect(root, ['web']);
+  const hints = found.hints.filter((h) => h.fw === 'dispatch');
+  assert.equal(hints.length, 32);
+  // merged into a map the way the driver does it: each is a screen, and what is behind it is its own renderer's code
+  const graph = {
+    files: [
+      { p: 'web/app/[...slug]/page.tsx', n: 'web' }, { p: 'web/lib/resolve.ts', n: 'web' },
+      { p: 'web/lib/renderers.tsx', n: 'web', s: types.map((t, i) => [comp(t), 'function', 1 + i * 4]) },
+      ...types.map((_, i) => ({ p: `web/components/Part${i}.tsx`, n: 'web' })),
+    ],
+    nodes: [{ id: 'web', kind: 'ui', label: 'Web' }],
+    links: types.map((_, i) => ({ a: 'f:web/lib/renderers.tsx', b: `f:web/components/Part${i}.tsx`, k: 'import', names: [`Part${i}`] })),
+    routes: [],
+    screens: [{ id: 'screen:web:/*', url: '/*', file: 'web/app/[...slug]/page.tsx', app: 'web', fw: 'next-app', name: 'Page', behind: [] }],
+  };
+  const m = screens.mergeScreens({ graph, scan: { files: [] }, root, found });
+  assert.equal(m.added, 32);
+  const added = graph.screens.filter((s) => s.fw === 'dispatch');
+  assert.equal(new Set(added.map((s) => s.id)).size, 32);
+  assert.equal(new Set(added.map((s) => s.name)).size, 32);
+  const first = added.find((s) => s.nav.type === 'kind-a');
+  assert.deepEqual([first.url, first.kind, first.file, first.nav.route, first.nav.renderer], ['/first', 'screen', 'web/lib/renderers.tsx', '/first', 'KindARenderer']);
+  assert.deepEqual(first.nav.evidence.map((e) => [e.file, e.line]), [['web/lib/renderers.tsx', 2], ['web/app/[...slug]/page.tsx', 4], ['web/lib/resolve.ts', 2]]);
+  assert.deepEqual(first.behind.map((b) => b.id), ['f:web/lib/renderers.tsx', 'f:web/components/Part0.tsx']);
+  const last = added.find((s) => s.nav.type === types[31]);
+  assert.deepEqual(last.behind.map((b) => b.id), ['f:web/lib/renderers.tsx', 'f:web/components/Part31.tsx']);
+  assert.equal(last.url, `/(${types[31]})/*`);
 });
