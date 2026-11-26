@@ -417,7 +417,7 @@ mod tests {
     use super::*;
 
     const ADDR: &str = "Error: marinaClub /marina-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-marina-addresses";
-    const FIX: &str = "Error: Charter date \"e2e-callout-expired\" is missing from the Charter Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
+    const FIX: &str = "Error: Tour date \"e2e-callout-expired\" is missing from the Tour Indexes: run the add-callout-e2e-fixtures migration on the staging dataset.";
 
     fn step(text: &str, blocked: bool) -> Step {
         Step {

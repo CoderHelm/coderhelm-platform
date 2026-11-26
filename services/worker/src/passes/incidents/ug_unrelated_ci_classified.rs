@@ -30,7 +30,7 @@ use common::ci_unrelated::{self, Rerun};
 const HEAD: &str = "d00dfeed12345678";
 
 /// The round's own conclusion, as it wrote it (names made generic).
-const ROUND: &str = "I made no code change. The failing e2e test (`Charters › dock filter shows only that dock's sailings and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the slips block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows sailing 4242.\n- Confirmed: the sailing went inactive minutes before the e2e run started.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
+const ROUND: &str = "I made no code change. The failing e2e test (`Tours › depot filter shows only that depot's sailings and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the slips block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows sailing 4242.\n- Confirmed: the sailing went inactive minutes before the e2e run started.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
 
 #[test]
 fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
@@ -45,7 +45,7 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
     .expect("the round's proof is read");
     assert_eq!(
         s.tests,
-        vec!["Charters › dock filter shows only that dock's sailings and clears".to_string()]
+        vec!["Tours › depot filter shows only that depot's sailings and clears".to_string()]
     );
     assert_eq!(s.proof.len(), 2);
     // The standing reads "not this change's" everywhere: the run's ending,
@@ -66,7 +66,7 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
     let mut s = s;
     s.rerun = Rerun::Started;
     let sec = ci_unrelated::section(&s);
-    assert!(sec.contains("`Deploy Preview` fails on `Charters › dock filter"));
+    assert!(sec.contains("`Deploy Preview` fails on `Tours › depot filter"));
     assert!(sec.contains("ran again once on d00dfee and failed the same way"));
     assert!(sec.contains("ready for review"));
     assert!(!sec.contains("without getting it green") && !sec.contains("stays a draft"));
@@ -106,7 +106,7 @@ fn a_check_that_never_runs_on_the_base_finds_its_base() {
     let r = ci_repro::from_history(
         HEAD,
         "Deploy Preview",
-        "Charters › dock filter",
+        "Tours › depot filter",
         "main",
         ("0badc0ffee1", true, "2030-03-23T17:30:00Z"),
     );

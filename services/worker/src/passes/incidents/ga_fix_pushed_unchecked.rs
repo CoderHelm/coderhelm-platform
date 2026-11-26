@@ -1,6 +1,6 @@
 //! ga. A pull request that removed a duplicated filter chip changed a shared
 //! slug helper and added hundreds of lines of unit tests for a few dozen
-//! lines of code, with fixtures named `dock-a` and `dock-b` although the run had
+//! lines of code, with fixtures named `depot-a` and `depot-b` although the run had
 //! queried the database and quoted the two real records' ids. CI went red on
 //! a test outside the diff. Each CI fix round's sandbox reported "2 of 2
 //! checks passed": its test step was the first workflow line with a test
@@ -50,9 +50,9 @@ fn manifests() -> Vec<(String, String)> {
 fn touched() -> Vec<String> {
     [
         "apps/web/src/utils/filterMaps.ts",
-        "apps/web/src/components/blocks/DocksFilter.tsx",
+        "apps/web/src/components/blocks/DepotsFilter.tsx",
         "apps/web/src/test/utils/filterMaps.test.ts",
-        "apps/web/src/test/components/dock-filter-dedupe.test.tsx",
+        "apps/web/src/test/components/depot-filter-dedupe.test.tsx",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -144,7 +144,7 @@ fn a_fix_whose_tests_failed_or_never_ran_is_not_pushed() {
 
 #[test]
 fn a_revert_message_that_adds_tests_back_is_rewritten_and_its_tests_must_go() {
-    let patch = "@@ -560,40 +560,3 @@\n-export function dedupeDocksBySlug(docks) {\n-  return docks;\n-}\n export const slugToId = (s) => s;";
+    let patch = "@@ -560,40 +560,3 @@\n-export function dedupeDepotsBySlug(depots) {\n-  return depots;\n-}\n export const slugToId = (s) => s;";
     let commit = vec![
         FileChange {
             path: "apps/web/src/utils/filterMaps.ts".into(),
@@ -154,7 +154,7 @@ fn a_revert_message_that_adds_tests_back_is_rewritten_and_its_tests_must_go() {
             patch: patch.into(),
         },
         FileChange {
-            path: "apps/web/src/test/components/charters-block-dedup.test.tsx".into(),
+            path: "apps/web/src/test/components/tours-block-dedup.test.tsx".into(),
             status: "added".into(),
             additions: 64,
             deletions: 0,
@@ -164,16 +164,16 @@ fn a_revert_message_that_adds_tests_back_is_rewritten_and_its_tests_must_go() {
     let old = "Revert the change that broke CI; it is deferred on the pull request";
     let msg = push_gate::true_message(old, &commit);
     assert!(
-        msg.starts_with("Change filterMaps.ts, charters-block-dedup.test.tsx (+64/-37)"),
+        msg.starts_with("Change filterMaps.ts, tours-block-dedup.test.tsx (+64/-37)"),
         "{msg}"
     );
     assert!(msg.contains("adds test lines to"));
     // The helper it takes out is still imported by a test: held.
     let removed = push_gate::removed_symbols(&commit);
-    assert_eq!(removed[0].0, "dedupeDocksBySlug");
+    assert_eq!(removed[0].0, "dedupeDepotsBySlug");
     let tests = vec![(
         "apps/web/src/test/utils/filterMaps.test.ts".to_string(),
-        "import { dedupeDocksBySlug, slugToId } from '../../utils/filterMaps';".to_string(),
+        "import { dedupeDepotsBySlug, slugToId } from '../../utils/filterMaps';".to_string(),
     )];
     let stale = push_gate::still_expected(&removed, &tests);
     assert_eq!(stale.len(), 1);
@@ -214,15 +214,15 @@ fn a_test_red_after_two_pushed_fixes_stops_named_without_a_rollback() {
 fn invented_fixture_ids_and_repeated_cases_go_back_to_the_coder() {
     // The run looked up the two records behind the duplicate chip.
     let lookups = vec![
-        "- [L1] Asked Production database: SELECT id, name FROM dock WHERE ... Came back: 1a2b3c4d… 'Guest-dock' (active); 5e6f7a8b… 'Guest-Dock' (inactive)".to_string(),
+        "- [L1] Asked Production database: SELECT id, name FROM depot WHERE ... Came back: 1a2b3c4d… 'Guest-depot' (active); 5e6f7a8b… 'Guest-Depot' (inactive)".to_string(),
     ];
     let mut cases = String::new();
-    for (i, name) in ["Guest-dock", "Guest-Dock", "guest dock", "GUEST-DOCK"]
+    for (i, name) in ["Guest-depot", "Guest-Depot", "guest depot", "GUEST-DEPOT"]
         .iter()
         .enumerate()
     {
         cases.push_str(&format!(
-            "+  it('keeps one chip for {name}', () => {{\n+    const out = dedupeDocksBySlug([{{ id: 'dock-{}', label: '{name}' }}]);\n+    expect(out).toHaveLength(1);\n+  }});\n",
+            "+  it('keeps one chip for {name}', () => {{\n+    const out = dedupeDepotsBySlug([{{ id: 'depot-{}', label: '{name}' }}]);\n+    expect(out).toHaveLength(1);\n+  }});\n",
             ["a", "b", "c", "d"][i]
         ));
     }
@@ -246,12 +246,12 @@ fn invented_fixture_ids_and_repeated_cases_go_back_to_the_coder() {
     let ids = minimal_change::made_up_ids(&diff, &lookups);
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0].kind, Kind::MadeUpIds);
-    assert!(ids[0].what.contains("`dock-a`") && ids[0].what.contains("`dock-d`"));
+    assert!(ids[0].what.contains("`depot-a`") && ids[0].what.contains("`depot-d`"));
     assert!(!ids[0].excusable());
     // Hundreds of test lines for 50 of code: the size check #742 added fires
     // on this diff today (the run predates it), and so does the new check
     // for cases that differ only in their values.
-    let found = minimal_change::check(&diff, &[], "Only one guest-dock filter shows", false);
+    let found = minimal_change::check(&diff, &[], "Only one guest-depot filter shows", false);
     let sizes: Vec<&str> = found
         .iter()
         .filter(|w| w.kind == Kind::TestSize)

@@ -42,7 +42,7 @@ fn answers() -> RunEvidence {
             "L1".into(),
             "Production database",
             LookupOutcome::Answered,
-            "SELECT count(*) FROM charter WHERE description ~ '&[a-z]+;'",
+            "SELECT count(*) FROM tour WHERE description ~ '&[a-z]+;'",
             "48 rows",
         )],
         checks: vec!["test: vitest run src/utils/html-text.test.ts: PASS".into()],

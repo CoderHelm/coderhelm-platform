@@ -2,7 +2,7 @@
 
 **What happened:** Two pull requests did far more than their tickets, and guessed where they should have measured.
 
-- **The charters ticket:** a data-pipeline ticket asked to link four charters to a second activity.
+- **The tours ticket:** a data-pipeline ticket asked to link four tours to a second activity.
   - The plan named the right overrides map, then reused the link helper that deletes every link it isn't given, on a sync that only inserted. Links nobody asked about were deleted.
   - The build wrote a second map and helpers beside the existing one.
   - It added counters, warnings and a log level change in shared code, because the data rules asked for reporting on any skip.

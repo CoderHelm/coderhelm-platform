@@ -1,7 +1,7 @@
 //! The plan is the smallest correct change, and says so in five sections.
 //!
 //! Two plans went wrong before a line was written. One, for linking four
-//! charters to a second activity, planned a new map and helpers beside the
+//! tours to a second activity, planned a new map and helpers beside the
 //! existing overrides map and a sync that "replaces" links, so the build
 //! deleted links nobody asked about. The other, for embedding a vendor's
 //! portal, planned end-to-end assertions about the vendor's page from
@@ -70,7 +70,7 @@ embed, an API, a webhook payload) and how you measure it before writing against 
 data. Write `None: the change stays inside this repository` when there are none. Never plan \
 selectors, fields or behaviour of another company's system from a guess.\n\
 - `## Smallest change`: the change in a few lines (for example \"4 entries in \
-`CHARTER_OVERRIDES`; an insert with `ON CONFLICT DO NOTHING` in the 3 write branches\"), and why \
+`TOUR_OVERRIDES`; an insert with `ON CONFLICT DO NOTHING` in the 3 write branches\"), and why \
 nothing smaller does it.\n\
 - `## Proof`: the one test or check that shows it, sized to the change: the new behaviour and \
 that nothing else changed, through the real entry point, with real or probed data. When an \
@@ -689,17 +689,17 @@ mod tests {
         }
     }
 
-    const GOOD: &str = "## Reuse\n- `CHARTER_MULTI_ACTIVITY_OVERRIDES` and `get_charter_multi_activity_names` in dags/charters/activities.py\n\n## Must not change\nNo deletes: existing links stay. Logging stays as it is.\n\n## Measure first\nNone: the change stays inside this repository.\n\n## Smallest change\n4 entries in `CHARTER_MULTI_ACTIVITY_OVERRIDES`; in the 3 write branches insert links for `get_charter_multi_activity_names` with ON CONFLICT DO NOTHING.\n\n## Proof\nOne test: the 4 names get Fishing and their own activity, others only their own, nothing deleted.\n\n## Out of scope\nNone: the ticket names the four charters and nothing else.\n";
+    const GOOD: &str = "## Reuse\n- `TOUR_MULTI_STOP_OVERRIDES` and `get_tour_multi_stop_names` in dags/tours/stops.py\n\n## Must not change\nNo deletes: existing links stay. Logging stays as it is.\n\n## Measure first\nNone: the change stays inside this repository.\n\n## Smallest change\n4 entries in `TOUR_MULTI_STOP_OVERRIDES`; in the 3 write branches insert links for `get_tour_multi_stop_names` with ON CONFLICT DO NOTHING.\n\n## Proof\nOne test: the 4 names get Food Tasting and their own activity, others only their own, nothing deleted.\n\n## Out of scope\nNone: the ticket names the four tours and nothing else.\n";
 
     #[test]
     fn the_small_plan_passes() {
         let p = plan(
             GOOD,
-            "- [ ] dags/charters/activities.py: add 4 entries\n- [ ] tests/test_activities.py: one test",
+            "- [ ] dags/tours/stops.py: add 4 entries\n- [ ] tests/test_stops.py: one test",
         );
         assert!(plan_gaps(
             &p,
-            "Link four charters to Fishing as well as their activity",
+            "Link four tours to Food Tasting as well as their activity",
             false,
             &[]
         )
@@ -729,17 +729,17 @@ mod tests {
     fn a_parallel_map_and_a_replacing_sync_are_rejected() {
         let design = GOOD.replace(
             "## Smallest change\n",
-            "## Smallest change\nAdd `CHARTER_FISHING_OVERRIDES` and `get_charter_fishing_names`; the sync upserts links and deletes stale ones. Change the INFO log to debug.\n",
+            "## Smallest change\nAdd `TOUR_TASTING_OVERRIDES` and `get_tour_tasting_names`; the sync upserts links and deletes stale ones. Change the INFO log to debug.\n",
         );
         let g = plan_gaps(
-            &plan(&design, "- [ ] dags/charters/activities.py: x"),
-            "Link four charters to Fishing",
+            &plan(&design, "- [ ] dags/tours/stops.py: x"),
+            "Link four tours to Food Tasting",
             false,
             &[],
         );
         assert!(
             g.iter().any(|l| l.contains(
-                "`CHARTER_FISHING_OVERRIDES` next to the existing `CHARTER_MULTI_ACTIVITY_OVERRIDES`"
+                "`TOUR_TASTING_OVERRIDES` next to the existing `TOUR_MULTI_STOP_OVERRIDES`"
             )),
             "{g:?}"
         );
@@ -790,19 +790,20 @@ mod tests {
     #[test]
     fn the_tickets_words_become_searches() {
         let t = ticket_terms(
-            "Link full-day charters to Fishing",
-            "These charters should also show under Fishing: \"Harbor Day Charter\", \"Fish Week\". See `CHARTER_MULTI_ACTIVITY_OVERRIDES`.",
+            "Link full-day tours to Food Tasting",
+            "These tours should also show under Food Tasting: \"Harbor Day Tour\", \"Market Week\". See `TOUR_MULTI_STOP_OVERRIDES`.",
         );
-        assert_eq!(t[0], "CHARTER_MULTI_ACTIVITY_OVERRIDES");
-        assert!(t.contains(&"Harbor Day Charter".to_string()));
-        assert!(t.contains(&"Fishing".to_string()));
+        assert_eq!(t[0], "TOUR_MULTI_STOP_OVERRIDES");
+        assert!(t.contains(&"Harbor Day Tour".to_string()));
+        assert!(t.contains(&"Tasting".to_string()));
         let names = existing_names(&[(
-            "Fishing".into(),
-            vec!["dags/charters/activities.py\nCHARTER_MULTI_ACTIVITY_OVERRIDES = {".into()],
+            "Food Tasting".into(),
+            vec!["dags/tours/stops.py\nTOUR_MULTI_STOP_OVERRIDES = {".into()],
         )]);
-        assert_eq!(names, vec!["CHARTER_MULTI_ACTIVITY_OVERRIDES"]);
+        assert_eq!(names, vec!["TOUR_MULTI_STOP_OVERRIDES"]);
         assert!(
-            existing_block(&[("Fishing".into(), vec!["dags/a.py".into()])]).contains("## Reuse")
+            existing_block(&[("Food Tasting".into(), vec!["dags/a.py".into()])])
+                .contains("## Reuse")
         );
     }
 }

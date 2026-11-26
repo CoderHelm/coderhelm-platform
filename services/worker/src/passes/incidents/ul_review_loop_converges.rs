@@ -40,8 +40,8 @@ fn a_style_finding_that_moves_is_one_item_and_then_a_note() {
     assert!(l.settled_item(P3).is_some());
     // A finding about behaviour still needs the same file.
     assert!(!own_review_ledger::same_finding(
-        "Live impact on charters is not measured (`dags/pipeline.py:1046`)",
-        "Live impact on charters is not measured (`dags/other.py:10`)"
+        "Live impact on tours is not measured (`dags/pipeline.py:1046`)",
+        "Live impact on tours is not measured (`dags/other.py:10`)"
     ));
     // The review demotes the noted style finding: never a block.
     let src = include_str!("../review_pr.rs");
