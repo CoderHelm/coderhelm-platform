@@ -275,7 +275,11 @@ impl RunMap {
             out.push(format!(
                 "screen {} in {} ({}) at {}",
                 s(&sc["name"]),
-                s(&sc["app"]),
+                if sc["app_name"].is_string() {
+                    s(&sc["app_name"])
+                } else {
+                    s(&sc["app"])
+                },
                 sc["gate"].as_str().unwrap_or("gate not known"),
                 s(&sc["at"])
             ));
@@ -501,7 +505,8 @@ impl RunMap {
                         format!(
                             "{} in {} ({}) at {}",
                             s["name"].as_str().unwrap_or(""),
-                            s["app"].as_str().unwrap_or(""),
+                            // the card the screen is under, by its name
+                            s["app_name"].as_str().or(s["app"].as_str()).unwrap_or(""),
                             s["gate"].as_str().unwrap_or("gate not known"),
                             s["at"].as_str().unwrap_or("")
                         )
