@@ -737,16 +737,97 @@ fn is_system(n: &Value) -> bool {
     n["level"] == "system" || n["parent"].is_null()
 }
 
-/// The repositories a card's own paths are in: (folder, the path inside it,
-/// empty for the whole repository), in the paths' order.
-fn card_repos(n: &Value, names: &HashMap<String, String>) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// A card's repositories: each folder with the paths inside it.
+type CardRepos = Vec<(String, Vec<Vec<String>>)>;
+
+/// The repositories a card's own paths are in, in the paths' order: each
+/// folder with the paths inside it, globs and slashes stripped (empty for the
+/// whole repository).
+fn card_repos(n: &Value, names: &HashMap<String, String>) -> CardRepos {
+    let mut out: CardRepos = Vec::new();
     for p in arr(n, "paths").filter_map(Value::as_str) {
-        let p = p.trim_matches('/');
-        let (folder, rest) = p.split_once('/').unwrap_or((p, ""));
-        if names.contains_key(folder) && !out.iter().any(|x| x.0 == folder && x.1 == rest) {
-            out.push((folder.to_string(), rest.to_string()));
+        let mut segs = p
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "." && !s.contains(['*', '?', '[', '{']));
+        let Some(folder) = segs.next() else { continue };
+        if !names.contains_key(folder) {
+            continue;
         }
+        let rest: Vec<String> = segs.map(str::to_string).collect();
+        match out.iter_mut().find(|x| x.0 == folder) {
+            Some((_, paths)) if !paths.contains(&rest) => paths.push(rest),
+            Some(_) => {}
+            None => out.push((folder.to_string(), vec![rest])),
+        }
+    }
+    out
+}
+
+/// Top-level folders a repository's cards share (its packages, tests, CI,
+/// scripts): a card that holds one of them beside its own app is named by
+/// the app.
+const SHARED_TOP: [&str; 11] = [
+    "packages", "e2e", ".github", "scripts", "docs", "test", "tests", "tools", "config", ".husky",
+    "shared",
+];
+
+/// Folders that only hold other folders: never a card's name on their own.
+const CONTAINERS: [&str; 10] = [
+    "apps",
+    "packages",
+    "services",
+    "src",
+    "lib",
+    "libs",
+    "modules",
+    "projects",
+    "workspaces",
+    "source",
+];
+
+/// The card's main path in one repository: its path outside the shared
+/// top-level folders holding the most of the map's files (the first on a
+/// tie); `None` when the card is the whole repository.
+fn main_path(graph: &Value, folder: &str, paths: &[Vec<String>]) -> Option<Vec<String>> {
+    if paths.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let own: Vec<&Vec<String>> = paths
+        .iter()
+        .filter(|p| !SHARED_TOP.contains(&p[0].as_str()))
+        .collect();
+    let pool = if own.is_empty() {
+        paths.iter().collect()
+    } else {
+        own
+    };
+    let files_under = |p: &Vec<String>| {
+        let prefix = format!("{folder}/{}/", p.join("/"));
+        arr(graph, "files")
+            .filter(|f| f["p"].as_str().is_some_and(|x| x.starts_with(&prefix)))
+            .count()
+    };
+    let mut best: Option<(&Vec<String>, usize)> = None;
+    for p in pool {
+        let c = files_under(p);
+        if best.is_none_or(|(_, b)| c > b) {
+            best = Some((p, c));
+        }
+    }
+    best.map(|(p, _)| p.clone())
+}
+
+/// The words a path is named by, shortest first: its most specific folder
+/// that is not a container (`apps/web` is `web`), then longer endings of the
+/// path (`admin/web`), to tell two cards apart.
+fn path_names(path: &[String]) -> Vec<String> {
+    let last = path
+        .iter()
+        .rposition(|s| !CONTAINERS.contains(&s.as_str()))
+        .unwrap_or(path.len() - 1);
+    let mut out = vec![path[last].clone()];
+    for k in (0..last).rev() {
+        out.push(path[k..=last].join("/"));
     }
     out
 }
@@ -767,22 +848,27 @@ pub fn repo_title(names: &[String]) -> String {
 /// - a card that is one repository: its name on GitHub, without the owner
 ///   (`harbor-api`);
 /// - a card that covers several: their names joined, or the first and how
-///   many more when that is long ([`repo_title`]);
+///   many more when that is long ([`repo_title`]); "more" counts
+///   repositories only, never paths;
 /// - a card that is one of several cards in the same repository (a web app
-///   and a content studio in one repository): `repo / folder`, so they stay
-///   apart;
+///   and a content studio in one repository): `repo / folder`, the folder
+///   being one word from the card's main path (`site/apps/web/**` is
+///   `site / web`; globs, containers like `apps` and the repository's shared
+///   folders like `packages` or `e2e` left out), longer only when two cards
+///   would read the same;
 /// - a card that is no repository (outside services, cloud resources, a
 ///   cloud setup made from no repository's folder) keeps its name.
 ///
 /// A renamed card keeps its old name as its `role` (unless it was already
-/// the repository's name) and lists every name in `repos`. Read from the paths the map already keeps, so a map built before
-/// this is named the same way; naming a map twice changes nothing.
+/// the repository's name) and lists every name in `repos`. Read from the
+/// paths the map already keeps, so a map built before this is named the
+/// same way; naming a map twice changes nothing.
 pub fn name_by_repo(graph: &mut Value) {
     let names = repo_names(graph);
     if names.is_empty() {
         return;
     }
-    let cards: Vec<(usize, Vec<(String, String)>)> = arr(graph, "nodes")
+    let cards: Vec<(usize, CardRepos)> = arr(graph, "nodes")
         .enumerate()
         .filter(|(_, n)| is_system(n) && n["kind"] != "external")
         .map(|(i, n)| (i, card_repos(n, &names)))
@@ -791,23 +877,48 @@ pub fn name_by_repo(graph: &mut Value) {
     // How many cards each repository is split across.
     let mut cards_in: HashMap<&str, usize> = HashMap::new();
     for (_, rs) in &cards {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
         for (folder, _) in rs {
-            if seen.insert(folder) {
-                *cards_in.entry(folder).or_default() += 1;
+            *cards_in.entry(folder).or_default() += 1;
+        }
+    }
+    // The folder word of each (card, repository) split across several cards:
+    // the shortest that no other card in that repository shares.
+    let mut word: HashMap<(usize, &str), String> = HashMap::new();
+    let mut by_repo: BTreeMap<&str, Vec<(usize, Vec<String>)>> = BTreeMap::new();
+    for (i, rs) in &cards {
+        for (folder, paths) in rs {
+            if cards_in[folder.as_str()] > 1 {
+                if let Some(m) = main_path(graph, folder, paths) {
+                    by_repo
+                        .entry(folder)
+                        .or_default()
+                        .push((*i, path_names(&m)));
+                }
             }
+        }
+    }
+    for (folder, list) in &by_repo {
+        for (i, options) in list {
+            let others: Vec<&Vec<String>> = list
+                .iter()
+                .filter(|(j, _)| j != i)
+                .map(|(_, o)| o)
+                .collect();
+            let pick = options
+                .iter()
+                .find(|w| !others.iter().any(|o| o.contains(w)))
+                .unwrap_or_else(|| options.last().unwrap_or(&options[0]));
+            word.insert((*i, folder), pick.clone());
         }
     }
     let mut titled: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, rs) in &cards {
         let mut list: Vec<String> = Vec::new();
-        for (folder, rest) in rs {
+        for (folder, _) in rs {
             let name = &names[folder];
-            let whole = rs.iter().any(|(f, r)| f == folder && r.is_empty());
-            let entry = if cards_in[folder.as_str()] > 1 && !whole {
-                format!("{name} / {rest}")
-            } else {
-                name.clone()
+            let entry = match word.get(&(*i, folder.as_str())) {
+                Some(w) => format!("{name} / {w}"),
+                None => name.clone(),
             };
             if !list.contains(&entry) {
                 list.push(entry);
@@ -820,15 +931,21 @@ pub fn name_by_repo(graph: &mut Value) {
     };
     for (i, list) in titled {
         let n = &mut nodes[i];
-        if n.get("repos").is_some() {
-            continue;
-        }
+        // Named before (by this or an earlier release): its own name is its role.
+        let named = n.get("repos").is_some();
+        let own = if named {
+            n["role"].clone()
+        } else {
+            n["label"].clone()
+        };
         let title = repo_title(&list);
-        if n["label"]
-            .as_str()
-            .is_some_and(|l| !l.trim().is_empty() && l != title)
-        {
-            n["role"] = n["label"].clone();
+        match own.as_str() {
+            Some(l) if !l.trim().is_empty() && l != title => n["role"] = own.clone(),
+            _ => {
+                if let Some(o) = n.as_object_mut() {
+                    o.remove("role");
+                }
+            }
         }
         n["label"] = json!(title);
         n["repos"] = json!(list);
@@ -909,8 +1026,10 @@ pub struct MapIndex {
 /// Raised when the page's copy of a map ([`viewer_copy`]) changes in a way
 /// the stored map already holds what it needs for, so the read API writes
 /// the copy again from the stored map instead of waiting for a build.
-/// 1: System cards titled by their repositories ([`name_by_repo`]).
-pub const COPY_VERSION: u32 = 1;
+/// 1: System cards titled by their repositories ([`name_by_repo`]). 2: a
+/// card split from a shared repository named by one folder word, not its
+/// path globs.
+pub const COPY_VERSION: u32 = 2;
 
 /// What a map covers, for the Knowledge page: screens per app, outside
 /// services, cloud links and repositories.
@@ -3794,6 +3913,104 @@ mod tests {
         // A part inside a card keeps its own name.
         assert_eq!(card(&g, "api-src")["label"], "Bookings");
         assert!(card(&g, "api-src").get("role").is_none());
+    }
+
+    /// A monorepo's cards as a model writes their paths: globs, the
+    /// repository's shared folders beside the main app.
+    fn site_monorepo() -> Value {
+        let mut g = harbor_cards(json!([
+            {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui",
+             "paths": ["site/apps/web/**", "site/packages/**", "site/e2e/**", "site/.github/**", "site/scripts/**"]},
+            {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/apps/studio/**"]},
+            {"id": "fns", "parent": null, "level": "system", "label": "Image helpers", "kind": "worker", "paths": ["site/lambdas/**"]},
+            {"id": "api", "parent": null, "level": "system", "label": "Main server", "kind": "service", "paths": ["harbor-api/**"]},
+        ]));
+        g["files"] = json!([
+            {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
+            {"p": "site/apps/web/app/slips/page.tsx", "n": "web", "r": "site"},
+            {"p": "site/packages/ui/button.tsx", "n": "web", "r": "site"},
+            {"p": "site/apps/studio/schemas/slip.ts", "n": "studio", "r": "site"},
+            {"p": "site/lambdas/resize/index.ts", "n": "fns", "r": "site"},
+        ]);
+        g
+    }
+
+    #[test]
+    fn split_repository_cards_are_named_by_one_clean_folder() {
+        let mut g = site_monorepo();
+        name_by_repo(&mut g);
+        let titles: Vec<(&str, &str)> = ["web", "studio", "fns", "api"]
+            .iter()
+            .map(|id| (*id, card(&g, id)["label"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("web", "site / web"),
+                ("studio", "site / studio"),
+                ("fns", "site / lambdas"),
+                ("api", "harbor-api"),
+            ]
+        );
+        // One repository: no "+N more" for its several paths, and no globs anywhere.
+        assert_eq!(card(&g, "web")["repos"], json!(["site / web"]));
+        assert_eq!(card(&g, "web")["role"], "Website");
+        for n in arr(&g, "nodes") {
+            let l = n["label"].as_str().unwrap();
+            assert!(!l.contains('*') && !l.contains("more"), "{l}");
+        }
+    }
+
+    #[test]
+    fn two_cards_with_the_same_folder_word_take_the_shortest_path_that_differs() {
+        let mut g = harbor_cards(json!([
+            {"id": "a", "parent": null, "level": "system", "label": "Public site", "kind": "ui", "paths": ["site/apps/web/**"]},
+            {"id": "b", "parent": null, "level": "system", "label": "Staff site", "kind": "ui", "paths": ["site/admin/web/**"]},
+            {"id": "c", "parent": null, "level": "system", "label": "Shared code", "kind": "library", "paths": ["site/packages/**"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "a")["label"], "site / apps/web");
+        assert_eq!(card(&g, "b")["label"], "site / admin/web");
+        // a card of only a container folder is named by it
+        assert_eq!(card(&g, "c")["label"], "site / packages");
+    }
+
+    #[test]
+    fn a_map_named_by_an_earlier_release_is_named_again_from_its_role() {
+        let mut g = site_monorepo();
+        // as the first release named it
+        let web = g["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|n| n["id"] == "web")
+            .unwrap();
+        web["role"] = json!("Website");
+        web["label"] = json!("site / apps/web/** +4 more");
+        web["repos"] = json!(["site / apps/web/**", "site / packages/**"]);
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "web")["label"], "site / web");
+        assert_eq!(card(&g, "web")["role"], "Website");
+        let once = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, once);
+    }
+
+    #[test]
+    fn journeys_read_split_cards_by_their_clean_names() {
+        let mut g = site_monorepo();
+        g["flows"] = json!([{"id": "book", "title": "Book a slip", "description": "", "steps": [
+            {"ref": "n:web", "note": "The slip page"},
+            {"ref": "n:api", "note": "Takes the booking"},
+            {"ref": "n:fns", "note": "Resizes the photo"},
+        ]}]);
+        let mut l = Lookups::new(g);
+        let (v, _) = l.lookup("map_flow", &json!({"journey": "book"}));
+        let through: Vec<&str> = arr(&v, "steps")
+            .map(|s| s["label"].as_str().unwrap())
+            .collect();
+        // What the page's journey line reads: "3 steps: site / web, then harbor-api, then site / lambdas".
+        assert_eq!(through, vec!["site / web", "harbor-api", "site / lambdas"]);
     }
 
     #[test]
