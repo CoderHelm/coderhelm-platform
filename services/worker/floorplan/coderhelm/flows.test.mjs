@@ -46,7 +46,7 @@ export function LoginDrawer() {
 
 export function LoginForm({ onSubmit }) {
   const router = useRouter();
-  const go = async () => { await onSubmit(); router.push('/slips'); };
+  const go = async () => { await onSubmit(); router.push('/slots'); };
   return <form onSubmit={go} />;
 }
 `,
@@ -76,7 +76,7 @@ export async function POST(req) {
   return Response.json(await r.json());
 }
 `,
-  'harbor-web/app/slips/page.tsx': `export default function SlipsPage() {
+  'harbor-web/app/slots/page.tsx': `export default function SlotsPage() {
   return <main />;
 }
 `,
@@ -141,7 +141,7 @@ const GRAPH = {
     { p: 'harbor-web/components/ResetForm.tsx', s: [sym('ResetForm', 'function', 1)] },
     { p: 'harbor-web/lib/session.tsx', s: [sym('useSession', 'function', 5), sym('SessionProvider', 'function', 9)] },
     { p: 'harbor-web/app/api/session/route.ts', s: [sym('POST', 'function', 3)] },
-    { p: 'harbor-web/app/slips/page.tsx', s: [sym('SlipsPage', 'default', 1)] },
+    { p: 'harbor-web/app/slots/page.tsx', s: [sym('SlotsPage', 'default', 1)] },
     { p: 'harbor-api/src/auth.controller.ts', s: [sym('AuthController', 'class', 5)] },
     { p: 'harbor-api/src/auth.service.ts', s: [sym('SIGNED_IN', 'const', 3), sym('AuthService', 'class', 5)] },
     { p: 'harbor-api/src/welcome.listener.ts', s: [sym('WelcomeListener', 'class', 4)] },
@@ -165,7 +165,7 @@ const GRAPH = {
   ],
   screens: [
     { id: 'screen:web:/login', url: '/login', file: 'harbor-web/app/login/page.tsx', app: 'web', name: 'Sign in' },
-    { id: 'screen:web:/slips', url: '/slips', file: 'harbor-web/app/slips/page.tsx', app: 'web', name: 'Slips' },
+    { id: 'screen:web:/slots', url: '/slots', file: 'harbor-web/app/slots/page.tsx', app: 'web', name: 'Slots' },
   ],
 };
 
@@ -209,7 +209,7 @@ test('the five gaps become candidates, each citing a line that holds its token',
   // A webhook endpoint called back by the service it is named for.
   assert.ok(leads(c, by(c, 'n:stripe'), hook));
   // Navigation written in the step's code.
-  assert.ok(leads(c, form, by(c, 'screen:web:/slips')));
+  assert.ok(leads(c, form, by(c, 'screen:web:/slots')));
   // Every citation holds its token on its line.
   for (const x of c.list) {
     for (const e of x.evidence) {
@@ -230,10 +230,10 @@ test('helpers read the code the way the closers need', () => {
   assert.deepEqual(F.eventSites("this.events.emit('a.b', x)\n@OnEvent(EMAIL_SEEN)").listens.map((e) => e.name), ['EMAIL_SEEN']);
   assert.deepEqual(F.outgoingHooks('await handleWebhookTrigger({});\nasync function sendWebhook() {}').map((h) => h.token), ['handleWebhookTrigger']);
   assert.deepEqual(F.routeHops('const r = await fetch(`${apiBase}/payments/sessions/${type}`)').map((h) => h.raw), ['${apiBase}/payments/sessions/${type}']);
-  const routes = [{ f: 'a.ts', m: 'POST', p: '/harbor/*' }, { f: 'b.ts', m: 'POST', p: '/harbor/boaters/createBoater' }, { f: 'c.ts', m: 'GET', p: '/slips/:id' }];
-  assert.equal(F.matchRoute(routes, '/harbor/boaters/createBoater', 'POST'), 1);
-  assert.equal(F.matchRoute(routes, '/harbor/boaters/getBoater', 'POST'), 0);
-  assert.equal(F.matchRoute(routes, '/slips/:p', 'GET'), 2);
+  const routes = [{ f: 'a.ts', m: 'POST', p: '/harbor/*' }, { f: 'b.ts', m: 'POST', p: '/harbor/patrons/createPatron' }, { f: 'c.ts', m: 'GET', p: '/slots/:id' }];
+  assert.equal(F.matchRoute(routes, '/harbor/patrons/createPatron', 'POST'), 1);
+  assert.equal(F.matchRoute(routes, '/harbor/patrons/getPatron', 'POST'), 0);
+  assert.equal(F.matchRoute(routes, '/slots/:p', 'GET'), 2);
   assert.equal(F.matchRoute(routes, '/nowhere', 'GET'), null);
   assert.equal(F.findToken(['a', 'b', 'x token', 'c'], 1, 'token'), 3);
   assert.equal(F.findToken(['a', 'b', 'c', 'd', 'e', 'f', 'token'], 1, 'token'), 7, 'moved further than 3 lines: found anywhere');
@@ -253,12 +253,12 @@ function stored(c, todo) {
     flows: [{
       id: 'sign-in', title: 'Sign in', entry: 'screen:web:/login', hash: entry.hash, origin: 'model',
       steps: [
-        step('screen:web:/login', 'The boater opens the sign-in drawer.'),
+        step('screen:web:/login', 'The patron opens the sign-in drawer.'),
         step('part:harbor-web/components/LoginForm.tsx#LoginForm', 'They type their email and password.'),
         step('req:POST /api/session', 'The site starts a session.'),
         step('req:POST /auth/login', 'The session route asks the API to sign them in.'),
         step('n:okta', 'Okta checks the password.'),
-        step('screen:web:/slips', 'They land on their slips.'),
+        step('screen:web:/slots', 'They land on their slots.'),
       ],
     }],
     asked: Object.fromEntries(todo.entries.map((e) => [e.key, e.hash])),
@@ -336,12 +336,12 @@ function traced(first, c) {
   store.flows = [{
     id: 'sign-in', title: 'Sign in', entry: 'screen:web:/login', hash: entry.hash, origin: 'trace',
     steps: [
-      step('screen:web:/login', 'The boater opens the sign-in drawer.'),
+      step('screen:web:/login', 'The patron opens the sign-in drawer.'),
       step('part:harbor-web/components/LoginForm.tsx#LoginForm', 'They type their email and password.'),
       step('req:POST /api/session', 'The site starts a session.'),
       step('req:POST /auth/login', 'The session route asks the API to sign them in.'),
       step('n:okta', 'Okta checks the password.'),
-      step('screen:web:/slips', 'They land on their slips.'),
+      step('screen:web:/slots', 'They land on their slots.'),
     ],
   }];
   store.asked = Object.fromEntries(first.todo.entries.map((e) => [e.key, { hash: e.hash, files: e.files }]));
@@ -355,8 +355,8 @@ test('a release that changed only the extractor traces nothing, spends nothing a
   // The same code, read by an extractor that names one screen differently
   // and finds one more link: every entry's candidates hash differently.
   const g2 = structuredClone(GRAPH);
-  g2.screens.find((x) => x.id === 'screen:web:/slips').id = 'screen:web:slips';
-  g2.links.push({ a: 'f:harbor-web/app/slips/page.tsx', b: 'f:harbor-web/lib/session.tsx', k: 'import', names: ['useSession'] });
+  g2.screens.find((x) => x.id === 'screen:web:/slots').id = 'screen:web:slots';
+  g2.links.push({ a: 'f:harbor-web/app/slots/page.tsx', b: 'f:harbor-web/lib/session.tsx', k: 'import', names: ['useSession'] });
   const bumped = F.prepare(root(), g2, store);
   const hashes = new Map(F.prepare(root(), g2, null).todo.entries.map((e) => [e.key, e.hash]));
   assert.ok(first.todo.entries.some((e) => hashes.has(e.key) && hashes.get(e.key) !== e.hash), 'the new extractor changes what the hashes stand on');
@@ -365,7 +365,7 @@ test('a release that changed only the extractor traces nothing, spends nothing a
   assert.equal(bumped.store.flows.length, 1);
   const fl = bumped.store.flows[0];
   assert.equal(fl.steps.length, 6, 'no step is lost');
-  assert.equal(fl.steps[5].key, 'screen:web:slips', 'the renamed screen is re-pointed by its code');
+  assert.equal(fl.steps[5].key, 'screen:web:slots', 'the renamed screen is re-pointed by its code');
   assert.equal(bumped.report.repointed, 1);
   // Stamped with the new extractor's hashes: the next build with this
   // extractor compares like with like.
@@ -384,10 +384,10 @@ test('a step on a catch-all screen now split by type is re-pointed to its type\'
   const dir = root({
     'harbor-web/app/login/page.tsx': FILES['harbor-web/app/login/page.tsx'],
     'harbor-web/app/[...slug]/page.tsx': `export default function Page({ type }) {
-  if (type === 'slip') return <SlipPage />;
+  if (type === 'slot') return <SlotPage />;
   return <EventPage />;
 }
-function SlipPage() {
+function SlotPage() {
   const book = () => fetch('/api/book');
   return <form onSubmit={book} />;
 }
@@ -403,35 +403,35 @@ function EventPage() {
   const slug = 'harbor-web/app/[...slug]/page.tsx';
   const list = [
     screen('screen:web:/login', 'harbor-web/app/login/page.tsx', 3, 'LoginPage'),
-    screen('screen:web:/slips/slip', slug, 5, 'SlipPage', [5, 8]),
-    screen('screen:web:/slips/event', slug, 9, 'EventPage', [9, 12]),
+    screen('screen:web:/slots/slot', slug, 5, 'SlotPage', [5, 8]),
+    screen('screen:web:/slots/event', slug, 9, 'EventPage', [9, 12]),
     { id: 'R1', kind: 'request', key: 'req:POST /api/book', view: 'r:1', evidence: [ev(slug, 6, "fetch('/api/book')")] },
   ];
   const c = { list, byKey: new Map(list.map((x) => [x.key, x])), edges: new Map() };
   const st = (key, kind, view, e, note) => ({ key, kind, view, note, evidence: [e], linked: true });
   const store = { flows: [{
-    id: 'book-a-slip', title: 'Book a slip', entry: 'screen:web:/login', origin: 'trace', steps: [
+    id: 'book-a-slot', title: 'Book a slot', entry: 'screen:web:/login', origin: 'trace', steps: [
       st('screen:web:/login', 'screen', 'f:harbor-web/app/login/page.tsx', ev('harbor-web/app/login/page.tsx', 3, 'LoginPage'), 'They sign in.'),
-      st('screen:web:/[...slug]', 'screen', 'f:' + slug, ev(slug, 7, '<form onSubmit={book}'), 'They open a slip and press Book.'),
+      st('screen:web:/[...slug]', 'screen', 'f:' + slug, ev(slug, 7, '<form onSubmit={book}'), 'They open a slot and press Book.'),
       st('req:POST /api/book', 'request', 'r:1', ev(slug, 6, "fetch('/api/book')"), 'The page asks to book it.'),
     ],
   }] };
   const out = F.revalidate(store, c, read);
   assert.equal(out.kept.length, 1, JSON.stringify(out.dropped));
-  assert.equal(out.kept[0].steps[1].key, 'screen:web:/slips/slip', 'the renderer whose lines hold the step');
+  assert.equal(out.kept[0].steps[1].key, 'screen:web:/slots/slot', 'the renderer whose lines hold the step');
   assert.equal(out.repointed, 1);
   assert.deepEqual(out.changed, [], 'the code is as it was: nothing to trace again');
   // The same step cited inside the other renderer lands there instead.
   store.flows[0].steps[1].evidence = [ev(slug, 11, '<div onClick={join}')];
-  assert.equal(F.revalidate(store, c, read).kept[0].steps[1].key, 'screen:web:/slips/event');
+  assert.equal(F.revalidate(store, c, read).kept[0].steps[1].key, 'screen:web:/slots/event');
   // A journey whose own first screen was split moves to the renderer it
   // starts in, and that entry is traced again as a new one.
   const fromSplit = { flows: [{ ...structuredClone(store.flows[0]), entry: 'screen:web:/[...slug]', steps: structuredClone(store.flows[0].steps).slice(1).concat([st('req:POST /api/book', 'request', 'r:1', ev(slug, 6, "fetch('/api/book')"), 'Again.')]) }] };
   fromSplit.flows[0].steps[0].key = 'screen:web:/[...slug]';
   fromSplit.flows[0].steps[0].evidence = [ev(slug, 6, "fetch('/api/book')")];
   const moved = F.revalidate(fromSplit, c, read);
-  assert.equal(moved.kept[0]?.entry, 'screen:web:/slips/slip', JSON.stringify(moved));
-  assert.deepEqual(moved.split, ['screen:web:/slips/slip']);
+  assert.equal(moved.kept[0]?.entry, 'screen:web:/slots/slot', JSON.stringify(moved));
+  assert.deepEqual(moved.split, ['screen:web:/slots/slot']);
 });
 
 test('new screens are traced first, then changed code, then the rest', () => {
@@ -512,48 +512,48 @@ test('a journey from a catch-all route now split by type names the screens whose
   assert.equal(merged[0].entry, 'screen:web:/events/(event)');
 });
 
-// The second round of gap closers, on a made-up marina app: an outside
+// The second round of gap closers, on a made-up library app: an outside
 // service behind two APIs, calls written directly or through an object of
 // paths, a call through an SDK, a Next route cited at its exported method,
 // and a join drawer mounted from a layout no page imports.
-const MARINA = {
-  'marina-web/app/api/dock/route.ts': `import { dock } from '../../../lib/dock';
+const LIBRARY = {
+  'library-web/app/api/wing/route.ts': `import { wing } from '../../../lib/wing';
 
 export async function POST(req) {
-  return Response.json(await dock(req));
+  return Response.json(await wing(req));
 }
 `,
-  'marina-web/lib/dock.ts': `export async function dock(req) {
-  return fetch('/api/dock', { method: 'POST' });
+  'library-web/lib/wing.ts': `export async function wing(req) {
+  return fetch('/api/wing', { method: 'POST' });
 }
 `,
-  'marina-mobile/src/api/urls.ts': `export const URLS = {
-  book: '/slips/:id/bookings',
-  cancel: '/slips/:id/cancel',
+  'library-mobile/src/api/urls.ts': `export const URLS = {
+  book: '/slots/:id/bookings',
+  cancel: '/slots/:id/cancel',
 };
 `,
-  'marina-mobile/src/screens/SlipScreen.tsx': `import { URLS } from '../api/urls';
+  'library-mobile/src/screens/Slotscreen.tsx': `import { URLS } from '../api/urls';
 import { apiPost } from '../api/client';
 
-export default function SlipScreen() {
+export default function Slotscreen() {
   const book = () => apiPost(URLS.book, {});
   return <Button onPress={book} />;
 }
 `,
-  'marina-mobile/src/api/client.ts': `export function apiPost(url, body) {
+  'library-mobile/src/api/client.ts': `export function apiPost(url, body) {
   return fetch(url, { method: 'POST', body });
 }
 `,
-  'marina-mobile/src/state/session.ts': `import { HarborSession } from '@marina/session-sdk';
+  'library-mobile/src/state/session.ts': `import { HarborSession } from '@library/session-sdk';
 
 export async function signIn(email, password) {
   return HarborSession.login({ email, password });
 }
 `,
-  'marina-api/src/bookings.controller.ts': `import { Controller, Post } from '@nestjs/common';
+  'library-api/src/bookings.controller.ts': `import { Controller, Post } from '@nestjs/common';
 import { TidesService } from './tides.service';
 
-@Controller('slips')
+@Controller('slots')
 export class BookingsController {
   constructor(private readonly tides: TidesService) {}
 
@@ -563,13 +563,13 @@ export class BookingsController {
   }
 }
 `,
-  'marina-api/src/tides.service.ts': `export class TidesService {
+  'library-api/src/tides.service.ts': `export class TidesService {
   check() {
     return fetch(process.env.TIDEWATCH_API_URL + '/now');
   }
 }
 `,
-  'marina-web/components/JoinDrawer.tsx': `import { SignupForm } from './SignupForm';
+  'library-web/components/JoinDrawer.tsx': `import { SignupForm } from './SignupForm';
 import { PaymentForm } from './PaymentForm';
 
 export function JoinDrawer({ step }) {
@@ -581,67 +581,67 @@ export function JoinDrawer({ step }) {
   }
 }
 `,
-  'marina-web/components/SignupForm.tsx': `export function SignupForm() {
+  'library-web/components/SignupForm.tsx': `export function SignupForm() {
   return <form />;
 }
 `,
-  'marina-web/components/PaymentForm.tsx': `export function PaymentForm() {
+  'library-web/components/PaymentForm.tsx': `export function PaymentForm() {
   return <form />;
 }
 `,
 };
-const MARINA_GRAPH = {
+const LIBRARY_GRAPH = {
   schema: 'floorplan/graph@1',
-  nodes: [{ id: 'ext-tidewatch', kind: 'external', label: 'Tidewatch', env: ['TIDEWATCH_API_URL', 'TIDEWATCH_MOBILE_API_URL'], evidence: [{ file: 'marina-api/src/tides.service.ts', line: 3 }] }],
-  files: Object.keys(MARINA).map((p) => ({ p, s: [] })).map((f) => ({ ...f, s: {
-    'marina-mobile/src/screens/SlipScreen.tsx': [sym('SlipScreen', 'default', 4)],
-    'marina-api/src/bookings.controller.ts': [sym('BookingsController', 'class', 5)],
-    'marina-api/src/tides.service.ts': [sym('TidesService', 'class', 1)],
-    'marina-web/components/JoinDrawer.tsx': [sym('JoinDrawer', 'function', 4)],
-    'marina-web/components/SignupForm.tsx': [sym('SignupForm', 'function', 1)],
-    'marina-web/components/PaymentForm.tsx': [sym('PaymentForm', 'function', 1)],
+  nodes: [{ id: 'ext-tidewatch', kind: 'external', label: 'Tidewatch', env: ['TIDEWATCH_API_URL', 'TIDEWATCH_MOBILE_API_URL'], evidence: [{ file: 'library-api/src/tides.service.ts', line: 3 }] }],
+  files: Object.keys(LIBRARY).map((p) => ({ p, s: [] })).map((f) => ({ ...f, s: {
+    'library-mobile/src/screens/Slotscreen.tsx': [sym('Slotscreen', 'default', 4)],
+    'library-api/src/bookings.controller.ts': [sym('BookingsController', 'class', 5)],
+    'library-api/src/tides.service.ts': [sym('TidesService', 'class', 1)],
+    'library-web/components/JoinDrawer.tsx': [sym('JoinDrawer', 'function', 4)],
+    'library-web/components/SignupForm.tsx': [sym('SignupForm', 'function', 1)],
+    'library-web/components/PaymentForm.tsx': [sym('PaymentForm', 'function', 1)],
   }[f.p] || [] })),
   routes: [
-    { f: 'marina-web/app/api/dock/route.ts', m: 'POST', p: '/api/dock', l: 1, h: 'POST' },
-    { f: 'marina-api/src/bookings.controller.ts', m: 'POST', p: '/slips/:id/bookings', l: 8, h: 'book' },
+    { f: 'library-web/app/api/wing/route.ts', m: 'POST', p: '/api/wing', l: 1, h: 'POST' },
+    { f: 'library-api/src/bookings.controller.ts', m: 'POST', p: '/slots/:id/bookings', l: 8, h: 'book' },
   ],
   links: [
-    { a: 'f:marina-mobile/src/screens/SlipScreen.tsx', b: 'f:marina-mobile/src/api/urls.ts', k: 'import', names: ['URLS'] },
-    { a: 'f:marina-mobile/src/screens/SlipScreen.tsx', b: 'f:marina-mobile/src/api/client.ts', k: 'import', names: ['apiPost'] },
-    { a: 'f:marina-api/src/bookings.controller.ts', b: 'f:marina-api/src/tides.service.ts', k: 'import', names: ['TidesService'] },
-    { a: 'f:marina-api/src/tides.service.ts', b: 'n:ext-tidewatch', k: 'http', labels: ['TIDEWATCH_API_URL'] },
-    { a: 'f:marina-web/components/JoinDrawer.tsx', b: 'f:marina-web/components/SignupForm.tsx', k: 'import', names: ['SignupForm'] },
-    { a: 'f:marina-web/components/JoinDrawer.tsx', b: 'f:marina-web/components/PaymentForm.tsx', k: 'import', names: ['PaymentForm'] },
+    { a: 'f:library-mobile/src/screens/Slotscreen.tsx', b: 'f:library-mobile/src/api/urls.ts', k: 'import', names: ['URLS'] },
+    { a: 'f:library-mobile/src/screens/Slotscreen.tsx', b: 'f:library-mobile/src/api/client.ts', k: 'import', names: ['apiPost'] },
+    { a: 'f:library-api/src/bookings.controller.ts', b: 'f:library-api/src/tides.service.ts', k: 'import', names: ['TidesService'] },
+    { a: 'f:library-api/src/tides.service.ts', b: 'n:ext-tidewatch', k: 'http', labels: ['TIDEWATCH_API_URL'] },
+    { a: 'f:library-web/components/JoinDrawer.tsx', b: 'f:library-web/components/SignupForm.tsx', k: 'import', names: ['SignupForm'] },
+    { a: 'f:library-web/components/JoinDrawer.tsx', b: 'f:library-web/components/PaymentForm.tsx', k: 'import', names: ['PaymentForm'] },
   ],
-  screens: [{ id: 'screen:mobile:/(Stack)/Slip', url: '/(Stack)/Slip', file: 'marina-mobile/src/screens/SlipScreen.tsx', app: 'mobile', name: 'Slip' }],
+  screens: [{ id: 'screen:mobile:/(Stack)/Slot', url: '/(Stack)/Slot', file: 'library-mobile/src/screens/Slotscreen.tsx', app: 'mobile', name: 'Slot' }],
 };
 
 test('second-round closers: split services, direct and URL-map calls, SDK calls, route methods, drawers', () => {
-  const dir = root(MARINA);
+  const dir = root(LIBRARY);
   const read = F.reader(dir);
-  const c = F.candidates(MARINA_GRAPH, read);
+  const c = F.candidates(LIBRARY_GRAPH, read);
   // The service is named by the API its code reads, cited there.
   const tide = by(c, 'n:ext-tidewatch#TIDEWATCH_API_URL');
   assert.ok(tide, JSON.stringify(c.list.map((x) => x.key)));
   assert.equal(tide.view, 'n:ext-tidewatch');
-  assert.deepEqual(tide.evidence[0], { file: 'marina-api/src/tides.service.ts', line: 3, token: 'TIDEWATCH_API_URL' });
+  assert.deepEqual(tide.evidence[0], { file: 'library-api/src/tides.service.ts', line: 3, token: 'TIDEWATCH_API_URL' });
   // A call through an object of paths: cited at the path, used by the screen.
-  const book = by(c, 'req:POST /slips/:p/bookings');
-  assert.equal(book.evidence[0].file, 'marina-mobile/src/api/urls.ts');
-  assert.ok(leads(c, by(c, 'screen:mobile:/(Stack)/Slip'), book));
+  const book = by(c, 'req:POST /slots/:p/bookings');
+  assert.equal(book.evidence[0].file, 'library-mobile/src/api/urls.ts');
+  assert.ok(leads(c, by(c, 'screen:mobile:/(Stack)/Slot'), book));
   assert.ok(leads(c, book, tide));
   // A direct fetch to a Next route, whose handler is its exported method.
-  const dock = by(c, 'req:POST /api/dock');
-  assert.deepEqual(dock.evidence[1], { file: 'marina-web/app/api/dock/route.ts', line: 3, token: 'export async function POST' });
+  const wing = by(c, 'req:POST /api/wing');
+  assert.deepEqual(wing.evidence[1], { file: 'library-web/app/api/wing/route.ts', line: 3, token: 'export async function POST' });
   // A call through an SDK, to the service behind its package.
   const login = by(c, 'req:SDK sdk:HarborSession.login');
-  assert.ok(login && leads(c, login, by(c, 'pkg:@marina/session-sdk')));
+  assert.ok(login && leads(c, login, by(c, 'pkg:@library/session-sdk')));
   // A drawer no page imports is a screen, with its forms as steps cited
   // where they are declared.
-  const drawer = by(c, 'part:marina-web/components/JoinDrawer.tsx#JoinDrawer');
-  const signup = by(c, 'part:marina-web/components/SignupForm.tsx#SignupForm');
+  const drawer = by(c, 'part:library-web/components/JoinDrawer.tsx#JoinDrawer');
+  const signup = by(c, 'part:library-web/components/SignupForm.tsx#SignupForm');
   assert.ok(drawer && signup && leads(c, drawer, signup));
-  assert.deepEqual(signup.evidence[0], { file: 'marina-web/components/SignupForm.tsx', line: 1, token: 'SignupForm' });
+  assert.deepEqual(signup.evidence[0], { file: 'library-web/components/SignupForm.tsx', line: 1, token: 'SignupForm' });
   for (const x of c.list) for (const e of x.evidence) assert.ok(read.lines(e.file)[e.line - 1].includes(e.token), `${x.key}: ${e.file}:${e.line}`);
 });
 

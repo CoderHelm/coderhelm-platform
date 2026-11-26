@@ -1,8 +1,8 @@
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useSession } from '../lib/session';
 import SignIn from '../screens/SignIn';
-import Slips from '../screens/Slips';
-import SlipDetail from '../screens/SlipDetail';
+import Slots from '../screens/Slots';
+import SlotDetail from '../screens/SlotDetail';
 
 const Stack = createNativeStackNavigator();
 
@@ -14,8 +14,8 @@ export default function RootNavigator() {
         <Stack.Screen name="SignIn" component={SignIn} />
       ) : (
         <>
-          <Stack.Screen name="Slips" component={Slips} />
-          <Stack.Screen name="SlipDetail" component={SlipDetail} />
+          <Stack.Screen name="Slots" component={Slots} />
+          <Stack.Screen name="SlotDetail" component={SlotDetail} />
         </>
       )}
     </Stack.Navigator>

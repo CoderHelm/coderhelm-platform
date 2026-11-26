@@ -51,13 +51,13 @@ fn held_description(version: Option<&str>) -> String {
         Some(v) => section.replace(&now, &proof::checked_by(v)),
         None => section.replace(&format!(" {now}"), ""),
     };
-    format!("## Summary\nOne Title Size setting for every marina block.\n\n{section}")
+    format!("## Summary\nOne Title Size setting for every library block.\n\n{section}")
 }
 
 fn facts(body: &str) -> Facts {
     Facts {
         draft: true,
-        title: "Add a Title Size setting to the marina page blocks".into(),
+        title: "Add a Title Size setting to the library page blocks".into(),
         body: body.to_string(),
         ci: Ci {
             green: true,

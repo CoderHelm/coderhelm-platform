@@ -1,4 +1,4 @@
-//! ds. A made-up marina's Insights line of deploys CoderHelm started went
+//! ds. A made-up library's Insights line of deploys CoderHelm started went
 //! flat and stayed flat for weeks. Its install reached
 //! GitHub through CoderHelm's token broker, so its gateway had no GitHub App
 //! key of its own: asking GitHub for the app's slug failed, and every
@@ -39,7 +39,7 @@ fn preview_run() -> serde_json::Value {
     })
 }
 
-/// Thirty to seventy deploys a day across the marina's repositories, every
+/// Thirty to seventy deploys a day across the library's repositories, every
 /// day for the three weeks to the last record (the 6th at 21:26 in this
 /// made-up month).
 fn records() -> Vec<(DateTime<Utc>, String)> {
@@ -48,12 +48,12 @@ fn records() -> Vec<(DateTime<Utc>, String)> {
     let mut t = last - Duration::days(21);
     let mut i = 0usize;
     while t <= last {
-        let repo = ["marina/web", "marina/api", "marina/docks"][i % 3];
+        let repo = ["library/web", "library/api", "library/wings"][i % 3];
         out.push((t, repo.to_string()));
         t += Duration::minutes(29);
         i += 1;
     }
-    out.push((last, "marina/web".to_string()));
+    out.push((last, "library/web".to_string()));
     out.sort();
     out
 }
@@ -113,14 +113,14 @@ fn seventeen_quiet_days_read_as_stalled_and_the_hole_is_read_back() {
     assert_eq!(gap, at(6, 21, 26));
     assert_eq!(health::first_gap(&times, now, Some(gap)), None);
     // Each repository from its own newest record before the hole.
-    let repos: Vec<String> = ["marina/web", "Marina/API", "marina/docks", "marina/new"]
+    let repos: Vec<String> = ["library/web", "Library/API", "library/wings", "library/new"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     let starts = health::repo_starts(&records, &repos, gap, now - Duration::days(182));
-    assert_eq!(starts["marina/web"], at(6, 21, 26));
-    assert!(starts["marina/api"] <= gap && starts["marina/api"] > gap - Duration::hours(2));
-    assert_eq!(starts["marina/new"], gap);
+    assert_eq!(starts["library/web"], at(6, 21, 26));
+    assert!(starts["library/api"] <= gap && starts["library/api"] > gap - Duration::hours(2));
+    assert_eq!(starts["library/new"], gap);
     // Recording came back after the fix: the hole is still found.
     let mut back = times.clone();
     back.push(at(24, 9, 0));

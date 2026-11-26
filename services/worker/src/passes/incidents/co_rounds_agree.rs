@@ -32,7 +32,7 @@ const BUILD: &str = "@@ -5,32 +5,24 @@\n-  linkLabel: string;\n }\n /**\n- * Ven
 /// The review round: the sizing and its comment go, the link stays gone.
 const REVIEW: &str = "@@ -8,9 +8,8 @@\n- * Vendor portal embed. The iframe is exactly one small viewport\n- * tall: the `h-svh!` stylesheet rule is `!important`, so it beats the inline\n- * height the vendor's script writes. The page above the frame scrolls away.\n+ * Vendor portal embed. The vendor's script sets the iframe's height.\n         src={src}\n-        className=\"h-svh!\"\n         style={{ width: \"100%\", border: 0 }}\n";
 
-const TICKET: &str = "Acceptance Criteria\nRemove \u{201c}Open booking in a new tab\u{201d} text and link\nDon\u{2019}t freeze the \u{201c}Book a Slip\u{201d} header, allow the user to scroll down the iframe.\nexample page: https://www.example.com/marina/slips/book";
+const TICKET: &str = "Acceptance Criteria\nRemove \u{201c}Open booking in a new tab\u{201d} text and link\nDon\u{2019}t freeze the \u{201c}Book a Slot\u{201d} header, allow the user to scroll down the iframe.\nexample page: https://www.example.com/library/slots/book";
 
 const ITEM: &str = "`apps/web/src/components/blocks/portal-embed.tsx` drops the link but never adds `className=\"h-svh!\"` to the iframe and never rewrites the doc comment, so the frame is still sized by the vendor's script and the page never scrolls.";
 

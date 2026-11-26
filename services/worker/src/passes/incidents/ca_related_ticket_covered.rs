@@ -25,8 +25,8 @@ const DRAWER: &str = "src/components/nav/booking-drawer.tsx";
 const CLOSED_PATCH: &str = "@@ -18,7 +18,7 @@ export function BookingDrawer() {
    return (
      <Drawer>
--      <Button href=\"https://www.example.com/old-slips/book\">Book</Button>
-+      <Button href=\"/marina-a/slips/book\">Book</Button>
+-      <Button href=\"https://www.example.com/old-slots/book\">Book</Button>
++      <Button href=\"/library-a/slots/book\">Book</Button>
      </Drawer>
    );
 ";
@@ -36,9 +36,9 @@ fn the_linked_ticket_reaches_the_plan() {
     let event = json!({"related": [{
         "key": "ABC-207",
         "relation": "relates to",
-        "summary": "Drawer Book button goes to the new slip booking page",
+        "summary": "Drawer Book button goes to the new slot booking page",
         "status": "Closed",
-        "description": "Acceptance criteria\n- The drawer's \"Book\" button links to /marina-a/slips/book\n"
+        "description": "Acceptance criteria\n- The drawer's \"Book\" button links to /library-a/slots/book\n"
     }]});
     let related = from_payload(&event);
     assert_eq!(related.len(), 1);
@@ -47,7 +47,7 @@ fn the_linked_ticket_reaches_the_plan() {
     assert_eq!(c[0].from, "ABC-207");
     let note = plan_note(&related);
     assert!(note.contains("ABC-207 (relates to)"), "{note}");
-    assert!(note.contains("links to /marina-a/slips/book"));
+    assert!(note.contains("links to /library-a/slots/book"));
     assert_eq!(
         criteria("Acceptance criteria\n- one\n- two\n\nNotes\n- not one"),
         ["one", "two"]
@@ -62,13 +62,13 @@ fn the_head_still_pointing_at_the_old_address_is_not_covered() {
     assert_eq!(closed_in_favor(&timeline, "acme/site")[0].0, 624);
     let moves = moved_links(DRAWER, CLOSED_PATCH);
     assert_eq!(moves.len(), 1);
-    let head = "<Button href=\"https://www.example.com/old-slips/book\">Book</Button>";
+    let head = "<Button href=\"https://www.example.com/old-slots/book\">Book</Button>";
     let v = check_source(&moves[0], Some(head));
     match &v {
         Verdict::NotCovered(why) => assert!(why.contains("still uses"), "{why}"),
         other => panic!("{other:?}"),
     }
-    let fixed = "<Button href=\"/marina-a/slips/book\">Book</Button>";
+    let fixed = "<Button href=\"/library-a/slots/book\">Book</Button>";
     assert!(matches!(
         check_source(&moves[0], Some(fixed)),
         Verdict::Covered(_)
@@ -77,16 +77,17 @@ fn the_head_still_pointing_at_the_old_address_is_not_covered() {
 
 #[test]
 fn a_link_criterion_is_checked_on_the_preview_and_the_rest_is_listed() {
-    let e = link_expectation("The drawer's \"Book\" button links to /marina-a/slips/book").unwrap();
+    let e =
+        link_expectation("The drawer's \"Book\" button links to /library-a/slots/book").unwrap();
     let old =
-        r#"<div role="dialog"><a href="https://www.example.com/old-slips/book">Book</a></div>"#;
+        r#"<div role="dialog"><a href="https://www.example.com/old-slots/book">Book</a></div>"#;
     assert!(matches!(
         check_page("the preview", old, &e),
         Some(Verdict::NotCovered(_))
     ));
     let c = fold(&from_payload(
         &json!({"related": [{"key": "ABC-207", "description":
-        "Acceptance criteria\n- The drawer's \"Book\" button links to /marina-a/slips/book"}]}),
+        "Acceptance criteria\n- The drawer's \"Book\" button links to /library-a/slots/book"}]}),
     ));
     let s = section(&[(
         c[0].clone(),

@@ -3033,7 +3033,7 @@ mod tests {
         let rows_v = [
             json!({"key": "screen:web:/*", "kind": "screen"}),
             json!({"key": "screen:web:/members/join", "kind": "screen"}),
-            json!({"key": "screen:web:/berths/:segment2", "kind": "screen"}),
+            json!({"key": "screen:web:/booths/:segment2", "kind": "screen"}),
             json!({"key": "screen:web:/(notice)/*", "kind": "screen"}),
             json!({"key": "screen:web:/(story)/*", "kind": "screen"}),
         ];
@@ -3043,7 +3043,7 @@ mod tests {
             Some("S2")
         );
         assert_eq!(
-            screen_for_path(&rows, "/berths/${id}").map(String::as_str),
+            screen_for_path(&rows, "/booths/${id}").map(String::as_str),
             Some("S3")
         );
         assert_eq!(

@@ -1,6 +1,6 @@
-//! sl. A ticket said a guest slips page showed two Multi-Kiosk filter
+//! sl. A ticket said a guest slots page showed two Multi-Booth filter
 //! chips (two rows of the schedule API share one slug). The plan fixed the
-//! chips and wrote, in its proposal, "Out: `/tours/<kiosk>` path pages
+//! chips and wrote, in its proposal, "Out: `/tours/<booth>` path pages
 //! ... Both are open product questions", with an "Open product questions"
 //! section that already answered each with "Meanwhile". Its task list
 //! then said "switch any other slugToId caller ... to slugToIds". Days
@@ -31,16 +31,16 @@ use crate::passes::{description_facts, scope_ledger as store};
 use common::pr_facts::{Facts, FileChange};
 use common::scope_ledger::{self, Ledger};
 
-const TICKET: &str = "Steps to reproduce\nGo to /harbor/guest-slips\nScroll to the kiosks filter\nObserved\nTwo Multi-Kiosk filters show\nAcceptance Criteria\nOnly one multi-kiosk filter to show";
+const TICKET: &str = "Steps to reproduce\nGo to /harbor/guest-slots\nScroll to the booths filter\nObserved\nTwo Multi-Booth filters show\nAcceptance Criteria\nOnly one multi-booth filter to show";
 
 /// The proposal as the planner wrote it.
-const PROPOSAL: &str = "## Problem\nTwo Multi-Kiosk chips.\n\n## Scope\n- In: shared kiosk chips and `?kiosks=` resolution on every page using them.\n- Out:\n  - Merging the two schedule API rows.\n  - `/tours/<kiosk>` path pages, which resolve one kiosk through `findNormalizedKiosk` and `selectedKiosk`. Both are open product questions.\n\n## Open product questions\n- Should the schedule API merge the two Multi-Kiosk rows? Meanwhile the rows stay as they are.\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/tours/<kiosk>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
+const PROPOSAL: &str = "## Problem\nTwo Multi-Booth chips.\n\n## Scope\n- In: shared booth chips and `?booths=` resolution on every page using them.\n- Out:\n  - Merging the two schedule API rows.\n  - `/tours/<booth>` path pages, which resolve one booth through `findNormalizedBooth` and `selectedBooth`. Both are open product questions.\n\n## Open product questions\n- Should the schedule API merge the two Multi-Booth rows? Meanwhile the rows stay as they are.\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/tours/<booth>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
 
-const TASKS: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeKiosksBySlug; switch any other slugToId caller in apps/web/src that builds a kiosk-id variable to slugToIds\n- [ ] apps/web/src/components/blocks/KiosksFilter.tsx: [modify] One chip per slug\n";
+const TASKS: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeBoothsBySlug; switch any other slugToId caller in apps/web/src that builds a booth-id variable to slugToIds\n- [ ] apps/web/src/components/blocks/BoothsFilter.tsx: [modify] One chip per slug\n";
 
 /// The plan after the send-back: scope decided once.
-const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/tours/<kiosk>` path pages (`selectedKiosk`, `findNormalizedKiosk`): decided with the default: one id, as today\n- The chip's spelling: decided with the default: whichever row comes first\n";
-const TASKS_AFTER: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeKiosksBySlug\n- [ ] apps/web/src/components/blocks/KiosksFilter.tsx: [modify] One chip per slug\n";
+const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/tours/<booth>` path pages (`selectedBooth`, `findNormalizedBooth`): decided with the default: one id, as today\n- The chip's spelling: decided with the default: whichever row comes first\n";
+const TASKS_AFTER: &str = "- [ ] apps/web/src/test/utils/filterMaps.test.ts: [modify] Add slugToIds cases\n- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds and dedupeBoothsBySlug\n- [ ] apps/web/src/components/blocks/BoothsFilter.tsx: [modify] One chip per slug\n";
 
 fn patch(lines: &[&str]) -> String {
     lines
@@ -57,21 +57,21 @@ fn path_page_round() -> Vec<(String, String, String)> {
             "apps/web/src/components/cms-blocks/tours-block.tsx".into(),
             "modified".into(),
             patch(&[
-                "  // A /tours/<kiosk> path page filters by every kiosk sharing the path",
-                "  const selectedKiosksIdList = selectedKiosk",
+                "  // A /tours/<booth> path page filters by every booth sharing the path",
+                "  const selectedBoothsIdList = selectedBooth",
             ]),
         ),
         (
             "apps/web/src/services/tourService.ts".into(),
             "modified".into(),
-            patch(&["    : selectedKiosk", "      ? [selectedKiosk.id]"]),
+            patch(&["    : selectedBooth", "      ? [selectedBooth.id]"]),
         ),
         (
             "apps/web/src/test/components/tours-block-dedup.test.tsx".into(),
             "modified".into(),
             patch(&[
-                "  it(\"sends every kiosk id sharing a /tours/<kiosk> path slug\", () => {",
-                "    expect(args.selectedKiosk?.id).toBe(\"s-b\");",
+                "  it(\"sends every booth id sharing a /tours/<booth> path slug\", () => {",
+                "    expect(args.selectedBooth?.id).toBe(\"s-b\");",
             ]),
         ),
     ]
@@ -117,14 +117,14 @@ fn the_plan_decides_scope_once_and_asks_nothing() {
     let l = ledger();
     assert_eq!(
         l.criteria,
-        vec!["Only one multi-kiosk filter to show".to_string()]
+        vec!["Only one multi-booth filter to show".to_string()]
     );
     let path = l
         .outs()
-        .find(|e| e.item.contains("/tours/<kiosk>"))
+        .find(|e| e.item.contains("/tours/<booth>"))
         .expect("path pages out");
     assert!(
-        path.marks.contains(&"selectedKiosk".to_string()),
+        path.marks.contains(&"selectedBooth".to_string()),
         "{:?}",
         path.marks
     );
@@ -165,8 +165,8 @@ fn every_round_is_held_to_it_tests_included() {
     let (keep, gone) = store::drop_covered(
         &l,
         vec![
-            "apps/web/src/services/tourService.ts: prefer the resolved id list over `selectedKiosk`".into(),
-            "apps/web/src/components/blocks/KiosksFilter.tsx: one chip per slug".into(),
+            "apps/web/src/services/tourService.ts: prefer the resolved id list over `selectedBooth`".into(),
+            "apps/web/src/components/blocks/BoothsFilter.tsx: one chip per slug".into(),
         ],
     );
     assert_eq!((keep.len(), gone.len()), (1, 1));
@@ -176,17 +176,17 @@ fn every_round_is_held_to_it_tests_included() {
 fn scope_changes_only_with_a_cited_reason() {
     let mut l = ledger();
     let sources = vec![
-        "Please also make the /tours/<kiosk> path pages list tours from every row sharing the slug"
+        "Please also make the /tours/<booth> path pages list tours from every row sharing the slug"
             .to_string(),
     ];
     let (ok, no) = l.apply_changes(
-        "Scope change: /tours/<kiosk> path pages: it seemed incomplete without them",
+        "Scope change: /tours/<booth> path pages: it seemed incomplete without them",
         &sources,
     );
     assert!(ok.is_empty() && no.len() == 1);
     assert_eq!(scope_ledger::breaches(&l, &path_page_round()).len(), 3);
     let (ok, _) = l.apply_changes(
-        "Scope change: /tours/<kiosk> path pages: the comment asks that path pages list tours from every row sharing the slug",
+        "Scope change: /tours/<booth> path pages: the comment asks that path pages list tours from every row sharing the slug",
         &sources,
     );
     assert_eq!(ok.len(), 1);
@@ -217,7 +217,7 @@ fn the_description_says_what_the_ledger_says() {
         !facts
             .out_of_scope
             .iter()
-            .any(|x| x.contains("/tours/<kiosk>")),
+            .any(|x| x.contains("/tours/<booth>")),
         "{:?}",
         facts.out_of_scope
     );
@@ -229,9 +229,9 @@ fn the_description_says_what_the_ledger_says() {
         .unverified
         .iter()
         .any(|u| u.what.contains("decided out of scope at plan time")));
-    let written = "## Changes\nOne chip per slug.\n\nRedirect helpers are untouched. Out of scope: merging the two rows, and `/tours/<kiosk>` pages, which still resolve one kiosk.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n";
+    let written = "## Changes\nOne chip per slug.\n\nRedirect helpers are untouched. Out of scope: merging the two rows, and `/tours/<booth>` pages, which still resolve one booth.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n";
     let (text, corrections) = description_facts::hold_scope(written, &mut facts);
-    assert!(!text.contains("still resolve one kiosk"), "{text}");
+    assert!(!text.contains("still resolve one booth"), "{text}");
     assert!(text.contains("Redirect helpers are untouched."));
     assert!(!text.to_lowercase().contains("question"), "{text}");
     assert_eq!(corrections.len(), 1);
@@ -243,7 +243,7 @@ fn the_description_says_what_the_ledger_says() {
         "{:?}",
         facts.out_of_scope
     );
-    let shaped = description_facts::shape(written, "ABC-1: One Multi-Kiosk chip", facts, None);
+    let shaped = description_facts::shape(written, "ABC-1: One Multi-Booth chip", facts, None);
     let low = shaped.body.to_lowercase();
     assert!(
         !low.contains("open product question") && !low.contains("please answer"),

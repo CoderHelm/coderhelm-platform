@@ -199,7 +199,7 @@ fn once_the_role_reads_the_run_reads_the_logs_and_plans_its_pr() {
             ("Accept-Language".into(), "en-US,en;q=0.9".into()),
         ],
         "GET",
-        "/listings?dock=a",
+        "/listings?wing=a",
         "US",
         &[],
     )];

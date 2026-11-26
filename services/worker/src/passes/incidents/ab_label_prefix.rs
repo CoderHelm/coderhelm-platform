@@ -79,7 +79,7 @@ fn repo_labels() -> Vec<String> {
         "CI:DEPLOY_PREVIEW",
         "E2E:booking",
         "E2E:nav",
-        "E2E:slips",
+        "E2E:slots",
         // Made by the add.
         "E2E:",
     ]

@@ -281,13 +281,13 @@ mod tests {
     fn planned_work_the_ledger_leaves_out_is_not_built() {
         let l = Ledger::from_plan(
             "",
-            "## Out of scope\n- `/tours/<depot>` path pages (`selectedDepot`): decided with the default: one id, as today\n",
+            "## Out of scope\n- `/tours/<wing>` path pages (`selectedWing`): decided with the default: one id, as today\n",
             "",
         );
         let (keep, gone) = drop_covered(
             &l,
             vec![
-                "apps/web/src/services/tourService.ts: prefer the id list over `selectedDepot`"
+                "apps/web/src/services/tourService.ts: prefer the id list over `selectedWing`"
                     .into(),
                 "apps/web/src/utils/filterMaps.ts: add slugToIds".into(),
             ],

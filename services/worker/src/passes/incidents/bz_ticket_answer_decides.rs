@@ -20,9 +20,9 @@ use common::ticket_decisions::{
     from_comments, remember, settle, settle_known, Known, DECIDED_HEADING,
 };
 
-const QUESTION: &str = "Final heading and intro copy per marina? Proposed default: '{Marina} \
-    Slip Booking' plus one portal sentence. I am building the default now; a different \
-    answer changes it in src/utils/slip-portal-copy.ts.";
+const QUESTION: &str = "Final heading and intro copy per library? Proposed default: '{Library} \
+    Slot Booking' plus one portal sentence. I am building the default now; a different \
+    answer changes it in src/utils/slot-portal-copy.ts.";
 
 /// The answer as it was kept: handled by the earlier run.
 fn handled_answer() -> Comment {
@@ -31,7 +31,7 @@ fn handled_answer() -> Comment {
         comment_id: "10001".into(),
         author: "a-product-owner".into(),
         text:
-            "Skip the H1 and intro copy; the page title alone is fine\n Book a Slip | Example Site"
+            "Skip the H1 and intro copy; the page title alone is fine\n Book a Slot | Example Site"
                 .into(),
         at: "2030-03-14T16:16:36Z".into(),
         run_id: "an-earlier-run".into(),
@@ -47,10 +47,10 @@ fn handled_answer() -> Comment {
 const DESCRIPTION: &str = "Ticket: [ABC-76](https://example.atlassian.net/browse/ABC-76)
 
 ## Summary
-Embeds the booking portal on the four slip booking pages.
+Embeds the booking portal on the four slot booking pages.
 
 ### Decisions pending product input
-- Final H1 and intro copy per marina: built with the default '{Marina} Slip Booking' and one portal sentence until product confirms.
+- Final H1 and intro copy per library: built with the default '{Library} Slot Booking' and one portal sentence until product confirms.
 - Whether the portal opens in a new tab on phones
 
 ## Testing

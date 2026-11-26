@@ -1,12 +1,12 @@
 import { notFound } from 'next/navigation';
 import { resolvePage, type PageType } from '../../lib/resolve';
-import { BerthRenderer, BerthListRenderer, MemberSignupRenderer, MemberCheckoutRenderer, NoticeRenderer } from '../../lib/renderers';
+import { BoothRenderer, BoothListRenderer, MemberSignupRenderer, MemberCheckoutRenderer, NoticeRenderer } from '../../lib/renderers';
 
 // One route for every page: the resolver says what the address is, and the
 // table below says which renderer draws it.
 const renderers = {
-  berth: BerthRenderer,
-  'berth-index': BerthListRenderer,
+  booth: BoothRenderer,
+  'booth-index': BoothListRenderer,
   'member-signup': MemberSignupRenderer,
   'member-checkout': MemberCheckoutRenderer,
   notice: NoticeRenderer,

@@ -32,10 +32,10 @@ fn journey(id: &str, title: &str, entry: &str, keys: &[&str]) -> Value {
 #[test]
 fn a_retrace_retires_what_it_replaces_and_one_journey_stands_per_goal() {
     let tail = [
-        "req:POST /api/berths/hold",
+        "req:POST /api/booths/hold",
         "n:stripe",
         "hook:POST /stripe/webhook",
-        "screen:web:/berths/booked",
+        "screen:web:/booths/booked",
     ];
     let with = |head: &[&str], extra: &[&str]| -> Vec<String> {
         head.iter()
@@ -49,36 +49,36 @@ fn a_retrace_retires_what_it_replaces_and_one_journey_stands_per_goal() {
     }
     let full = with(
         &[
-            "screen:web:/berths",
-            "part:harbor-web/BerthForm.tsx#BerthForm",
-            "req:GET /api/berths",
-            "screen:web:/berths/pick",
-            "req:POST /api/berths/quote",
+            "screen:web:/booths",
+            "part:harbor-web/BoothForm.tsx#BoothForm",
+            "req:GET /api/booths",
+            "screen:web:/booths/pick",
+            "req:POST /api/booths/quote",
         ],
         &[],
     );
     let short = with(
         &[
-            "screen:web:/berths",
-            "part:harbor-web/BerthForm.tsx#BerthForm",
+            "screen:web:/booths",
+            "part:harbor-web/BoothForm.tsx#BoothForm",
         ],
         &[],
     );
     let longer = with(
         &[
-            "screen:web:/berths",
-            "part:harbor-web/BerthForm.tsx#BerthForm",
-            "req:GET /api/berths",
-            "screen:web:/berths/pick",
-            "req:POST /api/berths/quote",
+            "screen:web:/booths",
+            "part:harbor-web/BoothForm.tsx#BoothForm",
+            "req:GET /api/booths",
+            "screen:web:/booths/pick",
+            "req:POST /api/booths/quote",
         ],
         &["screen:web:/account"],
     );
     let from_form = with(
         &[
-            "part:harbor-web/BerthForm.tsx#BerthForm",
-            "req:GET /api/berths",
-            "screen:web:/berths/pick",
+            "part:harbor-web/BoothForm.tsx#BoothForm",
+            "req:GET /api/booths",
+            "screen:web:/booths/pick",
         ],
         &[],
     );
@@ -96,11 +96,11 @@ fn a_retrace_retires_what_it_replaces_and_one_journey_stands_per_goal() {
     catch_all["split"] = json!(["screen:web:/events/(event)"]);
     // The stored map as the earlier release left it.
     let store = json!({"schema": fl::SCHEMA, "asked": {}, "flows": [
-        journey("book-a-berth", "Book a berth", "screen:web:/berths", &refs(&full)),
-        journey("book-a-berth-2", "Book a berth", "screen:web:/berths", &refs(&short)),
-        journey("book-a-berth-3", "Book a berth", "screen:web:/berths/pick", &refs(&full[3..])),
-        journey("a-book-a-berth", "Book a berth", "part:harbor-web/BerthForm.tsx#BerthForm", &refs(&from_form)),
-        journey("a-book-a-berth-2", "Book a berth", "screen:web:/berths", &refs(&longer)),
+        journey("book-a-booth", "Book a booth", "screen:web:/booths", &refs(&full)),
+        journey("book-a-booth-2", "Book a booth", "screen:web:/booths", &refs(&short)),
+        journey("book-a-booth-3", "Book a booth", "screen:web:/booths/pick", &refs(&full[3..])),
+        journey("a-book-a-booth", "Book a booth", "part:harbor-web/BoothForm.tsx#BoothForm", &refs(&from_form)),
+        journey("a-book-a-booth-2", "Book a booth", "screen:web:/booths", &refs(&longer)),
         catch_all,
     ]});
     // The renderer split from the catch-all is traced.
@@ -124,18 +124,18 @@ fn a_retrace_retires_what_it_replaces_and_one_journey_stands_per_goal() {
     assert_eq!(
         got,
         [
-            ("book-a-berth", "Book a berth"),
+            ("book-a-booth", "Book a booth"),
             ("book-an-event", "Book an event")
         ]
     );
-    // The berth journey kept is the most complete, standing for every entry.
+    // The booth journey kept is the most complete, standing for every entry.
     assert_eq!(flows[0]["steps"].as_array().unwrap().len(), longer.len());
     assert_eq!(
         flows[0]["from"],
         json!([
-            "part:harbor-web/BerthForm.tsx#BerthForm",
-            "screen:web:/berths",
-            "screen:web:/berths/pick"
+            "part:harbor-web/BoothForm.tsx#BoothForm",
+            "screen:web:/booths",
+            "screen:web:/booths/pick"
         ])
     );
     // The renderer's trace retired the catch-all's journey.

@@ -1,7 +1,7 @@
 //! A test branch that has never run is unverified code.
 //!
 //! A portal spec had two branches on the page's state: booking closed
-//! (the slip's button disabled, it must say so) and booking open (the
+//! (the slot's button disabled, it must say so) and booking open (the
 //! button enabled, choosing it must fill the cart). Only the closed one
 //! ever ran; the open one was written from a guess, and the day the vendor
 //! opened booking it failed on every branch, because a signed-out
@@ -479,12 +479,12 @@ export class Portal {
       await session.click();
       await expect(
         this.cartTotal(),
-        `Choosing "${slip}" did not add it to the booking total`,
+        `Choosing "${slot}" did not add it to the booking total`,
       ).not.toHaveText(/\$0$/);
     } else {
       await expect(
         session,
-        `"${slip}" is disabled but doesn't say booking is closed`,
+        `"${slot}" is disabled but doesn't say booking is closed`,
       ).toContainText(/not open/i);
     }
     if ((await more.count()) > 0) await more.first().click();
@@ -522,7 +522,7 @@ export class Portal {
     fn a_report_says_which_arm_ran_and_a_probe_which_can_run_now() {
         let b = &state_branches("e2e/pages/portal.ts", PAGE)[0];
         let report = serde_json::json!({"suites": [{"specs": [{"tests": [{"results": [{"steps": [
-            {"title": "\"Day slip\" is disabled but doesn't say booking is closed", "steps": []}
+            {"title": "\"Day slot\" is disabled but doesn't say booking is closed", "steps": []}
         ]}]}]}]}]});
         let steps = step_titles(&report);
         assert!(!executed(&b.arms[0], &steps));

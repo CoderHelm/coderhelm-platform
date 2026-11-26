@@ -1006,18 +1006,18 @@ mod tests {
         };
         assert!(view(&mine, "part", &q("api")).is_some());
         // Another team's part, file or screen is not in this team's map.
-        assert!(view(&mine, "part", &q("marina-docks")).is_none());
+        assert!(view(&mine, "part", &q("library-wings")).is_none());
         assert!(view(
             &mine,
             "file",
             &MapQuery {
-                path: "marina/src/x.js".into(),
+                path: "library/src/x.js".into(),
                 ..Default::default()
             }
         )
         .is_none());
-        assert!(view(&mine, "screen", &q("screen:marina:/berths")).is_none());
-        assert!(view(&mine, "screen", &q("/slips/:id")).is_some());
+        assert!(view(&mine, "screen", &q("screen:library:/booths")).is_none());
+        assert!(view(&mine, "screen", &q("/slots/:id")).is_some());
         // Each team's map has its own keys.
         assert_ne!(am::graph_key("team-a"), am::graph_key("team-b"));
         assert_eq!(am::map_pk("team-a"), "AM#team-a");
@@ -1196,7 +1196,7 @@ mod tests {
         assert_eq!(press(&state, team).await.0, StatusCode::ACCEPTED);
         assert_eq!(f.store.sent().len(), 2);
         // Another team's build is its own.
-        assert_eq!(press(&state, "TEAM#marina").await.0, StatusCode::ACCEPTED);
+        assert_eq!(press(&state, "TEAM#library").await.0, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -1394,7 +1394,7 @@ mod tests {
             vec![("infra/main.tf".to_string(), 0)]
         );
         assert!(infra_item(&json!({"id": "i2"})).is_none());
-        assert_eq!(why_of("# Proposal\n\n## Why\nBoaters can't book a slip twice.\nIt double charges.\n\n## What\nx"), "Boaters can't book a slip twice. It double charges.");
+        assert_eq!(why_of("# Proposal\n\n## Why\nPatrons can't book a slot twice.\nIt double charges.\n\n## What\nx"), "Patrons can't book a slot twice. It double charges.");
         // Placed on the map, in Floorplan's own Health field.
         let g = am::with_overlays(harbor(), None, Some(&[it]));
         assert!(g["health"]["issues"]
@@ -1408,23 +1408,23 @@ mod tests {
     /// A made-up map the size of a large team's: `files` files in 12 parts
     /// across 9 repositories, three lines per file.
     fn big_map(files: usize) -> Value {
-        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let repos: Vec<String> = (0..9).map(|i| format!("bookshop/yard{i}")).collect();
         let folders = am::folders(&repos);
         let fs: Vec<Value> = (0..files)
             .map(|i| {
                 let r = &repos[i % 9];
-                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes."})
+                json!({"p": format!("{}/src/area{}/booth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Booth keeper {i}"), "d": "Keeps one booth's bookings, its gate code and the lockers that may use it, and tells the office when it changes."})
             })
             .collect();
         let links: Vec<Value> = (0..files * 3)
             .map(|i| json!({"a": format!("f:{}", fs[i % files]["p"].as_str().unwrap()), "b": format!("f:{}", fs[(i * 7 + 13) % files]["p"].as_str().unwrap()), "k": "import", "w": 1}))
             .collect();
         let mut g = json!({
-            "schema": am::GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "schema": am::GRAPH_SCHEMA, "project": {"name": "Bookshop", "summary": "Booths and bookings."},
             "meta": {"root": "/tmp/x", "agent": "claude"},
-            "nodes": (0..12).map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service"})).collect::<Vec<_>>(),
+            "nodes": (0..12).map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Wing area {i}"), "kind": "service"})).collect::<Vec<_>>(),
             "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
-            "health": {"issues": [{"id": "open-endpoints:x", "severity": "high", "title": "Open", "items": [], "locations": [{"file": "yard0/src/area0/berth_0_keeper.ts", "line": 3}]}]},
+            "health": {"issues": [{"id": "open-endpoints:x", "severity": "high", "title": "Open", "items": [], "locations": [{"file": "yard0/src/area0/booth_0_keeper.ts", "line": 3}]}]},
         });
         am::stamp_repos(&mut g, &folders);
         g
@@ -1452,7 +1452,7 @@ mod tests {
         let state = crate::fake_aws::state(&f.url);
         let team = "TEAM#harbor";
         // No map yet: no address.
-        let first = read_map(&state, "TEAM#marina").await;
+        let first = read_map(&state, "TEAM#library").await;
         assert!(first["graph_url"].is_null() && first["graph"].is_null());
 
         // A map built before the page's copy and its index existed.
@@ -1505,9 +1505,11 @@ mod tests {
             .unwrap();
         assert_eq!(bytes.to_vec(), view.body);
         // Another team's copy is not this team's.
-        assert!(graph(State(state.clone()), Extension(admin("TEAM#marina")))
-            .await
-            .is_err());
+        assert!(
+            graph(State(state.clone()), Extension(admin("TEAM#library")))
+                .await
+                .is_err()
+        );
     }
 
     /// A page's copy made by an earlier release (its System cards still under
@@ -1579,7 +1581,7 @@ mod tests {
     async fn a_page_view_of_a_large_map_is_small_and_quick() {
         let f = crate::fake_aws::start().await;
         let state = crate::fake_aws::state(&f.url);
-        let team = "TEAM#dockyard";
+        let team = "TEAM#bookshop";
         let map = am::gzip(big_map(4_000).to_string().as_bytes());
         let map_len = map.len();
         f.store.put_object("bucket", &am::graph_key(team), map);

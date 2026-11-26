@@ -36,7 +36,7 @@ use crate::passes::reproduce;
 use common::repro_first::{self, Attempt};
 use common::test_env;
 
-const TICKET: &str = "Update activity categorization for summer tours\nObserved\nThe food tasting filter only catches the kids cooking lesson, not the Old Town Food Tasting-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Sailing, City Walk-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nCity Walk-Half Day (a0000002-0000-4000-8000-000000000002)\nCity Walk- Full Day (a0000003-0000-4000-8000-000000000003)\nSunrise City Walk Tour (a0000004-0000-4000-8000-000000000004)";
+const TICKET: &str = "Update activity categorization for summer tours\nObserved\nThe food tasting filter only catches the kids cooking lesson, not the Old Town Food Tasting-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Reading, City Walk-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nCity Walk-Half Day (a0000002-0000-4000-8000-000000000002)\nCity Walk- Full Day (a0000003-0000-4000-8000-000000000003)\nSunrise City Walk Tour (a0000004-0000-4000-8000-000000000004)";
 
 /// The call that reproduces it on the base, and what it printed.
 const CALL: &str = "cd dags && python -c \"from utils.booking_common import get_tour_stop_override as g; [print(n, g(n)) for n in ['City Walk-Half Day', 'City Walk-Full Day', 'City Walk- Full Day', 'Old Town Food Tasting-Full Day']]\"";

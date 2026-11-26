@@ -67,8 +67,8 @@ fn the_line_as_written() -> String {
 fn facts(body: &str) -> Facts {
     Facts {
         draft: true,
-        title: "Add a Title Size setting to the marina page blocks".into(),
-        body: format!("## Summary\nOne Title Size setting for every marina block.\n\n{body}"),
+        title: "Add a Title Size setting to the library page blocks".into(),
+        body: format!("## Summary\nOne Title Size setting for every library block.\n\n{body}"),
         ci: Ci {
             green: true,
             why: String::new(),

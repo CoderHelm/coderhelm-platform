@@ -37,8 +37,8 @@ const HEAD: &str = "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432";
 fn long_approval() -> String {
     [
         "## PR Overview",
-        "Adds the slip booking status to the slip cards.",
-        "| File | What |\n|---|---|\n| `apps/web/src/slips/card.tsx` | Shows the status |",
+        "Adds the slot booking status to the slot cards.",
+        "| File | What |\n|---|---|\n| `apps/web/src/slots/card.tsx` | Shows the status |",
         "✅ **Approved with notes**: nothing blocks the merge; 2 notes below are for a look.",
         "_Why approved: nothing blocks (no required rule broken, no failing check)._",
         "#### Risk: low\n`██░░░░░░░░` 2/10",
@@ -230,7 +230,7 @@ fn a_persons_unanswered_reply_keeps_the_thread() {
 #[test]
 fn a_finding_on_code_that_left_the_diff_settles() {
     let mut now = pr(PrState::Open);
-    now.changed_paths = Some(vec!["apps/web/src/slips/card.tsx".into()]);
+    now.changed_paths = Some(vec!["apps/web/src/slots/card.tsx".into()]);
     let t = rs::tidy(&[], &failing_check_thread(false), &now);
     assert_eq!(t.resolve, vec![("T1".to_string(), Settled::FileGone)]);
 }

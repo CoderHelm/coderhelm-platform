@@ -2609,9 +2609,9 @@ mod refresh_tests {
     fn the_writer_reports_the_runs_evidence() {
         assert_eq!(evidence_instructions(""), "");
         let block = evidence_instructions(
-            "- Ran api_get: /v1/products/7\n  Came back: {\"title\": \"Swim\"}",
+            "- Ran api_get: /v1/products/7\n  Came back: {\"title\": \"Atlas\"}",
         );
-        assert!(block.contains("Came back: {\"title\": \"Swim\"}"));
+        assert!(block.contains("Came back: {\"title\": \"Atlas\"}"));
         assert!(block.contains("Add an **Evidence** list at the end of the Verification section"));
         assert!(block.contains("Never write that something was not verified, not measured"));
         // The reviewer reads these markers back: an `Unconfirmed:` line holds

@@ -1,7 +1,7 @@
 //! Each thing the ticket asks for is proven end to end, both ways.
 //!
-//! A ticket asked for one thing: one berth chip, not two, on one marina's
-//! slips page. The run wrote several hundred lines of unit tests over
+//! A ticket asked for one thing: one booth chip, not two, on one library's
+//! slots page. The run wrote several hundred lines of unit tests over
 //! three new helpers and never loaded the page the ticket names. Its unit
 //! tests passed before and after; nothing showed the chip was ever doubled
 //! or that it is single now.
@@ -62,7 +62,7 @@ names the check that proves it instead.\n";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Criterion {
     pub text: String,
-    /// The site path it is about (`/marina/slips`), its own or the
+    /// The site path it is about (`/library/slots`), its own or the
     /// page the ticket's steps name.
     pub page: Option<String>,
     /// It describes something a person sees on a page.
@@ -238,7 +238,7 @@ fn path_ok(p: &str) -> bool {
         && !CODE_EXT.iter().any(|e| low.ends_with(e))
 }
 
-/// The site paths `text` names: `/marina/slips`, or the path of a
+/// The site paths `text` names: `/library/slots`, or the path of a
 /// full address, without its query.
 pub fn pages(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -998,7 +998,7 @@ pub fn find_test(c: &Criterion, specs: &[(String, String)]) -> Option<String> {
 mod tests {
     use super::*;
 
-    const TICKET: &str = "Steps to reproduce\nGo to /acme-marina/slips\nScroll to the berths filter\nObserved\nTwo Guest-Berth filters show\nExpected\nOnly one guest-berth filter to show\n";
+    const TICKET: &str = "Steps to reproduce\nGo to /acme-library/slots\nScroll to the booths filter\nObserved\nTwo Guest-Booth filters show\nExpected\nOnly one guest-booth filter to show\n";
 
     fn leg(ran: bool, passed: u32, failed: u32, note: &str) -> Leg {
         Leg {
@@ -1012,8 +1012,8 @@ mod tests {
 
     fn proof(test: &str, base: Leg, change: Leg) -> Proof {
         Proof {
-            criterion: "Only one guest-berth filter to show".into(),
-            page: "/acme-marina/slips".into(),
+            criterion: "Only one guest-booth filter to show".into(),
+            page: "/acme-library/slots".into(),
             test: test.into(),
             record: Record {
                 head: "abc1234".into(),
@@ -1030,10 +1030,10 @@ mod tests {
 
     #[test]
     fn criteria_come_from_expected_lines_with_the_tickets_page() {
-        let c = criteria("Duplicate filter on the slips page", TICKET, &[]);
+        let c = criteria("Duplicate filter on the slots page", TICKET, &[]);
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].text, "Only one guest-berth filter to show");
-        assert_eq!(c[0].page.as_deref(), Some("/acme-marina/slips"));
+        assert_eq!(c[0].text, "Only one guest-booth filter to show");
+        assert_eq!(c[0].page.as_deref(), Some("/acme-library/slots"));
         assert!(c[0].needs_e2e());
         // An acceptance list wins; a criterion's own page wins.
         let c = criteria(
@@ -1057,17 +1057,17 @@ mod tests {
         let g = map_gaps(&c, &parse_map(unit_only), true);
         assert_eq!(g.len(), 1);
         assert!(g[0].contains("no `## Criteria map`"), "{g:?}");
-        let unit = "## Criteria map\n- Only one guest-berth filter shows | page: /acme-marina/slips | e2e: apps/web/src/test/filter.test.tsx › one chip | asserts: one chip\n";
+        let unit = "## Criteria map\n- Only one guest-booth filter shows | page: /acme-library/slots | e2e: apps/web/src/test/filter.test.tsx › one chip | asserts: one chip\n";
         let g = map_gaps(&c, &parse_map(unit), true);
         assert!(g[0].contains("isn't an end-to-end spec"), "{g:?}");
-        let none = "## Criteria map\n- Only one guest-berth filter shows | page: /acme-marina/slips | e2e: none: unit tests cover it | asserts: one chip\n";
+        let none = "## Criteria map\n- Only one guest-booth filter shows | page: /acme-library/slots | e2e: none: unit tests cover it | asserts: one chip\n";
         assert!(map_gaps(&c, &parse_map(none), true)[0].contains("plans no end-to-end test"));
         // Without a suite in the repository it goes to the two-way proof,
         // which labels it unverified.
         assert!(map_gaps(&c, &parse_map(none), false).is_empty());
-        let good = "## Criteria map\n- Only one guest-berth filter shows | page: /acme-marina/slips | e2e: e2e/tests/slips.spec.ts › one guest-berth chip | asserts: exactly one Guest-Berth chip\n\n## Proof\nx";
+        let good = "## Criteria map\n- Only one guest-booth filter shows | page: /acme-library/slots | e2e: e2e/tests/slots.spec.ts › one guest-booth chip | asserts: exactly one Guest-Booth chip\n\n## Proof\nx";
         let m = parse_map(good);
-        assert_eq!(m[0].test, "e2e/tests/slips.spec.ts › one guest-berth chip");
+        assert_eq!(m[0].test, "e2e/tests/slots.spec.ts › one guest-booth chip");
         assert!(map_gaps(&c, &m, true).is_empty());
         // Nothing a person sees needs nothing here.
         assert!(map_gaps(
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn the_two_runs_decide() {
-        let t = "e2e/tests/slips.spec.ts › one guest-berth chip";
+        let t = "e2e/tests/slots.spec.ts › one guest-booth chip";
         let p = proof(
             t,
             leg(true, 0, 1, "Expected: 1 Received: 2"),
@@ -1121,15 +1121,15 @@ mod tests {
 
     #[test]
     fn a_changed_spec_that_loads_the_page_is_its_test() {
-        let spec = "test.describe('slips', () => {\n  test('shows one guest-berth chip', async ({ page }) => {\n    await page.goto('/acme-marina/slips');\n  });\n  it(\"other\", () => {});\n});\n";
+        let spec = "test.describe('slots', () => {\n  test('shows one guest-booth chip', async ({ page }) => {\n    await page.goto('/acme-library/slots');\n  });\n  it(\"other\", () => {});\n});\n";
         assert_eq!(
             test_titles(spec),
-            vec!["shows one guest-berth chip", "other"]
+            vec!["shows one guest-booth chip", "other"]
         );
         let c = &criteria("x", TICKET, &[])[0];
         assert_eq!(
-            find_test(c, &[("e2e/tests/slips.spec.ts".into(), spec.into())]).as_deref(),
-            Some("e2e/tests/slips.spec.ts › shows one guest-berth chip")
+            find_test(c, &[("e2e/tests/slots.spec.ts".into(), spec.into())]).as_deref(),
+            Some("e2e/tests/slots.spec.ts › shows one guest-booth chip")
         );
         assert!(find_test(c, &[("e2e/a.spec.ts".into(), "goto('/other')".into())]).is_none());
     }

@@ -34,8 +34,8 @@ const OLD: &str = "made no progress";
 /// The finding the run deferred, as two reviews worded it.
 const NAV: &str = "Site navbar and footer still render on the portal page; booking-portal isn't in settings.bareLayout (`apps/web/src/lib/routing/page-shell.tsx:412`)";
 const NAV_AGAIN: &str = "The site navbar and footer still render on the portal pages because `booking-portal` isn't in settings.bareLayout (`apps/web/src/lib/routing/page-shell.tsx:416`)";
-const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/slip-booking.spec.ts:88`)";
-const H1: &str = "Test plan says one H1; the spec asserts none (`e2e/specs/marina-browse.md:64`)";
+const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/slot-booking.spec.ts:88`)";
+const H1: &str = "Test plan says one H1; the spec asserts none (`e2e/specs/library-browse.md:64`)";
 
 /// What the round's log carried.
 fn the_blocked_round_log() -> Vec<serde_json::Value> {
@@ -108,7 +108,7 @@ fn rounds_the_tools_blocked_are_not_no_progress_and_the_omission_is_fixed() {
 
 #[test]
 fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred() {
-    let ticket = "### Ticket: Slip booking pages\nAdd the four slip booking pages.\n\n### Comment on the ticket by a teammate\nKeep the site's header and footer on these pages. The footer can stay even though the booking portal looks cleaner without it.";
+    let ticket = "### Ticket: Slot booking pages\nAdd the four slot booking pages.\n\n### Comment on the ticket by a teammate\nKeep the site's header and footer on these pages. The footer can stay even though the booking portal looks cleaner without it.";
     let mut l = Ledger::default();
     let open = vec![NAV.to_string()];
     l.observe(&open, ticket);

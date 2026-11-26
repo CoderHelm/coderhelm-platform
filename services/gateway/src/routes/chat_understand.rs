@@ -273,7 +273,7 @@ mod tests {
     /// code for exact lines; with no map, a one-line note and the code.
     #[test]
     fn a_question_about_how_the_app_fits_together_reaches_for_the_map_first() {
-        let q = "What happens when someone books a slip?";
+        let q = "What happens when someone books a slot?";
         let u = read(q, &[]);
         assert!(u.about_app());
         let mut tools = vec![

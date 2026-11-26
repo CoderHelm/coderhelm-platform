@@ -30,7 +30,7 @@ use common::ci_unrelated::{self, Rerun};
 const HEAD: &str = "d00dfeed12345678";
 
 /// The round's own conclusion, as it wrote it (names made generic).
-const ROUND: &str = "I made no code change. The failing e2e test (`Tours › depot filter shows only that depot's sailings and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the slips block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows sailing 4242.\n- Confirmed: the sailing went inactive minutes before the e2e run started.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
+const ROUND: &str = "I made no code change. The failing e2e test (`Tours › wing filter shows only that wing's readings and clears`) failed because staging data changed while it ran, not because of this PR.\n\n**What I found:**\n- Base branch fails the same way.\n- Why it isn't this PR: the PR only changes the slots block and one date helper.\n\nEvidence:\n- Confirmed: on the base branch's build the full-week page still shows reading 4242.\n- Confirmed: the reading went inactive minutes before the e2e run started.\n- Unconfirmed [check:tests]: I couldn't re-run the failing Playwright test.";
 
 #[test]
 fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
@@ -40,12 +40,12 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
         HEAD,
         &["Deploy Preview".into()],
         &[],
-        &["apps/web/src/components/slips-block.tsx".into()],
+        &["apps/web/src/components/slots-block.tsx".into()],
     )
     .expect("the round's proof is read");
     assert_eq!(
         s.tests,
-        vec!["Tours › depot filter shows only that depot's sailings and clears".to_string()]
+        vec!["Tours › wing filter shows only that wing's readings and clears".to_string()]
     );
     assert_eq!(s.proof.len(), 2);
     // The standing reads "not this change's" everywhere: the run's ending,
@@ -66,7 +66,7 @@ fn a_round_that_shows_the_failure_is_outside_the_change_classifies_it() {
     let mut s = s;
     s.rerun = Rerun::Started;
     let sec = ci_unrelated::section(&s);
-    assert!(sec.contains("`Deploy Preview` fails on `Tours › depot filter"));
+    assert!(sec.contains("`Deploy Preview` fails on `Tours › wing filter"));
     assert!(sec.contains("ran again once on d00dfee and failed the same way"));
     assert!(sec.contains("ready for review"));
     assert!(!sec.contains("without getting it green") && !sec.contains("stays a draft"));
@@ -106,7 +106,7 @@ fn a_check_that_never_runs_on_the_base_finds_its_base() {
     let r = ci_repro::from_history(
         HEAD,
         "Deploy Preview",
-        "Tours › depot filter",
+        "Tours › wing filter",
         "main",
         ("0badc0ffee1", true, "2030-03-23T17:30:00Z"),
     );
@@ -150,13 +150,13 @@ fn a_continuing_step_goes_on_from_what_the_steps_before_settled() {
     let call = |name: &str, path: &str| json!({"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": {"path": path}}]});
     let step = vec![
         call("write_file", "e2e/tests/browse/callouts.spec.ts"),
-        call("edit_file", "e2e/data/marinas.ts"),
-        call("restore_file", "e2e/data/marinas.ts"),
+        call("edit_file", "e2e/data/libraries.ts"),
+        call("restore_file", "e2e/data/libraries.ts"),
     ];
     let fb = common::run_round::settled_first("Fix the review finding.", &step);
     assert!(fb.contains("`e2e/tests/browse/callouts.spec.ts`"), "{fb}");
     assert!(
-        fb.contains("on purpose (leave them as they are): `e2e/data/marinas.ts`"),
+        fb.contains("on purpose (leave them as they are): `e2e/data/libraries.ts`"),
         "{fb}"
     );
     let src = include_str!("../resume.rs");

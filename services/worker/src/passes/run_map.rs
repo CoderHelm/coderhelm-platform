@@ -688,10 +688,10 @@ mod tests {
     fn the_planner_and_the_reviewer_get_the_traced_journeys_a_file_is_on() {
         let mut g = harbor();
         let store = json!({"flows": [{
-            "id": "book-a-slip", "title": "Book a slip", "entry": "screen:web:/slips", "origin": "trace",
+            "id": "book-a-slot", "title": "Book a slot", "entry": "screen:web:/slots", "origin": "trace",
             "steps": [
-                {"key": "screen:web:/slips", "kind": "screen", "role": "screen", "view": "f:harbor-web/app/slips/page.tsx", "note": "Pick a slip.",
-                 "evidence": [{"file": "harbor-web/app/slips/page.tsx", "line": 1, "token": "Slips"}]},
+                {"key": "screen:web:/slots", "kind": "screen", "role": "screen", "view": "f:harbor-web/app/slots/page.tsx", "note": "Pick a slot.",
+                 "evidence": [{"file": "harbor-web/app/slots/page.tsx", "line": 1, "token": "Slots"}]},
                 {"key": "code:harbor-api/src/bookings.js#book", "kind": "request", "role": "handler", "view": "f:harbor-api/src/bookings.js", "note": "The API books it.",
                  "evidence": [{"file": "harbor-api/src/bookings.js", "line": 3, "token": "book"}]},
                 {"key": "n:stripe", "kind": "outside", "role": "outside", "view": "n:stripe", "note": "Stripe charges.",
@@ -703,7 +703,7 @@ mod tests {
         let hits = m.reaches("harbor/harbor-api", "src/bookings.js");
         let journey = hits
             .iter()
-            .find(|h| h.starts_with("journey Book a slip"))
+            .find(|h| h.starts_with("journey Book a slot"))
             .unwrap_or_else(|| panic!("{hits:?}"));
         assert!(
             journey.contains("harbor-api/src/bookings.js:3"),
@@ -718,7 +718,7 @@ mod tests {
             "{review}"
         );
         assert!(
-            review.contains("journey Book a slip at harbor-api/src/bookings.js:3"),
+            review.contains("journey Book a slot at harbor-api/src/bookings.js:3"),
             "{review}"
         );
     }
@@ -761,9 +761,9 @@ mod tests {
         let names: Vec<String> = m.tools().into_iter().map(|t| t.name).collect();
         assert_eq!(names, am::TOOLS.to_vec());
         let out = m
-            .handle("map_impact", &json!({"target": "POST /slips/:id/bookings"}))
+            .handle("map_impact", &json!({"target": "POST /slots/:id/bookings"}))
             .unwrap();
-        assert!(out.contains("harbor-web/lib/slips.ts:2"), "{out}");
+        assert!(out.contains("harbor-web/lib/slots.ts:2"), "{out}");
         assert!(m.handle("read_file", &json!({})).is_none());
         assert!(m
             .prompt_line(super::super::code_graph::Role::Planner)
@@ -789,12 +789,12 @@ mod tests {
         );
         let gaps = m.plan_gaps(&files, "## Files\n- src/bookings.js\n");
         assert_eq!(gaps.len(), 1);
-        assert!(gaps[0].contains("harbor-web/lib/slips.ts:2"), "{}", gaps[0]);
-        assert!(gaps[0].contains("harbor-mobile/app/screens/SlipDetail.tsx:6"));
+        assert!(gaps[0].contains("harbor-web/lib/slots.ts:2"), "{}", gaps[0]);
+        assert!(gaps[0].contains("harbor-mobile/app/screens/SlotDetail.tsx:6"));
         assert!(m
             .plan_gaps(
                 &files,
-                &format!("{AFFECTED_HEADING}\n- harbor-web/lib/slips.ts:2\n")
+                &format!("{AFFECTED_HEADING}\n- harbor-web/lib/slots.ts:2\n")
             )
             .is_empty());
         // A file nothing else uses needs no section.
@@ -813,20 +813,20 @@ mod tests {
         let m = api();
         let design = format!(
             "## Approach\n- src/x.ts:99 is fine here\n\n{AFFECTED_HEADING}\n\
-             - harbor-web (Slip page) calls POST /slips/:id/bookings at harbor-web/lib/slips.ts:2\n\
-             - harbor-mobile calls it at harbor-mobile/app/screens/SlipDetail.tsx:600\n  continued\n\
+             - harbor-web (Slot page) calls POST /slots/:id/bookings at harbor-web/lib/slots.ts:2\n\
+             - harbor-mobile calls it at harbor-mobile/app/screens/SlotDetail.tsx:600\n  continued\n\
              - Stripe, reached through src/billing.js:1\n\
-             - None found for the receipts\n\n## Risks\n- harbor-web/lib/slips.ts:999\n"
+             - None found for the receipts\n\n## Risks\n- harbor-web/lib/slots.ts:999\n"
         );
         let (out, dropped) = m.checked_design(&design);
         assert_eq!(dropped, 1);
-        assert!(out.contains("harbor-web/lib/slips.ts:2"));
-        assert!(!out.contains("SlipDetail.tsx:600"));
+        assert!(out.contains("harbor-web/lib/slots.ts:2"));
+        assert!(!out.contains("SlotDetail.tsx:600"));
         assert!(!out.contains("  continued"));
         assert!(out.contains("src/billing.js:1"));
         assert!(out.contains("None found for the receipts"));
         // Outside the section nothing is touched.
-        assert!(out.contains("src/x.ts:99") && out.contains("slips.ts:999"));
+        assert!(out.contains("src/x.ts:99") && out.contains("slots.ts:999"));
     }
 
     /// Review: a diff that rewrites the booking endpoint, which the web app
@@ -843,18 +843,18 @@ mod tests {
         assert_eq!(
             flagged[0].callers,
             [
-                "harbor-mobile/app/screens/SlipDetail.tsx:6 (harbor-mobile)",
-                "harbor-web/lib/slips.ts:2 (harbor-web)"
+                "harbor-mobile/app/screens/SlotDetail.tsx:6 (harbor-mobile)",
+                "harbor-web/lib/slots.ts:2 (harbor-web)"
             ]
         );
         assert!(flagged[0]
             .screens
             .iter()
-            .any(|s| s.contains("SlipDetail in harbor-mobile (signed_in)")));
+            .any(|s| s.contains("SlotDetail in harbor-mobile (signed_in)")));
         let section = m.review_section(&changed);
         assert!(section.contains("## Cross-repository impact (from the app map)"));
         assert!(section.contains("raise a finding (a breaking change)"));
-        assert!(section.contains("called from harbor-web/lib/slips.ts:2 (harbor-web)"));
+        assert!(section.contains("called from harbor-web/lib/slots.ts:2 (harbor-web)"));
         assert!(section.len() <= REVIEW_CHARS);
         // A change inside the handler that keeps the endpoint's line is not
         // flagged as an endpoint change; the file is still named as shared.

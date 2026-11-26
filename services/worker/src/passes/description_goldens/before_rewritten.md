@@ -35,7 +35,7 @@ On d78bb24 (head of this PR):
 | Studio build (CI) | Passed |
 | Studio in local dev, manual (CoderHelm) | Passed; warning shows at 201 characters; Publish stays enabled |
 
-See it: document `/slips/summer-moorings`, Listing, Summary field.
+See it: document `/slots/summer-carrels`, Listing, Summary field.
 
 How to check: `npm test -- listing-block-validation`.
 

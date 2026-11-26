@@ -10,7 +10,7 @@
 // imports to where it is declared) and, where the code says it, the URL pattern the resolver gives
 // that type: an if chain on the URL's segments that returns the type, or a table or switch from
 // type to path template or prefix. Without one, the URL is the route's own pattern with the type
-// named as a group: /(berth)/*.
+// named as a group: /(booth)/*.
 //
 // Tables of blocks or sections (parts of a page, not pages) are kept apart.
 //
@@ -66,7 +66,7 @@ function routeOfUrl(url) {
   return { url: '/' + [...segs.slice(0, -1), tail].join('/'), base: segs.length > 1 ? '/' + segs.slice(0, -1).join('/') : '', last: tail };
 }
 
-/** "BoatCheckoutRenderer" or "boat-checkout" in plain words: "Boat checkout". */
+/** "LockerCheckoutRenderer" or "locker-checkout" in plain words: "Locker checkout". */
 export function plainName(raw, { fromType = false } = {}) {
   let s = String(raw || '').replace(/^(?:handle|render)(?=[A-Z])/, '');
   if (!fromType) s = s.replace(/(Renderer|Render|Component|Template|Container|View|Screen|Page|Route|Handler|Layout)$/, '') || s;
@@ -97,7 +97,7 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
   for (const f of all) { const r = routeOf(f); if (r) entries.set(f, r); }
   for (const r of routes) { if (!r?.file || !fileSet.has(r.file) || entries.has(r.file)) continue; const x = routeOfUrl(r.url); if (x) entries.set(r.file, x); }
 
-  // string constants, for keys and case labels written as PAGE_KINDS.BERTH or BERTH_KIND
+  // string constants, for keys and case labels written as PAGE_KINDS.BOOTH or BOOTH_KIND
   const constsOf = new Map();
   const consts = (f) => {
     if (constsOf.has(f)) return constsOf.get(f);
@@ -111,7 +111,7 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
     constsOf.set(f, out);
     return out;
   };
-  /** A key or label as text: 'berth', "berth", PAGE_KINDS.BERTH (through the files the dispatch reads). */
+  /** A key or label as text: 'booth', "booth", PAGE_KINDS.BOOTH (through the files the dispatch reads). */
   const keyText = (raw, files) => {
     const t = String(raw || '').trim().replace(/\s+as\s+const$/, '');
     const lit = LIT.exec(t);

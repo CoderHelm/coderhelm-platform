@@ -1382,15 +1382,15 @@ pub fn fit(text: &str, budget: usize) -> (String, bool) {
 mod tests {
     use super::*;
 
-    const PROPOSAL: &str = "## Problem\nTwo chips.\n\n## Scope\n- In: shared depot chips and `?depots=` resolution.\n- Out:\n  - Merging the two vendor rows.\n  - `/tours/<depot>` path pages, which resolve one depot through `findNormalizedDepot` and `selectedDepot`. Both are open product questions.\n\n## Open product questions\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/tours/<depot>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
-    const TASKS: &str = "- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds; switch any other slugToId caller in apps/web/src to slugToIds\n- [ ] apps/web/src/components/blocks/DepotsFilter.tsx: [modify] dedupe by slug\n";
+    const PROPOSAL: &str = "## Problem\nTwo chips.\n\n## Scope\n- In: shared wing chips and `?wings=` resolution.\n- Out:\n  - Merging the two vendor rows.\n  - `/tours/<wing>` path pages, which resolve one wing through `findNormalizedWing` and `selectedWing`. Both are open product questions.\n\n## Open product questions\n- Which spelling should the single chip use? Meanwhile it uses whichever row comes first.\n- Should `/tours/<wing>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).\n";
+    const TASKS: &str = "- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds; switch any other slugToId caller in apps/web/src to slugToIds\n- [ ] apps/web/src/components/blocks/WingsFilter.tsx: [modify] dedupe by slug\n";
 
     #[test]
     fn marks_are_names_paths_and_routes() {
-        let m = marks_of("`/tours/<depot>` pages via `findNormalizedDepot` and `selectedDepot` in apps/web/src/services/tourService.ts; `x`, `the` and https://a.b/c are not");
-        assert!(m.contains(&"/tours/<depot>".to_string()), "{m:?}");
-        assert!(m.contains(&"findNormalizedDepot".to_string()));
-        assert!(m.contains(&"selectedDepot".to_string()));
+        let m = marks_of("`/tours/<wing>` pages via `findNormalizedWing` and `selectedWing` in apps/web/src/services/tourService.ts; `x`, `the` and https://a.b/c are not");
+        assert!(m.contains(&"/tours/<wing>".to_string()), "{m:?}");
+        assert!(m.contains(&"findNormalizedWing".to_string()));
+        assert!(m.contains(&"selectedWing".to_string()));
         assert!(m.contains(&"apps/web/src/services/tourService.ts".to_string()));
         assert!(!m.iter().any(|x| x.contains("https")), "{m:?}");
     }
@@ -1405,11 +1405,11 @@ mod tests {
         assert_eq!(e.item, "Merging the two vendor rows");
         assert_eq!(e.why, "a data change in another repository");
         let e = parse_line(
-            "`/tours/<depot>` pages, which resolve one depot through `selectedDepot`",
+            "`/tours/<wing>` pages, which resolve one wing through `selectedWing`",
             BY_PLAN,
         )
         .unwrap();
-        assert_eq!(e.item, "`/tours/<depot>` pages");
+        assert_eq!(e.item, "`/tours/<wing>` pages");
         assert!(e.why.starts_with("it resolve"));
         assert!(parse_line("None", BY_PLAN).is_none());
         assert!(parse_line("- none: the change stays inside this file", BY_PLAN).is_none());
@@ -1417,9 +1417,9 @@ mod tests {
 
     #[test]
     fn a_question_becomes_its_default() {
-        let e = default_of("Should `/tours/<depot>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).");
+        let e = default_of("Should `/tours/<wing>` path pages also cover every row sharing the slug? Meanwhile they keep current behaviour (one id).");
         assert!(
-            e.item.starts_with("`/tours/<depot>` path pages also cover"),
+            e.item.starts_with("`/tours/<wing>` path pages also cover"),
             "{}",
             e.item
         );
@@ -1444,7 +1444,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|i| i.starts_with("`/tours/<depot>` path pages")),
+                .any(|i| i.starts_with("`/tours/<wing>` path pages")),
             "{items:?}"
         );
         assert!(
@@ -1464,7 +1464,7 @@ mod tests {
             .find(|e| e.item.starts_with("`/tours"))
             .unwrap();
         assert!(
-            path.marks.contains(&"selectedDepot".to_string()),
+            path.marks.contains(&"selectedWing".to_string()),
             "{:?}",
             path.marks
         );
@@ -1487,13 +1487,13 @@ mod tests {
             g.iter().any(|x| x.contains("reaches past its files")),
             "{g:?}"
         );
-        let good_design = "## Out of scope\n- Merging the two vendor rows: a data fix in another repository\n- `/tours/<depot>` path pages (`selectedDepot`): decided with the default: one id, as today\n";
+        let good_design = "## Out of scope\n- Merging the two vendor rows: a data fix in another repository\n- `/tours/<wing>` path pages (`selectedWing`): decided with the default: one id, as today\n";
         let good_tasks = "- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds\n";
         assert!(plan_gaps("## Problem\nx\n", good_design, good_tasks, &[]).is_empty());
-        let contradicting = "- [ ] apps/web/src/components/sanity-blocks/tours-block.tsx: [modify] use every id for `selectedDepot`\n";
+        let contradicting = "- [ ] apps/web/src/components/sanity-blocks/tours-block.tsx: [modify] use every id for `selectedWing`\n";
         let g = plan_gaps("", good_design, contradicting, &[]);
         assert!(
-            g.iter().any(|x| x.contains("A task names `selectedDepot`")),
+            g.iter().any(|x| x.contains("A task names `selectedWing`")),
             "{g:?}"
         );
         let no_reason = "## Out of scope\n- Merging the two vendor rows\n";
@@ -1515,8 +1515,8 @@ mod tests {
     #[test]
     fn scope_comes_from_the_criteria() {
         let criteria =
-            vec!["Only one guest-depot filter shows on the seasonal slips page".to_string()];
-        let design = "## Out of scope\n- The duplicate guest-depot filter on seasonal slips: another ticket\n- `/tours/<depot>` path pages (`selectedDepot`): decided with the default: one id, as today\n";
+            vec!["Only one guest-wing filter shows on the seasonal slots page".to_string()];
+        let design = "## Out of scope\n- The duplicate guest-wing filter on seasonal slots: another ticket\n- `/tours/<wing>` path pages (`selectedWing`): decided with the default: one id, as today\n";
         let g = plan_gaps("", design, "- [ ] a.ts: x\n", &criteria);
         assert!(
             g.iter()
@@ -1527,12 +1527,12 @@ mod tests {
         let l = Ledger::from_ticket_and_plan(&criteria, "", design, "");
         assert_eq!(l.criteria, criteria);
         assert_eq!(l.outs().count(), 1);
-        assert!(l.outs().next().unwrap().item.contains("/tours/<depot>"));
+        assert!(l.outs().next().unwrap().item.contains("/tours/<wing>"));
     }
 
     #[test]
     fn a_breach_is_found_in_code_and_in_tests() {
-        let design = "## Out of scope\n- `/tours/<depot>` path pages (`selectedDepot`, `findNormalizedDepot`): decided with the default: one id, as today\n";
+        let design = "## Out of scope\n- `/tours/<wing>` path pages (`selectedWing`, `findNormalizedWing`): decided with the default: one id, as today\n";
         let l = Ledger::from_plan("", design, TASKS);
         let in_scope = [file(
             "apps/web/src/utils/filterMaps.ts",
@@ -1542,22 +1542,22 @@ mod tests {
         let test_only = [file(
             "apps/web/src/test/components/tours-block-dedup.test.tsx",
             &[
-                "  it(\"sends every depot id sharing a /tours/<depot> path slug\", () => {",
-                "    expect(args.selectedDepot?.id).toBe(\"s-b\");",
+                "  it(\"sends every wing id sharing a /tours/<wing> path slug\", () => {",
+                "    expect(args.selectedWing?.id).toBe(\"s-b\");",
             ],
         )];
         let b = breaches(&l, &test_only);
         assert_eq!(b.len(), 1, "{b:?}");
         assert!(b[0].instruction().contains("Scope change:"));
         assert!(l
-            .covers("Planned: `selectedDepot` sends every id on /tours/<depot> pages")
+            .covers("Planned: `selectedWing` sends every id on /tours/<wing> pages")
             .is_some());
         assert!(l
-            .covers("Planned: one chip per slug in `DepotsFilter`")
+            .covers("Planned: one chip per slug in `WingsFilter`")
             .is_none());
         let mut moved = l.clone();
         assert!(moved.move_in(
-            "/tours/<depot> path pages",
+            "/tours/<wing> path pages",
             "criterion: path pages list every tour"
         ));
         assert!(breaches(&moved, &test_only).is_empty());
@@ -1565,20 +1565,20 @@ mod tests {
 
     #[test]
     fn a_scope_change_needs_a_criterion_or_a_comment() {
-        let design = "## Out of scope\n- `/tours/<depot>` path pages (`selectedDepot`): decided with the default: one id, as today\n";
+        let design = "## Out of scope\n- `/tours/<wing>` path pages (`selectedWing`): decided with the default: one id, as today\n";
         let mut l = Ledger::from_plan("", design, "");
         let sources = vec![
-            "The tours page for one depot lists the tours of every row sharing the depot's slug"
+            "The tours page for one wing lists the tours of every row sharing the wing's slug"
                 .to_string(),
         ];
         let (ok, no) = l.apply_changes(
-            "Scope change: `/tours/<depot>` path pages: the reviewer might want it",
+            "Scope change: `/tours/<wing>` path pages: the reviewer might want it",
             &sources,
         );
         assert!(ok.is_empty() && no.len() == 1, "{ok:?} {no:?}");
         assert!(l.entries[0].is_out());
         let (ok, _) = l.apply_changes(
-            "- Scope change: /tours/<depot> path pages: the ticket's criterion says the tours page lists every row sharing the depot's slug",
+            "- Scope change: /tours/<wing> path pages: the ticket's criterion says the tours page lists every row sharing the wing's slug",
             &sources,
         );
         assert_eq!(ok.len(), 1);
@@ -1588,7 +1588,7 @@ mod tests {
 
     #[test]
     fn questions_in_a_description_become_defaults() {
-        let body = "Changes here.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the chip use? Meanwhile it uses the first row.\n\n## Risk\nLow.\n- Open product question: Does the filter remember the marina? For now it does not.";
+        let body = "Changes here.\n\n## Open product questions\nThe ticket doesn't settle these. Please answer on the pull request:\n- Which spelling should the chip use? Meanwhile it uses the first row.\n\n## Risk\nLow.\n- Open product question: Does the filter remember the library? For now it does not.";
         let (text, e) = questions_to_defaults(body);
         assert!(!text.to_lowercase().contains("question"), "{text}");
         assert!(text.contains("## Risk"));
@@ -1610,17 +1610,17 @@ mod tests {
     #[test]
     fn a_written_claim_the_diff_refutes_goes() {
         let b = vec![Breach {
-            item: "`/tours/<depot>` path pages".into(),
+            item: "`/tours/<wing>` path pages".into(),
             why: "one id".into(),
             path: "apps/web/src/services/tourService.ts".into(),
-            mark: "/tours/<depot>".into(),
+            mark: "/tours/<wing>".into(),
             reverted: false,
         }];
         let changed = vec![
             "apps/web/src/services/tourService.ts".to_string(),
             "apps/web/src/test/components/tours-block-dedup.test.tsx".to_string(),
         ];
-        let text = "Redirect helpers are untouched. Out of scope: merging the rows, and `/tours/<depot>` pages, which still resolve one depot.\nRestored `tours-block-dedup.test.tsx` to the base.\nAdds `slugToIds`.";
+        let text = "Redirect helpers are untouched. Out of scope: merging the rows, and `/tours/<wing>` pages, which still resolve one wing.\nRestored `tours-block-dedup.test.tsx` to the base.\nAdds `slugToIds`.";
         let (out, r) = contradictions(text, &b, &changed);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(out.contains("Redirect helpers are untouched."));
@@ -1654,8 +1654,8 @@ mod tests {
 
     #[test]
     fn written_outs_are_read_from_sections_and_sentences() {
-        let w = written_outs("Out of scope: merging the two rows, and `/tours/<depot>` pages, which still resolve one depot.\n\n### Out of scope\n- The mobile app: another repository\n");
-        assert!(w.iter().any(|e| e.item.contains("/tours/<depot>")), "{w:?}");
+        let w = written_outs("Out of scope: merging the two rows, and `/tours/<wing>` pages, which still resolve one wing.\n\n### Out of scope\n- The mobile app: another repository\n");
+        assert!(w.iter().any(|e| e.item.contains("/tours/<wing>")), "{w:?}");
         assert!(w.iter().any(|e| e.item == "The mobile app"), "{w:?}");
     }
 }

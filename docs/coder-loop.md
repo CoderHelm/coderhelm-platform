@@ -8,7 +8,7 @@ in code, so the loop holds whatever the model writes.
 
 Two pull requests show what went wrong.
 
-- **A data-pipeline ticket** asked to link four slips to a second dock. The plan
+- **A data-pipeline ticket** asked to link four slots to a second wing. The plan
   added a second map and helpers beside the existing overrides map, and made an
   insert-only link sync replace and delete links. The build added warnings, three
   counters and a log level change in shared code, plus a test of several hundred
@@ -65,7 +65,7 @@ The causes were in the loop, not only in prompt wording:
    body (`minimal_change::write_semantics`: a `DELETE`, an `ON CONFLICT DO
    UPDATE`, a delete-then-insert, a relation `.set(`). A plan that reuses a
    replacing helper on a path that only inserts today is sent back unless the
-   ticket asks to replace. The slips run's plan named the right map, then
+   ticket asks to replace. The slots run's plan named the right map, then
    reused the link helper that deletes every link it isn't given.
 
    The plan also writes `## Criteria map`: one line for each acceptance
@@ -224,7 +224,7 @@ The causes were in the loop, not only in prompt wording:
      sandbox. Any sentence that blames the missing log is replaced.
    - **Fixtures use looked-up ids, and tests are sized to the behaviour**
      (`minimal_change::made_up_ids`, `repeated_cases`, in the habits check).
-     Ids like `dock-a` or `id-1` are sent back when the run's lookups
+     Ids like `wing-a` or `id-1` are sent back when the run's lookups
      returned real ids. Three or more added cases that differ only in their
      values are sent back as one case per behaviour. The size check (test
      lines against code lines) runs too; it fires on a run that added hundreds

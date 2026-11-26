@@ -26,7 +26,7 @@ use serde_json::json;
 const PLANNED: &[&str] = &[
     "apps/web/src/components/blocks/booking-embed.tsx",
     "apps/web/src/lib/routing/routing-service.ts",
-    "e2e/tests/browse/slip-booking.spec.ts",
+    "e2e/tests/browse/slot-booking.spec.ts",
 ];
 
 /// Files a merge of the base changed: never the pull request's.
@@ -45,7 +45,7 @@ fn plan() -> crate::passes::plan::PlanResult {
     crate::passes::plan::PlanResult {
         tasks: PLANNED
             .iter()
-            .map(|p| format!("- [ ] {p}: [modify] The slip booking change\n"))
+            .map(|p| format!("- [ ] {p}: [modify] The slot booking change\n"))
             .collect(),
         ..Default::default()
     }

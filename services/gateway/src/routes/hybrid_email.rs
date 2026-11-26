@@ -629,7 +629,7 @@ pub async fn recipients(
     }
     // How many of these addresses are new, counted against today's limit in
     // one conditional write before anything is listed: parallel requests
-    // can't each slip under it (the check above read the count earlier).
+    // can't each slot under it (the check above read the count earlier).
     let mut fresh = 0u64;
     for r in &req.add {
         let hash = relay::recipient_hash(&install.id, &r.email);

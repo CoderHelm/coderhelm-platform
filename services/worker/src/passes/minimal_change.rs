@@ -1148,7 +1148,7 @@ fn payload_key(line: &str) -> bool {
         && rest[end + 1..].trim_start().starts_with(':')
 }
 
-/// Test fixtures with invented ids (`kiosk-a`, `id-1`) while the run's
+/// Test fixtures with invented ids (`booth-a`, `id-1`) while the run's
 /// lookups (`lookups`: their recorded lines) returned real ones
 /// (`common::fixture_ids`).
 pub fn made_up_ids(diff: &Diff, lookups: &[String]) -> Vec<Widening> {
@@ -1506,7 +1506,7 @@ mod tests {
     fn a_second_map_next_to_the_first_is_a_parallel_structure() {
         let base = vec![(
             "dags/tours.py".to_string(),
-            "TOUR_MULTI_STOP_OVERRIDES = {\n    \"a\": [\"Sailing\"],\n}\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name, [])\n".to_string(),
+            "TOUR_MULTI_STOP_OVERRIDES = {\n    \"a\": [\"Reading\"],\n}\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name, [])\n".to_string(),
         )];
         let patch = "@@ -1,3 +1,9 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n+TOUR_TASTING_OVERRIDES = {\n+    \"b\": [\"Food Tasting\"],\n+}\n+def get_tour_tasting_names(name):\n+    return TOUR_TASTING_OVERRIDES.get(name, [])\n";
         let w = parallel_structures(&[d("dags/tours.py", "modified", patch)], &base);
@@ -1694,7 +1694,7 @@ mod tests {
         // "All" before a plural, or "every" before a noun, asks for the kind.
         for t in [
             "Fix all tours",
-            "Update every slip page",
+            "Update every slot page",
             "Backfill all records",
             "every record",
         ] {
@@ -1702,10 +1702,10 @@ mod tests {
         }
         // Any kind does, whatever it is called.
         for t in [
-            "Show the depot filter on all listings",
+            "Show the wing filter on all listings",
             "Every tour needs a price",
             "Recompute ALL invoices",
-            "Hide every slip without a photo",
+            "Hide every slot without a photo",
         ] {
             assert!(names_every_of_a_kind(t), "{t}");
         }

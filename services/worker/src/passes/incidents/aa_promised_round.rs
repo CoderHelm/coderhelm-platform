@@ -43,7 +43,7 @@ fn body() -> String {
     format!(
         "{}\n\n## Summary\nRe-index bookings written behind the sync cursor.",
         own_review::section(&[
-            "The backfill skips bookings with no slip (`harbor/backfill.py:88`)".to_string(),
+            "The backfill skips bookings with no slot (`harbor/backfill.py:88`)".to_string(),
             "The cursor reads the vendor's own timestamp (`harbor/cursor.py:41`)".to_string(),
         ])
     )

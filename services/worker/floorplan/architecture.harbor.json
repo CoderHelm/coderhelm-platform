@@ -2,14 +2,14 @@
   "$schema": "floorplan/architecture@1",
   "project": {
     "name": "Harbor",
-    "summary": "A website where boaters book a slip, and the booking service that takes the booking and the payment."
+    "summary": "A website where patrons book a slot, and the booking service that takes the booking and the payment."
   },
   "nodes": [
     {
       "id": "web",
       "label": "Harbor website",
       "kind": "ui",
-      "summary": "Where boaters find a slip and book it.",
+      "summary": "Where patrons find a slot and book it.",
       "paths": [
         "harbor-web"
       ]
@@ -18,7 +18,7 @@
       "id": "mobile",
       "label": "Harbor app",
       "kind": "ui",
-      "summary": "The phone app where boaters sign in, pick a slip and book it.",
+      "summary": "The phone app where patrons sign in, pick a slot and book it.",
       "paths": [
         "harbor-mobile"
       ]
@@ -36,7 +36,7 @@
       "id": "cloud",
       "label": "Cloud setup",
       "kind": "infra",
-      "summary": "The receipts function, its upload bucket, and the nightly slip load.",
+      "summary": "The receipts function, its upload bucket, and the nightly slot load.",
       "paths": [
         "harbor-infra"
       ]
@@ -55,7 +55,7 @@
     {
       "node": "web",
       "title": "Start with the website",
-      "note": "Boaters pick a slip here and book it."
+      "note": "Patrons pick a slot here and book it."
     },
     {
       "node": "api",

@@ -1069,7 +1069,7 @@ mod tests {
         assert!(!n.contains("Title before"), "{n}");
     }
 
-    /// One alarm on a made-up marina's slip sensors fired four times in a
+    /// One alarm on a made-up library's slot sensors fired four times in a
     /// day. Each firing past the alert's repeat window started a new run
     /// beside the one already waiting on a person's answer, and each asked
     /// the same question again: the gate read every firing as an edited
@@ -1078,8 +1078,8 @@ mod tests {
     fn an_alert_firing_again_while_its_run_waits_starts_nothing() {
         let firing = |value: &str, at: &str| {
             let msg = serde_json::json!({
-                "AlarmName": "harbor-slip-sensor-drift",
-                "AlarmArn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:harbor-slip-sensor-drift",
+                "AlarmName": "harbor-slot-sensor-drift",
+                "AlarmArn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:harbor-slot-sensor-drift",
                 "NewStateValue": "ALARM",
                 "OldStateValue": "OK",
                 "NewStateReason": format!(

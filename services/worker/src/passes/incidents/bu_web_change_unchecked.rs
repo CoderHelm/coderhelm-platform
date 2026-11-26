@@ -290,7 +290,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
     let mut failure = fr::read(
         "E2E on preview",
         &fr::Sources {
-            comment: "1 failed\n  1) [chromium] › tests/booking.spec.ts:9:3 › Booking › shows the boat length error\n    Error: expect(locator).toBeVisible() failed".into(),
+            comment: "1 failed\n  1) [chromium] › tests/booking.spec.ts:9:3 › Booking › shows the locker length error\n    Error: expect(locator).toBeVisible() failed".into(),
             ..Default::default()
         },
     )
@@ -333,7 +333,7 @@ fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
         .find(|e| e.starts_with("`E2E on preview` failed"))
         .expect("the failure, read");
     assert!(
-        read.contains("tests/booking.spec.ts › shows the boat length error"),
+        read.contains("tests/booking.spec.ts › shows the locker length error"),
         "{read}"
     );
     assert!(read.contains("This change caused it"), "{read}");

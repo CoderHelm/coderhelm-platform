@@ -101,7 +101,7 @@ fn facts(test_fix: Hold, draft: bool, body: &str) -> Facts {
     Facts {
         draft,
         body: body.into(),
-        title: "fix(e2e): settle the marina menu before the click".into(),
+        title: "fix(e2e): settle the library menu before the click".into(),
         test_fix: Some(test_fix),
         ci: Ci {
             green: true,
@@ -238,7 +238,7 @@ fn an_end_to_end_proof_that_skips_drafts_is_run_on_a_ready_pull_request() {
     let f = Facts {
         draft: true,
         title: format!(
-            "{} settle the marina menu",
+            "{} settle the library menu",
             crate::passes::e2e::FIX_TICKET_PREFIX
         ),
         runs_when_ready: vec!["E2E after staging deploy".into()],

@@ -46,7 +46,7 @@ const SYNC_FILE: &str = "dags/tours/sync_links.py";
 
 const TOUR_TICKET: &str = "Link four full-day tours to Food Tasting\n\nThese full-day tours should show under Food Tasting as well as their own activity: \"Dawn Reef Tour\", \"Taste and Stroll\", \"Bay Explorers\", \"Tide Week\".";
 
-const PORTAL_TICKET: &str = "Embed the booking portal on the slips page\n\nShow the vendor's booking portal in an iframe on the slips page.\n\nAcceptance criteria:\n- The portal loads inside the page\n- No double scrollbars on desktop\n";
+const PORTAL_TICKET: &str = "Embed the booking portal on the slots page\n\nShow the vendor's booking portal in an iframe on the slots page.\n\nAcceptance criteria:\n- The portal loads inside the page\n- No double scrollbars on desktop\n";
 
 const BASE_MAP: &str = "TOUR_MULTI_STOP_OVERRIDES = {\n    \"harbor sampler tour\": [\"multi-stop\"],\n}\n\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name.lower(), [])\n";
 
@@ -86,22 +86,22 @@ fn tours_plan_after() -> PlanResult {
 
 fn portal_plan_before() -> PlanResult {
     plan(
-        "## Reuse\n- `SlipsPage` in web/src/pages/slips.tsx\n\n## Must not change\nThe header.\n\n\
-         ## Measure first\nThe vendor portal renders in an iframe with no inner scroll; clicking a slip adds it to the booking total.\n\n\
-         ## Smallest change\nAn iframe block on the slips page.\n\n\
+        "## Reuse\n- `SlotsPage` in web/src/pages/slots.tsx\n\n## Must not change\nThe header.\n\n\
+         ## Measure first\nThe vendor portal renders in an iframe with no inner scroll; clicking a slot adds it to the booking total.\n\n\
+         ## Smallest change\nAn iframe block on the slots page.\n\n\
          ## Proof\ne2e spec for the portal. If the frame scrolls, update the test to match the vendor.\n",
-        "- [ ] web/src/pages/slips.tsx: embed\n- [ ] e2e/portal.spec.ts: spec",
+        "- [ ] web/src/pages/slots.tsx: embed\n- [ ] e2e/portal.spec.ts: spec",
     )
 }
 
 fn portal_plan_after() -> PlanResult {
     plan(
-        "## Reuse\n- `SlipsPage` in web/src/pages/slips.tsx and its layout\n\n## Must not change\nThe header and other pages.\n\n\
-         ## Measure first\nprobe_page on the portal at 1280x900: the embed script caps the frame at the window height below its top (640px) and the portal scrolls inside it; every slip button is disabled until booking opens; nights are `booking-night-tag-N`.\n\n\
-         ## Smallest change\nAn iframe block on the slips page; drop the footer and bottom padding there so the frame fills the window, as the vendor's embed docs recommend.\n\n\
+        "## Reuse\n- `SlotsPage` in web/src/pages/slots.tsx and its layout\n\n## Must not change\nThe header and other pages.\n\n\
+         ## Measure first\nprobe_page on the portal at 1280x900: the embed script caps the frame at the window height below its top (640px) and the portal scrolls inside it; every slot button is disabled until booking opens; nights are `booking-night-tag-N`.\n\n\
+         ## Smallest change\nAn iframe block on the slots page; drop the footer and bottom padding there so the frame fills the window, as the vendor's embed docs recommend.\n\n\
          ## Proof\nOne e2e spec from the probe record: the page itself has no scrollbar at 1280x900, the frame is 640px, night tags are listed.\n\n\
          ## Out of scope\n- Booking after it opens: decided with the default: the spec checks only what the probe saw.\n",
-        "- [ ] web/src/pages/slips.tsx: embed, no footer\n- [ ] e2e/portal.spec.ts: spec from the probe",
+        "- [ ] web/src/pages/slots.tsx: embed, no footer\n- [ ] e2e/portal.spec.ts: spec from the probe",
     )
 }
 
@@ -157,7 +157,7 @@ fn the_coder_searches_first_and_never_adds_a_twin() {
     assert!(g.check_edit(MAP_FILE, BASE_MAP, &twin, &named).is_err());
     let entries = BASE_MAP.replace(
         "    \"harbor sampler tour\": [\"multi-stop\"],\n",
-        "    \"harbor sampler tour\": [\"multi-stop\"],\n    \"dawn reef tour\": [\"tasting\", \"sailing\"],\n",
+        "    \"harbor sampler tour\": [\"multi-stop\"],\n    \"dawn reef tour\": [\"tasting\", \"reading\"],\n",
     );
     assert!(g.check_edit(MAP_FILE, BASE_MAP, &entries, &named).is_ok());
 }
@@ -179,7 +179,7 @@ fn diff_before() -> Vec<(String, String, String)> {
 }
 
 fn diff_after() -> Vec<(String, String, String)> {
-    let map = "@@ -1,3 +1,7 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n     \"harbor sampler tour\": [\"multi-stop\"],\n+    \"dawn reef tour\": [\"tasting\", \"sailing\"],\n+    \"taste and stroll\": [\"tasting\", \"sailing\"],\n+    \"bay explorers\": [\"tasting\", \"multi-stop\"],\n+    \"tide week\": [\"tasting\", \"multi-stop\"],\n }\n";
+    let map = "@@ -1,3 +1,7 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n     \"harbor sampler tour\": [\"multi-stop\"],\n+    \"dawn reef tour\": [\"tasting\", \"reading\"],\n+    \"taste and stroll\": [\"tasting\", \"reading\"],\n+    \"bay explorers\": [\"tasting\", \"multi-stop\"],\n+    \"tide week\": [\"tasting\", \"multi-stop\"],\n }\n";
     let sync = "@@ -1,6 +1,11 @@\n def write_links(cur, tour_id, activities):\n-    for activity_id in activities:\n+    for activity_id in activities + extra_activities(tour_name):\n         cur.execute(\n             \"INSERT INTO tour_stops (tour_id, activity_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n";
     let test: String = (0..24)
         .map(|i| format!("+    assert links[{i}]\n"))

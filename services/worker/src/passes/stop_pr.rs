@@ -419,7 +419,7 @@ pub async fn open_with(
     } else {
         String::new()
     };
-    // The standard body's rules (`outcome::body_problems`): a slip is said
+    // The standard body's rules (`outcome::body_problems`): a slot is said
     // loudly, never sent silently.
     let draft_body = body(
         &super::outcome::ticket_line_for(msg),

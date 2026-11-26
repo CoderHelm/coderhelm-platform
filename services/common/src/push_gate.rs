@@ -822,7 +822,7 @@ mod tests {
         let touched = vec![
             "apps/web/src/utils/filters.ts".to_string(),
             "apps/web/src/test/utils/filters.test.ts".to_string(),
-            "e2e/tests/slips.spec.ts".to_string(),
+            "e2e/tests/slots.spec.ts".to_string(),
         ];
         let steps = package_steps(&touched, &manifests, &["pnpm-lock.yaml".into()]);
         assert_eq!(
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn a_test_red_after_two_pushed_fixes_stops_with_its_name() {
         let logs = "2030-03-16T23:37:45.1Z  FAIL  src/test/app/global-error.test.tsx > global-error > reports the error\n\
-                    2030-03-16T23:37:45.2Z  ✘  3 [chromium] › tests/slips.spec.ts:12:3 › selecting a slip adds it (12.3s)\n\
+                    2030-03-16T23:37:45.2Z  ✘  3 [chromium] › tests/slots.spec.ts:12:3 › selecting a slot adds it (12.3s)\n\
                     FAILED tests/test_sync.py::test_upsert - assert 1 == 2\n\
                     test sync::keeps_rows ... FAILED\n\
                     --- FAIL: TestKeep (0.00s)";
@@ -955,7 +955,7 @@ mod tests {
             t,
             vec![
                 "src/test/app/global-error.test.tsx > global-error > reports the error",
-                "tests/slips.spec.ts:12:3 › selecting a slip adds it",
+                "tests/slots.spec.ts:12:3 › selecting a slot adds it",
                 "tests/test_sync.py::test_upsert",
                 "sync::keeps_rows",
                 "TestKeep",

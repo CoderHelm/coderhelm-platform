@@ -436,7 +436,7 @@ pub async fn run_lookup(
     let read = check_read_only(query)?;
     // A hidden field is refused outright, so its value never leaves the team's
     // system. Checked by real field name: renaming it with an alias (which
-    // would slip past hiding by name in the response) changes nothing.
+    // would slot past hiding by name in the response) changes nothing.
     let terms = hidden_terms(hidden);
     if let Some(field) = read.all_fields.iter().find(|f| is_hidden(f, &terms)) {
         return Err(StepError::new(

@@ -3,19 +3,19 @@
   "name": "five overlapping journeys from different entries are one, the most complete",
   "flows": [
    {
-    "id": "book-a-berth",
-    "title": "Book a berth",
-    "entry": "screen:web:/berths",
+    "id": "book-a-booth",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths",
+      "key": "screen:web:/booths",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/page.tsx",
+      "view": "f:harbor-web/app/booths/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/page.tsx",
+        "file": "harbor-web/app/booths/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -23,13 +23,13 @@
       "linked": true
      },
      {
-      "key": "part:harbor-web/components/BerthForm.tsx#BerthForm",
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
       "kind": "screen",
-      "view": "f:harbor-web/components/BerthForm.tsx",
+      "view": "f:harbor-web/components/BoothForm.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/components/BerthForm.tsx",
+        "file": "harbor-web/components/BoothForm.tsx",
         "line": 3,
         "token": "x"
        }
@@ -37,13 +37,13 @@
       "linked": true
      },
      {
-      "key": "req:GET /api/berths",
+      "key": "req:GET /api/booths",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -51,13 +51,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pick",
+      "key": "screen:web:/booths/pick",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pick/page.tsx",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pick/page.tsx",
+        "file": "harbor-web/app/booths/pick/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -65,13 +65,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/quote",
+      "key": "req:POST /api/booths/quote",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -79,13 +79,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -93,13 +93,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/hold",
+      "key": "req:POST /api/booths/hold",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -135,13 +135,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/booked",
+      "key": "screen:web:/booths/booked",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/booked/page.tsx",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/booked/page.tsx",
+        "file": "harbor-web/app/booths/booked/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -151,19 +151,19 @@
     ]
    },
    {
-    "id": "book-a-berth-2",
-    "title": "Book a berth",
-    "entry": "screen:web:/berths",
+    "id": "book-a-booth-2",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths",
+      "key": "screen:web:/booths",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/page.tsx",
+      "view": "f:harbor-web/app/booths/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/page.tsx",
+        "file": "harbor-web/app/booths/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -171,13 +171,13 @@
       "linked": true
      },
      {
-      "key": "part:harbor-web/components/BerthForm.tsx#BerthForm",
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
       "kind": "screen",
-      "view": "f:harbor-web/components/BerthForm.tsx",
+      "view": "f:harbor-web/components/BoothForm.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/components/BerthForm.tsx",
+        "file": "harbor-web/components/BoothForm.tsx",
         "line": 3,
         "token": "x"
        }
@@ -185,13 +185,13 @@
       "linked": true
      },
      {
-      "key": "req:GET /api/berths",
+      "key": "req:GET /api/booths",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -199,13 +199,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pick",
+      "key": "screen:web:/booths/pick",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pick/page.tsx",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pick/page.tsx",
+        "file": "harbor-web/app/booths/pick/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -213,13 +213,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/hold",
+      "key": "req:POST /api/booths/hold",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -255,13 +255,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/booked",
+      "key": "screen:web:/booths/booked",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/booked/page.tsx",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/booked/page.tsx",
+        "file": "harbor-web/app/booths/booked/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -271,19 +271,19 @@
     ]
    },
    {
-    "id": "book-a-berth-3",
-    "title": "Book a berth",
-    "entry": "screen:web:/berths/pick",
+    "id": "book-a-booth-3",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths/pick",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths/pick",
+      "key": "screen:web:/booths/pick",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pick/page.tsx",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pick/page.tsx",
+        "file": "harbor-web/app/booths/pick/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -291,13 +291,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/quote",
+      "key": "req:POST /api/booths/quote",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -305,13 +305,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -319,13 +319,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/hold",
+      "key": "req:POST /api/booths/hold",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -361,13 +361,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/booked",
+      "key": "screen:web:/booths/booked",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/booked/page.tsx",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/booked/page.tsx",
+        "file": "harbor-web/app/booths/booked/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -391,19 +391,19 @@
     ]
    },
    {
-    "id": "a-book-a-berth",
-    "title": "A book a berth",
-    "entry": "part:harbor-web/components/BerthForm.tsx#BerthForm",
+    "id": "a-book-a-booth",
+    "title": "A book a booth",
+    "entry": "part:harbor-web/components/BoothForm.tsx#BoothForm",
     "origin": "trace",
     "steps": [
      {
-      "key": "part:harbor-web/components/BerthForm.tsx#BerthForm",
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
       "kind": "screen",
-      "view": "f:harbor-web/components/BerthForm.tsx",
+      "view": "f:harbor-web/components/BoothForm.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/components/BerthForm.tsx",
+        "file": "harbor-web/components/BoothForm.tsx",
         "line": 3,
         "token": "x"
        }
@@ -411,13 +411,13 @@
       "linked": true
      },
      {
-      "key": "req:GET /api/berths",
+      "key": "req:GET /api/booths",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -425,13 +425,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pick",
+      "key": "screen:web:/booths/pick",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pick/page.tsx",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pick/page.tsx",
+        "file": "harbor-web/app/booths/pick/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -439,13 +439,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/quote",
+      "key": "req:POST /api/booths/quote",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -453,13 +453,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -467,13 +467,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/hold",
+      "key": "req:POST /api/booths/hold",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -509,13 +509,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/booked",
+      "key": "screen:web:/booths/booked",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/booked/page.tsx",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/booked/page.tsx",
+        "file": "harbor-web/app/booths/booked/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -525,19 +525,19 @@
     ]
    },
    {
-    "id": "a-book-a-berth-2",
-    "title": "The Book a berth",
-    "entry": "screen:web:/berths",
+    "id": "a-book-a-booth-2",
+    "title": "The Book a booth",
+    "entry": "screen:web:/booths",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths",
+      "key": "screen:web:/booths",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/page.tsx",
+      "view": "f:harbor-web/app/booths/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/page.tsx",
+        "file": "harbor-web/app/booths/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -545,13 +545,13 @@
       "linked": true
      },
      {
-      "key": "part:harbor-web/components/BerthForm.tsx#BerthForm",
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
       "kind": "screen",
-      "view": "f:harbor-web/components/BerthForm.tsx",
+      "view": "f:harbor-web/components/BoothForm.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/components/BerthForm.tsx",
+        "file": "harbor-web/components/BoothForm.tsx",
         "line": 3,
         "token": "x"
        }
@@ -559,13 +559,13 @@
       "linked": true
      },
      {
-      "key": "req:GET /api/berths",
+      "key": "req:GET /api/booths",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -573,13 +573,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pick",
+      "key": "screen:web:/booths/pick",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pick/page.tsx",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pick/page.tsx",
+        "file": "harbor-web/app/booths/pick/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -587,13 +587,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/quote",
+      "key": "req:POST /api/booths/quote",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -601,13 +601,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -615,13 +615,13 @@
       "linked": true
      },
      {
-      "key": "req:POST /api/berths/hold",
+      "key": "req:POST /api/booths/hold",
       "kind": "request",
-      "view": "f:harbor-api/src/berths.controller.ts",
+      "view": "f:harbor-api/src/booths.controller.ts",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-api/src/berths.controller.ts",
+        "file": "harbor-api/src/booths.controller.ts",
         "line": 3,
         "token": "x"
        }
@@ -657,13 +657,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/booked",
+      "key": "screen:web:/booths/booked",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/booked/page.tsx",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/booked/page.tsx",
+        "file": "harbor-web/app/booths/booked/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -717,16 +717,16 @@
   ],
   "want": {
    "titles": [
-    "The Book a berth"
+    "The Book a booth"
    ],
    "ids": [
-    "the-book-a-berth"
+    "the-book-a-booth"
    ],
    "from": [
     [
-     "part:harbor-web/components/BerthForm.tsx#BerthForm",
-     "screen:web:/berths",
-     "screen:web:/berths/pick"
+     "part:harbor-web/components/BoothForm.tsx#BoothForm",
+     "screen:web:/booths",
+     "screen:web:/booths/pick"
     ]
    ]
   }
@@ -783,13 +783,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths",
+      "key": "screen:web:/booths",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/page.tsx",
+      "view": "f:harbor-web/app/booths/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/page.tsx",
+        "file": "harbor-web/app/booths/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -1081,18 +1081,18 @@
   "flows": [
    {
     "id": "pay",
-    "title": "Pay for a berth",
-    "entry": "screen:web:/berths/pay",
+    "title": "Pay for a booth",
+    "entry": "screen:web:/booths/pay",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -1128,13 +1128,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/paid",
+      "key": "screen:web:/booths/paid",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/paid/page.tsx",
+      "view": "f:harbor-web/app/booths/paid/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/paid/page.tsx",
+        "file": "harbor-web/app/booths/paid/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -1145,18 +1145,18 @@
    },
    {
     "id": "pay-2",
-    "title": "Pay for a berth",
-    "entry": "screen:web:/berths/pay",
+    "title": "Pay for a booth",
+    "entry": "screen:web:/booths/pay",
     "origin": "trace",
     "steps": [
      {
-      "key": "screen:web:/berths/pay",
+      "key": "screen:web:/booths/pay",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/pay/page.tsx",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/pay/page.tsx",
+        "file": "harbor-web/app/booths/pay/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -1192,13 +1192,13 @@
       "linked": true
      },
      {
-      "key": "screen:web:/berths/wallet-done",
+      "key": "screen:web:/booths/wallet-done",
       "kind": "screen",
-      "view": "f:harbor-web/app/berths/wallet-done/page.tsx",
+      "view": "f:harbor-web/app/booths/wallet-done/page.tsx",
       "note": "A step.",
       "evidence": [
        {
-        "file": "harbor-web/app/berths/wallet-done/page.tsx",
+        "file": "harbor-web/app/booths/wallet-done/page.tsx",
         "line": 3,
         "token": "x"
        }
@@ -1210,19 +1210,19 @@
   ],
   "want": {
    "titles": [
-    "Pay for a berth through POST /api/card",
-    "Pay for a berth through POST /api/wallet"
+    "Pay for a booth through POST /api/card",
+    "Pay for a booth through POST /api/wallet"
    ],
    "ids": [
-    "pay-for-a-berth-through-post-api-card",
-    "pay-for-a-berth-through-post-api-wallet"
+    "pay-for-a-booth-through-post-api-card",
+    "pay-for-a-booth-through-post-api-wallet"
    ],
    "from": [
     [
-     "screen:web:/berths/pay"
+     "screen:web:/booths/pay"
     ],
     [
-     "screen:web:/berths/pay"
+     "screen:web:/booths/pay"
     ]
    ]
   }

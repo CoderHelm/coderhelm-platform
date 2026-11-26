@@ -498,7 +498,7 @@ mod tests {
         ] {
             assert_eq!(validate_name(n), Err(NameProblem::Reserved), "{n}");
         }
-        for n in ["acme", "acme-labs", "north-pier", "duomo-labs"] {
+        for n in ["acme", "acme-labs", "north-annex", "duomo-labs"] {
             assert!(validate_name(n).is_ok(), "{n}");
         }
     }

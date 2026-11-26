@@ -50,7 +50,7 @@ fn served(url: &str) -> (String, Option<String>) {
 fn a_path_with_special_characters_is_the_file_github_serves() {
     for path in [
         "apps/web/src/app/%5Fmarkdown/[[...slug]]/route.ts",
-        "apps/web/src/app/(site)/[marina]/page.tsx",
+        "apps/web/src/app/(site)/[library]/page.tsx",
         "docs/notes on #3?.md",
         "data/100%.json",
         "plain/path.ts",
