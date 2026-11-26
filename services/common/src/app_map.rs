@@ -950,6 +950,149 @@ pub fn name_by_repo(graph: &mut Value) {
         n["label"] = json!(title);
         n["repos"] = json!(list);
     }
+    place_screens(graph, &names);
+}
+
+/// Every screen under exactly one System card, the one its own file is in,
+/// so the page's screen list, the overview's counts and the lookups group a
+/// screen by the card it belongs to, never by a bare repository:
+///
+/// - the card whose paths hold the screen's file (its route, renderer or
+///   schema file), matched as [`name_by_repo`] matches them; when several
+///   do, the most specific path wins;
+/// - else the card the file's own part sits in;
+/// - else the repository's main card (the one holding most of its files).
+///
+/// Sets the screen's `app` and `nav.app` to the card's id and `app_name` to
+/// its title; the folder a detector gave as `nav.app` stays as `nav.repo`.
+/// Placing twice changes nothing.
+fn place_screens(graph: &mut Value, names: &HashMap<String, String>) {
+    // (card id, folder, path inside it) for every card made from a repository.
+    let mut spans: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut card_ids: BTreeSet<String> = BTreeSet::new();
+    for n in arr(graph, "nodes").filter(|n| is_system(n) && n["kind"] != "external") {
+        let Some(id) = n["id"].as_str() else { continue };
+        for (folder, paths) in card_repos(n, names) {
+            card_ids.insert(id.to_string());
+            for p in paths {
+                spans.push((id.to_string(), folder.clone(), p));
+            }
+        }
+    }
+    if spans.is_empty() {
+        return;
+    }
+    let title: HashMap<String, String> = arr(graph, "nodes")
+        .filter_map(|n| {
+            Some((
+                n["id"].as_str()?.to_string(),
+                n["label"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let parents: HashMap<String, String> = arr(graph, "nodes")
+        .filter_map(|n| {
+            Some((
+                n["id"].as_str()?.to_string(),
+                n["parent"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let part_of: HashMap<&str, &str> = arr(graph, "files")
+        .filter_map(|f| Some((f["p"].as_str()?, f["n"].as_str()?)))
+        .collect();
+    // The card a path is in by the cards' paths: the longest that holds it.
+    let by_paths = |file: &str| -> Option<String> {
+        let mut segs = file.split('/').filter(|s| !s.is_empty());
+        let folder = segs.next()?;
+        let rest: Vec<&str> = segs.collect();
+        spans
+            .iter()
+            .filter(|(_, f, p)| {
+                f == folder && p.len() <= rest.len() && p.iter().zip(&rest).all(|(a, b)| a == b)
+            })
+            .max_by_key(|(_, _, p)| p.len())
+            .map(|(id, _, _)| id.clone())
+    };
+    // The card a file's own part sits in.
+    let by_part = |file: &str| -> Option<String> {
+        let mut cur = part_of.get(file)?.to_string();
+        for _ in 0..40 {
+            if card_ids.contains(&cur) {
+                return Some(cur);
+            }
+            cur = parents.get(&cur)?.clone();
+        }
+        None
+    };
+    // Each repository's main card: the one holding most of its files.
+    let mut held: HashMap<String, BTreeMap<String, usize>> = HashMap::new();
+    for f in arr(graph, "files") {
+        if let Some(p) = f["p"].as_str() {
+            if let (Some(card), Some(folder)) = (by_paths(p), p.split('/').next()) {
+                *held
+                    .entry(folder.to_string())
+                    .or_default()
+                    .entry(card)
+                    .or_default() += 1;
+            }
+        }
+    }
+    let main_card = |folder: &str| -> Option<String> {
+        if let Some(m) = held.get(folder) {
+            // most files, then the first card in the map's order on a tie
+            let order = |id: &String| {
+                spans
+                    .iter()
+                    .position(|(c, _, _)| c == id)
+                    .unwrap_or(usize::MAX)
+            };
+            return m
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| order(b.0).cmp(&order(a.0))))
+                .map(|(c, _)| c.clone());
+        }
+        spans
+            .iter()
+            .find(|(_, f, _)| f == folder)
+            .map(|(c, _, _)| c.clone())
+    };
+    let placed: Vec<Option<(String, String)>> = arr(graph, "screens")
+        .map(|s| {
+            let nav = &s["nav"];
+            let files: Vec<&str> = [s["file"].as_str(), nav["dispatcher"].as_str()]
+                .into_iter()
+                .flatten()
+                .chain(arr(nav, "evidence").filter_map(|e| e["file"].as_str()))
+                .collect();
+            let card = files
+                .iter()
+                .find_map(|f| by_paths(f))
+                .or_else(|| files.iter().find_map(|f| by_part(f)))
+                .or_else(|| files.iter().find_map(|f| main_card(f.split('/').next()?)))?;
+            let repo = nav["repo"]
+                .as_str()
+                .or(nav["app"].as_str().filter(|a| names.contains_key(*a)))
+                .or(files.first().and_then(|f| f.split('/').next()))
+                .unwrap_or("")
+                .to_string();
+            Some((card, repo))
+        })
+        .collect();
+    let Some(screens) = graph["screens"].as_array_mut() else {
+        return;
+    };
+    for (s, p) in screens.iter_mut().zip(placed) {
+        let Some((card, repo)) = p else { continue };
+        s["app"] = json!(card);
+        s["app_name"] = json!(title.get(&card).cloned().unwrap_or_else(|| card.clone()));
+        if s["nav"].is_object() {
+            s["nav"]["app"] = json!(card);
+            if !repo.is_empty() {
+                s["nav"]["repo"] = json!(repo);
+            }
+        }
+    }
 }
 
 fn arr<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = &'a Value> {
@@ -1028,8 +1171,9 @@ pub struct MapIndex {
 /// the copy again from the stored map instead of waiting for a build.
 /// 1: System cards titled by their repositories ([`name_by_repo`]). 2: a
 /// card split from a shared repository named by one folder word, not its
-/// path globs.
-pub const COPY_VERSION: u32 = 2;
+/// path globs. 3: every screen under the System card its file is in
+/// ([`place_screens`]).
+pub const COPY_VERSION: u32 = 3;
 
 /// What a map covers, for the Knowledge page: screens per app, outside
 /// services, cloud links and repositories.
@@ -1439,9 +1583,18 @@ pub fn viewer_copy(graph: &Value, now: &str) -> Value {
 
 /// The page's copy and the index of a map, gzipped, as they are stored.
 pub fn derived(graph: &Value, now: &str) -> (Vec<u8>, Vec<u8>) {
-    let view = gzip(viewer_copy(graph, now).to_string().as_bytes());
-    let index = gzip(&serde_json::to_vec(&MapIndex::of(graph)).unwrap_or_default());
+    let (view, index, _) = derived_with_index(graph, now);
     (view, index)
+}
+
+/// [`derived`] and the index itself. The index is counted on the copy, so
+/// screens are counted by the card they are under.
+fn derived_with_index(graph: &Value, now: &str) -> (Vec<u8>, Vec<u8>, MapIndex) {
+    let copy = viewer_copy(graph, now);
+    let view = gzip(copy.to_string().as_bytes());
+    let idx = MapIndex::of(&copy);
+    let index = gzip(&serde_json::to_vec(&idx).unwrap_or_default());
+    (view, index, idx)
 }
 
 /// Writes the page's copy and the index of `graph` next to it (the worker
@@ -1454,7 +1607,7 @@ pub async fn store_derived(
     team_id: &str,
     graph: &Value,
 ) -> Result<MapIndex, String> {
-    let (view, index) = derived(graph, &chrono::Utc::now().to_rfc3339());
+    let (view, index, idx) = derived_with_index(graph, &chrono::Utc::now().to_rfc3339());
     s3.put_object()
         .bucket(bucket)
         .key(view_key(team_id))
@@ -1474,7 +1627,7 @@ pub async fn store_derived(
         .send()
         .await
         .map_err(|e| format!("app map: could not keep the map's index: {e}"))?;
-    Ok(MapIndex::of(graph))
+    Ok(idx)
 }
 
 /// The team's map index and when it was written (unix seconds), if any.
@@ -1574,10 +1727,13 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
 /// read from the code (`url_from`) or is the route's own.
 fn screen_json(s: &Value) -> Value {
     let mut out = json!({"id": s["id"], "url": s["url"], "name": s["name"], "app": s["app"], "file": s["file"]});
+    keep(&mut out, s, &["app_name"]);
     let nav = &s["nav"];
     if nav.is_object() {
         keep(&mut out, nav, &["navigator", "group", "gate"]);
-        out["app"] = nav["app"].clone();
+        if !nav["app"].is_null() {
+            out["app"] = nav["app"].clone();
+        }
         if let Some(route) = nav["dispatcher"].as_str() {
             out["dispatch"] = json!({
                 "type": nav["type"],
@@ -1643,12 +1799,14 @@ pub fn overview(graph: &Value) -> Value {
     })
 }
 
-/// How many screens each app has (the overview lists the first 80).
+/// How many screens each app has (the overview lists the first 80), by
+/// the System card a screen is under ([`place_screens`]) when it is placed.
 fn screen_counts(graph: &Value) -> Value {
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
     for s in arr(graph, "screens") {
-        let app = s["nav"]["app"]
+        let app = s["app_name"]
             .as_str()
+            .or(s["nav"]["app"].as_str())
             .or(s["app"].as_str())
             .unwrap_or("app");
         *by.entry(app.to_string()).or_default() += 1;
@@ -3093,7 +3251,15 @@ mod tests {
         let view: Value = serde_json::from_slice(&gunzip(&view, MAX_GRAPH_BYTES).unwrap()).unwrap();
         let idx: MapIndex =
             serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
-        assert_eq!(idx, MapIndex::of(&harbor()));
+        // counted on the page's copy: screens by the card they are under
+        assert_eq!(idx, MapIndex::of(&viewer_copy(&harbor(), now)));
+        assert_eq!(
+            idx.coverage.screens,
+            BTreeMap::from([
+                ("harbor-mobile".to_string(), 3),
+                ("harbor-web".to_string(), 1)
+            ])
+        );
         assert_eq!(view["meta"]["exported"]["by"], "Coderhelm");
         assert!(view["meta"]["root"].is_null());
         for (r, f) in [
@@ -3933,6 +4099,123 @@ mod tests {
             {"p": "site/lambdas/resize/index.ts", "n": "fns", "r": "site"},
         ]);
         g
+    }
+
+    /// The monorepo with its screens as the detectors leave them: route
+    /// screens and screens a catch-all route dispatches to in the web app,
+    /// the studio's document kinds and tools, all under the bare folder.
+    fn site_with_screens() -> Value {
+        let mut g = site_monorepo();
+        let files = g["files"].as_array_mut().unwrap();
+        for (p, n) in [
+            ("site/apps/web/app/[...slug]/page.tsx", "web"),
+            ("site/apps/web/components/blocks/SlipList.tsx", "web"),
+            ("site/apps/web/components/blocks/Hero.tsx", "web"),
+            ("site/apps/studio/schemas/offer.ts", "studio"),
+            ("site/apps/studio/tools/import.tsx", "studio"),
+            ("site/tools/seed.ts", "web"),
+        ] {
+            files.push(json!({"p": p, "n": n, "r": "site"}));
+        }
+        let route = |id: &str, url: &str, file: &str| json!({"id": id, "url": url, "name": id, "file": file, "kind": "route", "nav": {"app": "site", "evidence": [{"file": file, "line": 1}]}});
+        let dispatched = |id: &str, file: &str| json!({"id": id, "url": "/:slug", "name": id, "file": file, "kind": "dispatch", "nav": {"app": "site", "dispatcher": "site/apps/web/app/[...slug]/page.tsx", "renderer": id, "evidence": [{"file": file, "line": 3}]}});
+        let studio = |id: &str, kind: &str, file: &str| json!({"id": id, "url": format!("/studio/{id}"), "name": id, "file": file, "kind": kind, "nav": {"app": "site", "evidence": [{"file": file, "line": 2}]}});
+        g["screens"] = json!([
+            route("screen:home", "/", "site/apps/web/app/page.tsx"),
+            route("screen:slips", "/slips", "site/apps/web/app/slips/page.tsx"),
+            dispatched("screen:slip-list", "site/apps/web/components/blocks/SlipList.tsx"),
+            dispatched("screen:hero", "site/apps/web/components/blocks/Hero.tsx"),
+            studio("screen:doc-slip", "page-kind", "site/apps/studio/schemas/slip.ts"),
+            studio("screen:doc-offer", "page-kind", "site/apps/studio/schemas/offer.ts"),
+            studio("screen:tool-import", "tool", "site/apps/studio/tools/import.tsx"),
+            // in no card's paths: under the card its part is in
+            route("screen:seed", "/seed", "site/tools/seed.ts"),
+            // a file the map doesn't hold, in no card: the repository's main card
+            route("screen:lost", "/lost", "site/other/lost.tsx"),
+            // Floorplan's own screen, already under a card id
+            {"id": "screen:fp", "url": "/about", "name": "About", "file": "site/apps/web/app/about/page.tsx", "app": "web"},
+        ]);
+        g
+    }
+
+    #[test]
+    fn every_screen_sits_under_the_card_its_file_is_in() {
+        let mut g = site_with_screens();
+        name_by_repo(&mut g);
+        let under: Vec<(&str, &str, &str)> = arr(&g, "screens")
+            .map(|s| {
+                (
+                    s["id"].as_str().unwrap(),
+                    s["app"].as_str().unwrap(),
+                    s["app_name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            under,
+            vec![
+                ("screen:home", "web", "site / web"),
+                ("screen:slips", "web", "site / web"),
+                ("screen:slip-list", "web", "site / web"),
+                ("screen:hero", "web", "site / web"),
+                ("screen:doc-slip", "studio", "site / studio"),
+                ("screen:doc-offer", "studio", "site / studio"),
+                ("screen:tool-import", "studio", "site / studio"),
+                ("screen:seed", "web", "site / web"),
+                ("screen:lost", "web", "site / web"),
+                ("screen:fp", "web", "site / web"),
+            ]
+        );
+        // the viewer groups by nav.app: a card's id, the folder kept as repo
+        let s = arr(&g, "screens")
+            .find(|s| s["id"] == "screen:hero")
+            .unwrap();
+        assert_eq!(
+            (&s["nav"]["app"], &s["nav"]["repo"]),
+            (&json!("web"), &json!("site"))
+        );
+        // No bare repository bucket, and the counts add up.
+        let counts = screen_counts(&g);
+        assert_eq!(counts, json!({"site / web": 7, "site / studio": 3}));
+        let total: u64 = counts
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert_eq!(total as usize, arr(&g, "screens").count());
+        // Placing twice changes nothing.
+        let once = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, once);
+    }
+
+    #[test]
+    fn the_overview_and_the_knowledge_counts_group_screens_by_card() {
+        let g = site_with_screens();
+        let mut l = Lookups::new(g.clone());
+        let (o, _) = l.lookup("map_overview", &json!({}));
+        assert_eq!(
+            o["screen_count"],
+            json!({"site / web": 7, "site / studio": 3})
+        );
+        assert!(
+            arr(&o, "screens").all(|s| s["app"] == "web" || s["app"] == "studio"),
+            "{o}"
+        );
+        let (sc, _) = l.lookup("map_screen", &json!({"screen": "screen:doc-offer"}));
+        assert_eq!(sc["screen"]["app_name"], "site / studio", "{sc}");
+        // the index the Knowledge page reads is counted on the page's copy
+        let (_, index) = derived(&g, "now");
+        let idx: MapIndex =
+            serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        assert_eq!(
+            idx.coverage.screens,
+            BTreeMap::from([
+                ("site / studio".to_string(), 3),
+                ("site / web".to_string(), 7)
+            ])
+        );
     }
 
     #[test]

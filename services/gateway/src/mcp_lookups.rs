@@ -2209,6 +2209,52 @@ mod tests {
         );
     }
 
+    /// The overview on /mcp counts and lists each screen under the System
+    /// card its file is in, never under a bare repository.
+    #[test]
+    fn the_map_overview_counts_screens_by_card() {
+        let mut g = json!({
+            "schema": common::app_map::GRAPH_SCHEMA, "project": {"name": "Site"},
+            "nodes": [
+                {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui", "paths": ["site/apps/web/**", "site/packages/**"]},
+                {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/apps/studio/**"]},
+            ],
+            "files": [
+                {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
+                {"p": "site/apps/web/blocks/Hero.tsx", "n": "web", "r": "site"},
+                {"p": "site/apps/studio/schemas/slip.ts", "n": "studio", "r": "site"},
+            ],
+            "screens": [
+                {"id": "screen:home", "url": "/", "name": "Home", "file": "site/apps/web/app/page.tsx", "nav": {"app": "site"}},
+                {"id": "screen:hero", "url": "/:slug", "name": "Hero", "file": "site/apps/web/blocks/Hero.tsx", "nav": {"app": "site", "dispatcher": "site/apps/web/app/page.tsx"}},
+                {"id": "screen:doc", "url": "/studio/slip", "name": "Slip", "file": "site/apps/studio/schemas/slip.ts", "kind": "page-kind", "nav": {"app": "site"}},
+            ],
+            "links": [],
+        });
+        common::app_map::stamp_repos(&mut g, &common::app_map::folders(&["harbor/site".into()]));
+        let read = read_of(MAP_OVERVIEW, &json!({})).unwrap();
+        let (text, _) = map_read(Some(g), &mut Registry::default(), &read).unwrap();
+        let o: Value = serde_json::from_str(text.split_once("] ").unwrap().1).unwrap();
+        assert_eq!(
+            o["screen_count"],
+            json!({"site / web": 2, "site / studio": 1})
+        );
+        let apps: Vec<(&str, &str)> = o["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["id"].as_str().unwrap(), s["app_name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            apps,
+            vec![
+                ("screen:home", "site / web"),
+                ("screen:hero", "site / web"),
+                ("screen:doc", "site / studio")
+            ]
+        );
+    }
+
     /// A journey on /mcp: the same lookup as Chat's, every step citing its
     /// file and line, cited back to the App map page.
     #[test]
@@ -2612,8 +2658,8 @@ mod tests {
         ] {
             assert!(listed.contains(&n), "{n} in {listed:?}");
         }
-        // every screen is counted: the route files under the app's part, the
-        // dispatched pages under its repository, as the detectors' screens are
+        // every screen is counted, all under the app's card (named by its
+        // repository): the route files and the pages they dispatch to alike
         let counted: u64 = o["screen_count"]
             .as_object()
             .unwrap()
@@ -2621,7 +2667,7 @@ mod tests {
             .filter_map(Value::as_u64)
             .sum();
         assert_eq!(counted, 7);
-        assert_eq!(o["screen_count"]["marina-web"], 5);
+        assert_eq!(o["screen_count"], json!({ "marina-web": 7 }));
 
         let f = marina_tool(MAP_FIND, json!({ "query": "member checkout" }));
         assert_eq!(f["screens"][0]["url"], "/members/checkout");
