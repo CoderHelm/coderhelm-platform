@@ -2179,6 +2179,8 @@ pub fn to_flow(
         "id": fl::slug(&title),
         "title": title,
         "entry": table[entry_id]["key"],
+        // The entry it came from: its retrace replaces it.
+        "from": [table[entry_id]["key"]],
         "origin": "trace",
         "open": journey["open"] == true,
         "steps": steps,
@@ -2942,7 +2944,8 @@ mod tests {
             .iter()
             .map(|f| f["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["j-a", "j-b", "j-c", "j-d"]);
+        // Each id is its title's.
+        assert_eq!(ids, ["a", "b", "c", "d"]);
         for id in ["a", "b", "c", "d"] {
             assert_eq!(
                 store["asked"][format!("screen:web:/{id}")],

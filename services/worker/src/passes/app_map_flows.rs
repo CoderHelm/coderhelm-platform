@@ -611,19 +611,14 @@ pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
         .iter()
         .filter_map(|f| f["entry"].as_str().map(str::to_string))
         .collect();
+    // A retrace replaces every journey that came from its entry, including
+    // one moved here from a split catch-all (`from`).
     let mut flows: Vec<Value> = store["flows"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|f| {
-            let e = f["entry"].as_str().unwrap_or("");
-            !written.contains(e)
-        })
+        .filter(|f| !from_of(f).iter().any(|e| written.contains(e)))
         .cloned()
-        .collect();
-    let mut taken: BTreeSet<String> = flows
-        .iter()
-        .filter_map(|f| f["id"].as_str().map(str::to_string))
         .collect();
     for mut f in new {
         let entry = f["entry"].as_str().unwrap_or("").to_string();
@@ -632,16 +627,11 @@ pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
             a => a["hash"].as_str().unwrap_or("").to_string(),
         });
         f["hash"] = json!(hash.unwrap_or_default());
-        let base = f["id"].as_str().unwrap_or("journey").to_string();
-        let mut id = base.clone();
-        let mut n = 2;
-        while !taken.insert(id.clone()) {
-            id = format!("{base}-{n}");
-            n += 1;
-        }
-        f["id"] = json!(id);
+        f["from"] = json!([entry]);
+        f["_fresh"] = json!(true);
         flows.push(f);
     }
+    let flows = dedupe(flows);
     let mut asked: serde_json::Map<String, Value> =
         store["asked"].as_object().cloned().unwrap_or_default();
     for (k, h) in hashes {
@@ -654,6 +644,242 @@ pub fn merge(store: &Value, todo: &Value, new: Vec<Value>) -> Value {
     out["schema"] = json!(SCHEMA);
     out["flows"] = json!(flows);
     out["asked"] = Value::Object(asked);
+    out
+}
+
+/// The entries a stored journey stands for (`from`, else its entry).
+fn from_of(f: &Value) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = f["from"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.as_str().map(str::to_string))
+        .collect();
+    if f["from"].as_array().is_none() {
+        if let Some(e) = f["entry"].as_str().filter(|e| !e.is_empty()) {
+            out.insert(e.to_string());
+        }
+    }
+    out
+}
+
+/// A title compared as words: case, punctuation and a leading article
+/// ignored (`flows.mjs` `titleWords`).
+pub fn title_words(t: &str) -> String {
+    let lower = t.to_lowercase();
+    let spaced: String = lower
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let mut w: Vec<&str> = spaced.split_whitespace().collect();
+    while w.len() > 1 && ["a", "an", "the"].contains(&w[0]) {
+        w.remove(0);
+    }
+    w.join(" ")
+}
+
+/// A step's place in plain words (`flows.mjs` `stepLabel`).
+pub fn step_label(key: &str) -> String {
+    if let Some(r) = key.strip_prefix("screen:") {
+        return match r.split_once(':') {
+            Some((app, rest)) => format!("{app} {rest}"),
+            None => r.to_string(),
+        };
+    }
+    for p in ["part:", "code:"] {
+        if let Some(r) = key.strip_prefix(p) {
+            return match key.find('#') {
+                Some(i) => key[i + 1..].to_string(),
+                None => r.to_string(),
+            };
+        }
+    }
+    for p in ["req:", "hook:", "event:", "n:"] {
+        if let Some(r) = key.strip_prefix(p) {
+            return r.to_string();
+        }
+    }
+    key.to_string()
+}
+
+fn step_keys(f: &Value) -> Vec<String> {
+    f["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            s["key"]
+                .as_str()
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Whether two journeys are one (`flows.mjs` `sameJourney`): a journey
+/// from a catch-all route and the trace of a screen it was split into with
+/// the same goal or end; else the same goal with mostly the same steps (the
+/// same last 3, or 60% shared), or 80% of their steps shared.
+pub fn same_journey(a: &Value, b: &Value) -> bool {
+    let (ka, kb) = (step_keys(a), step_keys(b));
+    let sa: BTreeSet<&String> = ka.iter().collect();
+    let sb: BTreeSet<&String> = kb.iter().collect();
+    let both = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    let j = if union == 0 {
+        0.0
+    } else {
+        both as f64 / union as f64
+    };
+    let last3 = ka.len() >= 3 && kb.len() >= 3 && ka[ka.len() - 3..] == kb[kb.len() - 3..];
+    let same_title = title_words(a["title"].as_str().unwrap_or(""))
+        == title_words(b["title"].as_str().unwrap_or(""));
+    let split_of = |o: &Value, f: &Value| {
+        o["split"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|k| *k == f["entry"]))
+    };
+    let same_end = !ka.is_empty() && ka.last() == kb.last();
+    if (split_of(a, b) || split_of(b, a)) && (same_title || same_end) {
+        return true;
+    }
+    (same_title && (last3 || j >= 0.6)) || j >= 0.8
+}
+
+/// One journey per goal (`flows.mjs` `dedupe`, the same rules, both tested
+/// on `floorplan/fixtures/journeys-dedupe.json`). Near-identical journeys
+/// are merged into the most complete one (a fresh trace, `_fresh`, first;
+/// then the most steps on the map, the most steps, the most cited steps),
+/// which stands for all their entries (`from`). Journeys left with the same
+/// title are titled by how they differ (where they start, or a step only
+/// they take), and every id is its title's.
+pub fn dedupe(flows: Vec<Value>) -> Vec<Value> {
+    let mut list: Vec<(Value, usize)> = flows
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut f)| {
+            f["from"] = json!(from_of(&f).into_iter().collect::<Vec<_>>());
+            (f, i)
+        })
+        .collect();
+    let on_map = |f: &Value| {
+        step_keys(f)
+            .iter()
+            .filter(|k| !k.starts_with("code:"))
+            .count()
+    };
+    let steps = |f: &Value| f["steps"].as_array().map(Vec::len).unwrap_or(0);
+    let cited = |f: &Value| {
+        f["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                s["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e["line"].as_f64().is_some_and(|l| l >= 1.0))
+            })
+            .count()
+    };
+    list.sort_by(|(x, i), (y, j)| {
+        (y["_fresh"] == true)
+            .cmp(&(x["_fresh"] == true))
+            .then(on_map(y).cmp(&on_map(x)))
+            .then(steps(y).cmp(&steps(x)))
+            .then(cited(y).cmp(&cited(x)))
+            .then(i.cmp(j))
+    });
+    let mut kept: Vec<(Value, usize)> = Vec::new();
+    for (f, i) in list {
+        if let Some((into, _)) = kept.iter_mut().find(|(k, _)| same_journey(k, &f)) {
+            let mut from = from_of(into);
+            from.extend(from_of(&f));
+            into["from"] = json!(from.into_iter().collect::<Vec<_>>());
+            continue;
+        }
+        kept.push((f, i));
+    }
+    kept.sort_by_key(|(_, i)| *i);
+    let mut out: Vec<Value> = kept.into_iter().map(|(f, _)| f).collect();
+    // Titles that still repeat say how the journeys differ.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, f) in out.iter().enumerate() {
+        let w = title_words(f["title"].as_str().unwrap_or(""));
+        match groups.iter_mut().find(|(g, _)| *g == w) {
+            Some((_, v)) => v.push(i),
+            None => groups.push((w, vec![i])),
+        }
+    }
+    for (_, g) in &groups {
+        if g.len() < 2 {
+            continue;
+        }
+        let keys: Vec<Vec<String>> = g.iter().map(|i| step_keys(&out[*i])).collect();
+        let starts: Vec<String> = keys
+            .iter()
+            .map(|k| k.first().map(|s| step_label(s)).unwrap_or_default())
+            .collect();
+        for (n, i) in g.iter().enumerate() {
+            let own = keys[n].iter().find(|k| {
+                keys.iter()
+                    .enumerate()
+                    .all(|(m, o)| m == n || !o.contains(k))
+            });
+            let base = out[*i]["title"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("Journey")
+                .to_string();
+            if !starts[n].is_empty() && starts.iter().filter(|s| **s == starts[n]).count() == 1 {
+                out[*i]["title"] = json!(format!("{base} from {}", starts[n]));
+            } else if let Some(own) = own {
+                out[*i]["title"] = json!(format!("{base} through {}", step_label(own)));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for f in out.iter_mut() {
+        let title = f["title"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Journey")
+            .to_string();
+        let mut t = title.clone();
+        let mut n = 2;
+        while seen.contains(&title_words(&t)) {
+            t = format!("{title} ({n})");
+            n += 1;
+        }
+        seen.insert(title_words(&t));
+        f["title"] = json!(t);
+    }
+    let mut ids = BTreeSet::new();
+    for f in out.iter_mut() {
+        let s = slug(f["title"].as_str().unwrap_or(""));
+        let base = if s.is_empty() {
+            "journey".to_string()
+        } else {
+            s
+        };
+        let mut id = base.clone();
+        let mut n = 2;
+        while !ids.insert(id.clone()) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        f["id"] = json!(id);
+        if let Some(o) = f.as_object_mut() {
+            o.remove("_fresh");
+        }
+    }
     out
 }
 
@@ -1130,6 +1356,119 @@ mod tests {
             json!({"flows": []})
         );
         assert!(parse_answer("no json").is_none());
+    }
+
+    #[test]
+    fn near_identical_journeys_are_one_and_no_two_share_a_title_as_the_sandbox_has_it() {
+        // The same cases the sandbox's `dedupe` is tested on.
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../floorplan/fixtures/journeys-dedupe.json"
+        ))
+        .unwrap();
+        for c in cases.as_array().unwrap() {
+            let out = dedupe(c["flows"].as_array().unwrap().clone());
+            let got = |k: &str| out.iter().map(|f| f[k].clone()).collect::<Vec<_>>();
+            let name = c["name"].as_str().unwrap();
+            assert_eq!(json!(got("title")), c["want"]["titles"], "{name}");
+            assert_eq!(json!(got("id")), c["want"]["ids"], "{name}");
+            assert_eq!(json!(got("from")), c["want"]["from"], "{name}");
+            assert!(out.iter().all(|f| f.get("_fresh").is_none()));
+            let titles: BTreeSet<String> = out
+                .iter()
+                .map(|f| title_words(f["title"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                titles.len(),
+                out.len(),
+                "{name}: no two journeys share a title"
+            );
+            // Running it again changes nothing.
+            assert_eq!(dedupe(out.clone()), out, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_retrace_replaces_every_journey_from_its_entry() {
+        let step = |k: &str| json!({"key": k, "kind": "screen", "view": "f:x.tsx", "note": "A step.", "evidence": [{"file": "x.tsx", "line": 1, "token": "x"}]});
+        let fl = |id: &str, title: &str, entry: &str, from: Option<Value>, keys: &[&str]| {
+            let mut f = json!({"id": id, "title": title, "entry": entry, "origin": "trace", "steps": keys.iter().map(|k| step(k)).collect::<Vec<_>>()});
+            if let Some(from) = from {
+                f["from"] = from;
+            }
+            f
+        };
+        let store = json!({"schema": SCHEMA, "flows": [
+            // Two older traces of the sign-in screen, under different titles.
+            fl("sign-in", "Sign in", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/session", "screen:web:/slips"]),
+            fl("log-in-again", "Log in again", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/refresh", "screen:web:/slips"]),
+            // A journey moved here from a split catch-all.
+            fl("book-an-event", "Book an event", "screen:web:/events/(event)", Some(json!(["screen:web:/[...slug]", "screen:web:/events/(event)"])), &["screen:web:/events/(event)", "req:GET /api/events", "screen:web:/events/booked"]),
+            fl("book-a-slip", "Book a slip", "screen:web:/slips/:id", None, &["screen:web:/slips/:id", "req:POST /api/slips", "screen:web:/slips/booked"]),
+        ], "asked": {}});
+        let todo = json!({"entries": [{"key": "screen:web:/login", "hash": "h1"}, {"key": "screen:web:/[...slug]", "hash": "h2"}]});
+        let new = vec![
+            fl(
+                "sign-in",
+                "Sign in",
+                "screen:web:/login",
+                None,
+                &[
+                    "screen:web:/login",
+                    "req:POST /auth/login",
+                    "n:okta",
+                    "screen:web:/slips",
+                ],
+            ),
+            fl(
+                "book-an-event",
+                "Book an event",
+                "screen:web:/[...slug]",
+                None,
+                &[
+                    "screen:web:/[...slug]",
+                    "req:POST /api/events/book",
+                    "screen:web:/events/booked",
+                ],
+            ),
+        ];
+        let m = merge(&store, &todo, new);
+        let got: Vec<(String, String, Value)> = m["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["id"].as_str().unwrap().to_string(),
+                    f["title"].as_str().unwrap().to_string(),
+                    f["from"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "book-a-slip".to_string(),
+                    "Book a slip".to_string(),
+                    json!(["screen:web:/slips/:id"])
+                ),
+                (
+                    "sign-in".to_string(),
+                    "Sign in".to_string(),
+                    json!(["screen:web:/login"])
+                ),
+                (
+                    "book-an-event".to_string(),
+                    "Book an event".to_string(),
+                    json!(["screen:web:/[...slug]"])
+                ),
+            ]
+        );
+        assert_eq!(
+            m["flows"][1]["steps"].as_array().unwrap().len(),
+            4,
+            "the new trace"
+        );
     }
 
     #[test]

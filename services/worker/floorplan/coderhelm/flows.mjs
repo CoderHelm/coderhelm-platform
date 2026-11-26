@@ -1134,7 +1134,7 @@ export function candidates(graph, read) {
     const focus = s.nav?.renderer && s.fw === 'dispatch' ? [s.nav.renderer] : null;
     // the lines its renderer spans, so a traced step inside them lands on this screen and not a neighbour
     const span = focus ? ranges(ix, r, file).get(focus[0]) : null;
-    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}) });
+    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}), ...(focus && s.nav?.dispatcher ? { dispatcher: s.nav.dispatcher } : {}) });
     if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
     return c;
   };
@@ -1564,9 +1564,130 @@ export function revalidate(store, c, read) {
     else if (steps.length < 3) why = 'fewer than 3 steps are left';
     if (why) { dropped.push({ id: fl.id, title: fl.title, entry: fl.entry, why }); continue; }
     if (entry !== fl.entry) split.push(entry);
-    kept.push({ ...fl, entry, steps });
+    // The entries this journey stands for: a retrace of any of them replaces it.
+    const from = [...new Set([...(fl.from || [fl.entry]), entry])].sort();
+    // A journey that starts on a catch-all route now split into one screen
+    // per type: those screens' traces retire it when they have its goal.
+    const start = c.byKey.get(entry);
+    const routeFile = steps[0]?.evidence?.[0]?.file;
+    const splitInto = start?.dispatcher ? [] : c.list.filter((x) => x.kind === 'screen' && x.dispatcher && (x.dispatcher === routeFile || x.dispatcher === start?.file)).map((x) => x.key).sort();
+    const { split: _old, ...rest } = fl;
+    kept.push({ ...rest, entry, from, ...(splitInto.length ? { split: splitInto } : {}), steps });
   }
   return { kept, dropped, changed, split, repointed };
+}
+
+// ── One journey per goal ─────────────────────────────────────────────────
+// The same rules as the worker's `app_map_flows::dedupe` (both read
+// `fixtures/journeys-dedupe.json` in their tests).
+
+/** A title compared as words: case, punctuation and a leading article ignored. */
+export function titleWords(t) {
+  const w = String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
+  while (w.length > 1 && ['a', 'an', 'the'].includes(w[0])) w.shift();
+  return w.join(' ');
+}
+
+/** A journey id from its title (the worker's `slug`). */
+export function slug(s) {
+  let out = '';
+  for (const ch of String(s || '')) {
+    if (/^[A-Za-z0-9]$/.test(ch)) out += ch.toLowerCase();
+    else if (out && !out.endsWith('-')) out += '-';
+  }
+  return out.replace(/-+$/, '').slice(0, 60);
+}
+
+/** A step's place in plain words, for a title that says how two journeys differ. */
+export function stepLabel(key) {
+  const k = String(key || '');
+  const after = (p) => k.slice(p.length);
+  if (k.startsWith('screen:')) {
+    const r = after('screen:');
+    const i = r.indexOf(':');
+    return i >= 0 ? `${r.slice(0, i)} ${r.slice(i + 1)}` : r;
+  }
+  for (const p of ['part:', 'code:']) if (k.startsWith(p)) { const i = k.indexOf('#'); return i >= 0 ? k.slice(i + 1) : after(p); }
+  for (const p of ['req:', 'hook:', 'event:', 'n:']) if (k.startsWith(p)) return after(p);
+  return k;
+}
+
+const stepKeys = (f) => (f.steps || []).map((s) => (typeof s.key === 'string' ? s.key : '')).filter(Boolean);
+
+/** Whether two journeys are one: the same goal with mostly the same steps
+ * (the same last 3, or 60% of their steps shared), or 80% of their steps
+ * shared whatever they are called. */
+export function sameJourney(a, b) {
+  const ka = stepKeys(a);
+  const kb = stepKeys(b);
+  const A = new Set(ka);
+  const B = new Set(kb);
+  const both = [...A].filter((k) => B.has(k)).length;
+  const union = new Set([...A, ...B]).size;
+  const j = union ? both / union : 0;
+  const last3 = ka.length >= 3 && kb.length >= 3 && ka.slice(-3).join('\n') === kb.slice(-3).join('\n');
+  const sameTitle = titleWords(a.title) === titleWords(b.title);
+  // A journey from a catch-all route and the trace of one of the screens it
+  // was split into: one, when they have the same goal or end in one place.
+  const splitOf = (o, f) => (o.split || []).includes(f.entry);
+  const sameEnd = ka.length > 0 && ka[ka.length - 1] === kb[kb.length - 1];
+  if ((splitOf(a, b) || splitOf(b, a)) && (sameTitle || sameEnd)) return true;
+  return (sameTitle && (last3 || j >= 0.6)) || j >= 0.8;
+}
+
+/** One journey per goal. Near-identical journeys are merged into the most
+ * complete (a fresh trace first, then the most steps on the map, the most
+ * steps, the most cited steps), which then stands for all their entries
+ * (`from`). Journeys left with the same title are titled by how they
+ * differ (where they start, or a step only they take), and every id is
+ * its title's. Pure: the same input gives the same journeys. */
+export function dedupe(flows) {
+  const list = (flows || []).map((f, i) => ({ f: { ...f, from: [...new Set(f.from || (f.entry ? [f.entry] : []))].sort() }, i }));
+  const onMap = (f) => stepKeys(f).filter((k) => !k.startsWith('code:')).length;
+  const cited = (f) => (f.steps || []).filter((s) => (s.evidence || []).some((e) => Number(e.line) >= 1)).length;
+  const order = [...list].sort((x, y) => Number(!!y.f._fresh) - Number(!!x.f._fresh) || onMap(y.f) - onMap(x.f) || (y.f.steps || []).length - (x.f.steps || []).length || cited(y.f) - cited(x.f) || x.i - y.i);
+  const kept = [];
+  for (const x of order) {
+    const into = kept.find((k) => sameJourney(k.f, x.f));
+    if (into) {
+      into.f.from = [...new Set([...into.f.from, ...x.f.from])].sort();
+      continue;
+    }
+    kept.push(x);
+  }
+  kept.sort((x, y) => x.i - y.i);
+  const out = kept.map((x) => x.f);
+  // Titles that still repeat say how the journeys differ.
+  const groups = new Map();
+  for (const f of out) { const w = titleWords(f.title); if (!groups.has(w)) groups.set(w, []); groups.get(w).push(f); }
+  for (const g of groups.values()) {
+    if (g.length < 2) continue;
+    const starts = g.map((f) => stepLabel(stepKeys(f)[0]));
+    g.forEach((f, n) => {
+      const others = g.filter((o) => o !== f).map((o) => new Set(stepKeys(o)));
+      const own = stepKeys(f).find((k) => others.every((o) => !o.has(k)));
+      const base = f.title || 'Journey';
+      if (starts.filter((s) => s === starts[n]).length === 1 && starts[n]) f.title = `${base} from ${starts[n]}`;
+      else if (own) f.title = `${base} through ${stepLabel(own)}`;
+    });
+  }
+  const seen = new Set();
+  for (const f of out) {
+    let t = f.title || 'Journey';
+    for (let n = 2; seen.has(titleWords(t)); n++) t = `${f.title || 'Journey'} (${n})`;
+    f.title = t;
+    seen.add(titleWords(t));
+  }
+  const ids = new Set();
+  for (const f of out) {
+    const base = slug(f.title) || 'journey';
+    let id = base;
+    for (let n = 2; ids.has(id); n++) id = `${base}-${n}`;
+    ids.add(id);
+    f.id = id;
+    delete f._fresh;
+  }
+  return out;
 }
 
 /** The files the candidates `ids` cite, sorted. */
@@ -1648,7 +1769,11 @@ export function table(c, ids, read) {
 export function prepare(root, graph, prev) {
   const read = reader(root);
   const c = candidates(graph, read);
-  const { kept, dropped, changed, split, repointed } = revalidate(prev, c, read);
+  const checked = revalidate(prev, c, read);
+  const { dropped, changed, split, repointed } = checked;
+  // Near-identical journeys from different entries are one (no model call).
+  const carried = checked.kept.length;
+  const kept = dedupe(checked.kept);
   const asked = { ...(prev?.asked || {}) };
   const ent = entries(c);
   const subs = new Map(ent.map((e) => [e.key, subgraph(c, e)]));
@@ -1730,6 +1855,6 @@ export function prepare(root, graph, prev) {
     store,
     flows: kept.map(forViewer),
     todo,
-    report: { candidates: c.list.length, entries: ent.length, kept: kept.length, dropped, redo: todoEntries.length, new: count('new'), changed: count('changed'), missing: count('missing'), repointed },
+    report: { candidates: c.list.length, entries: ent.length, kept: kept.length, dropped, redo: todoEntries.length, new: count('new'), changed: count('changed'), missing: count('missing'), repointed, merged: carried - kept.length },
   };
 }
