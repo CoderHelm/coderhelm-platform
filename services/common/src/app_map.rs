@@ -2035,7 +2035,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
 /// Most items [`impact`] lists in each of its groups; the rest are counted.
 pub const IMPACT_CAP: usize = 20;
 
-/// The methods an endpoint target may start with (`POST /slips/:id`).
+/// The methods an endpoint target may start with (`POST /slots/:id`).
 const METHODS: [&str; 9] = [
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY", "ALL",
 ];
@@ -2126,7 +2126,7 @@ fn capped(items: Vec<Value>, key: &str, more: &mut Map<String, Value>) -> Value 
 
 /// What changing one thing reaches across the whole app, in one answer:
 /// `target` is a file on the map (`harbor-api/src/bookings.js`), an
-/// endpoint (`POST /slips/:id/bookings`, or `r:0`) or a part's id. Lists the
+/// endpoint (`POST /slots/:id/bookings`, or `r:0`) or a part's id. Lists the
 /// callers in other repositories and in the same one, the screens that use
 /// it (with their app and whether they need a signed-in user), the journeys
 /// that pass through it, the outside services it reaches (and those that
@@ -2626,7 +2626,7 @@ pub const TOOLS: [&str; 7] = [
 
 /// What `map_impact` is told to be for, the same words everywhere it is
 /// offered (runs, Chat and `/mcp`).
-pub const IMPACT_DESCRIPTION: &str = "Before changing shared code or an endpoint: everything on the app map that changing one thing reaches, in one answer. Give a file's path on the map (repository folder first, like harbor-api/src/bookings.js), an endpoint (method and path, like POST /slips/:id/bookings) or a part's id. Returns the callers in other repositories and in the same one, the screens that use it (their app and whether they need a signed-in user), the journeys that pass through it, the outside services it reaches or that call it, the cloud resources that start or deploy it, and the data links (tables), each with the file:line it rests on.";
+pub const IMPACT_DESCRIPTION: &str = "Before changing shared code or an endpoint: everything on the app map that changing one thing reaches, in one answer. Give a file's path on the map (repository folder first, like harbor-api/src/bookings.js), an endpoint (method and path, like POST /slots/:id/bookings) or a part's id. Returns the callers in other repositories and in the same one, the screens that use it (their app and whether they need a signed-in user), the journeys that pass through it, the outside services it reaches or that call it, the cloud resources that start or deploy it, and the data links (tables), each with the file:line it rests on.";
 
 pub fn is_tool(name: &str) -> bool {
     TOOLS.contains(&name)
@@ -2639,7 +2639,7 @@ pub fn tool_defs() -> Vec<Value> {
         json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the journeys (user flows such as sign in or checkout), the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
         json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
         json!({"name": TOOLS[2], "description": "One part of the app map by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
-        json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
+        json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slots/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
         json!({"name": TOOLS[4], "description": "One file by its path on the app map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
         json!({"name": TOOLS[5], "description": "One journey on the app map (a user flow such as sign in, password reset or checkout), by its id or the words of its title (like \"mobile sign in\"): every step in order, from the screen through the requests, the server code and outside services to the next screen, each with what happens there and the file:line it cites. Use it to walk someone through a flow.", "input_schema": obj(json!({"journey": {"type": "string"}}), &["journey"])}),
         json!({"name": TOOLS[6], "description": IMPACT_DESCRIPTION, "input_schema": obj(json!({"target": {"type": "string", "description": "A file's path on the map, an endpoint (METHOD /path) or a part's id."}}), &["target"])}),
@@ -2758,7 +2758,7 @@ impl Lookups {
     }
 }
 
-/// What a lookup is shown as: "Searched the app map for slip".
+/// What a lookup is shown as: "Searched the app map for slot".
 pub fn label(name: &str, input: &Value) -> String {
     let s = |k: &str| crate::truncate_str(input[k].as_str().unwrap_or("").trim(), 80).to_string();
     match name {
@@ -3107,11 +3107,11 @@ mod tests {
     fn repositories_get_stable_folders() {
         let f = folders(&[
             "harbor/web".into(),
-            "marina/web".into(),
+            "library/web".into(),
             "harbor/api".into(),
         ]);
         assert_eq!(f["harbor/web"], "harbor-web");
-        assert_eq!(f["marina/web"], "marina-web");
+        assert_eq!(f["library/web"], "library-web");
         assert_eq!(f["harbor/api"], "api");
         let g = harbor();
         assert_eq!(
@@ -3132,9 +3132,9 @@ mod tests {
             WorkItem {
                 run_id: "r1".into(),
                 repo: "harbor/harbor-api".into(),
-                ticket: "DOCK-42".into(),
+                ticket: "WING-42".into(),
                 title: "Stop double bookings".into(),
-                why: "Two boaters could book one slip.".into(),
+                why: "Two patrons could book one slot.".into(),
                 pr_url: "https://github.example/harbor/harbor-api/pull/7".into(),
                 files: vec!["src/bookings.js".into(), "README.md".into()],
                 ..Default::default()
@@ -3149,7 +3149,7 @@ mod tests {
         let g = with_overlays(harbor(), Some(&runs), None);
         let r = &g["recent"];
         assert_eq!(r["tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(r["tasks"][0]["title"], "DOCK-42: Stop double bookings");
+        assert_eq!(r["tasks"][0]["title"], "WING-42: Stop double bookings");
         assert_eq!(r["tasks"][0]["request"], "");
         assert!(r["tasks"][0]["summary"]
             .as_str()
@@ -3157,7 +3157,7 @@ mod tests {
             .contains("pull/7"));
         assert_eq!(
             r["items"],
-            json!([{"id": "f:harbor-api/src/bookings.js", "task": 0, "change": "changed", "note": "Changed by Coderhelm's run for DOCK-42"}])
+            json!([{"id": "f:harbor-api/src/bookings.js", "task": 0, "change": "changed", "note": "Changed by Coderhelm's run for WING-42"}])
         );
         // No run on the map: no recent work at all.
         assert!(with_overlays(harbor(), Some(&runs[1..]), None)
@@ -3221,7 +3221,7 @@ mod tests {
     fn overlays_from_the_index_match_the_map_with_its_overlays() {
         let runs = [WorkItem {
             repo: "harbor/harbor-api".into(),
-            ticket: "DOCK-42".into(),
+            ticket: "WING-42".into(),
             title: "Stop double bookings".into(),
             files: vec!["src/bookings.js".into()],
             ..Default::default()
@@ -3290,15 +3290,15 @@ mod tests {
     /// A made-up map the size of a large team's: `files` files in 12 parts
     /// across 9 repositories, three lines per file, 20 Floorplan checks.
     fn synthetic(files: usize) -> Value {
-        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let repos: Vec<String> = (0..9).map(|i| format!("bookshop/yard{i}")).collect();
         let folders = folders(&repos);
         let nodes: Vec<Value> = (0..12)
-            .map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service", "summary": "Looks after berths.", "stats": {"files": files / 12}}))
+            .map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Wing area {i}"), "kind": "service", "summary": "Looks after booths.", "stats": {"files": files / 12}}))
             .collect();
         let fs: Vec<Value> = (0..files)
             .map(|i| {
                 let r = &repos[i % 9];
-                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes.", "h": "0123456789abcdef", "s": [], "sig": ""})
+                json!({"p": format!("{}/src/area{}/booth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Booth keeper {i}"), "d": "Keeps one booth's bookings, its gate code and the lockers that may use it, and tells the office when it changes.", "h": "0123456789abcdef", "s": [], "sig": ""})
             })
             .collect();
         let links: Vec<Value> = (0..files * 3)
@@ -3308,7 +3308,7 @@ mod tests {
             .map(|i| json!({"id": format!("open-endpoints:{}", fs[i * 17]["p"].as_str().unwrap()), "kind": "open-endpoints", "severity": if i % 3 == 0 { "high" } else { "medium" }, "title": "An endpoint anyone can call", "detail": "", "items": [format!("f:{}", fs[i * 17]["p"].as_str().unwrap())], "notes": {}, "locations": [{"file": fs[i * 17]["p"], "line": 10}], "fix": ""}))
             .collect();
         let mut g = json!({
-            "schema": GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "schema": GRAPH_SCHEMA, "project": {"name": "Bookshop", "summary": "Booths and bookings."},
             "meta": {"root": "/tmp/x", "agent": "claude", "repos": repos},
             "nodes": nodes, "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
             "health": {"issues": issues, "checked": [], "appWide": []},
@@ -3345,8 +3345,8 @@ mod tests {
         let runs: Vec<WorkItem> = (0..60)
             .map(|i| WorkItem {
                 repo: paths[i % paths.len()].0.clone(),
-                ticket: format!("DOCK-{i}"),
-                title: "Tidy the berths".into(),
+                ticket: format!("WING-{i}"),
+                title: "Tidy the booths".into(),
                 files: (0..20)
                     .map(|j| paths[(i * 31 + j * 7) % paths.len()].1.clone())
                     .collect(),
@@ -3454,12 +3454,12 @@ mod tests {
         assert_eq!(parts.iter().filter(|p| p["parent"].is_null()).count(), 8);
         assert_eq!(o["screen_count"], json!({"harbor-mobile": 3, "web": 1}));
         let p = part_view(&g, "api").unwrap();
-        assert_eq!(p["endpoints"][0]["path"], "/slips/:id/bookings");
+        assert_eq!(p["endpoints"][0]["path"], "/slots/:id/bookings");
         assert!(p["links"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l["from"]["path"] == "harbor-web/lib/slips.ts" && l["kind"] == "http"));
+            .any(|l| l["from"]["path"] == "harbor-web/lib/slots.ts" && l["kind"] == "http"));
         assert!(part_view(&g, "nope").is_none());
         let f = file_view(&g, "harbor-api/src/billing.js").unwrap();
         assert!(f["links"]
@@ -3467,7 +3467,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l["to"]["label"] == "Stripe"));
-        let s = screen_view(&g, "/slips/:id").unwrap();
+        let s = screen_view(&g, "/slots/:id").unwrap();
         let steps: Vec<&str> = s["behind"]
             .as_array()
             .unwrap()
@@ -3476,8 +3476,8 @@ mod tests {
             .collect();
         assert_eq!(steps.first(), Some(&"screen"));
         assert_eq!(steps.last(), Some(&"outside"));
-        assert_eq!(search(&g, "book slip")["endpoints"][0]["method"], "POST");
-        let parts = parts_of(&g, &["f:harbor-web/lib/slips.ts".into(), "r:0".into()]);
+        assert_eq!(search(&g, "book slot")["endpoints"][0]["method"], "POST");
+        let parts = parts_of(&g, &["f:harbor-web/lib/slots.ts".into(), "r:0".into()]);
         assert_eq!(
             parts,
             BTreeSet::from(["api".to_string(), "web".to_string()])
@@ -3541,14 +3541,14 @@ mod tests {
                 .unwrap()
                 .starts_with("harbor-api/.github/workflows/deploy-receipts.yml"))));
         // a nightly load writes the table an entity holds
-        let e = file_view(&g, "harbor-api/src/entities/slip.entity.ts").unwrap();
+        let e = file_view(&g, "harbor-api/src/entities/slot.entity.ts").unwrap();
         assert!(e["links"]
             .as_array()
             .unwrap()
             .iter()
             .any(|l| l["kind"] == "data"
-                && l["from"]["path"] == "harbor-infra/dags/nightly_slips.py"
-                && l["tables"] == json!(["slip"])));
+                && l["from"]["path"] == "harbor-infra/dags/nightly_slots.py"
+                && l["tables"] == json!(["slot"])));
         // screens: the navigator file lists the screens it registers, with their gates
         let nav = file_view(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
         let gates: Vec<(&str, &str)> = nav["screens"]
@@ -3561,11 +3561,11 @@ mod tests {
             gates,
             vec![
                 ("SignIn", "signed_out"),
-                ("SlipDetail", "signed_in"),
-                ("Slips", "signed_in")
+                ("SlotDetail", "signed_in"),
+                ("Slots", "signed_in")
             ]
         );
-        let sv = screen_view(&g, "screen:mobile:/(Stack)/SlipDetail").unwrap();
+        let sv = screen_view(&g, "screen:mobile:/(Stack)/SlotDetail").unwrap();
         assert_eq!(sv["screen"]["app"], "harbor-mobile");
         assert_eq!(
             sv["screen"]["evidence"][0]["at"],
@@ -3575,9 +3575,9 @@ mod tests {
         assert_eq!(came_from["kind"], "nav");
         assert_eq!(
             came_from["from"]["path"],
-            "harbor-mobile/app/screens/Slips.tsx"
+            "harbor-mobile/app/screens/Slots.tsx"
         );
-        assert_eq!(came_from["screen"]["name"], "SlipDetail");
+        assert_eq!(came_from["screen"]["name"], "SlotDetail");
         // search finds services by their env names and screens by their app
         assert_eq!(
             search(&g, "tidewatch_api_url")["parts"][0]["id"],
@@ -3595,39 +3595,39 @@ mod tests {
     fn the_overview_lists_app_screens_before_editor_kinds() {
         let mut g = harbor();
         let kinds: Vec<Value> = (0..90)
-            .map(|i| json!({"id": format!("screen:studio:/(structure)/k{i}"), "url": format!("/(structure)/k{i}"), "name": format!("Kind {i}"), "kind": "page-kind", "file": "harbor-web/lib/slips.ts", "behind": []}))
+            .map(|i| json!({"id": format!("screen:studio:/(structure)/k{i}"), "url": format!("/(structure)/k{i}"), "name": format!("Kind {i}"), "kind": "page-kind", "file": "harbor-web/lib/slots.ts", "behind": []}))
             .collect();
         let mut all = kinds;
         all.extend(g["screens"].as_array().unwrap().iter().cloned());
-        all.push(json!({"id": "screen:web:/(notice)/*", "url": "/(notice)/*", "name": "Notice page", "kind": "screen", "fw": "dispatch", "file": "harbor-web/lib/slips.ts", "behind": [],
-            "nav": {"app": "harbor-web", "dispatcher": "harbor-web/app/slips/[id]/page.tsx", "type": "notice", "renderer": "NoticeRenderer", "urlFrom": "route", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}]}}));
+        all.push(json!({"id": "screen:web:/(notice)/*", "url": "/(notice)/*", "name": "Notice page", "kind": "screen", "fw": "dispatch", "file": "harbor-web/lib/slots.ts", "behind": [],
+            "nav": {"app": "harbor-web", "dispatcher": "harbor-web/app/slots/[id]/page.tsx", "type": "notice", "renderer": "NoticeRenderer", "urlFrom": "route", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}]}}));
         g["screens"] = json!(all);
         let o = overview(&g);
         let listed = o["screens"].as_array().unwrap();
         assert_eq!(listed.len(), 80);
-        assert!(listed.iter().any(|s| s["url"] == "/slips/:id"));
+        assert!(listed.iter().any(|s| s["url"] == "/slots/:id"));
         let notice = listed.iter().find(|s| s["name"] == "Notice page").unwrap();
         assert_eq!(
             notice["dispatch"]["renderer_at"],
-            "harbor-web/lib/slips.ts:2"
+            "harbor-web/lib/slots.ts:2"
         );
         assert_eq!(
             notice["dispatch"]["route_file"],
-            "harbor-web/app/slips/[id]/page.tsx"
+            "harbor-web/app/slots/[id]/page.tsx"
         );
         // a screen nothing dispatches carries no dispatch record
-        let slip = listed.iter().find(|s| s["url"] == "/slips/:id").unwrap();
-        assert!(slip.get("dispatch").is_none());
+        let slot = listed.iter().find(|s| s["url"] == "/slots/:id").unwrap();
+        assert!(slot.get("dispatch").is_none());
     }
 
     /// The harbor map with one journey through the booking.
     pub(crate) fn harbor_with_journey() -> Value {
         let mut g = harbor();
         g["flows"] = json!([{
-            "id": "book-a-slip", "title": "Book a slip", "description": "",
+            "id": "book-a-slot", "title": "Book a slot", "description": "",
             "steps": [
-                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
-                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
                 {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
             ],
         }]);
@@ -3663,7 +3663,7 @@ mod tests {
     #[test]
     fn impact_of_an_endpoint_names_its_callers_elsewhere() {
         let g = harbor_with_journey();
-        let v = impact(&g, "POST /slips/:id/bookings").unwrap();
+        let v = impact(&g, "POST /slots/:id/bookings").unwrap();
         assert_eq!(v["target"]["kind"], "endpoint");
         assert_eq!(v["target"]["at"], "harbor-api/src/bookings.js:5");
         let callers: Vec<(&str, &str)> = v["callers_elsewhere"]
@@ -3676,10 +3676,10 @@ mod tests {
             callers,
             [
                 (
-                    "harbor-mobile/app/screens/SlipDetail.tsx",
-                    "harbor-mobile/app/screens/SlipDetail.tsx:6"
+                    "harbor-mobile/app/screens/SlotDetail.tsx",
+                    "harbor-mobile/app/screens/SlotDetail.tsx:6"
                 ),
-                ("harbor-web/lib/slips.ts", "harbor-web/lib/slips.ts:2"),
+                ("harbor-web/lib/slots.ts", "harbor-web/lib/slots.ts:2"),
             ]
         );
         assert_eq!(v["other_repos"], json!(["harbor-mobile", "harbor-web"]));
@@ -3688,7 +3688,7 @@ mod tests {
         let screens = v["screens"].as_array().unwrap();
         let detail = screens
             .iter()
-            .find(|s| s["id"] == "screen:mobile:/(Stack)/SlipDetail")
+            .find(|s| s["id"] == "screen:mobile:/(Stack)/SlotDetail")
             .unwrap();
         assert_eq!(detail["app"], "harbor-mobile");
         assert_eq!(detail["gate"], "signed_in");
@@ -3696,8 +3696,8 @@ mod tests {
             detail["at"],
             "harbor-mobile/app/navigation/RootNavigator.tsx:18"
         );
-        assert!(screens.iter().any(|s| s["id"] == "screen:web:/slips/:id"));
-        assert_eq!(v["journeys"][0]["id"], "book-a-slip");
+        assert!(screens.iter().any(|s| s["id"] == "screen:web:/slots/:id"));
+        assert_eq!(v["journeys"][0]["id"], "book-a-slot");
         assert_eq!(v["journeys"][0]["steps"], json!([2]));
         // Stripe is reached through billing.js, which bookings.js imports.
         let stripe = v["outside_services"]
@@ -3717,10 +3717,10 @@ mod tests {
             v["callers_elsewhere"]
         );
         assert_eq!(
-            impact(&g, "/slips/:id/bookings").unwrap()["target"]["kind"],
+            impact(&g, "/slots/:id/bookings").unwrap()["target"]["kind"],
             "endpoint"
         );
-        assert!(impact(&g, "DELETE /slips/:id/bookings").is_none());
+        assert!(impact(&g, "DELETE /slots/:id/bookings").is_none());
         assert!(impact(&g, "nowhere.js").is_none());
     }
 
@@ -3729,21 +3729,21 @@ mod tests {
     #[test]
     fn impact_of_a_file_behind_a_screen_and_a_journey() {
         let g = harbor_with_journey();
-        let v = impact(&g, "harbor-web/lib/slips.ts").unwrap();
+        let v = impact(&g, "harbor-web/lib/slots.ts").unwrap();
         assert_eq!(v["target"]["kind"], "file");
         let s = &v["screens"][0];
-        assert_eq!(s["id"], "screen:web:/slips/:id");
-        assert_eq!(s["at"], "harbor-web/app/slips/[id]/page.tsx:1");
-        assert_eq!(v["journeys"][0]["id"], "book-a-slip");
+        assert_eq!(s["id"], "screen:web:/slots/:id");
+        assert_eq!(s["at"], "harbor-web/app/slots/[id]/page.tsx:1");
+        assert_eq!(v["journeys"][0]["id"], "book-a-slot");
         assert_eq!(v["journeys"][0]["steps"], json!([2]));
         assert!(v["journeys"][0]["at"]
             .as_array()
             .unwrap()
-            .contains(&json!("harbor-web/lib/slips.ts:2")));
+            .contains(&json!("harbor-web/lib/slots.ts:2")));
         // The page that imports it is its caller in the same repository.
         assert_eq!(
             v["callers_here"][0]["from"],
-            "harbor-web/app/slips/[id]/page.tsx"
+            "harbor-web/app/slots/[id]/page.tsx"
         );
         // The mobile sign-in screen is registered by the navigator file.
         let nav = impact(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
@@ -3754,11 +3754,11 @@ mod tests {
             .map(|s| (s["name"].as_str().unwrap(), s["gate"].as_str().unwrap()))
             .collect();
         assert!(gates.contains(&("SignIn", "signed_out")));
-        assert!(gates.contains(&("Slips", "signed_in")));
+        assert!(gates.contains(&("Slots", "signed_in")));
         // The table a nightly job writes.
-        let e = impact(&g, "harbor-api/src/entities/slip.entity.ts").unwrap();
-        assert_eq!(e["data"][0]["tables"], json!(["slip"]));
-        assert_eq!(e["data"][0]["at"], "harbor-infra/dags/nightly_slips.py:6");
+        let e = impact(&g, "harbor-api/src/entities/slot.entity.ts").unwrap();
+        assert_eq!(e["data"][0]["tables"], json!(["slot"]));
+        assert_eq!(e["data"][0]["at"], "harbor-infra/dags/nightly_slots.py:6");
         for c in cites_in(&v)
             .into_iter()
             .chain(cites_in(&nav))
@@ -3798,11 +3798,11 @@ mod tests {
         assert_eq!(p["other_repos"], json!(["harbor-mobile", "harbor-web"]));
         // The lookup, its label and its place among the tools.
         let mut l = Lookups::new(g);
-        let (found, label) = l.lookup("map_impact", &json!({"target": "POST /slips/:id/bookings"}));
+        let (found, label) = l.lookup("map_impact", &json!({"target": "POST /slots/:id/bookings"}));
         assert!(found.get("error").is_none());
         assert_eq!(
             label,
-            "Looked up what changing POST /slips/:id/bookings reaches on the app map"
+            "Looked up what changing POST /slots/:id/bookings reaches on the app map"
         );
         assert!(l.parts().contains(&"api".to_string()));
         assert!(l.lookup("map_impact", &json!({"target": "x"})).0["error"].is_string());
@@ -3852,40 +3852,40 @@ mod tests {
     fn a_journey_is_walked_step_by_step() {
         let mut g = harbor();
         g["flows"] = json!([{
-            "id": "book-a-slip", "title": "Book a slip", "description": "", "custom": true,
+            "id": "book-a-slot", "title": "Book a slot", "description": "", "custom": true,
             "coderhelm": {"linked": [true, true, false]},
             "steps": [
-                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
-                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
                 {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
             ],
         }]);
-        for q in ["book-a-slip", "book slip", "Book a SLIP"] {
+        for q in ["book-a-slot", "book slot", "Book a SLOT"] {
             let v = flow_view(&g, q).unwrap();
-            assert_eq!(v["journey"]["title"], "Book a slip", "{q}");
+            assert_eq!(v["journey"]["title"], "Book a slot", "{q}");
         }
         assert!(flow_view(&g, "sign in").is_none());
         assert!(flow_view(&g, "  ").is_none());
-        let v = flow_view(&g, "book-a-slip").unwrap();
+        let v = flow_view(&g, "book-a-slot").unwrap();
         let steps = v["steps"].as_array().unwrap();
         assert_eq!(steps[1]["method"], "POST");
         assert_eq!(
             steps[1]["cites"],
-            json!(["harbor-web/lib/slips.ts:2", "harbor-api/src/bookings.js:5"])
+            json!(["harbor-web/lib/slots.ts:2", "harbor-api/src/bookings.js:5"])
         );
         assert_eq!(steps[2]["label"], "Stripe");
         assert_eq!(steps[2]["inferred"], true);
         assert!(steps[1].get("inferred").is_none());
         assert_eq!(
             overview(&g)["journeys"],
-            json!([{"id": "book-a-slip", "title": "Book a slip", "steps": 3}])
+            json!([{"id": "book-a-slot", "title": "Book a slot", "steps": 3}])
         );
-        assert_eq!(search(&g, "slip")["journeys"][0]["id"], "book-a-slip");
+        assert_eq!(search(&g, "slot")["journeys"][0]["id"], "book-a-slot");
         let mut b = Lookups::new(g.clone());
-        let (_, label) = b.lookup("map_flow", &json!({"journey": "book a slip"}));
+        let (_, label) = b.lookup("map_flow", &json!({"journey": "book a slot"}));
         assert_eq!(
             label,
-            "Walked through the journey book a slip on the app map"
+            "Walked through the journey book a slot on the app map"
         );
         assert_eq!(b.parts(), vec!["api", "stripe", "web"]);
         // On a mini map that holds every step it stays; otherwise it goes.
@@ -3907,13 +3907,13 @@ mod tests {
         let mut b = Lookups::new(harbor());
         let mut reg = crate::knowledge::answer::Registry::default();
         let (text, label, failed) =
-            b.cite(&mut reg, "map_screen", &json!({"screen": "/slips/:id"}));
+            b.cite(&mut reg, "map_screen", &json!({"screen": "/slots/:id"}));
         assert!(!failed && text.starts_with("[S1] "), "{text}");
-        assert_eq!(label, "Followed the screen /slips/:id on the app map");
+        assert_eq!(label, "Followed the screen /slots/:id on the app map");
         let s = reg.get("S1").unwrap();
         assert_eq!(s.kind, SOURCE_KIND);
         assert_eq!(s.href.as_deref(), Some("/app-map?focus=api,stripe,web"));
-        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips/:id"}));
+        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slots/:id"}));
         assert_eq!(
             v["behind"].as_array().unwrap().last().unwrap()["step"],
             "outside"
@@ -3935,7 +3935,7 @@ mod tests {
         // The overview and a search touch no part: no mini map.
         let mut b = Lookups::new(harbor());
         b.lookup("map_overview", &json!({}));
-        b.lookup("map_find", &json!({"query": "slip"}));
+        b.lookup("map_find", &json!({"query": "slot"}));
         assert!(b.mini_map("now").is_none());
         let names: Vec<String> = tool_defs()
             .iter()
@@ -4093,9 +4093,9 @@ mod tests {
         ]));
         g["files"] = json!([
             {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
-            {"p": "site/apps/web/app/slips/page.tsx", "n": "web", "r": "site"},
+            {"p": "site/apps/web/app/slots/page.tsx", "n": "web", "r": "site"},
             {"p": "site/packages/ui/button.tsx", "n": "web", "r": "site"},
-            {"p": "site/apps/studio/schemas/slip.ts", "n": "studio", "r": "site"},
+            {"p": "site/apps/studio/schemas/slot.ts", "n": "studio", "r": "site"},
             {"p": "site/lambdas/resize/index.ts", "n": "fns", "r": "site"},
         ]);
         g
@@ -4109,7 +4109,7 @@ mod tests {
         let files = g["files"].as_array_mut().unwrap();
         for (p, n) in [
             ("site/apps/web/app/[...slug]/page.tsx", "web"),
-            ("site/apps/web/components/blocks/SlipList.tsx", "web"),
+            ("site/apps/web/components/blocks/SlotList.tsx", "web"),
             ("site/apps/web/components/blocks/Hero.tsx", "web"),
             ("site/apps/studio/schemas/offer.ts", "studio"),
             ("site/apps/studio/tools/import.tsx", "studio"),
@@ -4122,10 +4122,10 @@ mod tests {
         let studio = |id: &str, kind: &str, file: &str| json!({"id": id, "url": format!("/studio/{id}"), "name": id, "file": file, "kind": kind, "nav": {"app": "site", "evidence": [{"file": file, "line": 2}]}});
         g["screens"] = json!([
             route("screen:home", "/", "site/apps/web/app/page.tsx"),
-            route("screen:slips", "/slips", "site/apps/web/app/slips/page.tsx"),
-            dispatched("screen:slip-list", "site/apps/web/components/blocks/SlipList.tsx"),
+            route("screen:slots", "/slots", "site/apps/web/app/slots/page.tsx"),
+            dispatched("screen:slot-list", "site/apps/web/components/blocks/SlotList.tsx"),
             dispatched("screen:hero", "site/apps/web/components/blocks/Hero.tsx"),
-            studio("screen:doc-slip", "page-kind", "site/apps/studio/schemas/slip.ts"),
+            studio("screen:doc-slot", "page-kind", "site/apps/studio/schemas/slot.ts"),
             studio("screen:doc-offer", "page-kind", "site/apps/studio/schemas/offer.ts"),
             studio("screen:tool-import", "tool", "site/apps/studio/tools/import.tsx"),
             // in no card's paths: under the card its part is in
@@ -4155,10 +4155,10 @@ mod tests {
             under,
             vec![
                 ("screen:home", "web", "site / web"),
-                ("screen:slips", "web", "site / web"),
-                ("screen:slip-list", "web", "site / web"),
+                ("screen:slots", "web", "site / web"),
+                ("screen:slot-list", "web", "site / web"),
                 ("screen:hero", "web", "site / web"),
-                ("screen:doc-slip", "studio", "site / studio"),
+                ("screen:doc-slot", "studio", "site / studio"),
                 ("screen:doc-offer", "studio", "site / studio"),
                 ("screen:tool-import", "studio", "site / studio"),
                 ("screen:seed", "web", "site / web"),
@@ -4282,8 +4282,8 @@ mod tests {
     #[test]
     fn journeys_read_split_cards_by_their_clean_names() {
         let mut g = site_monorepo();
-        g["flows"] = json!([{"id": "book", "title": "Book a slip", "description": "", "steps": [
-            {"ref": "n:web", "note": "The slip page"},
+        g["flows"] = json!([{"id": "book", "title": "Book a slot", "description": "", "steps": [
+            {"ref": "n:web", "note": "The slot page"},
             {"ref": "n:api", "note": "Takes the booking"},
             {"ref": "n:fns", "note": "Resizes the photo"},
         ]}]);

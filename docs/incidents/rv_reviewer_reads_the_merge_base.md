@@ -4,7 +4,7 @@
 
 - **The base merge:** after the base branch was merged into the pull request, the re-review read the diff from the commit it had approved. That diff carried a drawer component another pull request had already merged, and the review called it an unrelated change. Against the merge base the pull request changed a handful of files, and the drawer wasn't one of them.
 - **The passing run:** the preview's end-to-end run exercised the vendor's test ids against the live portal and passed. The review still blocked on "selectors no probe observed", because it only read probe records committed in the repository.
-- **The red check:** the end-to-end check was red on the pull request and on the base branch. The review was told only the check's name, and it wrote that an unrelated fuel-pricing test was "broken on main". The failing test was the slip-selection test in the spec the pull request changed. It failed because the vendor had opened next season's booking.
+- **The red check:** the end-to-end check was red on the pull request and on the base branch. The review was told only the check's name, and it wrote that an unrelated late-fee test was "broken on main". The failing test was the slot-selection test in the spec the pull request changed. It failed because the vendor had opened next season's booking.
 - **The missing test:** on the CI script's pull request the review rightly asked for a test, and the run handed it back. A stub of the cloud command on PATH and a fixture of its answer were all the test needed.
 
 **The guarantee:**

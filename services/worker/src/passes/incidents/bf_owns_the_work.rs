@@ -268,7 +268,7 @@ fn the_second_pull_requests_three_items() {
     assert_eq!(person_gate::decide(&deploy.ask(), &ctx).class(), Class::Do);
     // A look at a field: the reviewer's sign-off, folded into the review.
     let look = Step {
-        what: "Look at Studio: the slip page document, hero Tagline field".into(),
+        what: "Look at Studio: the slot page document, hero Tagline field".into(),
         how: String::new(),
         when: When::Any,
         owner: "the reviewer".into(),
@@ -289,7 +289,7 @@ fn the_second_pull_requests_three_items() {
     // The look is part of the review: shown in Verification, never a
     // chore under "Needed from you".
     assert!(
-        lead.contains("See it: Studio: the slip page document, hero Tagline field."),
+        lead.contains("See it: Studio: the slot page document, hero Tagline field."),
         "{lead}"
     );
     assert!(!lead.contains("judgement only a person"), "{lead}");
@@ -319,7 +319,7 @@ fn question(text: &str, suggestions: &[&str]) -> Question {
         question: text.into(),
         why: "the four pages need a heading".into(),
         suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
-        checked: vec!["the marina pages' current headings".into()],
+        checked: vec!["the library pages' current headings".into()],
         changes: "the heading text on four pages".into(),
         ..Default::default()
     }
@@ -334,11 +334,11 @@ fn page_copy_with_a_default_is_decided_never_asked_and_never_twice() {
     };
     let qs = vec![
         question(
-            "What H1 and intro copy should each of the four marina pages use? (Default: '{Marina} Slip Booking' plus one sentence.)",
+            "What H1 and intro copy should each of the four library pages use? (Default: '{Library} Slot Booking' plus one sentence.)",
             &[],
         ),
         question(
-            "Which heading and intro sentence should the four marina pages show? (Default: '{Marina} Slip Booking' plus one sentence.)",
+            "Which heading and intro sentence should the four library pages show? (Default: '{Library} Slot Booking' plus one sentence.)",
             &[],
         ),
     ];
@@ -355,7 +355,7 @@ fn an_irreversible_customer_facing_choice_is_one_yes_no_with_the_work_done() {
         ..Default::default()
     };
     let q = question(
-        "Should the migration email customers whose bookings move to the new marina?",
+        "Should the migration email customers whose bookings move to the new library?",
         &["email them once", "send nothing"],
     );
     let s = screen::screen(

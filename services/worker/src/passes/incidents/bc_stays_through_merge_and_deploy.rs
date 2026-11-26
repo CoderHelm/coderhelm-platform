@@ -146,10 +146,10 @@ fn a_failed_deploy_gets_a_revert_ready_for_approval_with_the_evidence() {
     assert!(comment.contains("should `a1b2c3d` be rolled back?"));
 
     // Nothing merged since: every path the merge changed goes back.
-    let before = tree(&[("apps/web/src/dock-hours.tsx", "h1"), ("README.md", "r1")]);
+    let before = tree(&[("apps/web/src/wing-hours.tsx", "h1"), ("README.md", "r1")]);
     let merged = tree(&[
-        ("apps/web/src/dock-hours.tsx", "h2"),
-        ("apps/web/src/dock-hours.test.tsx", "t1"),
+        ("apps/web/src/wing-hours.tsx", "h2"),
+        ("apps/web/src/wing-hours.test.tsx", "t1"),
         ("README.md", "r1"),
     ]);
     let Plan::Clean(changes) = deploy_revert::plan(&before, &merged, &merged) else {
@@ -167,13 +167,13 @@ fn a_failed_deploy_gets_a_revert_ready_for_approval_with_the_evidence() {
     assert!(body.contains("actions/runs/88/job/3) (failure)"));
     assert!(body.contains("does not merge it"));
     assert_eq!(
-        deploy_revert::title("Show the dock hours"),
-        "Revert \"Show the dock hours\""
+        deploy_revert::title("Show the wing hours"),
+        "Revert \"Show the wing hours\""
     );
     // The existing record of reverts recognises it.
     assert_eq!(
         common::rewards::mapping::revert_target(
-            &deploy_revert::title("Show the dock hours"),
+            &deploy_revert::title("Show the wing hours"),
             &body,
             &format!("{OWNER}/{REPO}")
         ),
@@ -203,16 +203,16 @@ fn a_failed_deploy_gets_a_revert_ready_for_approval_with_the_evidence() {
 
 #[test]
 fn a_revert_never_undoes_someone_elses_later_work() {
-    let before = tree(&[("apps/web/src/dock-hours.tsx", "h1")]);
-    let merged = tree(&[("apps/web/src/dock-hours.tsx", "h2")]);
+    let before = tree(&[("apps/web/src/wing-hours.tsx", "h1")]);
+    let merged = tree(&[("apps/web/src/wing-hours.tsx", "h2")]);
     // A later commit changed the same file.
-    let head = tree(&[("apps/web/src/dock-hours.tsx", "h3")]);
+    let head = tree(&[("apps/web/src/wing-hours.tsx", "h3")]);
     let Plan::Moved(files) = deploy_revert::plan(&before, &merged, &head) else {
         panic!("no clean revert");
     };
     let line = deploy_revert::report_line(&Outcome::Moved(files));
     assert!(line.contains("did not open a revert"));
-    assert!(line.contains("`apps/web/src/dock-hours.tsx`"));
+    assert!(line.contains("`apps/web/src/wing-hours.tsx`"));
     // Someone reverted it by hand already: nothing to do.
     assert_eq!(
         deploy_revert::plan(&before, &merged, &before),

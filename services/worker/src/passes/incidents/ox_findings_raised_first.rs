@@ -31,14 +31,14 @@ use crate::passes::review_rules::wider_findings;
 use std::collections::{HashMap, HashSet};
 
 const FILTERS: &str = "apps/web/src/utils/filterMaps.ts";
-const TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
+const TEST: &str = "apps/web/src/test/components/filter-nav-wing-grid.test.tsx";
 
 fn the_two() -> Vec<Finding> {
     wider_findings(&[
         Widening {
             kind: Kind::Parallel,
             path: FILTERS.into(),
-            what: "`dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`".into(),
+            what: "`dedupeWingOptionsBySlug` next to the existing `dedupeWingsBySlug`".into(),
         },
         Widening {
             kind: Kind::TestSize,
@@ -211,16 +211,16 @@ fn a_review_cut_by_its_steps_goes_on_in_a_second_pass() {
     assert_eq!(review_agent::opened_files(&messages), vec![FILTERS]);
     let first: review_agent::ReviewOutput = serde_json::from_value(serde_json::json!({
         "summary": "First pass.",
-        "findings": [{"file": FILTERS, "line": 3, "title": "Dropdown lists one dock twice", "body": "b"}]
+        "findings": [{"file": FILTERS, "line": 3, "title": "Dropdown lists one wing twice", "body": "b"}]
     }))
     .unwrap();
     let prompt = review_agent::continue_prompt("PR: x", &first, &[FILTERS.to_string()]);
     assert!(prompt.contains("ran out of tool"));
-    assert!(prompt.contains("Dropdown lists one dock twice"));
+    assert!(prompt.contains("Dropdown lists one wing twice"));
     let second: review_agent::ReviewOutput = serde_json::from_value(serde_json::json!({
         "summary": "Second pass.",
         "findings": [
-            {"file": FILTERS, "line": 3, "title": "Dropdown lists one dock twice", "body": "b"},
+            {"file": FILTERS, "line": 3, "title": "Dropdown lists one wing twice", "body": "b"},
             {"file": TEST, "line": 9, "title": "Test asserts the old order", "body": "b"}
         ]
     }))

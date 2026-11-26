@@ -71,11 +71,11 @@ into the same loop as the run's other open gaps:
   "head": "c0ffee1…",
   "rows": [
     {
-      "criterion": "Only one dock filter chip shows on /slips",
+      "criterion": "Only one wing filter chip shows on /slots",
       "source": "ticket",
-      "page": "/slips",
-      "code": [{ "path": "src/utils/filters.ts", "symbols": ["dedupeDocksBySlug"] }],
-      "tests": ["e2e/slips.spec.ts › shows one chip"],
+      "page": "/slots",
+      "code": [{ "path": "src/utils/filters.ts", "symbols": ["dedupeWingsBySlug"] }],
+      "tests": ["e2e/slots.spec.ts › shows one chip"],
       "proof": { "state": "proven", "by": "end to end on staging and the preview", "detail": "…" }
     }
   ]

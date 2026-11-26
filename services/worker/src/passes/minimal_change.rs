@@ -1,6 +1,6 @@
 //! The change is the smallest one that does what the ticket asks.
 //!
-//! A ticket asked to link four charters to a second activity. The pull request
+//! A ticket asked to link four tours to a second activity. The pull request
 //! added a second map and helpers beside the existing overrides map, turned
 //! an insert-only link sync into a replacing upsert that deleted links
 //! nobody asked to delete, added warnings, three summary counters and a log
@@ -1148,7 +1148,7 @@ fn payload_key(line: &str) -> bool {
         && rest[end + 1..].trim_start().starts_with(':')
 }
 
-/// Test fixtures with invented ids (`berth-a`, `id-1`) while the run's
+/// Test fixtures with invented ids (`booth-a`, `id-1`) while the run's
 /// lookups (`lookups`: their recorded lines) returned real ones
 /// (`common::fixture_ids`).
 pub fn made_up_ids(diff: &Diff, lookups: &[String]) -> Vec<Widening> {
@@ -1261,8 +1261,8 @@ fn entry_line(line: &str) -> bool {
 /// A change that rewrites a code path while its ticket names a few records
 /// (`common::repro_first::ticket_ids`): more than [`WHOLE_PATH_LINES`]
 /// changed code lines that are no entries of a map or list. A ticket that
-/// named four charters filed under the wrong activity got hundreds of changed
-/// lines across the pipeline that loads every charter; the fix was a suffix
+/// named four tours filed under the wrong activity got hundreds of changed
+/// lines across the pipeline that loads every tour; the fix was a suffix
 /// stripped in the existing lookup and two entries. A `Wider than the
 /// ticket:` line keeps it, with the reason the narrower change can't work.
 pub fn whole_path(diff: &Diff, ticket: &str) -> Vec<Widening> {
@@ -1486,9 +1486,8 @@ mod tests {
 
     #[test]
     fn definitions_by_language() {
-        let py =
-            "CHARTER_MULTI_ACTIVITY_OVERRIDES = {\ndef get_charter_multi_activity_names(name):\n    X = {}";
-        let got = defs(py, "dags/charters.py");
+        let py = "TOUR_MULTI_STOP_OVERRIDES = {\ndef get_tour_multi_stop_names(name):\n    X = {}";
+        let got = defs(py, "dags/tours.py");
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, DefKind::Table);
         assert_eq!(got[1].kind, DefKind::Function);
@@ -1506,38 +1505,36 @@ mod tests {
     #[test]
     fn a_second_map_next_to_the_first_is_a_parallel_structure() {
         let base = vec![(
-            "dags/charters.py".to_string(),
-            "CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n    \"a\": [\"Sailing\"],\n}\n\ndef get_charter_multi_activity_names(name):\n    return CHARTER_MULTI_ACTIVITY_OVERRIDES.get(name, [])\n".to_string(),
+            "dags/tours.py".to_string(),
+            "TOUR_MULTI_STOP_OVERRIDES = {\n    \"a\": [\"Reading\"],\n}\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name, [])\n".to_string(),
         )];
-        let patch = "@@ -1,3 +1,9 @@\n CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+CHARTER_FISHING_OVERRIDES = {\n+    \"b\": [\"Fishing\"],\n+}\n+def get_charter_fishing_names(name):\n+    return CHARTER_FISHING_OVERRIDES.get(name, [])\n";
-        let w = parallel_structures(&[d("dags/charters.py", "modified", patch)], &base);
+        let patch = "@@ -1,3 +1,9 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n+TOUR_TASTING_OVERRIDES = {\n+    \"b\": [\"Food Tasting\"],\n+}\n+def get_tour_tasting_names(name):\n+    return TOUR_TASTING_OVERRIDES.get(name, [])\n";
+        let w = parallel_structures(&[d("dags/tours.py", "modified", patch)], &base);
         assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w[0].what.contains("CHARTER_FISHING_OVERRIDES"));
-        assert!(w[0].what.contains("CHARTER_MULTI_ACTIVITY_OVERRIDES"));
-        assert!(w[1].what.contains("get_charter_multi_activity_names"));
+        assert!(w[0].what.contains("TOUR_TASTING_OVERRIDES"));
+        assert!(w[0].what.contains("TOUR_MULTI_STOP_OVERRIDES"));
+        assert!(w[1].what.contains("get_tour_multi_stop_names"));
         // Four new entries in the existing map are no new structure.
-        let small = "@@ -1,3 +1,7 @@\n CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+    \"c\": [\"Fishing\", \"Kayaking\"],\n";
-        assert!(parallel_structures(&[d("dags/charters.py", "modified", small)], &base).is_empty());
+        let small = "@@ -1,3 +1,7 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n+    \"c\": [\"Food Tasting\", \"Walking\"],\n";
+        assert!(parallel_structures(&[d("dags/tours.py", "modified", small)], &base).is_empty());
         // A rename is not a parallel.
-        let rename = "-CHARTER_MULTI_ACTIVITY_OVERRIDES = {\n+CHARTER_ACTIVITY_OVERRIDES = {\n";
-        assert!(
-            parallel_structures(&[d("dags/charters.py", "modified", rename)], &base).is_empty()
-        );
+        let rename = "-TOUR_MULTI_STOP_OVERRIDES = {\n+TOUR_STOP_OVERRIDES = {\n";
+        assert!(parallel_structures(&[d("dags/tours.py", "modified", rename)], &base).is_empty());
     }
 
     #[test]
     fn insert_only_made_replacing_blocks_unless_asked() {
-        let patch = "-    ON CONFLICT (charter_id, activity_id) DO NOTHING\n+    ON CONFLICT (charter_id, activity_id) DO UPDATE SET activity_id = EXCLUDED.activity_id\n+DELETE FROM charter_activities WHERE charter_id = %s AND activity_id <> ALL(%s)\n";
+        let patch = "-    ON CONFLICT (tour_id, activity_id) DO NOTHING\n+    ON CONFLICT (tour_id, activity_id) DO UPDATE SET activity_id = EXCLUDED.activity_id\n+DELETE FROM tour_stops WHERE tour_id = %s AND activity_id <> ALL(%s)\n";
         let base = vec![(
             "dags/sync.py".to_string(),
-            "INSERT INTO charter_activities VALUES (%s, %s) ON CONFLICT (charter_id, activity_id) DO NOTHING"
+            "INSERT INTO tour_stops VALUES (%s, %s) ON CONFLICT (tour_id, activity_id) DO NOTHING"
                 .to_string(),
         )];
         let diff = [d("dags/sync.py", "modified", patch)];
         let w = check(
             &diff,
             &base,
-            "Link these four charters to Fishing as well",
+            "Link these four tours to Food Tasting as well",
             false,
         );
         let r: Vec<&Widening> = w.iter().filter(|w| w.kind == Kind::Replacing).collect();
@@ -1552,7 +1549,7 @@ mod tests {
                 .all(|w| w.kind != Kind::Replacing)
         );
         // An additive insert is fine.
-        let add = "+    INSERT INTO charter_activities VALUES (%s, %s) ON CONFLICT DO NOTHING\n";
+        let add = "+    INSERT INTO tour_stops VALUES (%s, %s) ON CONFLICT DO NOTHING\n";
         assert!(replacing(&[d("dags/sync.py", "modified", add)], &base).is_empty());
     }
 
@@ -1560,7 +1557,7 @@ mod tests {
     fn log_levels_and_new_reporting() {
         let patch = "-logger.setLevel(logging.INFO)\n+logger.setLevel(logging.DEBUG)\n+    skipped += 1\n+    linked += 1\n+    log.warning(\"skipped %s\", ids)\n";
         let diff = [d("dags/common/log.py", "modified", patch)];
-        let w = check(&diff, &[], "Link four charters to Fishing", false);
+        let w = check(&diff, &[], "Link four tours to Food Tasting", false);
         assert!(w.iter().any(|w| w.kind == Kind::LogLevel), "{w:?}");
         assert!(w.iter().any(|w| w.kind == Kind::Reporting), "{w:?}");
         // A reason keeps an excusable item.
@@ -1570,7 +1567,7 @@ mod tests {
         );
         assert!(kept.is_empty());
         // A ticket that asks for logging gets it.
-        assert!(check(&diff, &[], "Log how many charters were skipped", false).is_empty());
+        assert!(check(&diff, &[], "Log how many tours were skipped", false).is_empty());
         // One new log line in a change is ordinary.
         let one = [d("a.py", "modified", "+    log.info(\"done\")\n")];
         assert!(reporting(&one).is_empty());
@@ -1620,8 +1617,8 @@ mod tests {
 
     #[test]
     fn what_a_helper_does_to_existing_rows() {
-        let text = "def upsert_multi_activity_links(cur, group_id, activity_ids):\n    cur.execute(\"DELETE FROM group_activity WHERE group_id = %s AND NOT (activity_id = ANY(%s))\", (group_id, activity_ids))\n    for s in activity_ids:\n        cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, s))\n\n\ndef upsert_group_activity_link(cur, group_id, activity_id):\n    cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, activity_id))\n\n\ndef activity_names(name):\n    return OVERRIDES.get(name, [])\n";
-        let replacing = body_of(text, "a.py", "upsert_multi_activity_links").unwrap();
+        let text = "def upsert_multi_stop_links(cur, group_id, activity_ids):\n    cur.execute(\"DELETE FROM group_activity WHERE group_id = %s AND NOT (activity_id = ANY(%s))\", (group_id, activity_ids))\n    for s in activity_ids:\n        cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, s))\n\n\ndef upsert_group_activity_link(cur, group_id, activity_id):\n    cur.execute(\"INSERT INTO group_activity VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, activity_id))\n\n\ndef activity_names(name):\n    return OVERRIDES.get(name, [])\n";
+        let replacing = body_of(text, "a.py", "upsert_multi_stop_links").unwrap();
         assert!(!replacing.contains("def upsert_group_activity_link"));
         assert_eq!(
             write_semantics(&replacing),
@@ -1696,8 +1693,8 @@ mod tests {
     fn all_or_every_before_a_noun_asks_for_the_whole_kind() {
         // "All" before a plural, or "every" before a noun, asks for the kind.
         for t in [
-            "Fix all charters",
-            "Update every slip page",
+            "Fix all tours",
+            "Update every slot page",
             "Backfill all records",
             "every record",
         ] {
@@ -1705,10 +1702,10 @@ mod tests {
         }
         // Any kind does, whatever it is called.
         for t in [
-            "Show the dock filter on all listings",
-            "Every charter needs a price",
+            "Show the wing filter on all listings",
+            "Every tour needs a price",
             "Recompute ALL invoices",
-            "Hide every slip without a photo",
+            "Hide every slot without a photo",
         ] {
             assert!(names_every_of_a_kind(t), "{t}");
         }

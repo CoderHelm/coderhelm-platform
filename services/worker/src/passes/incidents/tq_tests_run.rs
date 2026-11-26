@@ -224,27 +224,24 @@ fn a_loop_ci_runs_the_test_and_its_fixtures_are_not_tests() {
     };
     let diff: Vec<(String, String, String)> = [
         "dags/utils/booking_common.py",
-        "tests/fixtures/charter_activities.json",
-        "tests/fixtures/charter_live_names.json",
-        "tests/test_charter_activity.py",
+        "tests/fixtures/tour_stops.json",
+        "tests/fixtures/tour_live_names.json",
+        "tests/test_tour_stop.py",
     ]
     .iter()
     .map(|p| (p.to_string(), "modified".to_string(), String::new()))
     .collect();
     let files = bench_files(&diff);
-    assert_eq!(files, vec!["tests/test_charter_activity.py"]);
-    let t = tree(&["tests/test_charter_activity.py", "requirement.txt"]);
+    assert_eq!(files, vec!["tests/test_tour_stop.py"]);
+    let t = tree(&["tests/test_tour_stop.py", "requirement.txt"]);
     let plan = bench_plan(&files, &t, None, Some(&ci), &|_| None);
     assert_eq!(
         plan.per_file,
-        vec![Ok("python tests/test_charter_activity.py".to_string())]
+        vec![Ok("python tests/test_tour_stop.py".to_string())]
     );
     // A file no command runs is not run, with why; the others still run.
     let plan = bench_plan(
-        &[
-            "tests/test_charter_activity.py".into(),
-            "scripts/check.sh".into(),
-        ],
+        &["tests/test_tour_stop.py".into(), "scripts/check.sh".into()],
         &t,
         None,
         Some(&ci),
@@ -261,9 +258,8 @@ fn a_loop_ci_runs_the_test_and_its_fixtures_are_not_tests() {
     };
     make.resolve_scripts(&tree(&["Makefile"]), &read);
     assert_eq!(
-        make.file_command("tests/test_charter_activity.py")
-            .as_deref(),
-        Some("python -m pytest tests/test_charter_activity.py")
+        make.file_command("tests/test_tour_stop.py").as_deref(),
+        Some("python -m pytest tests/test_tour_stop.py")
     );
 }
 

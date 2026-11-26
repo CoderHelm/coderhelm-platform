@@ -730,7 +730,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_ticket_key_a_pr_and_a_repo_narrow_the_runs() {
-        let mut with_pr = run("02", "completed", "ABC-12", "Add slips", "acme/api");
+        let mut with_pr = run("02", "completed", "ABC-12", "Add slots", "acme/api");
         with_pr.insert("pr_number".into(), AttributeValue::N("41".into()));
         let items = vec![with_pr, run("01", "failed", "ABC-120", "Other", "acme/web")];
         assert_eq!(

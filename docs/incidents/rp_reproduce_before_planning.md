@@ -1,6 +1,6 @@
 # rp. `rp_reproduce_before_planning`
 
-**What happened:** A data-pipeline ticket named a few charters that were filed under the wrong activity. The pipeline already had an overrides table for exactly this case, with entries for those charters. Its lookup matched exact names, though, and the booking vendor appends a "-Half Day" or "-Full Day" suffix, so the entries never matched: the lookup returned nothing for each of the ticket's names on the base.
+**What happened:** A data-pipeline ticket named a few tours that were filed under the wrong activity. The pipeline already had an overrides table for exactly this case, with entries for those tours. Its lookup matched exact names, though, and the booking vendor appends a "-Half Day" or "-Full Day" suffix, so the entries never matched: the lookup returned nothing for each of the ticket's names on the base.
 
 The run's notes said so, then planned a keyword step beside the table. The diff was hundreds of lines across the pipeline: a moved extractor, keyword matching, new logging and a fixture. It also moved other programs to another lookup, which its own reviewer flagged as out of scope, and it asked two questions on the pull request that one page load answered.
 

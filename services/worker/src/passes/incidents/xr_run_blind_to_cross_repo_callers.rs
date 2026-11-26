@@ -2,7 +2,7 @@
 //! to rename the booking endpoint in the booking service; the planner read
 //! only that repository, planned the route and its test, and the reviewer
 //! passed the pull request. The website and the phone app both call that
-//! endpoint, behind the slip page and the slip screen: the app map Chat and
+//! endpoint, behind the slot page and the slot screen: the app map Chat and
 //! `/mcp` read had them, with their lines, and no run asked it.
 //!
 //! Guarantee: every pass that reads code (planner, coder and the rounds
@@ -63,8 +63,8 @@ fn the_planner_names_the_other_repositories_the_endpoint_reaches() {
     let gaps = map.plan_gaps(&files, "## Approach\nRename the route.\n");
     assert_eq!(gaps.len(), 1);
     for at in [
-        "harbor-web/lib/slips.ts:2",
-        "harbor-mobile/app/screens/SlipDetail.tsx:6",
+        "harbor-web/lib/slots.ts:2",
+        "harbor-mobile/app/screens/SlotDetail.tsx:6",
     ] {
         assert!(gaps[0].contains(at), "{}", gaps[0]);
     }
@@ -72,14 +72,14 @@ fn the_planner_names_the_other_repositories_the_endpoint_reaches() {
     // The revision names them; a made-up line is left out.
     let design = format!(
         "## Approach\nRename the route.\n\n{AFFECTED_HEADING}\n\
-         - harbor-web calls POST /slips/:id/bookings at harbor-web/lib/slips.ts:2 (Slip page)\n\
-         - harbor-mobile calls it at harbor-mobile/app/screens/SlipDetail.tsx:6 (SlipDetail, signed in)\n\
+         - harbor-web calls POST /slots/:id/bookings at harbor-web/lib/slots.ts:2 (Slot page)\n\
+         - harbor-mobile calls it at harbor-mobile/app/screens/SlotDetail.tsx:6 (SlotDetail, signed in)\n\
          - harbor-mobile also at harbor-mobile/app/lib/api.ts:400\n"
     );
     assert!(map.plan_gaps(&files, &design).is_empty());
     let (kept, dropped) = map.checked_design(&design);
     assert_eq!(dropped, 1);
-    assert!(kept.contains("harbor-web/lib/slips.ts:2"));
+    assert!(kept.contains("harbor-web/lib/slots.ts:2"));
     assert!(!kept.contains("api.ts:400"));
 }
 
@@ -89,12 +89,12 @@ fn the_reviewer_is_shown_the_endpoints_other_repositories_call() {
     let patch = "@@ -4,3 +4,3 @@\n const router = express.Router();\n-router.post('/:id/bookings', async (req, res) => {\n+router.post('/:id/reservations', async (req, res) => {\n   await charge(req.params.id);\n";
     let section = map.review_section(&[("src/bookings.js".into(), patch.into())]);
     assert!(
-        section.contains("POST /slips/:id/bookings (harbor-api/src/bookings.js:5)"),
+        section.contains("POST /slots/:id/bookings (harbor-api/src/bookings.js:5)"),
         "{section}"
     );
-    assert!(section.contains("called from harbor-web/lib/slips.ts:2 (harbor-web)"));
+    assert!(section.contains("called from harbor-web/lib/slots.ts:2 (harbor-web)"));
     assert!(
-        section.contains("called from harbor-mobile/app/screens/SlipDetail.tsx:6 (harbor-mobile)")
+        section.contains("called from harbor-mobile/app/screens/SlotDetail.tsx:6 (harbor-mobile)")
     );
     assert!(section.contains("breaking change"));
 }

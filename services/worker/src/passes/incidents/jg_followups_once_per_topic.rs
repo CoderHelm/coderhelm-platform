@@ -50,11 +50,11 @@ const FIRST: [(&str, &str); 6] = [
     ),
     (
         "ABC-95",
-        "Skipper images: fall back to the skipper name for alt; empty when the name is adjacent",
+        "Writer images: fall back to the writer name for alt; empty when the name is adjacent",
     ),
     (
         "ABC-96",
-        "Fix alt on the unused Hero, ContactCard, FeatureSection and SkippersCarousel components",
+        "Fix alt on the unused Hero, ContactCard, FeatureSection and WritersCarousel components",
     ),
     ("ABC-97", "Confirm hardcoded alt=\"\" images are decorative"),
 ];
@@ -63,7 +63,7 @@ const FIRST: [(&str, &str); 6] = [
 const SECOND: [&str; 4] = [
     "Remove unused Hero, FeatureSection and ContactCard prototype components",
     "Replace placeholder and whitespace alt text with data-derived or decorative alt",
-    "Studio: warn when image alt is missing on imageWithAlt and skipper image",
+    "Studio: warn when image alt is missing on imageWithAlt and writer image",
     "Content-image alt: apply the same missing-alt warning to block alt fields and title fallbacks on the web",
 ];
 
@@ -260,7 +260,7 @@ fn findings_are_the_deliverable_never_a_plan_that_stopped_short() {
 fn a_new_run_takes_up_the_findings_plan_instead_of_planning_again() {
     // The earlier run's plan: findings, drafts in proposal.md, no spec.
     let plan = PlanResult {
-        proposal: "# Audit\n\n## Follow-up tickets to file\n1. Add alt validation to `imageWithAlt`.\n2. Fall back to the skipper name.\n".into(),
+        proposal: "# Audit\n\n## Follow-up tickets to file\n1. Add alt validation to `imageWithAlt`.\n2. Fall back to the writer name.\n".into(),
         design: String::new(),
         tasks: "NO_CODE_CHANGE: the audit and 2 follow-up tickets are in proposal.md.".into(),
         spec: String::new(),

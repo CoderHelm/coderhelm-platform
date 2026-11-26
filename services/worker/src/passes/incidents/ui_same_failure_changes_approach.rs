@@ -19,13 +19,13 @@ use common::content_gap;
 
 #[test]
 fn a_repeat_is_told_the_last_account_and_to_change_approach() {
-    let last = "I made no code change this round. The failing test is right: staging has no marina addresses.";
+    let last = "I made no code change this round. The failing test is right: staging has no library addresses.";
     let gap = content_gap::names_gap(
-        "Error: marinaPage /marina-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-marina-addresses",
+        "Error: libraryPage /library-a metadata.address is incomplete in this dataset; run apps/studio/migrations/fill-library-addresses",
     );
     let b = content_gap::repeat_brief(1, last, gap.as_ref());
     assert!(b.contains("Do not repeat their approach"));
-    assert!(b.contains("staging has no marina addresses"));
+    assert!(b.contains("staging has no library addresses"));
     assert!(b.contains("tolerant-code route"));
     let b = content_gap::repeat_brief(2, "The account limit was reached.", None);
     assert!(b.contains("different hypothesis"));

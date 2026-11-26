@@ -134,14 +134,14 @@ test('webhooks are named from the vendor beside the hook word; data links join E
   const root = tree({
     'api/src/hooks.ts': "// verifies the stripe-signature header\nexport const h = (req) => stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], 'whsec');\n",
     'api/src/events.ts': 'export const list = () => [];\n',
-    'api/src/slip.entity.ts': "@Entity('slip')\nexport class Slip {}\n",
-    'etl/dags/load.py': 'def run(h):\n    h.run("INSERT INTO slip (id) VALUES (1)")\n    h.run("SELECT * FROM slip")\n',
+    'api/src/slot.entity.ts': "@Entity('slot')\nexport class Slot {}\n",
+    'etl/dags/load.py': 'def run(h):\n    h.run("INSERT INTO slot (id) VALUES (1)")\n    h.run("SELECT * FROM slot")\n',
   });
   const routes = [{ m: 'POST', p: '/webhooks/stripe', f: 'api/src/hooks.ts', l: 2 }, { m: 'POST', p: '/api/events', f: 'api/src/events.ts' }, { m: 'GET', p: '/webhooks/stripe/status', f: 'api/src/hooks.ts' }];
   const w = webhooks(root, routes, {});
   assert.deepEqual(w.map((x) => [x.vendor, x.route, x.signature]), [['stripe', 0, true]]);
   const d = dataLinks(root, ['api', 'etl']);
-  assert.deepEqual(d.links.map((l) => [l.file, l.entity, l.mode, l.table]), [['etl/dags/load.py', 'api/src/slip.entity.ts', 'write', 'slip']]);
+  assert.deepEqual(d.links.map((l) => [l.file, l.entity, l.mode, l.table]), [['etl/dags/load.py', 'api/src/slot.entity.ts', 'write', 'slot']]);
 });
 
 test('screens: React Navigation gates, Expo Router at its real root, Sanity, dispatched screens, Flutter, Android, iOS', () => {
@@ -161,8 +161,8 @@ test('screens: React Navigation gates, Expo Router at its real root, Sanity, dis
     'site/app/[...slug]/page.tsx': "const pages = { post: Post, venue: Venue, club: Club };\nexport default function P({ doc }) { const C = pages[doc._type]; return <C />; }\n",
     'fl/pubspec.yaml': 'name: fl\n',
     'fl/lib/router.dart': "final router = GoRouter(routes: [\n  GoRoute(path: '/', builder: (c, s) => const HomePage()),\n  GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),\n]);\n",
-    'droid/app/src/main/AndroidManifest.xml': '<manifest package="com.example.dock"><application><activity android:name=".MainActivity"><intent-filter><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity></application></manifest>\n',
-    'droid/app/src/main/res/navigation/nav.xml': '<navigation xmlns:android="x" xmlns:app="y" android:id="@+id/nav" app:startDestination="@id/list"><fragment android:id="@+id/list" android:name="com.example.dock.ListFragment"><action android:id="@+id/open" app:destination="@id/detail"/></fragment><fragment android:id="@+id/detail" android:name="com.example.dock.DetailFragment"/></navigation>\n',
+    'droid/app/src/main/AndroidManifest.xml': '<manifest package="com.example.wing"><application><activity android:name=".MainActivity"><intent-filter><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity></application></manifest>\n',
+    'droid/app/src/main/res/navigation/nav.xml': '<navigation xmlns:android="x" xmlns:app="y" android:id="@+id/nav" app:startDestination="@id/list"><fragment android:id="@+id/list" android:name="com.example.wing.ListFragment"><action android:id="@+id/open" app:destination="@id/detail"/></fragment><fragment android:id="@+id/detail" android:name="com.example.wing.DetailFragment"/></navigation>\n',
     'ios/App/Main.storyboard': '<document><scenes><scene><objects><viewController id="a1" customClass="InboxViewController" storyboardIdentifier="Inbox"/></objects></scene></scenes></document>\n',
     'ios/App/InboxViewController.swift': 'import UIKit\nclass InboxViewController: UIViewController {}\nclass DetailViewController: UIViewController {}\n',
   });
@@ -253,14 +253,14 @@ test('dispatch: a switch on the type (with fall-through cases) and an if chain, 
   const root = tree({
     'pages/[...slug].tsx': "import { Router } from '../components/Router';\nexport default function P(props) { return <Router {...props} />; }\n",
     'components/Router.tsx': [
-      "import { Dock } from './Dock';",
+      "import { Wing } from './Wing';",
       "import { Crew, CrewList } from './Crew';",
       "export function Router({ entry }) {",
       "  switch (entry.kind) {",
-      "    case 'dock':",
-      "      return <Dock entry={entry} />;",
+      "    case 'wing':",
+      "      return <Wing entry={entry} />;",
       "    case 'crew':",
-      "    case 'skipper':",
+      "    case 'writer':",
       "      return <Crew entry={entry} />;",
       "    case KINDS.CREW_LIST: {",
       "      return <CrewList />;",
@@ -271,24 +271,24 @@ test('dispatch: a switch on the type (with fall-through cases) and an if chain, 
       "}",
       "const KINDS = { CREW_LIST: 'crew-list' };",
     ].join('\n'),
-    'components/Dock.tsx': 'export function Dock() { return null; }\n',
+    'components/Wing.tsx': 'export function Wing() { return null; }\n',
     'components/Crew.tsx': 'export function Crew() { return null; }\nexport function CrewList() { return null; }\n',
-    'routes/$.tsx': "import { Buoy } from '../ui/Buoy';\nimport { Mooring } from '../ui/Mooring';\nexport default function Splat({ data }) {\n  if (data.template === 'buoy') return <Buoy />;\n  if (data.template === 'mooring') {\n    return <Mooring />;\n  }\n  return null;\n}\n",
-    'ui/Buoy.tsx': 'export function Buoy() { return null; }\n',
-    'ui/Mooring.tsx': 'export function Mooring() { return null; }\n',
+    'routes/$.tsx': "import { Lamp } from '../ui/Lamp';\nimport { Carrel } from '../ui/Carrel';\nexport default function Splat({ data }) {\n  if (data.template === 'lamp') return <Lamp />;\n  if (data.template === 'carrel') {\n    return <Carrel />;\n  }\n  return null;\n}\n",
+    'ui/Lamp.tsx': 'export function Lamp() { return null; }\n',
+    'ui/Carrel.tsx': 'export function Carrel() { return null; }\n',
     'src/routes/charts/[...rest]/+page.svelte': "<script>\n  import Chart from '$lib/Chart.svelte';\n  import Legend from '$lib/Legend.svelte';\n  export let data;\n  const parts = { chart: Chart, legend: Legend, key: Legend };\n</script>\n<svelte:component this={parts[data.type]} />\n",
   });
   const r = DISPATCH.detect(root);
   const sw = byType(only(r, 'pages/[...slug].tsx'));
-  assert.deepEqual(Object.keys(sw).sort(), ['crew', 'crew-list', 'dock', 'skipper']);
-  assert.deepEqual([sw.dock.file, sw.dock.renderer, sw.dock.table.how], ['components/Dock.tsx', 'Dock', 'switch']);
+  assert.deepEqual(Object.keys(sw).sort(), ['crew', 'crew-list', 'wing', 'writer']);
+  assert.deepEqual([sw.wing.file, sw.wing.renderer, sw.wing.table.how], ['components/Wing.tsx', 'Wing', 'switch']);
   // two types one renderer draws are named by their types
-  assert.deepEqual([sw.crew.name, sw.skipper.name, sw.crew.renderer], ['Crew page', 'Skipper page', 'Crew']);
+  assert.deepEqual([sw.crew.name, sw.writer.name, sw.crew.renderer], ['Crew page', 'Writer page', 'Crew']);
   assert.equal(sw['crew-list'].name, 'Crew list');
   // Remix / React Router flat routes: the splat
   const ifs = only(r, 'routes/$.tsx');
   assert.equal(ifs.route, '/*');
-  assert.deepEqual(ifs.screens.map((s) => [s.type, s.file, s.table.how]), [['buoy', 'ui/Buoy.tsx', 'if'], ['mooring', 'ui/Mooring.tsx', 'if']]);
+  assert.deepEqual(ifs.screens.map((s) => [s.type, s.file, s.table.how]), [['lamp', 'ui/Lamp.tsx', 'if'], ['carrel', 'ui/Carrel.tsx', 'if']]);
   // SvelteKit: the route's own base stays in front of the type
   const sk = only(r, 'src/routes/charts/[...rest]/+page.svelte');
   assert.equal(sk.route, '/charts/*');
@@ -297,8 +297,8 @@ test('dispatch: a switch on the type (with fall-through cases) and an if chain, 
 
 test('dispatch: the URL each type gets, read from the resolver, a path table, a slug builder and a prefix table', () => {
   const root = tree({
-    'app/[[...slug]]/page.tsx': "import { find } from '../../lib/find';\nimport { Berth, Club, Event, Join, Pay, Story } from '../../lib/views';\nconst views = { berth: Berth, club: Club, event: Event, join: Join, pay: Pay, story: Story };\nexport default async function P({ params }) { const m = await find(params.slug); const V = views[m.type]; return <V />; }\n",
-    'lib/views.tsx': ['Berth', 'Club', 'Event', 'Join', 'Pay', 'Story'].map((n) => `export function ${n}() { return null; }`).join('\n') + '\n',
+    'app/[[...slug]]/page.tsx': "import { find } from '../../lib/find';\nimport { Booth, Club, Event, Join, Pay, Story } from '../../lib/views';\nconst views = { booth: Booth, club: Club, event: Event, join: Join, pay: Pay, story: Story };\nexport default async function P({ params }) { const m = await find(params.slug); const V = views[m.type]; return <V />; }\n",
+    'lib/views.tsx': ['Booth', 'Club', 'Event', 'Join', 'Pay', 'Story'].map((n) => `export function ${n}() { return null; }`).join('\n') + '\n',
     'lib/find.ts': [
       "import { pathFor } from './paths';",
       "import { PREFIXES } from './prefixes';",
@@ -313,13 +313,13 @@ test('dispatch: the URL each type gets, read from the resolver, a path table, a 
       "  return lookup(parts);",
       "}",
     ].join('\n'),
-    'lib/paths.ts': "export function pathFor(doc) {\n  switch (doc.type) {\n    case 'berth':\n      return `/berths/${doc.number}`;\n    case 'event':\n      return `/events/${doc.slug}`;\n  }\n}\n",
+    'lib/paths.ts': "export function pathFor(doc) {\n  switch (doc.type) {\n    case 'booth':\n      return `/booths/${doc.number}`;\n    case 'event':\n      return `/events/${doc.slug}`;\n  }\n}\n",
     'lib/prefixes.ts': "export const PREFIXES = {\n  story: '/stories',\n  club: '/clubs',\n};\n",
   });
   const t = byType(only(DISPATCH.detect(root), 'app/[[...slug]]/page.tsx'));
   assert.deepEqual([t.join.url, t.join.urlFrom.how, t.join.urlFrom.file, t.join.urlFrom.line], ['/members/join', 'resolver', 'lib/find.ts', 5]);
   assert.equal(t.pay.url, '/:club/pay/:segment3');
-  assert.deepEqual([t.berth.url, t.berth.urlFrom.how], ['/berths/:number', 'path builder']);
+  assert.deepEqual([t.booth.url, t.booth.urlFrom.how], ['/booths/:number', 'path builder']);
   assert.equal(t.event.url, '/events/:slug');
   assert.deepEqual([t.story.url, t.story.urlFrom.how], ['/stories/*', 'prefix']);
   assert.equal(t.club.url, '/clubs/*');
@@ -331,15 +331,15 @@ test('dispatch: the pieces on their own (route files, plain names, URL rules)', 
   assert.deepEqual(DISPATCH.routeOf('web/pages/guides/[...slug].vue'), { url: '/guides/*', base: '/guides', last: '*' });
   assert.deepEqual(DISPATCH.routeOf('src/pages/[...path].astro'), { url: '/*', base: '', last: '*' });
   assert.deepEqual(DISPATCH.routeOf('app/routes/docs.$.tsx'), { url: '/docs/*', base: '/docs', last: '*' });
-  assert.deepEqual(DISPATCH.routeOf('app/routes/boats.$boatId.tsx'), { url: '/boats/:boatId', base: '/boats', last: ':boatId' });
+  assert.deepEqual(DISPATCH.routeOf('app/routes/lockers.$lockerId.tsx'), { url: '/lockers/:lockerId', base: '/lockers', last: ':lockerId' });
   assert.equal(DISPATCH.routeOf('web/app/about/page.tsx'), null, 'a static route dispatches nothing');
   assert.equal(DISPATCH.routeOf('web/app/[...slug]/layout.tsx'), null);
   assert.equal(DISPATCH.routeOf('web/app/api/[...route]/route.ts'), null);
-  assert.equal(DISPATCH.plainName('BoatCheckoutRenderer'), 'Boat checkout');
-  assert.equal(DISPATCH.plainName('DockRenderer'), 'Dock page');
-  assert.equal(DISPATCH.plainName('DocksIndexRenderer'), 'Docks list');
+  assert.equal(DISPATCH.plainName('LockerCheckoutRenderer'), 'Locker checkout');
+  assert.equal(DISPATCH.plainName('WingRenderer'), 'Wing page');
+  assert.equal(DISPATCH.plainName('WingsIndexRenderer'), 'Wings list');
   assert.equal(DISPATCH.plainName('PageRenderer'), 'Content page');
-  assert.equal(DISPATCH.plainName('sailing-course-index', { fromType: true }), 'Sailing course list');
+  assert.equal(DISPATCH.plainName('reading-course-index', { fromType: true }), 'Reading course list');
   assert.equal(DISPATCH.segPattern(["slug.startsWith('/news/')"]), '/news/*');
   assert.equal(DISPATCH.segPattern(["parts[0] === 'a' && parts.length >= 2"]), '/a/:segment2/*');
   assert.equal(DISPATCH.segPattern(['user.isAdmin']), null);

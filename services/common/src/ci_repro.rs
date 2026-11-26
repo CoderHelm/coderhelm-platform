@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn blame_needs_a_record_and_a_count_is_evidence() {
-        let text = "The fix is in.\n- `seasonal slip pricing` is broken on main since #12. Nothing else changed.";
+        let text = "The fix is in.\n- `seasonal slot pricing` is broken on main since #12. Nothing else changed.";
         let (held, changed) = hold_blame(text, &[], "abc1234");
         assert!(changed);
         assert!(!held.contains("broken on main"), "{held}");
@@ -1001,7 +1001,7 @@ mod tests {
     fn the_comparison_command_and_targets() {
         let c = leg_cmd(
             "e2e",
-            "tests/browse/slip.spec.ts",
+            "tests/browse/slot.spec.ts",
             "adds it (AM)",
             "https://staging.example.com",
         )

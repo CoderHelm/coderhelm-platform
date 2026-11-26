@@ -1,4 +1,4 @@
-//! k. A ticket about a wrong charter time (a schedule data fix) failed in
+//! k. A ticket about a wrong tour time (a schedule data fix) failed in
 //! the plan pass at its time limit: "The step reached its time limit and
 //! the run couldn't continue in a fresh step: no work is committed to
 //! continue from." It planned (with two reviewers and a revision), switched
@@ -33,19 +33,19 @@ const OLD: &str = "no work is committed to continue from";
 /// check pushed it to write, and both environments listed as unchecked.
 fn schedule_fix() -> PlanResult {
     PlanResult {
-        proposal: "Correct the Saturday sunset charter from 9am to 8am.".into(),
-        design: "A data migration runs UPDATE charter_schedule SET start_time = '08:00', \
-                 updated_at = now() WHERE charter_id = 42. No schema change."
+        proposal: "Correct the Saturday sunset tour from 9am to 8am.".into(),
+        design: "A data migration runs UPDATE tour_schedule SET start_time = '08:00', \
+                 updated_at = now() WHERE tour_id = 42. No schema change."
             .into(),
-        tasks: "- [ ] src/database/migrations/1900000000000-FixCharterTime.ts: [create] Set the \
-                charter's start time to 08:00 and bump updated_at\n"
+        tasks: "- [ ] src/database/migrations/1900000000000-FixTourTime.ts: [create] Set the \
+                tour's start time to 08:00 and bump updated_at\n"
             .into(),
-        spec: "Given the charter page, the Saturday time reads 8am.".into(),
+        spec: "Given the tour page, the Saturday time reads 8am.".into(),
         repo_tasks: vec![],
         fix: Some(FixDecision {
-            cause: "The charter is stored with a 9am start; the ticket says 8am.".into(),
+            cause: "The tour is stored with a 9am start; the ticket says 8am.".into(),
             evidence: FixEvidence {
-                data_shows: "charter_schedule row 42 has start_time 09:00".into(),
+                data_shows: "tour_schedule row 42 has start_time 09:00".into(),
                 environments: vec![
                     EnvCheck {
                         env: "production".into(),
@@ -64,7 +64,7 @@ fn schedule_fix() -> PlanResult {
                 fields: vec![FieldChange {
                     old: vec!["updated_at".into()],
                     new: String::new(),
-                    types: vec!["charter_schedule".into()],
+                    types: vec!["tour_schedule".into()],
                 }],
                 ..Default::default()
             }),

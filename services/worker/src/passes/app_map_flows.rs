@@ -1058,9 +1058,9 @@ mod tests {
     fn todo() -> Value {
         let ev = |file: &str, line: u64, token: &str, window: &[&str]| json!({"file": file, "line": line, "token": token, "from": line.saturating_sub(3).max(1), "window": window});
         json!({
-            "list": "S1 screen web /login @ harbor-web/app/login/page.tsx:4 requests[R1]\nR1 request POST /api/session @ harbor-web/lib/session.ts:9 then harbor-web/app/api/session/route.ts:3 outside[X1]\nX1 outside Okta @ harbor-api/src/auth.js:1\nS2 screen web /slips @ harbor-web/app/slips/page.tsx:2",
+            "list": "S1 screen web /login @ harbor-web/app/login/page.tsx:4 requests[R1]\nR1 request POST /api/session @ harbor-web/lib/session.ts:9 then harbor-web/app/api/session/route.ts:3 outside[X1]\nX1 outside Okta @ harbor-api/src/auth.js:1\nS2 screen web /slots @ harbor-web/app/slots/page.tsx:2",
             "entries": [{"id": "S1", "key": "screen:web:/login", "hash": "h1"}],
-            "keep": [{"id": "book-a-slip", "title": "Book a slip"}],
+            "keep": [{"id": "book-a-slot", "title": "Book a slot"}],
             "table": {
                 "S1": {"key": "screen:web:/login", "kind": "screen", "view": "f:harbor-web/app/login/page.tsx", "label": "web /login", "next": ["R1"],
                        "evidence": [ev("harbor-web/app/login/page.tsx", 4, "LoginPage", &["", "", "", "export default function LoginPage() {"])]},
@@ -1069,8 +1069,8 @@ mod tests {
                                     ev("harbor-web/app/api/session/route.ts", 3, "POST", &["", "", "export async function POST(req) {"])]},
                 "X1": {"key": "n:okta", "kind": "outside", "view": "n:okta", "label": "Okta", "next": [],
                        "evidence": [ev("harbor-api/src/auth.js", 1, "@okta/okta-auth-js", &["import { OktaAuth } from '@okta/okta-auth-js';"])]},
-                "S2": {"key": "screen:web:/slips", "kind": "screen", "view": "f:harbor-web/app/slips/page.tsx", "label": "web /slips", "next": [],
-                       "evidence": [ev("harbor-web/app/slips/page.tsx", 2, "Slips()", &["", "export default function Slips() {"])]},
+                "S2": {"key": "screen:web:/slots", "kind": "screen", "view": "f:harbor-web/app/slots/page.tsx", "label": "web /slots", "next": [],
+                       "evidence": [ev("harbor-web/app/slots/page.tsx", 2, "Slots()", &["", "export default function Slots() {"])]},
             }
         })
     }
@@ -1079,12 +1079,12 @@ mod tests {
     fn the_checker_takes_only_listed_ids_whose_lines_still_hold_their_tokens() {
         let answer = json!({"flows": [
             {"id": "sign-in", "title": "Sign in", "steps": [
-                {"ref": "S1", "note": "The boater opens the sign-in page."},
+                {"ref": "S1", "note": "The patron opens the sign-in page."},
                 {"ref": "R1", "note": "The page posts the email -> the session route."},
                 {"ref": "R1", "note": "The route checks the password."},
                 {"ref": "R9", "note": "An invented request."},
                 {"ref": "X1", "note": "Okta checks the password."},
-                {"ref": "S2", "note": "The boater lands on their slips."},
+                {"ref": "S2", "note": "The patron lands on their slots."},
             ]},
             {"id": "too-short", "title": "Too short", "steps": [{"ref": "S1", "note": "a"}, {"ref": "R1", "note": "b"}]},
             {"id": "not-a-screen", "title": "Starts at a request", "steps": [{"ref": "R1", "note": "a"}, {"ref": "X1", "note": "b"}, {"ref": "S1", "note": "c"}]},
@@ -1107,7 +1107,7 @@ mod tests {
                 "screen:web:/login",
                 "req:POST /api/session",
                 "n:okta",
-                "screen:web:/slips"
+                "screen:web:/slots"
             ]
         );
         // Words, never arrows; the repeated request folded into one step.
@@ -1161,8 +1161,8 @@ mod tests {
             {"ref": "R1", "note": "Posts the email."},
             {"ref": "S1", "note": "Opens the page."},
             {"ref": "X1", "note": "Okta answers again."},
-            {"ref": "R2", "note": "Loads the boater."},
-            {"ref": "S2", "note": "Lands on the slips."},
+            {"ref": "R2", "note": "Loads the patron."},
+            {"ref": "S2", "note": "Lands on the slots."},
         ]}]});
         let (flows, rep) = check(&answer, &t);
         let keys: Vec<&str> = flows[0]["steps"]
@@ -1180,7 +1180,7 @@ mod tests {
                 "req:POST /api/session",
                 "n:okta",
                 "req:GET /me",
-                "screen:web:/slips"
+                "screen:web:/slots"
             ]
         );
         assert_eq!(
@@ -1348,7 +1348,7 @@ mod tests {
         let p = user_prompt(&t, &groups(&t)[0]);
         assert!(p.contains("- S1 web /login"));
         assert!(p.contains("## Journey family: any"));
-        assert!(p.contains("- Book a slip"));
+        assert!(p.contains("- Book a slot"));
         assert!(p.contains("R1 request POST /api/session"));
         assert!(!SYSTEM.contains('\u{2192}'));
         assert_eq!(
@@ -1399,11 +1399,11 @@ mod tests {
         };
         let store = json!({"schema": SCHEMA, "flows": [
             // Two older traces of the sign-in screen, under different titles.
-            fl("sign-in", "Sign in", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/session", "screen:web:/slips"]),
-            fl("log-in-again", "Log in again", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/refresh", "screen:web:/slips"]),
+            fl("sign-in", "Sign in", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/session", "screen:web:/slots"]),
+            fl("log-in-again", "Log in again", "screen:web:/login", None, &["screen:web:/login", "req:POST /api/refresh", "screen:web:/slots"]),
             // A journey moved here from a split catch-all.
             fl("book-an-event", "Book an event", "screen:web:/events/(event)", Some(json!(["screen:web:/[...slug]", "screen:web:/events/(event)"])), &["screen:web:/events/(event)", "req:GET /api/events", "screen:web:/events/booked"]),
-            fl("book-a-slip", "Book a slip", "screen:web:/slips/:id", None, &["screen:web:/slips/:id", "req:POST /api/slips", "screen:web:/slips/booked"]),
+            fl("book-a-slot", "Book a slot", "screen:web:/slots/:id", None, &["screen:web:/slots/:id", "req:POST /api/slots", "screen:web:/slots/booked"]),
         ], "asked": {}});
         let todo = json!({"entries": [{"key": "screen:web:/login", "hash": "h1"}, {"key": "screen:web:/[...slug]", "hash": "h2"}]});
         let new = vec![
@@ -1416,7 +1416,7 @@ mod tests {
                     "screen:web:/login",
                     "req:POST /auth/login",
                     "n:okta",
-                    "screen:web:/slips",
+                    "screen:web:/slots",
                 ],
             ),
             fl(
@@ -1448,9 +1448,9 @@ mod tests {
             got,
             [
                 (
-                    "book-a-slip".to_string(),
-                    "Book a slip".to_string(),
-                    json!(["screen:web:/slips/:id"])
+                    "book-a-slot".to_string(),
+                    "Book a slot".to_string(),
+                    json!(["screen:web:/slots/:id"])
                 ),
                 (
                     "sign-in".to_string(),
@@ -1475,8 +1475,8 @@ mod tests {
     fn a_merge_replaces_only_the_entries_asked_about_and_remembers_them() {
         let store = json!({"schema": SCHEMA, "flows": [
             {"id": "sign-in", "title": "Old sign in", "entry": "screen:web:/login", "hash": "h0", "steps": []},
-            {"id": "book-a-slip", "title": "Book a slip", "entry": "screen:web:/slips/:id", "hash": "h2", "steps": []},
-        ], "asked": {"screen:web:/slips/:id": "h2"}});
+            {"id": "book-a-slot", "title": "Book a slot", "entry": "screen:web:/slots/:id", "hash": "h2", "steps": []},
+        ], "asked": {"screen:web:/slots/:id": "h2"}});
         let new = vec![
             json!({"id": "sign-in", "title": "Sign in", "entry": "screen:web:/login", "steps": []}),
         ];
@@ -1487,10 +1487,10 @@ mod tests {
             .iter()
             .map(|f| f["title"].as_str().unwrap())
             .collect();
-        assert_eq!(titles, ["Book a slip", "Sign in"]);
+        assert_eq!(titles, ["Book a slot", "Sign in"]);
         assert_eq!(m["flows"][1]["hash"], "h1");
         assert_eq!(m["asked"]["screen:web:/login"], "h1");
-        assert_eq!(m["asked"]["screen:web:/slips/:id"], "h2");
+        assert_eq!(m["asked"]["screen:web:/slots/:id"], "h2");
         // The model wrote nothing for an entry: it keeps what it had.
         let m = merge(&store, &todo(), Vec::new());
         assert_eq!(m["flows"].as_array().unwrap().len(), 2);

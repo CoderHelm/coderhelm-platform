@@ -1,10 +1,10 @@
-//! df. A ticket said a charter card showed a broken image: the page used an
+//! df. A ticket said a tour card showed a broken image: the page used an
 //! older image address that returned an error, while the address the
 //! reporter expected was stored in our database. The trace found it all:
-//! the charter's own record in the source system holds the broken address,
+//! the tour's own record in the source system holds the broken address,
 //! a second source record of the same kind (its fleet) holds a working
-//! one, and our pipeline gives the charter's own image priority, so the
-//! broken one is stored on the charter and rendered. Many other charters
+//! one, and our pipeline gives the tour's own image priority, so the
+//! broken one is stored on the tour and rendered. Many other tours
 //! carried addresses of the same kind. The run decided the fix is
 //! outside the code (edit the one source record), and a later run of the
 //! unchanged ticket stopped on that earlier verdict: "No new pull request:
@@ -41,25 +41,23 @@ fn layer(layer: &str, where_: &str, shows: &str, state: &str) -> Layer {
 fn outside_decision() -> FixDecision {
     FixDecision {
         fix_location: FixLocation::OutsideCode,
-        cause: "The charter record's own image address returns an error, and the pipeline gives \
-                the charter's image priority over its fleet's."
+        cause: "The tour record's own image address returns an error, and the pipeline gives \
+                the tour's image priority over its fleet's."
             .into(),
         intent: TicketIntent::Bug,
         evidence: FixEvidence {
-            looked_up: vec!["[prod database] the charter and its fleet".into()],
-            data_shows: "The charter holds the broken address; the fleet holds a working one."
-                .into(),
+            looked_up: vec!["[prod database] the tour and its fleet".into()],
+            data_shows: "The tour holds the broken address; the fleet holds a working one.".into(),
             basis: "data".into(),
             producer: Producer {
                 kind: "source".into(),
-                where_: "booking system, charter record 1001: image address returns 502".into(),
+                where_: "booking system, tour record 1001: image address returns 502".into(),
             },
-            scope:
-                "One charter confirmed; hundreds of active charters carry addresses of that kind."
-                    .into(),
+            scope: "One tour confirmed; hundreds of active tours carry addresses of that kind."
+                .into(),
             layers: vec![
                 layer(
-                    "source (charter record)",
+                    "source (tour record)",
                     "booking system, raw copy in the warehouse",
                     "image = old-bucket/a.jpg (the image proxy returns 502)",
                     "wrong",
@@ -72,14 +70,14 @@ fn outside_decision() -> FixDecision {
                 ),
                 layer(
                     "pipeline",
-                    "acme/pipelines:dags/charter_pipeline.py:212",
-                    "copies the charter's own image when set, per its rule",
+                    "acme/pipelines:dags/tour_pipeline.py:212",
+                    "copies the tour's own image when set, per its rule",
                     "ok",
                 ),
                 layer(
                     "app database",
-                    "charter table",
-                    "fleet files-bucket/b.jpg; charter old-bucket/a.jpg",
+                    "tour table",
+                    "fleet files-bucket/b.jpg; tour old-bucket/a.jpg",
                     "wrong",
                 ),
                 layer(
@@ -93,7 +91,7 @@ fn outside_decision() -> FixDecision {
         },
         outside_change: Some(OutsideChange {
             system: "the booking system".into(),
-            change: "Replace the charter record's image with a working one".into(),
+            change: "Replace the tour record's image with a working one".into(),
             ..Default::default()
         }),
         ..Default::default()
@@ -107,7 +105,7 @@ fn a_broken_source_value_with_a_working_one_in_reach_goes_back_as_a_code_fix() {
     let all = gaps.join("\n");
     assert!(all.contains("working value in reach"), "{all}");
     assert!(
-        all.contains("acme/pipelines:dags/charter_pipeline.py:212"),
+        all.contains("acme/pipelines:dags/tour_pipeline.py:212"),
         "{all}"
     );
     assert!(all.contains("fall back to"), "{all}");

@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn collects_questions_from_the_plan_and_the_coder_once_each() {
         let design = "## Approach\nx\n\n## Open product questions\n- Should members see the block, or everyone? Meanwhile: everyone, as today.\n- none\n\n## Reuse\n- a/b.ts\n";
-        let notes = "Done.\nOpen product question: Should members see the block, or everyone? Meanwhile: everyone, as today.\n- Open product question: Does the filter remember the last marina?\n";
+        let notes = "Done.\nOpen product question: Should members see the block, or everyone? Meanwhile: everyone, as today.\n- Open product question: Does the filter remember the last library?\n";
         let q = collect(design, notes);
         assert_eq!(q.len(), 2);
         assert!(q[1].starts_with("Does the filter"));
@@ -100,7 +100,7 @@ mod tests {
             ),
             "{md}"
         );
-        assert!(md.contains("The filter remember the last marina: decided with the default: today's behaviour stays"), "{md}");
+        assert!(md.contains("The filter remember the last library: decided with the default: today's behaviour stays"), "{md}");
         assert!(!md.contains('?'));
         assert!(!md.to_lowercase().contains("please answer"));
         assert!(markdown(&[]).is_empty());

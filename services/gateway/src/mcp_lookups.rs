@@ -326,7 +326,7 @@ pub const TOOLS: &[Tool] = &[
         title: "Search the app map",
         description: "Searches the team's app map for parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word, with their ids for map_part, map_screen, map_file and map_flow.",
         scopes: &[CODE_SCOPE],
-        schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slip." } }), &["query"]),
+        schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slot." } }), &["query"]),
         output: None,
     },
     Tool {
@@ -340,7 +340,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_SCREEN,
         title: "Follow a screen on the app map",
-        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. A page one route picks by type (a catch-all that renders a different component for each kind of page) is a screen of its own, with the type, its renderer's file:line and the route that picks it. Give the screen's id, its address (like /slips/:id) or its name.",
+        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. A page one route picks by type (a catch-all that renders a different component for each kind of page) is a screen of its own, with the type, its renderer's file:line and the route that picks it. Give the screen's id, its address (like /slots/:id) or its name.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id, address or name, from map_overview or map_find." } }), &["screen"]),
         output: None,
@@ -366,7 +366,7 @@ pub const TOOLS: &[Tool] = &[
         title: "What a change reaches on the app map",
         description: common::app_map::IMPACT_DESCRIPTION,
         scopes: &[CODE_SCOPE],
-        schema: || obj(json!({ "target": { "type": "string", "description": "A file's path on the map (like harbor-api/src/bookings.js), an endpoint (METHOD /path, like POST /slips/:id/bookings) or a part's id, from map_overview or map_find." } }), &["target"]),
+        schema: || obj(json!({ "target": { "type": "string", "description": "A file's path on the map (like harbor-api/src/bookings.js), an endpoint (METHOD /path, like POST /slots/:id/bookings) or a part's id, from map_overview or map_find." } }), &["target"]),
         output: None,
     },
 ];
@@ -1808,10 +1808,10 @@ mod tests {
             (MAP_OVERVIEW, json!({})),
             (MAP_FIND, json!({ "query": "booking" })),
             (MAP_PART, json!({ "id": "api" })),
-            (MAP_SCREEN, json!({ "screen": "/slips/:id" })),
+            (MAP_SCREEN, json!({ "screen": "/slots/:id" })),
             (MAP_FILE, json!({ "path": "harbor-api/src/bookings.js" })),
-            (MAP_FLOW, json!({ "journey": "book a slip" })),
-            (MAP_IMPACT, json!({ "target": "POST /slips/:id/bookings" })),
+            (MAP_FLOW, json!({ "journey": "book a slot" })),
+            (MAP_IMPACT, json!({ "target": "POST /slots/:id/bookings" })),
         ];
         for k in FINDING_KINDS {
             v.push((FIND_FINDINGS, json!({ "kind": k })));
@@ -2097,10 +2097,10 @@ mod tests {
     #[test]
     fn the_map_lookups_answer_from_the_signed_in_teams_map_only() {
         let member = Holder::builtin("member");
-        let read = read_of(MAP_SCREEN, &json!({ "screen": "/slips/:id" })).unwrap();
+        let read = read_of(MAP_SCREEN, &json!({ "screen": "/slots/:id" })).unwrap();
         assert_eq!(scope_needed(MAP_SCREEN, &json!({})), None);
         assert_eq!(
-            scope_needed(MAP_SCREEN, &json!({ "screen": "/slips/:id" })),
+            scope_needed(MAP_SCREEN, &json!({ "screen": "/slots/:id" })),
             Some(CODE_SCOPE)
         );
         assert!(decide(&BTreeSet::from([READ_SCOPE, CODE_SCOPE]), &member, &read).is_ok());
@@ -2131,14 +2131,14 @@ mod tests {
         );
         assert_eq!(
             found[0].title,
-            "Followed the screen /slips/:id on the app map"
+            "Followed the screen /slots/:id on the app map"
         );
         // Its id reads the same lookup again.
         let t = decode_id(&found[0].id).unwrap();
         assert_eq!(t.read, read);
         // Another team's part or screen isn't in this team's map, and a team
         // with no map gets a plain answer.
-        let theirs = read_of(MAP_PART, &json!({ "id": "marina-docks" })).unwrap();
+        let theirs = read_of(MAP_PART, &json!({ "id": "library-wings" })).unwrap();
         assert!(map_read(Some(harbor("harbor")), &mut Registry::default(), &theirs).is_err());
         let err = map_read(None, &mut Registry::default(), &read).unwrap_err();
         assert!(err.contains("no app map yet"), "{err}");
@@ -2222,12 +2222,12 @@ mod tests {
             "files": [
                 {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
                 {"p": "site/apps/web/blocks/Hero.tsx", "n": "web", "r": "site"},
-                {"p": "site/apps/studio/schemas/slip.ts", "n": "studio", "r": "site"},
+                {"p": "site/apps/studio/schemas/slot.ts", "n": "studio", "r": "site"},
             ],
             "screens": [
                 {"id": "screen:home", "url": "/", "name": "Home", "file": "site/apps/web/app/page.tsx", "nav": {"app": "site"}},
                 {"id": "screen:hero", "url": "/:slug", "name": "Hero", "file": "site/apps/web/blocks/Hero.tsx", "nav": {"app": "site", "dispatcher": "site/apps/web/app/page.tsx"}},
-                {"id": "screen:doc", "url": "/studio/slip", "name": "Slip", "file": "site/apps/studio/schemas/slip.ts", "kind": "page-kind", "nav": {"app": "site"}},
+                {"id": "screen:doc", "url": "/studio/slot", "name": "Slot", "file": "site/apps/studio/schemas/slot.ts", "kind": "page-kind", "nav": {"app": "site"}},
             ],
             "links": [],
         });
@@ -2261,14 +2261,14 @@ mod tests {
     fn a_journey_is_walked_step_by_step_with_its_files() {
         let mut g = harbor("harbor");
         g["flows"] = json!([{
-            "id": "book-a-slip", "title": "Book a slip", "custom": true, "coderhelm": {"linked": [true, true, true]},
+            "id": "book-a-slot", "title": "Book a slot", "custom": true, "coderhelm": {"linked": [true, true, true]},
             "steps": [
-                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater opens a slip.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
-                {"ref": "r:0", "note": "The page asks the booking service to book it.", "evidence": [{"file": "harbor-web/lib/slips.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks the booking service to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
                 {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
             ],
         }]);
-        let read = read_of(MAP_FLOW, &json!({ "journey": "book a slip" })).unwrap();
+        let read = read_of(MAP_FLOW, &json!({ "journey": "book a slot" })).unwrap();
         assert_eq!(read.lookup, MAP_FLOW);
         assert_eq!(
             scope_needed(MAP_FLOW, &json!({ "journey": "x" })),
@@ -2277,12 +2277,12 @@ mod tests {
         assert!(read_of(MAP_FLOW, &json!({})).is_err());
         let mut reg = Registry::default();
         let (text, _) = map_read(Some(g.clone()), &mut reg, &read).unwrap();
-        assert!(text.contains("harbor-web/lib/slips.ts:2"), "{text}");
+        assert!(text.contains("harbor-web/lib/slots.ts:2"), "{text}");
         assert!(text.contains("Stripe charges the card."), "{text}");
         let found = items(&reg, &read, "https://app.example");
         assert_eq!(
             found[0].title,
-            "Walked through the journey book a slip on the app map"
+            "Walked through the journey book a slot on the app map"
         );
         assert_eq!(
             found[0].url,
@@ -2296,16 +2296,16 @@ mod tests {
         )
         .unwrap();
         assert!(
-            overview.contains("\"journeys\":[{\"id\":\"book-a-slip\""),
+            overview.contains("\"journeys\":[{\"id\":\"book-a-slot\""),
             "{overview}"
         );
         let (found, _) = map_read(
             Some(g),
             &mut Registry::default(),
-            &read_of(MAP_FIND, &json!({ "query": "slip book" })).unwrap(),
+            &read_of(MAP_FIND, &json!({ "query": "slot book" })).unwrap(),
         )
         .unwrap();
-        assert!(found.contains("\"title\":\"Book a slip\""), "{found}");
+        assert!(found.contains("\"title\":\"Book a slot\""), "{found}");
     }
 
     #[test]
@@ -2605,34 +2605,34 @@ mod tests {
         assert_eq!(body_of(&rendered), "1 | fn a() {}\n2 | }\n");
     }
 
-    /// The marina map: one website whose catch-all route dispatches its
-    /// pages by type (services/worker/floorplan/fixtures/marina), with a
+    /// The library map: one website whose catch-all route dispatches its
+    /// pages by type (services/worker/floorplan/fixtures/library), with a
     /// journey through two of the dispatched pages as the worker stores it.
-    fn marina() -> Value {
+    fn library() -> Value {
         let mut g: Value = serde_json::from_str(include_str!(
-            "../../worker/floorplan/fixtures/marina-graph.json"
+            "../../worker/floorplan/fixtures/library-graph.json"
         ))
         .unwrap();
         common::app_map::stamp_repos(
             &mut g,
-            &common::app_map::folders(&["marina/marina-web".to_string()]),
+            &common::app_map::folders(&["library/library-web".to_string()]),
         );
         g["flows"] = json!([{
-            "id": "join-the-marina", "title": "Join the marina", "custom": true,
+            "id": "join-the-library", "title": "Join the library", "custom": true,
             "coderhelm": {"entry": "screen:site:/members/join", "linked": [true, true, true]},
             "steps": [
-                {"ref": "f:marina-web/lib/renderers.tsx", "screen": "screen:site:/members/join", "note": "The boater fills in the sign-up form.", "evidence": [{"file": "marina-web/lib/renderers.tsx", "line": 19}]},
-                {"ref": "r:1", "note": "The form saves the new member.", "evidence": [{"file": "marina-web/components/SignupForm.tsx", "line": 7}, {"file": "marina-web/app/api/members/route.ts", "line": 1}]},
-                {"ref": "f:marina-web/lib/renderers.tsx", "screen": "screen:site:/members/checkout", "note": "The boater pays for the season.", "evidence": [{"file": "marina-web/lib/renderers.tsx", "line": 24}]},
+                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/join", "note": "The patron fills in the sign-up form.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 19}]},
+                {"ref": "r:1", "note": "The form saves the new member.", "evidence": [{"file": "library-web/components/SignupForm.tsx", "line": 7}, {"file": "library-web/app/api/members/route.ts", "line": 1}]},
+                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/checkout", "note": "The patron pays for the season.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 24}]},
             ],
         }]);
         g
     }
 
-    /// One map tool on /mcp over the marina map, as the model reads it.
-    fn marina_tool(name: &str, input: Value) -> Value {
+    /// One map tool on /mcp over the library map, as the model reads it.
+    fn library_tool(name: &str, input: Value) -> Value {
         let read = read_of(name, &input).unwrap();
-        let (text, _) = map_read(Some(marina()), &mut Registry::default(), &read).unwrap();
+        let (text, _) = map_read(Some(library()), &mut Registry::default(), &read).unwrap();
         let body = text.split_once("] ").map(|(_, b)| b).unwrap_or(&text);
         serde_json::from_str(body).unwrap()
     }
@@ -2642,7 +2642,7 @@ mod tests {
     /// renderer, named for their renderer file, and walked in a journey.
     #[test]
     fn dispatched_screens_come_through_the_map_tools() {
-        let o = marina_tool(MAP_OVERVIEW, json!({}));
+        let o = library_tool(MAP_OVERVIEW, json!({}));
         let listed: Vec<&str> = o["screens"]
             .as_array()
             .unwrap()
@@ -2652,8 +2652,8 @@ mod tests {
         for n in [
             "Member signup",
             "Member checkout",
-            "Berth page",
-            "Berth list",
+            "Booth page",
+            "Booth list",
             "Notice page",
         ] {
             assert!(listed.contains(&n), "{n} in {listed:?}");
@@ -2667,50 +2667,50 @@ mod tests {
             .filter_map(Value::as_u64)
             .sum();
         assert_eq!(counted, 7);
-        assert_eq!(o["screen_count"], json!({ "marina-web": 7 }));
+        assert_eq!(o["screen_count"], json!({ "library-web": 7 }));
 
-        let f = marina_tool(MAP_FIND, json!({ "query": "member checkout" }));
+        let f = library_tool(MAP_FIND, json!({ "query": "member checkout" }));
         assert_eq!(f["screens"][0]["url"], "/members/checkout");
         assert_eq!(
             f["screens"][0]["dispatch"]["renderer"],
             "MemberCheckoutRenderer"
         );
         // by the type the route dispatches on, too
-        let f = marina_tool(MAP_FIND, json!({ "query": "berth-index" }));
-        assert_eq!(f["screens"][0]["name"], "Berth list");
+        let f = library_tool(MAP_FIND, json!({ "query": "booth-index" }));
+        assert_eq!(f["screens"][0]["name"], "Booth list");
 
         for q in [
             "/members/join",
             "screen:site:/members/join",
             "Member signup",
         ] {
-            let v = marina_tool(MAP_SCREEN, json!({ "screen": q }));
+            let v = library_tool(MAP_SCREEN, json!({ "screen": q }));
             let s = &v["screen"];
             assert_eq!(s["url"], "/members/join", "{q}");
-            assert_eq!(s["file"], "marina-web/lib/renderers.tsx");
+            assert_eq!(s["file"], "library-web/lib/renderers.tsx");
             assert_eq!(s["dispatch"]["type"], "member-signup");
             assert_eq!(
                 s["dispatch"]["renderer_at"],
-                "marina-web/lib/renderers.tsx:19"
+                "library-web/lib/renderers.tsx:19"
             );
             assert_eq!(
                 s["dispatch"]["route_file"],
-                "marina-web/app/[...slug]/page.tsx"
+                "library-web/app/[...slug]/page.tsx"
             );
             assert_eq!(s["dispatch"]["url_from"], "resolver");
-            assert_eq!(s["evidence"][0]["at"], "marina-web/lib/renderers.tsx:19");
-            assert_eq!(s["evidence"][2]["at"], "marina-web/lib/resolve.ts:13");
+            assert_eq!(s["evidence"][0]["at"], "library-web/lib/renderers.tsx:19");
+            assert_eq!(s["evidence"][2]["at"], "library-web/lib/resolve.ts:13");
             let behind: Vec<&str> = v["behind"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(|b| b["id"].as_str())
                 .collect();
-            assert!(behind.contains(&"f:marina-web/components/SignupForm.tsx"));
-            assert!(!behind.contains(&"f:marina-web/components/CheckoutForm.tsx"));
+            assert!(behind.contains(&"f:library-web/components/SignupForm.tsx"));
+            assert!(!behind.contains(&"f:library-web/components/CheckoutForm.tsx"));
         }
         // a pattern only the route gives says so
-        let v = marina_tool(MAP_SCREEN, json!({ "screen": "/(notice)/*" }));
+        let v = library_tool(MAP_SCREEN, json!({ "screen": "/(notice)/*" }));
         assert_eq!(v["screen"]["dispatch"]["url_from"], "route");
 
         let names = |v: &Value| -> Vec<String> {
@@ -2721,14 +2721,14 @@ mod tests {
                 .filter_map(|s| s["name"].as_str().map(str::to_string))
                 .collect()
         };
-        let file = marina_tool(MAP_FILE, json!({ "path": "marina-web/lib/renderers.tsx" }));
+        let file = library_tool(MAP_FILE, json!({ "path": "library-web/lib/renderers.tsx" }));
         let on_file = names(&file);
-        for n in ["Member signup", "Member checkout", "Berth page"] {
+        for n in ["Member signup", "Member checkout", "Booth page"] {
             assert!(on_file.iter().any(|x| x == n), "{n} in {on_file:?}");
         }
-        let imp = marina_tool(
+        let imp = library_tool(
             MAP_IMPACT,
-            json!({ "target": "marina-web/lib/renderers.tsx" }),
+            json!({ "target": "library-web/lib/renderers.tsx" }),
         );
         let hit = names(&imp);
         for n in ["Member signup", "Member checkout", "Notice page"] {
@@ -2740,19 +2740,19 @@ mod tests {
             .iter()
             .filter_map(|s| s["at"].as_str())
             .collect();
-        assert!(at.contains(&"marina-web/lib/renderers.tsx:24"), "{at:?}");
-        assert_eq!(imp["journeys"][0]["id"], "join-the-marina");
+        assert!(at.contains(&"library-web/lib/renderers.tsx:24"), "{at:?}");
+        assert_eq!(imp["journeys"][0]["id"], "join-the-library");
         // the form one screen uses reaches that screen only
-        let imp = marina_tool(
+        let imp = library_tool(
             MAP_IMPACT,
-            json!({ "target": "marina-web/components/CheckoutForm.tsx" }),
+            json!({ "target": "library-web/components/CheckoutForm.tsx" }),
         );
         let mut reached = names(&imp);
         reached.sort();
         assert_eq!(reached, ["Member checkout", "Page"]);
 
-        let j = marina_tool(MAP_FLOW, json!({ "journey": "join the marina" }));
-        assert_eq!(j["journey"]["id"], "join-the-marina");
+        let j = library_tool(MAP_FLOW, json!({ "journey": "join the library" }));
+        assert_eq!(j["journey"]["id"], "join-the-library");
         let on: Vec<&str> = j["steps"]
             .as_array()
             .unwrap()
@@ -2761,6 +2761,9 @@ mod tests {
             .collect();
         assert_eq!(on, vec!["Member signup", "-", "Member checkout"]);
         assert_eq!(j["steps"][2]["screen"]["url"], "/members/checkout");
-        assert_eq!(j["steps"][2]["cites"][0], "marina-web/lib/renderers.tsx:24");
+        assert_eq!(
+            j["steps"][2]["cites"][0],
+            "library-web/lib/renderers.tsx:24"
+        );
     }
 }

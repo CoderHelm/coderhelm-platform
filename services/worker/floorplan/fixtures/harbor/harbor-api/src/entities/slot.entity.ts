@@ -1,7 +1,7 @@
 import { Column, Entity, PrimaryColumn } from 'typeorm';
 
-@Entity('slip')
-export class Slip {
+@Entity('slot')
+export class Slot {
   @PrimaryColumn()
   id!: string;
 

@@ -1,5 +1,5 @@
 {
-  "name": "marina-web",
+  "name": "library-web",
   "private": true,
   "dependencies": { "next": "14.2.5", "react": "18.3.1" }
 }

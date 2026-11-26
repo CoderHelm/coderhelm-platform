@@ -73,7 +73,7 @@ fn tag_step(status: Status) -> Step {
 fn left_behind(status: Status) -> (Record, Meta) {
     let rec = Record {
         steps: vec![tag_step(status)],
-        head_branch: "fix/dock-timeouts".into(),
+        head_branch: "fix/wing-timeouts".into(),
         base_branch: "main".into(),
         chain_id: "old-chain".into(),
         armed_at: NOW - 9 * DAY,
@@ -94,8 +94,8 @@ fn a_record_left_at_approval_or_pending_is_resumed() {
     }
     // The key names the repository and pull request the tick is for.
     assert_eq!(
-        release_run::parse_sk("RELEASE#harbor/dock-api#000007"),
-        Some(("harbor".into(), "dock-api".into(), 7))
+        release_run::parse_sk("RELEASE#harbor/wing-api#000007"),
+        Some(("harbor".into(), "wing-api".into(), 7))
     );
 }
 
@@ -175,14 +175,14 @@ fn a_shipped_merge_follows_the_tag_that_holds_it() {
         s,
         Status::Running,
         "harbor",
-        "dock-api",
+        "wing-api",
         release_run::said_at(s),
     )
     .unwrap();
     assert_eq!(
         line,
         "Deployed to production in `v2.3.0` at 09:12 UTC \
-         (https://github.com/harbor/dock-api/actions/runs/3003)."
+         (https://github.com/harbor/wing-api/actions/runs/3003)."
     );
     let _ = MERGE;
 }
@@ -238,12 +238,12 @@ async fn a_record_on_a_large_settings_table_is_found_and_resumed() {
         ));
     }
     let (rec, meta) = left_behind(Status::Approval);
-    let sk = "RELEASE#harbor/dock-api#000007";
+    let sk = "RELEASE#harbor/wing-api#000007";
     table.put(fake::release_item("TEAM#harbor", sk, &rec, &meta));
     for v in 0..120 {
         table.put(fake::item(
             "TEAM#harbor",
-            &format!("RELEASE#harbor/dock-api#v2.{v}.0"),
+            &format!("RELEASE#harbor/wing-api#v2.{v}.0"),
         ));
     }
     // Far past any page cap the old scan had.
@@ -272,7 +272,7 @@ async fn a_record_on_a_large_settings_table_is_found_and_resumed() {
     // Once the record is gone, the team leaves the index.
     let empty = fake::Table::new(25);
     empty.add_member("TEAM#harbor");
-    empty.put(fake::item("TEAM#harbor", "RELEASE#harbor/dock-api#v2.0.0"));
+    empty.put(fake::item("TEAM#harbor", "RELEASE#harbor/wing-api#v2.0.0"));
     let found = release_run::find_stalled(&empty, NOW).await.unwrap();
     assert_eq!(found.dropped, vec!["TEAM#harbor".to_string()]);
     assert!(empty.members().is_empty());

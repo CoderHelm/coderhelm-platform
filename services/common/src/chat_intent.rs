@@ -756,11 +756,11 @@ mod tests {
     #[test]
     fn how_the_app_fits_together_reads_as_a_map_question() {
         for q in [
-            "What happens when someone books a slip?",
-            "how does booking a slip work",
+            "What happens when someone books a slot?",
+            "how does booking a slot work",
             "How do refunds get to Stripe?",
             "what calls the bookings endpoint",
-            "What's behind the /slips/:id screen?",
+            "What's behind the /slots/:id screen?",
             "which service charges the card",
             "where does the booking request go",
             "how is the harbor website connected to the booking service",

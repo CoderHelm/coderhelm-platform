@@ -30,8 +30,8 @@ fn facts() -> Facts {
         ("apps/web/src/lib/routing/content-renderers.tsx", 4),
         ("apps/web/src/utils/globalConstants.ts", 2),
         ("apps/web/src/test/components/portal-embed.test.tsx", 60),
-        ("e2e/pages/slip-booking.ts", 40),
-        ("e2e/tests/browse/slip-booking.spec.ts", 72),
+        ("e2e/pages/slot-booking.ts", 40),
+        ("e2e/tests/browse/slot-booking.spec.ts", 72),
     ];
     Facts {
         head: "fedcba9876543210fedcba9876543210fedcba98".into(),
@@ -54,8 +54,8 @@ fn written() -> String {
     format!(
         "## Changes\nRemoves the new-tab link from the portal page and lets the header scroll.\n\n\
          ## Earlier attempts\n- The first push froze the header; the review took the sizing out; a planned-work round put it back.\n\n\
-         ## Deferred\n- Waiting on CI for the reverted files.\n- Reverted 5 file(s) to the last green head <!-- coderhelm:revert to=a1b2c3d4e paths=e2e/pages/slip-booking.ts -->\n\n\
-         ## Notes\nThe page scroll assertions were dropped from this pull request (`slip-booking.ts`).\n\n{notes}\n\n{notes}\n\n{notes}"
+         ## Deferred\n- Waiting on CI for the reverted files.\n- Reverted 5 file(s) to the last green head <!-- coderhelm:revert to=a1b2c3d4e paths=e2e/pages/slot-booking.ts -->\n\n\
+         ## Notes\nThe page scroll assertions were dropped from this pull request (`slot-booking.ts`).\n\n{notes}\n\n{notes}\n\n{notes}"
     )
 }
 

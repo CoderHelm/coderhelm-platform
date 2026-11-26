@@ -1,5 +1,5 @@
-//! cr. A pull request that removed a link from a slip booking page had its
-//! end-to-end check fail on a test it had edited: "selecting a slip adds it
+//! cr. A pull request that removed a link from a slot booking page had its
+//! end-to-end check fail on a test it had edited: "selecting a slot adds it
 //! to the cart while booking is open". The booking vendor's portal the
 //! page embeds had just opened booking, and a visitor who isn't signed
 //! in gets the vendor's sign-in drawer instead of a cart line, so the test
@@ -40,7 +40,7 @@ use common::ci_lines::{self, HeadCi};
 use common::ci_repro::{self as repro, Leg, Record, RevertGate, Verdict};
 
 const HEAD: &str = "e1e2e3f4a5b6c7d8";
-const TEST: &str = "tests/browse/slip-booking.spec.ts › selecting a slip adds it to the cart while booking is open";
+const TEST: &str = "tests/browse/slot-booking.spec.ts › selecting a slot adds it to the cart while booking is open";
 
 /// The e2e reporter's comment on the pull request, as it was posted.
 fn failure_comment() -> String {
@@ -49,13 +49,13 @@ fn failure_comment() -> String {
         "",
         "1 failed, 52 passed",
         "",
-        "  1) [chromium] › tests/browse/slip-booking.spec.ts:141:7 › Slip booking › selecting a slip adds it to the cart while booking is open",
+        "  1) [chromium] › tests/browse/slot-booking.spec.ts:141:7 › Slot booking › selecting a slot adds it to the cart while booking is open",
         "",
-        "    Error: Choosing \"Acme Guest Slip (morning)\" did not add it to the portal's Booking total",
+        "    Error: Choosing \"Acme Guest Slot (morning)\" did not add it to the portal's Booking total",
         "    expect(locator).not.toHaveText(expected) failed",
         "    Received: Total$0",
         "",
-        "![failure](https://github.com/user-attachments/assets/0b7a-slip-drawer.png)",
+        "![failure](https://github.com/user-attachments/assets/0b7a-slot-drawer.png)",
         "",
         "[Full report](https://e2e-reports.example.com/pr-12/index.html)",
     ]
@@ -65,7 +65,7 @@ fn failure_comment() -> String {
 /// What the sandbox printed for each side: red on staging and on the
 /// preview alike.
 fn compared() -> Record {
-    let red = "Running 1 test using 1 worker\n  1) [chromium] › tests/browse/slip-booking.spec.ts:141:7 › selecting a slip\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Total$0\n  1 failed\n";
+    let red = "Running 1 test using 1 worker\n  1) [chromium] › tests/browse/slot-booking.spec.ts:141:7 › selecting a slot\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Total$0\n  1 failed\n";
     Record {
         head: HEAD.into(),
         check: "Deploy Preview".into(),
@@ -88,18 +88,18 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
     );
     assert_eq!(
         ev.shots,
-        vec!["https://github.com/user-attachments/assets/0b7a-slip-drawer.png".to_string()]
+        vec!["https://github.com/user-attachments/assets/0b7a-slot-drawer.png".to_string()]
     );
     assert!(ci_repro::image_host_allowed(
         "github.com",
-        "/user-attachments/assets/0b7a-slip-drawer.png",
+        "/user-attachments/assets/0b7a-slot-drawer.png",
         &[]
     ));
     // The test runs against both addresses with the head's test code.
     let (spec, title) = repro::spec_and_title(TEST);
     let cmd = repro::leg_cmd("e2e", &spec, &title, "https://staging.harbor.example.com").unwrap();
     assert!(
-        cmd.contains("--grep 'selecting a slip adds it to the cart while booking is open'"),
+        cmd.contains("--grep 'selecting a slot adds it to the cart while booking is open'"),
         "{cmd}"
     );
     assert!(cmd.contains("--retries=0"));
@@ -115,7 +115,7 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
         brief.contains("Total$0") || brief.contains("Booking total"),
         "{brief}"
     );
-    assert!(brief.contains("0b7a-slip-drawer.png"), "{brief}");
+    assert!(brief.contains("0b7a-slot-drawer.png"), "{brief}");
     assert!(brief.contains("attached to this message as an image"));
     assert!(
         brief.contains("Fix the test, or the code it checks, on this branch"),
@@ -172,7 +172,7 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
 fn blame_and_unconfirmed_need_the_record_and_the_report() {
     // The first attempt's account, before anything was compared.
     let said =
-        "The `slip pricing` spec is broken on main since #310; nothing in this diff touches it.";
+        "The `slot pricing` spec is broken on main since #310; nothing in this diff touches it.";
     let held = resume::held_tried(&[said.to_string()], &[], HEAD, "");
     assert!(!held[0].contains("broken on main"), "{held:?}");
     assert!(held[0].contains(repro::BLAME_HELD));
@@ -187,9 +187,9 @@ fn blame_and_unconfirmed_need_the_record_and_the_report() {
     let ev = ci_repro::evidence_of("Deploy Preview", &failure_comment(), "").unwrap();
     let unsure = "I couldn't confirm what the e2e test saw on the portal.";
     let held = resume::held_tried(&[unsure.to_string()], &[compared()], HEAD, &ev.line());
-    assert!(held[0].starts_with("The failure's report says: `Deploy Preview` failed in `tests/browse/slip-booking.spec.ts"), "{held:?}");
+    assert!(held[0].starts_with("The failure's report says: `Deploy Preview` failed in `tests/browse/slot-booking.spec.ts"), "{held:?}");
     assert!(held[0]
-        .contains("screenshot: https://github.com/user-attachments/assets/0b7a-slip-drawer.png"));
+        .contains("screenshot: https://github.com/user-attachments/assets/0b7a-slot-drawer.png"));
 
     // The pipeline: every account goes through the hold before the pull
     // request, and the fixer's message carries the brief and the shot.
@@ -210,7 +210,7 @@ fn the_error_quoted_is_the_tests_never_the_workflow_script() {
         "2030-03-17T04:36:58.1Z ✖ 1 problem (0 errors, 1 warning)",
         "2030-03-17T04:36:58.2Z 0 errors and 1 warning potentially fixable with the `--fix` option.",
         "2030-03-17T04:37:00.7683325Z \u{1b}[36;1m# With a build ID, also wait until the page is served by that build\u{1b}[0m",
-        "2030-03-17T15:22:44.6320006Z Error: Choosing \"Acme Guest Slip (morning)\" did not add it to the portal's Booking total",
+        "2030-03-17T15:22:44.6320006Z Error: Choosing \"Acme Guest Slot (morning)\" did not add it to the portal's Booking total",
         "2030-03-17T15:22:44.6320874Z expect(locator).not.toHaveText(expected) failed",
     ]
     .join("\n");
@@ -223,7 +223,7 @@ fn the_ci_lines_are_true_for_the_head() {
     let section = resume::ci_failing_section(
         "c4c5c6c7c8c9",
         &["Deploy Preview".to_string()],
-        "Error: Choosing a slip did not add it",
+        "Error: Choosing a slot did not add it",
         &[],
         "CoderHelm fixes the test on this branch.",
     );

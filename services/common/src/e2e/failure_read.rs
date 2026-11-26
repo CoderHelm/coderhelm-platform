@@ -273,7 +273,7 @@ pub fn says_unreadable(text: &str) -> bool {
 mod tests {
     use super::*;
 
-    const COMMENT: &str = "## E2E results\n\n❌ 1 failed, 41 passed\n\n  1) [chromium] › tests/checkout/booking.spec.ts:88:7 › Slip booking › pays with a saved card\n\n    Error: expect(locator).toBeVisible() failed\n    Locator: getByTestId('payment-confirmation')\n";
+    const COMMENT: &str = "## E2E results\n\n❌ 1 failed, 41 passed\n\n  1) [chromium] › tests/checkout/booking.spec.ts:88:7 › Slot booking › pays with a saved card\n\n    Error: expect(locator).toBeVisible() failed\n    Locator: getByTestId('payment-confirmation')\n";
 
     /// A pull request said it couldn't read the log while the e2e
     /// workflow's comment named the failing test and its error.

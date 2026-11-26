@@ -44,7 +44,7 @@ fn the_line_as_written() -> String {
     );
     let lines: Vec<String> = [
         dropped("harborHeroText", "isTitlePrimary"),
-        dropped("chartersCarousel", "isTitleSecondary"),
+        dropped("toursCarousel", "isTitleSecondary"),
     ]
     .iter()
     .map(|n| {
@@ -67,8 +67,8 @@ fn the_line_as_written() -> String {
 fn facts(body: &str) -> Facts {
     Facts {
         draft: true,
-        title: "Add a Title Size setting to the marina page blocks".into(),
-        body: format!("## Summary\nOne Title Size setting for every marina block.\n\n{body}"),
+        title: "Add a Title Size setting to the library page blocks".into(),
+        body: format!("## Summary\nOne Title Size setting for every library block.\n\n{body}"),
         ci: Ci {
             green: true,
             why: String::new(),
@@ -82,7 +82,7 @@ fn facts(body: &str) -> Facts {
 fn the_changes_own_migration_and_dropped_fields_are_never_staging_work() {
     let needs = vec![
         dropped("harborHeroText", "isTitlePrimary"),
-        dropped("chartersCarousel", "isTitleSecondary"),
+        dropped("toursCarousel", "isTitleSecondary"),
         Need::Require {
             doc_type: "harborHeroText".into(),
             field: "titleLevel".into(),
@@ -96,7 +96,7 @@ fn the_changes_own_migration_and_dropped_fields_are_never_staging_work() {
     // With one, CoderHelm still removes a dropped field the migration doesn't.
     assert_eq!(
         content::still_needed(needs.clone(), &removes, &sets, true),
-        vec![dropped("chartersCarousel", "isTitleSecondary")]
+        vec![dropped("toursCarousel", "isTitleSecondary")]
     );
     // A required field nothing sets is still real work.
     assert_eq!(
@@ -117,7 +117,7 @@ fn a_line_listing_only_dropped_fields_never_holds_the_pull_request() {
 
     // A line that also names content a person must make still holds.
     let real = body.replace(
-        "remove `isTitleSecondary` from every `chartersCarousel` document that still has it",
+        "remove `isTitleSecondary` from every `toursCarousel` document that still has it",
         "give every `harborHeroText` document a value for the now required `titleLevel`",
     );
     assert!(matches!(ready::found(&facts(&real)), Decision::Held { .. }));

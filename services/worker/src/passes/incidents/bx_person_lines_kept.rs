@@ -21,7 +21,7 @@ use crate::clients::github::{person_commits, FileOp};
 use common::person_lines::{guard, note, refusal, PersonEdit, Undo, NOTE_MARKER};
 use serde_json::json;
 
-const SPEC: &str = "e2e/tests/browse/slip-booking.spec.ts";
+const SPEC: &str = "e2e/tests/browse/slot-booking.spec.ts";
 
 /// The spec as the person left it: two failing assertions out, the
 /// book button found by its new name.
@@ -29,7 +29,7 @@ const PERSONS_SPEC: &str = "\
 import { test, expect } from '@playwright/test';
 
 test('booking page embeds the portal', async ({ page }) => {
-  await page.goto('/marina-a/slips/book');
+  await page.goto('/library-a/slots/book');
   await expect(page.frameLocator('iframe').first()).toBeTruthy();
   await page.getByRole('button', { name: 'Book now' }).click();
 });
@@ -39,8 +39,8 @@ test('booking page embeds the portal', async ({ page }) => {
 const PERSONS_PATCH: &str = "\
 @@ -3,8 +3,6 @@ import { test, expect } from '@playwright/test';
  test('booking page embeds the portal', async ({ page }) => {
-   await page.goto('/marina-a/slips/book');
--  await expect(page.getByRole('heading', { name: 'Slip Booking' })).toBeVisible();
+   await page.goto('/library-a/slots/book');
+-  await expect(page.getByRole('heading', { name: 'Slot Booking' })).toBeVisible();
 -  await expect(page.getByRole('dialog', { name: 'Book' }).getByRole('heading', { name: 'Price Per Night' })).toBeVisible();
    await expect(page.frameLocator('iframe').first()).toBeTruthy();
 -  await page.getByRole('button', { name: 'Book' }).click();
@@ -54,15 +54,15 @@ const ROUNDS_SPEC: &str = "\
 import { test, expect } from '@playwright/test';
 
 test('booking page embeds the portal', async ({ page }) => {
-  await page.goto('/marina-a/slips/book');
-  await expect(page.getByRole('heading', { name: 'Slip Booking' })).toBeVisible();
+  await page.goto('/library-a/slots/book');
+  await expect(page.getByRole('heading', { name: 'Slot Booking' })).toBeVisible();
   await expect(page.getByRole('dialog', { name: 'Book' }).getByRole('heading', { name: 'Price Per Night' })).toBeVisible();
   await expect(page.frameLocator('iframe').first()).toBeTruthy();
   await page.getByRole('button', { name: 'Book' }).click();
 });
 
 test('booking page has a title', async ({ page }) => {
-  await page.goto('/marina-a/slips/book');
+  await page.goto('/library-a/slots/book');
   await expect(page).toHaveTitle(/Book/);
 });
 ";
@@ -76,7 +76,7 @@ fn a_round_that_writes_back_what_a_person_removed_commits_only_its_own_change() 
     let g = guard(SPEC, Some(PERSONS_SPEC), ROUNDS_SPEC, &[persons_edit()]);
     // The person's fix stands.
     assert!(!g.content.contains("Price Per Night"), "{}", g.content);
-    assert!(!g.content.contains("'Slip Booking'"));
+    assert!(!g.content.contains("'Slot Booking'"));
     assert!(g.content.contains("name: 'Book now'"));
     assert!(!g.content.contains("{ name: 'Book' }).click()"));
     // The round's own new test goes through.

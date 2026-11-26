@@ -2048,7 +2048,7 @@ mod tests {
         // A setting change adds no content: no note.
         let setting = OutsideChange {
             system: "the booking system".into(),
-            change: "Set the marina's opening time to 6am".into(),
+            change: "Set the library's opening time to 6am".into(),
             ..Default::default()
         };
         assert!(!setting.adds_content());
@@ -2705,12 +2705,12 @@ mod missing_block_tests {
         // A plan that says it changes no code keeps its own line as the cause.
         let d = fallback(
             TicketIntent::Bug,
-            "NO_CODE_CHANGE: the marina's hours are unset in the CMS",
+            "NO_CODE_CHANGE: the library's hours are unset in the CMS",
             "x",
         )
         .unwrap();
         assert_eq!(d.fix_location, FixLocation::Unknown);
-        assert_eq!(d.cause, "the marina's hours are unset in the CMS");
+        assert_eq!(d.cause, "the library's hours are unset in the CMS");
         // A decision settled for new work never reads as a fault question.
         let d = fallback(TicketIntent::Feature, FEATURE_TASKS, "x").unwrap();
         assert_eq!(ask_title(&d), "Questions before I build this");

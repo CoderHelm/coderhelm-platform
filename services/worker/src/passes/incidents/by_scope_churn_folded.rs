@@ -1,5 +1,5 @@
 //! by. A web pull request ended with "restore ... to base" commits for
-//! files it never meant to touch: an account form hook, a charter
+//! files it never meant to touch: an account form hook, a tour
 //! service, date validation, logging and their tests.
 //! After red checks, the revert went back to the last green head and put
 //! back every file that differed from it, including files a merge
@@ -26,13 +26,13 @@ use serde_json::json;
 const PLANNED: &[&str] = &[
     "apps/web/src/components/blocks/booking-embed.tsx",
     "apps/web/src/lib/routing/routing-service.ts",
-    "e2e/tests/browse/slip-booking.spec.ts",
+    "e2e/tests/browse/slot-booking.spec.ts",
 ];
 
 /// Files a merge of the base changed: never the pull request's.
 const BASE_FILES: &[&str] = &[
     "apps/web/src/components/account/use-account-form.ts",
-    "apps/web/src/features/charters/services/charterService.ts",
+    "apps/web/src/features/tours/services/tourService.ts",
     "apps/web/src/lib/validation-utils.ts",
     "apps/web/src/test/lib/validation-utils-dates.test.ts",
 ];
@@ -45,7 +45,7 @@ fn plan() -> crate::passes::plan::PlanResult {
     crate::passes::plan::PlanResult {
         tasks: PLANNED
             .iter()
-            .map(|p| format!("- [ ] {p}: [modify] The slip booking change\n"))
+            .map(|p| format!("- [ ] {p}: [modify] The slot booking change\n"))
             .collect(),
         ..Default::default()
     }
@@ -74,7 +74,7 @@ fn the_build_of_the_plan_refuses_an_unplanned_file_until_it_says_why() {
     assert!(refused.contains("the plan's tasks"), "{refused}");
     // With a stated reason the plan gains the file and the pull request
     // says why.
-    let why = "the booking route reads its charter flag from this service";
+    let why = "the booking route reads its tour flag from this service";
     assert!(g.check(stray, Some(why)).is_ok());
     assert!(g.outside().iter().any(|(p, w)| p == stray && w == why));
     // A plan that names no file leaves the build unbounded, and the

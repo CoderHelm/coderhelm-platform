@@ -12,8 +12,8 @@
 //!   probe observed", because it only read committed probe records.
 //! - The end-to-end check was red on the pull request and on the base
 //!   branch. The review was told only the check's name, and wrote that an
-//!   unrelated fuel-pricing test was "broken on main". The failing test was
-//!   the slip-selection test in the spec the pull request changed, red
+//!   unrelated late-fee test was "broken on main". The failing test was
+//!   the slot-selection test in the spec the pull request changed, red
 //!   because the vendor had opened next season's booking.
 //! - On the CI script's pull request the review asked for a test of the
 //!   script and the run handed it back, though a stub of the cloud command
@@ -125,7 +125,7 @@ fn the_reviewer_wires_the_merge_base_scope_in_both_re_review_paths() {
     assert!(src.contains("review_scope::drop_outside_claims(&mut findings, &changed_list)"));
 }
 
-const SPEC: &str = "import { test, expect } from '@playwright/test';\nconst PORTAL = 'https://portal.example-vendor.io/org/7/portal/42';\ntest('choosing a slip adds it to the booking', async ({ page }) => {\n  const frame = page.frameLocator('iframe');\n  await frame.getByTestId('slip-option').first().click();\n  await expect(frame.getByTestId('booking-total-preview')).not.toHaveText('$0');\n});\n";
+const SPEC: &str = "import { test, expect } from '@playwright/test';\nconst PORTAL = 'https://portal.example-vendor.io/org/7/portal/42';\ntest('choosing a slot adds it to the booking', async ({ page }) => {\n  const frame = page.frameLocator('iframe');\n  await frame.getByTestId('slot-option').first().click();\n  await expect(frame.getByTestId('booking-total-preview')).not.toHaveText('$0');\n});\n";
 
 fn gaps() -> Vec<common::e2e::probe::Unprobed> {
     let files = vec![(
@@ -143,7 +143,7 @@ fn a_passing_end_to_end_run_on_the_head_is_a_record_of_the_ids_it_exercised() {
     let head = "c0ffee1d2e3f405162738495a6b7c8d9e0f1a2b3";
     let checks = vec![
         json!({"name": "Lint", "status": "completed", "conclusion": "success"}),
-        json!({"name": "E2E:slips / Playwright", "status": "completed", "conclusion": "success"}),
+        json!({"name": "E2E:slots / Playwright", "status": "completed", "conclusion": "success"}),
     ];
     let comments = vec![
         json!({"body": "## Playwright E2E results for c0ffee1\n\n12 passed, 0 failed\n\n[Full report](https://reports.acme.example/pr-1/index.html)"}),
@@ -156,7 +156,7 @@ fn a_passing_end_to_end_run_on_the_head_is_a_record_of_the_ids_it_exercised() {
     // The report's text shows both ids (`report_shows`): they are observed.
     let found = vec![
         "booking-total-preview".to_string(),
-        "slip-option".to_string(),
+        "slot-option".to_string(),
     ];
     let record =
         review_probe::from_report(&g[0].origin, run.report.as_deref().unwrap(), head, &found);
@@ -168,7 +168,7 @@ fn a_passing_end_to_end_run_on_the_head_is_a_record_of_the_ids_it_exercised() {
     assert!(common::e2e::probe::unprobed(&files, &[record], &["acme.example".into()]).is_empty());
     // A red or running run is no record.
     let red = vec![
-        json!({"name": "E2E:slips / Playwright", "status": "completed", "conclusion": "failure"}),
+        json!({"name": "E2E:slots / Playwright", "status": "completed", "conclusion": "failure"}),
     ];
     assert_eq!(e2e_reads::passing_run(&red, &comments, head), None);
 }
@@ -184,7 +184,7 @@ fn what_is_still_unobserved_the_reviewer_probes_and_decides_from_the_record() {
     let seen = common::e2e::probe::ProbeRecord {
         origin: g.origin.clone(),
         url: PORTAL.into(),
-        testids: vec!["slip-option".into(), "booking-total-preview".into()],
+        testids: vec!["slot-option".into(), "booking-total-preview".into()],
         ..Default::default()
     };
     assert!(review_probe::decide(g, SPEC, SPEC, &review_probe::Probed::Ran(seen)).is_none());
@@ -192,7 +192,7 @@ fn what_is_still_unobserved_the_reviewer_probes_and_decides_from_the_record() {
     let partial = common::e2e::probe::ProbeRecord {
         origin: g.origin.clone(),
         url: PORTAL.into(),
-        testids: vec!["slip-option".into()],
+        testids: vec!["slot-option".into()],
         ..Default::default()
     };
     let f = review_probe::decide(g, SPEC, SPEC, &review_probe::Probed::Ran(partial)).unwrap();
@@ -222,11 +222,11 @@ fn the_reviewer_settles_probe_gaps_before_they_are_findings() {
     assert!(!body.contains("review_rules::probe_findings("));
 }
 
-const HEAD_NOTES: &str = "\n--- E2E on preview / Playwright e2e (all tests) ---\nfailure: e2e/tests/browse/portal.spec.ts:120: 1) [chromium] › browse/portal.spec.ts:120:7 › Portal › selecting a slip adds it to the booking while booking is open ──\n\n    Error: Choosing \"Guest Slip (AM)\" did not add it to the booking total\n    expect(locator).not.toHaveText(expected) failed\n    Received: \"Total$0\"\n";
+const HEAD_NOTES: &str = "\n--- E2E on preview / Playwright e2e (all tests) ---\nfailure: e2e/tests/browse/portal.spec.ts:120: 1) [chromium] › browse/portal.spec.ts:120:7 › Portal › selecting a slot adds it to the booking while booking is open ──\n\n    Error: Choosing \"Guest Slot (AM)\" did not add it to the booking total\n    expect(locator).not.toHaveText(expected) failed\n    Received: \"Total$0\"\n";
 
 #[test]
 fn a_red_check_is_read_test_by_test_and_a_blame_it_doesnt_back_is_held() {
-    // Red on both heads, the same slip test (the vendor opened booking).
+    // Red on both heads, the same slot test (the vendor opened booking).
     let base_notes = HEAD_NOTES.replace("portal.spec.ts:120", "portal.spec.ts:118");
     let base_runs = json!({"check_runs": [
         {"name": "E2E on preview / Playwright e2e (all tests)", "status": "completed", "conclusion": "failure"}
@@ -239,20 +239,20 @@ fn a_red_check_is_read_test_by_test_and_a_blame_it_doesnt_back_is_held() {
     // The check is never the base's by its name: only the test is.
     assert_eq!(
         cmp.base_failing(),
-        vec!["Portal › selecting a slip adds it to the booking while booking is open"]
+        vec!["Portal › selecting a slot adds it to the booking while booking is open"]
     );
     let ctx = cmp.context();
     assert!(ctx.contains("(a spec this change touches)"));
     assert!(ctx.contains("did not add it to the booking total"));
 
     let mut summary =
-        "The fuel pricing test is broken on main, so the red e2e check isn't this change's. \
+        "The late fee test is broken on main, so the red e2e check isn't this change's. \
                        Revert the portal spec to the last green head to get CI green."
             .to_string();
     let mut findings = vec![Finding {
         file: "e2e/tests/browse/portal.spec.ts".into(),
-        title: "Slip selection test fails".into(),
-        body: "selecting a slip adds it to the booking while booking is open fails, and it's pre-existing on main.".into(),
+        title: "Slot selection test fails".into(),
+        body: "selecting a slot adds it to the booking while booking is open fails, and it's pre-existing on main.".into(),
         caused_by_diff: Some(false),
         ..Default::default()
     }];
@@ -260,8 +260,8 @@ fn a_red_check_is_read_test_by_test_and_a_blame_it_doesnt_back_is_held() {
     assert_eq!(held, 3);
     assert!(summary.starts_with(review_ci::BLAME_HELD));
     assert!(summary.contains(review_ci::REVERT_HELD));
-    assert!(!summary.contains("fuel pricing"));
-    // The slip test fails on the base too, but it is in the spec this PR
+    assert!(!summary.contains("late fee"));
+    // The slot test fails on the base too, but it is in the spec this PR
     // changes: its fix belongs on this branch, never "pre-existing".
     assert!(findings[0].body.contains(review_ci::TOUCHED_HELD));
     assert_eq!(findings[0].caused_by_diff, None);

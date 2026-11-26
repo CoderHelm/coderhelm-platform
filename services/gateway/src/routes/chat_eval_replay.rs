@@ -1,6 +1,6 @@
 //! Chat's replay evals: does Chat understand what a person asks, and answer
 //! that? The cases (`chat_eval_cases.json`) are real conversations, made
-//! anonymous and moved onto the made-up marina team of `chat_eval`, and
+//! anonymous and moved onto the made-up library team of `chat_eval`, and
 //! variants that cover every kind of question: an orientation, what Chat can
 //! do, what needs me, a status, a how-to, a lookup, a judgement, a
 //! correction of Chat itself, and small talk. Some carry the thread before
@@ -79,13 +79,13 @@ const INFRA_FILES: &[(&str, &str)] = &[
     ),
     (
         "envs/prod/waf.tf",
-        "# Crawler B7: the team's name for one bot that crawls the slip listing pages. It looks\n\
+        "# Crawler B7: the team's name for one bot that crawls the slot listing pages. It looks\n\
          # like ordinary Chrome on Windows, sends no cookie, comes through residential proxies and\n\
          # changes its Chrome version often, so fingerprint rules miss it. It is matched by the\n\
-         # shape of its requests: a listing page filtered for 4 or more marinas, with no cookie\n\
+         # shape of its requests: a listing page filtered for 4 or more libraries, with no cookie\n\
          # and no Referer. Counted only for now; switch to block once the counts agree.\n\
          module \"waf\" {\n  source = \"../../modules/waf\"\n  signature_b7 = {\n    \
-         action = \"count\"\n    paths = [\"/slips\", \"/moorings\"]\n    min_marinas = 4\n  }\n}\n",
+         action = \"count\"\n    paths = [\"/slots\", \"/carrels\"]\n    min_libraries = 4\n  }\n}\n",
     ),
     (
         "envs/prod/alarms.tf",
@@ -129,7 +129,7 @@ pub const KNOWLEDGE: &[(&str, &str, &str)] = &[
     (
         "Booking policy.pdf",
         "Page 2",
-        "Cancelling a slip booking: cancel from My bookings in the Harbor app, or ask the harbor \
+        "Cancelling a slot booking: cancel from My bookings in the Harbor app, or ask the harbor \
          office to cancel it for you. Cancel at least 48 hours before arrival to get the full \
          amount back; a later cancellation gets half back. A no-show gets nothing back.",
     ),
@@ -857,8 +857,8 @@ mod tests {
     /// there, the answer cites the map, and it carries the mini map of the
     /// parts it involves.
     #[tokio::test]
-    async fn offline_what_happens_when_someone_books_a_slip_reads_the_map_first() {
-        let c = case("map: what happens when someone books a slip");
+    async fn offline_what_happens_when_someone_books_a_slot_reads_the_map_first() {
+        let c = case("map: what happens when someone books a slot");
         let (host, repos) = replay_fixture();
         let store = work_store();
         let steps: Vec<Step> = vec![
@@ -867,12 +867,12 @@ mod tests {
                 assert_eq!(b["tools"][0]["name"], "map_overview", "{}", b["tools"]);
                 let first = b["messages"].to_string();
                 assert!(first.contains("start from the app map"), "{first}");
-                calls("m", "map_screen", json!({"screen": "/slips/:id"}))
+                calls("m", "map_screen", json!({"screen": "/slots/:id"}))
             }),
             Box::new(|b| {
                 let r = super::super::chat_agent::testing::last_result(b);
                 assert!(r.contains("[S1]") && r.contains("Stripe"), "{r}");
-                say("Booking a slip:\n1. The slip page on the Harbor website sends the booking to the booking service [S1].\n2. The booking service saves it and charges the card through Stripe [S1].")
+                say("Booking a slot:\n1. The slot page on the Harbor website sends the booking to the booking service [S1].\n2. The booking service saves it and charges the card through Stripe [S1].")
             }),
         ];
         let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
@@ -882,7 +882,7 @@ mod tests {
         assert!(out.fin.grounded);
         let cited = &out.fin.citations[0];
         assert_eq!(cited.kind, common::app_map::SOURCE_KIND);
-        assert_eq!(cited.title, "Followed the screen /slips/:id on the app map");
+        assert_eq!(cited.title, "Followed the screen /slots/:id on the app map");
         assert_eq!(cited.href.as_deref(), Some("/app-map?focus=api,stripe,web"));
         assert_eq!(reg.len(), 1);
         let mini = mini.expect("a mini map");
@@ -907,8 +907,8 @@ mod tests {
         // A made-up mobile app beside harbor's website: its sign-in screen,
         // the session endpoint and Okta behind it.
         map["files"].as_array_mut().unwrap().extend([
-            json!({"p": "harbor-mobile/src/screens/SignIn.tsx", "n": "web", "r": "harbor-mobile", "name": "Sign-in screen", "d": "Asks for the boater's email and password."}),
-            json!({"p": "harbor-api/src/sessions.js", "n": "api", "r": "harbor-api", "name": "Sessions", "d": "Signs a boater in."}),
+            json!({"p": "harbor-mobile/src/screens/SignIn.tsx", "n": "web", "r": "harbor-mobile", "name": "Sign-in screen", "d": "Asks for the patron's email and password."}),
+            json!({"p": "harbor-api/src/sessions.js", "n": "api", "r": "harbor-api", "name": "Sessions", "d": "Signs a patron in."}),
         ]);
         map["routes"].as_array_mut().unwrap().push(json!({"f": "harbor-api/src/sessions.js", "m": "POST", "p": "/sessions", "l": 4, "name": "Sign in", "d": "Checks the password with Okta."}));
         map["nodes"].as_array_mut().unwrap().push(json!({"id": "okta", "parent": null, "label": "Okta", "kind": "external", "summary": "Sign-in."}));
@@ -916,10 +916,10 @@ mod tests {
             "id": "mobile-sign-in", "title": "Mobile sign-in", "description": "", "custom": true,
             "coderhelm": {"entry": "screen:mobile:/(Auth)/SignIn", "linked": [true, true, true, true]},
             "steps": [
-                {"ref": "f:harbor-mobile/src/screens/SignIn.tsx", "note": "The boater types their email and password.", "evidence": [{"file": "harbor-mobile/src/navigation/Auth.tsx", "line": 12}]},
+                {"ref": "f:harbor-mobile/src/screens/SignIn.tsx", "note": "The patron types their email and password.", "evidence": [{"file": "harbor-mobile/src/navigation/Auth.tsx", "line": 12}]},
                 {"ref": "r:1", "note": "The app posts them to the sessions endpoint.", "evidence": [{"file": "harbor-mobile/src/api.ts", "line": 30}, {"file": "harbor-api/src/sessions.js", "line": 4}]},
                 {"ref": "n:okta", "note": "Okta checks the password.", "evidence": [{"file": "harbor-api/src/sessions.js", "line": 1}]},
-                {"ref": "f:harbor-web/app/slips/[id]/page.tsx", "note": "The boater lands on their slips.", "evidence": [{"file": "harbor-web/app/slips/[id]/page.tsx", "line": 3}]},
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron lands on their slots.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
             ],
         }]);
         let (host, repos) = replay_fixture();
@@ -945,7 +945,7 @@ mod tests {
                         && r.contains("harbor-api/src/sessions.js:4"),
                     "{r}"
                 );
-                say("Signing in on the mobile app:\n1. The boater types their email and password on the sign-in screen (harbor-mobile/src/navigation/Auth.tsx:12) [S1].\n2. The app posts them to the sessions endpoint (harbor-api/src/sessions.js:4) [S1].\n3. Okta checks the password [S1].\n4. The boater lands on their slips [S1].")
+                say("Signing in on the mobile app:\n1. The patron types their email and password on the sign-in screen (harbor-mobile/src/navigation/Auth.tsx:12) [S1].\n2. The app posts them to the sessions endpoint (harbor-api/src/sessions.js:4) [S1].\n3. Okta checks the password [S1].\n4. The patron lands on their slots [S1].")
             }),
         ];
         let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
@@ -974,7 +974,7 @@ mod tests {
             origin: "variant".into(),
             intent: "how_to".into(),
             history: Vec::new(),
-            question: "What breaks if I change POST /slips/:id/bookings?".into(),
+            question: "What breaks if I change POST /slots/:id/bookings?".into(),
             wants: "The callers in other repositories and the screens, citing files.".into(),
         };
         let (host, repos) = replay_fixture();
@@ -993,7 +993,7 @@ mod tests {
                 calls(
                     "m",
                     "map_impact",
-                    json!({"target": "POST /slips/:id/bookings"}),
+                    json!({"target": "POST /slots/:id/bookings"}),
                 )
             }),
             Box::new(|b| {
@@ -1006,11 +1006,11 @@ mod tests {
                     .unwrap_or_default();
                 assert!(id.starts_with('S'), "{r}");
                 assert!(
-                    r.contains("harbor-web/lib/slips.ts:2")
-                        && r.contains("harbor-mobile/app/screens/SlipDetail.tsx:6"),
+                    r.contains("harbor-web/lib/slots.ts:2")
+                        && r.contains("harbor-mobile/app/screens/SlotDetail.tsx:6"),
                     "{r}"
                 );
-                say(&format!("Changing POST /slips/:id/bookings reaches two other repositories: the website calls it from harbor-web/lib/slips.ts:2 and the phone app from harbor-mobile/app/screens/SlipDetail.tsx:6, behind the Slip page and the SlipDetail screen [{id}]."))
+                say(&format!("Changing POST /slots/:id/bookings reaches two other repositories: the website calls it from harbor-web/lib/slots.ts:2 and the phone app from harbor-mobile/app/screens/SlotDetail.tsx:6, behind the Slot page and the SlotDetail screen [{id}]."))
             }),
         ];
         let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
@@ -1021,7 +1021,7 @@ mod tests {
         assert_eq!(cited.kind, common::app_map::SOURCE_KIND);
         assert_eq!(
             cited.title,
-            "Looked up what changing POST /slips/:id/bookings reaches on the app map"
+            "Looked up what changing POST /slots/:id/bookings reaches on the app map"
         );
     }
 
@@ -1029,7 +1029,7 @@ mod tests {
     /// the answer is told to say so in one line and read the code.
     #[tokio::test]
     async fn offline_no_map_means_no_map_lookups_and_a_one_line_note() {
-        let c = case("map: what happens when someone books a slip");
+        let c = case("map: what happens when someone books a slot");
         let (host, repos) = replay_fixture();
         let store = work_store();
         let steps: Vec<Step> = vec![

@@ -18,12 +18,12 @@ export const read = (f) => JSON.parse(fs.readFileSync(path.join(HERE, f), 'utf8'
 /** The answers the worker's model jobs would send for the harbor fixture. */
 export const harborAnswers = () => ({ 'floorplan/architecture.json': read('architecture.harbor.json'), ...read('descriptions.harbor.json') });
 
-/** The answers for the marina fixture: one website whose pages one catch-all route dispatches by type. */
-export const marinaAnswers = () => ({
+/** The answers for the library fixture: one website whose pages one catch-all route dispatches by type. */
+export const libraryAnswers = () => ({
   'floorplan/architecture.json': {
     $schema: 'floorplan/architecture@1',
-    project: { name: 'Marina', summary: 'A website where boaters find a berth and join the marina.' },
-    nodes: [{ id: 'site', label: 'Marina website', kind: 'ui', summary: 'Where boaters find a berth, sign up and pay for the season.', paths: ['marina-web'] }],
+    project: { name: 'Library', summary: 'A website where patrons find a booth and join the library.' },
+    nodes: [{ id: 'site', label: 'Library website', kind: 'ui', summary: 'Where patrons find a booth, sign up and pay for the season.', paths: ['library-web'] }],
   },
 });
 

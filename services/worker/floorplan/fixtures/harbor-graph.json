@@ -45,7 +45,7 @@
  },
  "project": {
   "name": "Harbor",
-  "summary": "A website where boaters book a slip, and the booking service that takes the booking and the payment."
+  "summary": "A website where patrons book a slot, and the booking service that takes the booking and the payment."
  },
  "nodes": [
   {
@@ -53,7 +53,7 @@
    "parent": null,
    "label": "Harbor website",
    "kind": "ui",
-   "summary": "Where boaters find a slip and book it.",
+   "summary": "Where patrons find a slot and book it.",
    "details": "",
    "tags": [],
    "paths": [
@@ -78,7 +78,7 @@
    "parent": null,
    "label": "Harbor app",
    "kind": "ui",
-   "summary": "The phone app where boaters sign in, pick a slip and book it.",
+   "summary": "The phone app where patrons sign in, pick a slot and book it.",
    "details": "",
    "tags": [],
    "paths": [
@@ -129,7 +129,7 @@
    "parent": null,
    "label": "Cloud setup",
    "kind": "infra",
-   "summary": "The receipts function, its upload bucket, and the nightly slip load.",
+   "summary": "The receipts function, its upload bucket, and the nightly slot load.",
    "details": "",
    "tags": [],
    "paths": [
@@ -293,7 +293,7 @@
      "confidence": 0.95
     },
     {
-     "file": "harbor-api/src/entities/slip.entity.ts",
+     "file": "harbor-api/src/entities/slot.entity.ts",
      "line": 1,
      "how": "code",
      "confidence": 0.95
@@ -417,7 +417,7 @@
    "l": "javascript",
    "loc": 6,
    "name": "Card charges",
-   "d": "Charges a boater's card through Stripe for a slip booking.",
+   "d": "Charges a patron's card through Stripe for a slot booking.",
    "h": "fd5a61a79231",
    "sig": "bf9c021a1595",
    "s": [
@@ -436,8 +436,8 @@
    "r": "harbor-api",
    "l": "javascript",
    "loc": 8,
-   "name": "Slip bookings",
-   "d": "Takes a booking for a slip and charges for it.",
+   "name": "Slot bookings",
+   "d": "Takes a booking for a slot and charges for it.",
    "h": "9bdc67ac4d30",
    "sig": "c38869c7d94e",
    "s": [
@@ -451,18 +451,18 @@
    ]
   },
   {
-   "p": "harbor-api/src/entities/slip.entity.ts",
+   "p": "harbor-api/src/entities/slot.entity.ts",
    "n": "api",
    "r": "harbor-api",
    "l": "typescript",
    "loc": 8,
-   "name": "Slip record",
-   "d": "The stored slip: its id and name.",
+   "name": "Slot record",
+   "d": "The stored slot: its id and name.",
    "h": "7298b9ab2006",
    "sig": "47a2fbdede73",
    "s": [
     [
-     "Slip",
+     "Slot",
      "class",
      4,
      0,
@@ -488,7 +488,7 @@
    "l": "javascript",
    "loc": 7,
    "name": "Booking service start",
-   "d": "Starts the booking service and sends slip requests to the bookings code.",
+   "d": "Starts the booking service and sends slot requests to the bookings code.",
    "h": "3528e13bf0b8",
    "sig": "04e9fed06a2f"
   },
@@ -499,7 +499,7 @@
    "l": "javascript",
    "loc": 6,
    "name": "Tide lookup",
-   "d": "Asks the tide service for the water level at a slip.",
+   "d": "Asks the tide service for the water level at a slot.",
    "h": "f0c1b5c2208a",
    "sig": "bf9c021a1595",
    "s": [
@@ -533,18 +533,18 @@
    ]
   },
   {
-   "p": "harbor-infra/dags/nightly_slips.py",
+   "p": "harbor-infra/dags/nightly_slots.py",
    "n": "cloud",
    "r": "harbor-infra",
    "l": "python",
    "loc": 4,
-   "name": "Nightly slip load",
-   "d": "Copies the day's slips into the booking database each night.",
+   "name": "Nightly slot load",
+   "d": "Copies the day's slots into the booking database each night.",
    "h": "b9206fe1200e",
    "sig": "805a2effaaeb",
    "s": [
     [
-     "load_slips",
+     "load_slots",
      "function",
      4,
      0,
@@ -589,7 +589,7 @@
    "r": "harbor-mobile",
    "l": "typescript",
    "loc": 3,
-   "name": "Signed-in boater",
+   "name": "Signed-in patron",
    "d": "Says who is signed in, if anyone.",
    "h": "daddb3a074bc",
    "sig": "5e6867f72fca",
@@ -610,7 +610,7 @@
    "l": "typescript",
    "loc": 21,
    "name": "App screens",
-   "d": "Lists the app's screens: sign in when signed out, the slips when signed in.",
+   "d": "Lists the app's screens: sign in when signed out, the slots when signed in.",
    "h": "7c3f97edba4a",
    "sig": "206910fa60d6",
    "s": [
@@ -630,7 +630,7 @@
    "l": "typescript",
    "loc": 4,
    "name": "Sign in",
-   "d": "Signs the boater in and opens the slips.",
+   "d": "Signs the patron in and opens the slots.",
    "h": "ff435d50b6c6",
    "sig": "e3a1c6342e8b",
    "s": [
@@ -644,18 +644,18 @@
    ]
   },
   {
-   "p": "harbor-mobile/app/screens/SlipDetail.tsx",
+   "p": "harbor-mobile/app/screens/SlotDetail.tsx",
    "n": "mobile",
    "r": "harbor-mobile",
    "l": "typescript",
    "loc": 6,
-   "name": "Slip",
-   "d": "Shows one slip with a button to book it.",
+   "name": "Slot",
+   "d": "Shows one slot with a button to book it.",
    "h": "33596162548f",
    "sig": "233ad78d138e",
    "s": [
     [
-     "SlipDetail",
+     "SlotDetail",
      "function",
      4,
      1,
@@ -664,18 +664,18 @@
    ]
   },
   {
-   "p": "harbor-mobile/app/screens/Slips.tsx",
+   "p": "harbor-mobile/app/screens/Slots.tsx",
    "n": "mobile",
    "r": "harbor-mobile",
    "l": "typescript",
    "loc": 10,
-   "name": "Slips",
-   "d": "Lists slips; tapping one opens it.",
+   "name": "Slots",
+   "d": "Lists slots; tapping one opens it.",
    "h": "18990fb68b09",
    "sig": "59f4fe7c2d28",
    "s": [
     [
-     "Slips",
+     "Slots",
      "function",
      4,
      1,
@@ -684,18 +684,18 @@
    ]
   },
   {
-   "p": "harbor-web/app/slips/[id]/page.tsx",
+   "p": "harbor-web/app/slots/[id]/page.tsx",
    "n": "web",
    "r": "harbor-web",
    "l": "typescript",
    "loc": 4,
-   "name": "Slip page",
-   "d": "Shows one slip with a button to book it.",
+   "name": "Slot page",
+   "d": "Shows one slot with a button to book it.",
    "h": "b7e0894ff4a4",
    "sig": "7816c41cd764",
    "s": [
     [
-     "SlipPage",
+     "SlotPage",
      "function",
      3,
      1,
@@ -704,18 +704,18 @@
    ]
   },
   {
-   "p": "harbor-web/lib/slips.ts",
+   "p": "harbor-web/lib/slots.ts",
    "n": "web",
    "r": "harbor-web",
    "l": "typescript",
    "loc": 4,
    "name": "Booking request",
-   "d": "Sends the booking for a slip to the booking service.",
+   "d": "Sends the booking for a slot to the booking service.",
    "h": "28a5a30879a7",
    "sig": "595abd0dce03",
    "s": [
     [
-     "bookSlip",
+     "bookSlot",
      "function",
      1,
      0,
@@ -728,11 +728,11 @@
   {
    "f": "harbor-api/src/bookings.js",
    "m": "POST",
-   "p": "/slips/:id/bookings",
+   "p": "/slots/:id/bookings",
    "l": 5,
    "h": "router",
-   "name": "Book a slip",
-   "d": "Books the slip and charges the boater's card."
+   "name": "Book a slot",
+   "d": "Books the slot and charges the patron's card."
   },
   {
    "f": "harbor-api/src/webhooks.js",
@@ -792,7 +792,7 @@
   },
   {
    "a": "f:harbor-mobile/app/navigation/RootNavigator.tsx",
-   "b": "f:harbor-mobile/app/screens/Slips.tsx",
+   "b": "f:harbor-mobile/app/screens/Slots.tsx",
    "k": "import",
    "w": 1,
    "names": [
@@ -801,7 +801,7 @@
   },
   {
    "a": "f:harbor-mobile/app/navigation/RootNavigator.tsx",
-   "b": "f:harbor-mobile/app/screens/SlipDetail.tsx",
+   "b": "f:harbor-mobile/app/screens/SlotDetail.tsx",
    "k": "import",
    "w": 1,
    "names": [
@@ -809,7 +809,7 @@
    ]
   },
   {
-   "a": "f:harbor-mobile/app/screens/SlipDetail.tsx",
+   "a": "f:harbor-mobile/app/screens/SlotDetail.tsx",
    "b": "f:harbor-mobile/app/lib/api.ts",
    "k": "import",
    "w": 1,
@@ -818,21 +818,21 @@
    ]
   },
   {
-   "a": "f:harbor-web/app/slips/[id]/page.tsx",
-   "b": "f:harbor-web/lib/slips.ts",
+   "a": "f:harbor-web/app/slots/[id]/page.tsx",
+   "b": "f:harbor-web/lib/slots.ts",
    "k": "import",
    "w": 1,
    "names": [
-    "bookSlip"
+    "bookSlot"
    ]
   },
   {
-   "a": "f:harbor-mobile/app/screens/SlipDetail.tsx",
+   "a": "f:harbor-mobile/app/screens/SlotDetail.tsx",
    "b": "f:harbor-api/src/bookings.js",
    "k": "http",
    "w": 1,
    "labels": [
-    "POST /slips/:id/bookings"
+    "POST /slots/:id/bookings"
    ],
    "inferred": true,
    "calls": [
@@ -847,7 +847,7 @@
    ],
    "evidence": [
     {
-     "file": "harbor-mobile/app/screens/SlipDetail.tsx",
+     "file": "harbor-mobile/app/screens/SlotDetail.tsx",
      "line": 6,
      "how": "code",
      "confidence": 0.9
@@ -855,12 +855,12 @@
    ]
   },
   {
-   "a": "f:harbor-web/lib/slips.ts",
+   "a": "f:harbor-web/lib/slots.ts",
    "b": "f:harbor-api/src/bookings.js",
    "k": "http",
    "w": 1,
    "labels": [
-    "POST /slips/:id/bookings"
+    "POST /slots/:id/bookings"
    ],
    "inferred": true,
    "calls": [
@@ -875,7 +875,7 @@
    ],
    "evidence": [
     {
-     "file": "harbor-web/lib/slips.ts",
+     "file": "harbor-web/lib/slots.ts",
      "line": 2,
      "how": "code",
      "confidence": 0.9
@@ -953,14 +953,14 @@
    ]
   },
   {
-   "a": "f:harbor-api/src/entities/slip.entity.ts",
+   "a": "f:harbor-api/src/entities/slot.entity.ts",
    "b": "n:ext-postgres",
    "k": "import",
    "w": 1,
    "inferred": false,
    "evidence": [
     {
-     "file": "harbor-api/src/entities/slip.entity.ts",
+     "file": "harbor-api/src/entities/slot.entity.ts",
      "line": 1,
      "how": "code",
      "confidence": 0.95
@@ -1073,15 +1073,15 @@
    ]
   },
   {
-   "a": "f:harbor-infra/dags/nightly_slips.py",
-   "b": "f:harbor-api/src/entities/slip.entity.ts",
+   "a": "f:harbor-infra/dags/nightly_slots.py",
+   "b": "f:harbor-api/src/entities/slot.entity.ts",
    "k": "data",
    "w": 1,
    "labels": [
-    "writes slip"
+    "writes slot"
    ],
    "tables": [
-    "slip"
+    "slot"
    ],
    "conns": [
     "harbor-db"
@@ -1089,13 +1089,13 @@
    "inferred": true,
    "evidence": [
     {
-     "file": "harbor-infra/dags/nightly_slips.py",
+     "file": "harbor-infra/dags/nightly_slots.py",
      "line": 6,
      "how": "inferred",
      "confidence": 0.85
     },
     {
-     "file": "harbor-api/src/entities/slip.entity.ts",
+     "file": "harbor-api/src/entities/slot.entity.ts",
      "line": 3,
      "how": "code",
      "confidence": 0.95
@@ -1104,7 +1104,7 @@
   },
   {
    "a": "f:harbor-mobile/app/screens/SignIn.tsx",
-   "b": "f:harbor-mobile/app/screens/Slips.tsx",
+   "b": "f:harbor-mobile/app/screens/Slots.tsx",
    "k": "nav",
    "w": 1,
    "labels": [
@@ -1113,7 +1113,7 @@
    "from": [
     "screen:mobile:/(Stack)/SignIn"
    ],
-   "to": "screen:mobile:/(Stack)/Slips",
+   "to": "screen:mobile:/(Stack)/Slots",
    "inferred": false,
    "evidence": [
     {
@@ -1125,21 +1125,21 @@
    ]
   },
   {
-   "a": "f:harbor-mobile/app/screens/Slips.tsx",
-   "b": "f:harbor-mobile/app/screens/SlipDetail.tsx",
+   "a": "f:harbor-mobile/app/screens/Slots.tsx",
+   "b": "f:harbor-mobile/app/screens/SlotDetail.tsx",
    "k": "nav",
    "w": 1,
    "labels": [
     "navigate"
    ],
    "from": [
-    "screen:mobile:/(Stack)/Slips"
+    "screen:mobile:/(Stack)/Slots"
    ],
-   "to": "screen:mobile:/(Stack)/SlipDetail",
+   "to": "screen:mobile:/(Stack)/SlotDetail",
    "inferred": false,
    "evidence": [
     {
-     "file": "harbor-mobile/app/screens/Slips.tsx",
+     "file": "harbor-mobile/app/screens/Slots.tsx",
      "line": 8,
      "how": "code",
      "confidence": 0.9
@@ -1152,7 +1152,7 @@
   {
    "ref": "n:web",
    "title": "Start with the website",
-   "note": "Boaters pick a slip here and book it."
+   "note": "Patrons pick a slot here and book it."
   },
   {
    "ref": "n:api",
@@ -1190,7 +1190,7 @@
       "line": 5
      }
     ],
-    "fix": "Review access control in harbor-api. None of these endpoints verify the caller in code:\n- POST /slips/:id/bookings — harbor-api/src/bookings.js:5\n\nFirst tell me in plain words whether this server is reachable from the internet and whether anything in front of it (gateway, network rules) checks logins. If it is public, propose the smallest safe way to require login for the data-changing endpoints (POST/PUT/PATCH/DELETE) first, show me the plan, and wait for my OK before changing code."
+    "fix": "Review access control in harbor-api. None of these endpoints verify the caller in code:\n- POST /slots/:id/bookings — harbor-api/src/bookings.js:5\n\nFirst tell me in plain words whether this server is reachable from the internet and whether anything in front of it (gateway, network rules) checks logins. If it is public, propose the smallest safe way to require login for the data-changing endpoints (POST/PUT/PATCH/DELETE) first, show me the plan, and wait for my OK before changing code."
    },
    {
     "id": "unused:api",
@@ -1199,16 +1199,16 @@
     "title": "2 files in Booking service look unused",
     "detail": "Nothing in the app imports or calls these files (14 lines). Leftover code confuses AI assistants, which may edit or copy the wrong version. Double-check before deleting: some files are loaded in ways the map can't see.",
     "items": [
-     "f:harbor-api/src/entities/slip.entity.ts",
+     "f:harbor-api/src/entities/slot.entity.ts",
      "f:harbor-api/src/tides.js"
     ],
     "notes": {
-     "f:harbor-api/src/entities/slip.entity.ts": "Nothing uses this file (8 lines)",
+     "f:harbor-api/src/entities/slot.entity.ts": "Nothing uses this file (8 lines)",
      "f:harbor-api/src/tides.js": "Nothing uses this file (6 lines)"
     },
     "locations": [
      {
-      "file": "harbor-api/src/entities/slip.entity.ts",
+      "file": "harbor-api/src/entities/slot.entity.ts",
       "line": 1
      },
      {
@@ -1216,7 +1216,7 @@
       "line": 1
      }
     ],
-    "fix": "Cleanup check: these files look unused (nothing imports or calls them):\n- harbor-api/src/entities/slip.entity.ts\n- harbor-api/src/tides.js\n\nFor each file, search the codebase (including configs, scripts, HTML templates and dynamic imports) to confirm nothing uses it. Then tell me which ones are safe to delete and which are actually used, with one line of evidence each. Don't delete anything until I confirm."
+    "fix": "Cleanup check: these files look unused (nothing imports or calls them):\n- harbor-api/src/entities/slot.entity.ts\n- harbor-api/src/tides.js\n\nFor each file, search the codebase (including configs, scripts, HTML templates and dynamic imports) to confirm nothing uses it. Then tell me which ones are safe to delete and which are actually used, with one line of evidence each. Don't delete anything until I confirm."
    },
    {
     "id": "unused:mobile",
@@ -1274,37 +1274,37 @@
  },
  "screens": [
   {
-   "id": "screen:web:/slips/:id",
-   "url": "/slips/:id",
-   "file": "harbor-web/app/slips/[id]/page.tsx",
+   "id": "screen:web:/slots/:id",
+   "url": "/slots/:id",
+   "file": "harbor-web/app/slots/[id]/page.tsx",
    "app": "web",
    "fw": "next-app",
-   "name": "Slip page",
-   "description": "Shows one slip with a button to book it.",
+   "name": "Slot page",
+   "description": "Shows one slot with a button to book it.",
    "behind": [
     {
-     "id": "f:harbor-web/app/slips/[id]/page.tsx",
+     "id": "f:harbor-web/app/slots/[id]/page.tsx",
      "note": "The screen itself",
      "kind": "screen"
     },
     {
-     "id": "f:harbor-web/lib/slips.ts",
+     "id": "f:harbor-web/lib/slots.ts",
      "note": "Talks to the server for this screen",
      "kind": "part"
     },
     {
      "id": "r:0",
-     "note": "Asks the server to book a slip",
+     "note": "Asks the server to book a slot",
      "kind": "request"
     },
     {
      "id": "f:harbor-api/src/bookings.js",
-     "note": "Server code that handles “Book a slip”",
+     "note": "Server code that handles “Book a slot”",
      "kind": "server"
     },
     {
      "id": "f:harbor-api/src/billing.js",
-     "note": "Does the work behind “Book a slip”",
+     "note": "Does the work behind “Book a slot”",
      "kind": "server"
     },
     {
@@ -1321,7 +1321,7 @@
    "app": "mobile",
    "fw": "react-navigation",
    "name": "SignIn",
-   "description": "Signs the boater in and opens the slips.",
+   "description": "Signs the patron in and opens the slots.",
    "behind": [
     {
      "id": "f:harbor-mobile/app/screens/SignIn.tsx",
@@ -1348,16 +1348,16 @@
    }
   },
   {
-   "id": "screen:mobile:/(Stack)/SlipDetail",
-   "url": "/(Stack)/SlipDetail",
-   "file": "harbor-mobile/app/screens/SlipDetail.tsx",
+   "id": "screen:mobile:/(Stack)/SlotDetail",
+   "url": "/(Stack)/SlotDetail",
+   "file": "harbor-mobile/app/screens/SlotDetail.tsx",
    "app": "mobile",
    "fw": "react-navigation",
-   "name": "SlipDetail",
-   "description": "Shows one slip with a button to book it.",
+   "name": "SlotDetail",
+   "description": "Shows one slot with a button to book it.",
    "behind": [
     {
-     "id": "f:harbor-mobile/app/screens/SlipDetail.tsx",
+     "id": "f:harbor-mobile/app/screens/SlotDetail.tsx",
      "note": "The screen itself",
      "kind": "screen"
     },
@@ -1368,17 +1368,17 @@
     },
     {
      "id": "r:0",
-     "note": "Asks the server to book a slip",
+     "note": "Asks the server to book a slot",
      "kind": "request"
     },
     {
      "id": "f:harbor-api/src/bookings.js",
-     "note": "Server code that handles “Book a slip”",
+     "note": "Server code that handles “Book a slot”",
      "kind": "server"
     },
     {
      "id": "f:harbor-api/src/billing.js",
-     "note": "Does the work behind “Book a slip”",
+     "note": "Does the work behind “Book a slot”",
      "kind": "server"
     },
     {
@@ -1406,16 +1406,16 @@
    }
   },
   {
-   "id": "screen:mobile:/(Stack)/Slips",
-   "url": "/(Stack)/Slips",
-   "file": "harbor-mobile/app/screens/Slips.tsx",
+   "id": "screen:mobile:/(Stack)/Slots",
+   "url": "/(Stack)/Slots",
+   "file": "harbor-mobile/app/screens/Slots.tsx",
    "app": "mobile",
    "fw": "react-navigation",
-   "name": "Slips",
-   "description": "Lists slips; tapping one opens it.",
+   "name": "Slots",
+   "description": "Lists slots; tapping one opens it.",
    "behind": [
     {
-     "id": "f:harbor-mobile/app/screens/Slips.tsx",
+     "id": "f:harbor-mobile/app/screens/Slots.tsx",
      "note": "The screen itself",
      "kind": "screen"
     }

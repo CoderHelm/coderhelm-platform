@@ -692,34 +692,34 @@ mod tests {
         vec![
             file(
                 "apps/web/src/utils/filterMaps.ts",
-                "@@ -1,3 +1,9 @@ export function slugToId(\n+export function slugToIds(slug: string, rows: Row[]) {\n+  // every berth row sharing the slug\n+}\n",
+                "@@ -1,3 +1,9 @@ export function slugToId(\n+export function slugToIds(slug: string, rows: Row[]) {\n+  // every booth row sharing the slug\n+}\n",
             ),
             file(
-                "apps/web/src/components/BerthsFilter.tsx",
-                "@@ -10 +10,2 @@\n+  const chips = dedupeBerthsBySlug(berths);\n+export const dedupeBerthsBySlug = (s) => s;\n",
+                "apps/web/src/components/BoothsFilter.tsx",
+                "@@ -10 +10,2 @@\n+  const chips = dedupeBoothsBySlug(booths);\n+export const dedupeBoothsBySlug = (s) => s;\n",
             ),
             file(
                 "apps/web/src/lib/analytics.ts",
                 "@@ -1 +1 @@\n+export function trackPageView(page: string) {}\n",
             ),
             file(
-                "e2e/slips.spec.ts",
-                "@@ -0,0 +1,5 @@\n+test('shows one guest-berth filter chip', async ({ page }) => {\n+  await page.goto('/club/slips');\n+});\n",
+                "e2e/slots.spec.ts",
+                "@@ -0,0 +1,5 @@\n+test('shows one guest-booth filter chip', async ({ page }) => {\n+  await page.goto('/club/slots');\n+});\n",
             ),
         ]
     }
 
     fn map() -> Vec<MapLine> {
         e2e_proof::parse_map(
-            "## Criteria map\n- Only one guest-berth filter chip shows | page: /club/slips | e2e: e2e/slips.spec.ts › shows one guest-berth filter chip | asserts: one Guest-Berth chip | code: filterMaps.ts, dedupeBerthsBySlug\n- Page views are tracked on the slips page | page: /club/slips | e2e: none: an analytics call | asserts: a page view event\n",
+            "## Criteria map\n- Only one guest-booth filter chip shows | page: /club/slots | e2e: e2e/slots.spec.ts › shows one guest-booth filter chip | asserts: one Guest-Booth chip | code: filterMaps.ts, dedupeBoothsBySlug\n- Page views are tracked on the slots page | page: /club/slots | e2e: none: an analytics call | asserts: a page view event\n",
         )
     }
 
     fn proven(criterion: &str, head: &str) -> e2e_proof::Proof {
         e2e_proof::Proof {
             criterion: criterion.into(),
-            page: "/club/slips".into(),
-            test: "e2e/slips.spec.ts › shows one guest-berth filter chip".into(),
+            page: "/club/slots".into(),
+            test: "e2e/slots.spec.ts › shows one guest-booth filter chip".into(),
             record: Record {
                 head: head.into(),
                 base: Leg {
@@ -742,15 +742,15 @@ mod tests {
     fn each_criterion_links_its_code_tests_and_proof() {
         let criteria = vec![
             crit(
-                "Only one guest-berth filter chip shows",
-                Some("/club/slips"),
+                "Only one guest-booth filter chip shows",
+                Some("/club/slots"),
             ),
-            crit("Page views are tracked on the slips page", None),
+            crit("Page views are tracked on the slots page", None),
         ];
         let m = map();
         let f = files();
         let proofs = vec![proven(
-            "Only one guest-berth filter chip shows",
+            "Only one guest-booth filter chip shows",
             "abc1234def",
         )];
         let t = build(&Inputs {
@@ -768,13 +768,13 @@ mod tests {
             paths,
             vec![
                 "apps/web/src/utils/filterMaps.ts",
-                "apps/web/src/components/BerthsFilter.tsx"
+                "apps/web/src/components/BoothsFilter.tsx"
             ]
         );
         assert_eq!(chip.code[0].symbols, vec!["slugToId", "slugToIds"]);
         assert_eq!(
             chip.tests,
-            vec!["e2e/slips.spec.ts › shows one guest-berth filter chip"]
+            vec!["e2e/slots.spec.ts › shows one guest-booth filter chip"]
         );
         assert_eq!(chip.proof.state, State::Proven);
         // The second criterion: its code by its words, no test, an open gap.
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(views.proof.state, State::Missing);
         let g = gaps(&t);
         assert_eq!(g.len(), 1, "{g:?}");
-        assert_eq!(g[0].criterion, "Page views are tracked on the slips page");
+        assert_eq!(g[0].criterion, "Page views are tracked on the slots page");
         assert!(g[0].what.contains("no test"));
         let tbl = table(&t);
         assert!(tbl.contains("| Criterion | Code | Tests | Proof |"));
@@ -796,12 +796,12 @@ mod tests {
 
     #[test]
     fn a_proof_of_another_head_does_not_count_and_tests_runs_do() {
-        let criteria = vec![crit("Only one guest-berth filter chip shows", None)];
+        let criteria = vec![crit("Only one guest-booth filter chip shows", None)];
         let m = map();
         let f = files();
-        let old = vec![proven("Only one guest-berth filter chip shows", "0000000")];
+        let old = vec![proven("Only one guest-booth filter chip shows", "0000000")];
         let runs = vec![TestRun {
-            path: "e2e/slips.spec.ts".into(),
+            path: "e2e/slots.spec.ts".into(),
             state: State::NotTheTicket,
             detail: String::new(),
         }];
@@ -822,7 +822,7 @@ mod tests {
         assert!(!g[0].by_two_way);
         // A criterion nothing in the diff serves, with several criteria.
         let criteria = vec![
-            crit("Only one guest-berth filter chip shows", None),
+            crit("Only one guest-booth filter chip shows", None),
             crit("Refunds are emailed within a day", None),
         ];
         let t = build(&Inputs {

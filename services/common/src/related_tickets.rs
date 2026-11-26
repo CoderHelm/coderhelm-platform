@@ -286,7 +286,7 @@ pub fn addresses(line: &str) -> Vec<String> {
         out.push(a.to_string());
         rest = &tail[end..];
     }
-    // Quoted site paths: "/marina/register", '/x', `/x`.
+    // Quoted site paths: "/library/register", '/x', `/x`.
     for q in ['"', '\'', '`'] {
         let parts: Vec<&str> = line.split(q).collect();
         for (k, p) in parts.iter().enumerate() {
@@ -379,7 +379,7 @@ pub fn check_source(m: &MovedLink, content: Option<&str>) -> Verdict {
 }
 
 /// A criterion that names a control and where it goes: "the Register
-/// button links to /slips/register".
+/// button links to /slots/register".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkExpectation {
     /// The control's visible text.
@@ -577,11 +577,11 @@ mod tests {
 
     #[test]
     fn criteria_under_their_heading() {
-        let t = "What & why\nChange the button.\n\nAcceptance criteria\n- The Register button links to /slips/register\n- Opens in the same tab\n\nNotes\n- not this\n";
+        let t = "What & why\nChange the button.\n\nAcceptance criteria\n- The Register button links to /slots/register\n- Opens in the same tab\n\nNotes\n- not this\n";
         assert_eq!(
             criteria(t),
             vec![
-                "The Register button links to /slips/register",
+                "The Register button links to /slots/register",
                 "Opens in the same tab"
             ]
         );
@@ -589,17 +589,17 @@ mod tests {
 
     #[test]
     fn a_moved_link_is_read_from_the_patch_and_checked_on_the_head() {
-        let patch = "@@ -10,3 +10,3 @@\n <Drawer>\n-  <Button href=\"/old/register\">Register</Button>\n+  <Button href=\"/slips/register\">Register</Button>\n </Drawer>\n";
+        let patch = "@@ -10,3 +10,3 @@\n <Drawer>\n-  <Button href=\"/old/register\">Register</Button>\n+  <Button href=\"/slots/register\">Register</Button>\n </Drawer>\n";
         let m = moved_links("src/drawer.tsx", patch);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].from, "/old/register");
-        assert_eq!(m[0].to, "/slips/register");
+        assert_eq!(m[0].to, "/slots/register");
         let old = "<Button href=\"/old/register\">Register</Button>";
         assert!(matches!(
             check_source(&m[0], Some(old)),
             Verdict::NotCovered(_)
         ));
-        let new = "<Button href=\"/slips/register\">Register</Button>";
+        let new = "<Button href=\"/slots/register\">Register</Button>";
         assert!(matches!(
             check_source(&m[0], Some(new)),
             Verdict::Covered(_)
@@ -609,15 +609,15 @@ mod tests {
     #[test]
     fn a_link_criterion_is_checked_on_the_page() {
         let e =
-            link_expectation("The drawer's \"Register\" button links to /slips/register").unwrap();
+            link_expectation("The drawer's \"Register\" button links to /slots/register").unwrap();
         assert_eq!(e.label, "Register");
-        assert_eq!(e.target, "/slips/register");
+        assert_eq!(e.target, "/slots/register");
         let old = r#"<nav><a class="btn" href="/old/register"><span>Register</span></a></nav>"#;
         assert!(matches!(
             check_page("the preview", old, &e),
             Some(Verdict::NotCovered(_))
         ));
-        let new = r#"<a href="https://preview.example.com/slips/register">Register</a>"#;
+        let new = r#"<a href="https://preview.example.com/slots/register">Register</a>"#;
         assert!(matches!(
             check_page("the preview", new, &e),
             Some(Verdict::Covered(_))

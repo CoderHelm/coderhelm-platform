@@ -35,7 +35,7 @@ pub fn tool() -> ToolDefinition {
              repository's test environment installed, and get its exit code and output. Use it to \
              reproduce a bug: put the ticket's exact names or ids (and each variant the data holds) \
              through the code path the bug is in, for example `python -c \"from dags.utils.common \
-             import get_override; print(get_override('Charter-Half Day'))\"`, or run the nearest \
+             import get_override; print(get_override('Walk-Half Day'))\"`, or run the nearest \
              existing test. Quote the command and its output in `## Reproduce`. Read-only: \
              nothing it writes is kept. At most {MAX_RUNS} runs."
         ),

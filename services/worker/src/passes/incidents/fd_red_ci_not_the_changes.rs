@@ -172,7 +172,7 @@ fn the_cloud_accounts_limit_is_not_the_changes_failure() {
         // The code under test throwing the same words is the change's own.
         "DOMException: QuotaExceededError: the quota has been exceeded (localStorage)",
         "FetchError: TooManyRedirects: maximum redirect reached at /account",
-        "TooManyBookingsError: the slip already has a booking",
+        "TooManyBookingsError: the slot already has a booking",
     ] {
         assert_eq!(looks_account_limit(l), None, "{l}");
     }

@@ -57,7 +57,7 @@ fn blocked_log() -> Vec<serde_json::Value> {
             "type": "tool_result",
             "tool_use_id": "t1",
             "content": format!(
-                "exit 1\n  1) [chromium] > tests/browse/marinas.spec.ts:111:3\n    Error: page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{STAGING}/marinas/guest-slips\n  20 failed\nCODERHELM_EGRESS_BLOCKED {STAGING}\n"
+                "exit 1\n  1) [chromium] > tests/browse/libraries.spec.ts:111:3\n    Error: page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://{STAGING}/libraries/guest-slots\n  20 failed\nCODERHELM_EGRESS_BLOCKED {STAGING}\n"
             )
         }]
     })]

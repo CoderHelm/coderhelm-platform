@@ -5632,7 +5632,7 @@ mod merge_control_command_tests {
 
     #[test]
     fn only_safe_repo_names_reach_the_permission_path() {
-        for ok in ["web", "terraform_devops", "my.repo", "a-b"] {
+        for ok in ["web", "harbor_infra", "my.repo", "a-b"] {
             assert!(valid_repo_name(ok), "{ok}");
         }
         let long = "x".repeat(101);

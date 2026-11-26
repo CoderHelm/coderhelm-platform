@@ -36,7 +36,7 @@ const BODY: &str = "";
 const HEAD: &str = "d0d1d2d3d4d5";
 
 /// The plan's criteria map: the only place the run's criteria were written.
-const DESIGN: &str = "## Approach\nRender the block with native markup.\n\n## Criteria map\n- Every answer, including those behind Show more, is in the server HTML | page: /acme/charters | e2e: e2e/tests/site/questions.spec.ts › every answer is served | asserts: all answers are in the page source\n- One item opens at a time | page: /acme/charters | e2e: e2e/tests/site/questions.spec.ts › one open | asserts: opening one closes the other\n";
+const DESIGN: &str = "## Approach\nRender the block with native markup.\n\n## Criteria map\n- Every answer, including those behind Show more, is in the server HTML | page: /acme/tours | e2e: e2e/tests/site/questions.spec.ts › every answer is served | asserts: all answers are in the page source\n- One item opens at a time | page: /acme/tours | e2e: e2e/tests/site/questions.spec.ts › one open | asserts: opening one closes the other\n";
 
 /// The preview's page as its server sent it: the block is loaded on the
 /// client only, so the served HTML has the section and no answers.
@@ -64,7 +64,7 @@ fn served(url: &str, shown: Option<bool>, quote: &str) -> Served {
 fn proof(criterion: &str, change: Option<Served>, base: Option<Served>) -> Proof {
     Proof {
         criterion: criterion.into(),
-        page: "/acme/charters".into(),
+        page: "/acme/tours".into(),
         test: "e2e/tests/site/questions.spec.ts › every answer is served".into(),
         record: Record {
             head: HEAD.into(),
@@ -89,14 +89,14 @@ fn an_empty_ticket_body_still_has_the_plans_criteria_to_prove() {
     let criteria = ep::criteria_or_map(TITLE, BODY, &[], &map);
     assert_eq!(criteria.len(), 2, "{criteria:?}");
     assert!(criteria.iter().all(|c| c.needs_e2e()));
-    assert_eq!(criteria[0].page.as_deref(), Some("/acme/charters"));
+    assert_eq!(criteria[0].page.as_deref(), Some("/acme/tours"));
     // The served-page criterion is known as one; the click one is not.
     assert!(criteria[0].about_served());
     assert!(!criteria[1].about_served());
     // A ticket that has its own criteria keeps them.
     let own = ep::criteria_or_map(
         TITLE,
-        "Expected\nThe answers show on /acme/charters with JavaScript off",
+        "Expected\nThe answers show on /acme/tours with JavaScript off",
         &[],
         &map,
     );
@@ -116,8 +116,8 @@ fn the_served_page_is_read_without_its_scripts() {
     );
     assert!(ld.contains("FAQPage"), "{ld}");
     assert_eq!(
-        page_url("https://pr-12.preview.example.dev/", "/acme/charters"),
-        "https://pr-12.preview.example.dev/acme/charters"
+        page_url("https://pr-12.preview.example.dev/", "/acme/tours"),
+        "https://pr-12.preview.example.dev/acme/tours"
     );
 }
 
@@ -128,13 +128,13 @@ fn the_judgment_reads_each_side_and_an_unanswered_check_is_never_a_pass() {
         ServedCheck {
             criterion: criterion.into(),
             side: "preview",
-            url: "https://pr-12.preview.example.dev/acme/charters".into(),
+            url: "https://pr-12.preview.example.dev/acme/tours".into(),
             view: ep::served_view(PREVIEW_HTML),
         },
         ServedCheck {
             criterion: criterion.into(),
             side: "staging",
-            url: "https://staging.example.dev/acme/charters".into(),
+            url: "https://staging.example.dev/acme/tours".into(),
             view: ep::served_view(PREVIEW_HTML),
         },
     ];
@@ -160,12 +160,12 @@ fn missing_from_the_served_page_is_coder_work_though_the_browser_test_passes() {
     let p = proof(
         criterion,
         Some(served(
-            "https://pr-12.preview.example.dev/acme/charters",
+            "https://pr-12.preview.example.dev/acme/tours",
             Some(false),
             "section#questions holds only a loading placeholder",
         )),
         Some(served(
-            "https://staging.example.dev/acme/charters",
+            "https://staging.example.dev/acme/tours",
             Some(false),
             "",
         )),
@@ -193,12 +193,12 @@ fn shown_on_the_preview_and_missing_on_staging_is_proven_and_a_failed_fetch_is_u
     let proven = proof(
         criterion,
         Some(served(
-            "https://pr-12.preview.example.dev/acme/charters",
+            "https://pr-12.preview.example.dev/acme/tours",
             Some(true),
             "<details><summary>Can I book online?</summary>Yes",
         )),
         Some(served(
-            "https://staging.example.dev/acme/charters",
+            "https://staging.example.dev/acme/tours",
             Some(false),
             "answers are empty hidden divs",
         )),
@@ -207,14 +207,14 @@ fn shown_on_the_preview_and_missing_on_staging_is_proven_and_a_failed_fetch_is_u
     assert_eq!(standing_of(&[proven], HEAD), Standing::Done(vec![]));
 
     // A preview that answers with an error page is coder work.
-    let mut down = served("https://pr-12.preview.example.dev/acme/charters", None, "");
+    let mut down = served("https://pr-12.preview.example.dev/acme/tours", None, "");
     down.status = 500;
     let p = proof(criterion, Some(down), None);
     assert!(ep::outcome(&p).is_coder_work(), "{:?}", ep::outcome(&p));
 
     // Not judged and no browser test: unverified with why, never a pass.
     let unjudged = Served {
-        url: "https://pr-12.preview.example.dev/acme/charters".into(),
+        url: "https://pr-12.preview.example.dev/acme/tours".into(),
         note: "the judgment didn't answer".into(),
         ..Default::default()
     };

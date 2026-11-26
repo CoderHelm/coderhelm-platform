@@ -38,27 +38,27 @@ const OLD: &str = "isn't registered in `apps/studio/backfills";
 /// A studio's document schemas, by the name of their type.
 fn documents() -> Vec<String> {
     [
-        "berth",
-        "boat",
-        "boat-index",
-        "captain",
-        "charter",
-        "charter-index",
+        "annex",
+        "bookfair",
+        "bookfair-index",
+        "booth",
+        "carrel",
         "crew",
-        "dock",
-        "dock-index",
-        "ferry",
-        "fuel-dock",
+        "curator",
         "harbor-page",
         "lesson",
         "lesson-index",
-        "marina",
-        "mooring",
-        "pier",
-        "regatta",
-        "regatta-index",
-        "sail",
-        "slip",
+        "library",
+        "locker",
+        "locker-index",
+        "periodical",
+        "print-room",
+        "shuttle",
+        "slot",
+        "tour",
+        "tour-index",
+        "wing",
+        "wing-index",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -121,9 +121,9 @@ fn structure() -> String {
 /// not in a folder called `migrations`.
 fn backfill() -> String {
     "import {defineMigration} from 'cms-kit/migrate'\n\nexport default defineMigration({\n  \
-     title: 'Replace the slip url with a link object',\n  documentTypes: [\n    'berth',\n    \
-     'boat-index',\n    'captain',\n    'charter-index',\n    'dock',\n    'ferry',\n    'pier',\n    \
-     'regatta',\n  ],\n  migrate: {},\n})\n"
+     title: 'Replace the slot url with a link object',\n  documentTypes: [\n    'annex',\n    \
+     'bookfair',\n    'booth',\n    'curator',\n    'locker-index',\n    'shuttle',\n    \
+     'tour-index',\n    'wing',\n  ],\n  migrate: {},\n})\n"
         .to_string()
 }
 
@@ -145,7 +145,7 @@ fn tree() -> Vec<String> {
         [
             "apps/studio/schemaTypes/documents/index.ts",
             "apps/studio/structure.ts",
-            "apps/studio/backfills/replace-slip-url/index.ts",
+            "apps/studio/backfills/replace-slot-url/index.ts",
             TYPES,
         ]
         .iter()
@@ -164,7 +164,7 @@ fn found() -> Vec<(String, String)> {
         ),
         ("apps/studio/structure.ts".to_string(), structure()),
         (
-            "apps/studio/backfills/replace-slip-url/index.ts".to_string(),
+            "apps/studio/backfills/replace-slot-url/index.ts".to_string(),
             backfill(),
         ),
         (TYPES.to_string(), generated_types()),
@@ -181,9 +181,9 @@ fn history(p: &str) -> History {
         },
         "apps/studio/structure.ts" => History::Read {
             commits: 14,
-            earliest: "export const structure = (S) =>\n  S.list().items([\n    S.documentTypeListItem('berth'),\n  ])\n".to_string(),
+            earliest: "export const structure = (S) =>\n  S.list().items([\n    S.documentTypeListItem('booth'),\n  ])\n".to_string(),
         },
-        "apps/studio/backfills/replace-slip-url/index.ts" => History::Read {
+        "apps/studio/backfills/replace-slot-url/index.ts" => History::Read {
             commits: 1,
             earliest: backfill(),
         },
@@ -250,7 +250,7 @@ fn a_one_off_backfill_lists_the_types_it_never_registers_them() {
         &item,
         &sibs,
         &[(
-            "apps/studio/backfills/replace-slip-url/index.ts".to_string(),
+            "apps/studio/backfills/replace-slot-url/index.ts".to_string(),
             backfill(),
         )],
     );
@@ -284,10 +284,10 @@ fn a_generated_file_is_never_a_place() {
 fn a_registry_kept_under_a_migrations_folder_is_still_a_registry() {
     // Migrations are a kind too: every new one is added to the index.
     let t: Vec<String> = [
-        "db/migrations/0001-create-berths.ts",
-        "db/migrations/0002-add-slips.ts",
-        "db/migrations/0003-add-moorings.ts",
-        "db/migrations/0004-add-charters.ts",
+        "db/migrations/0001-create-booths.ts",
+        "db/migrations/0002-add-slots.ts",
+        "db/migrations/0003-add-carrels.ts",
+        "db/migrations/0004-add-tours.ts",
         "db/migrations/index.ts",
     ]
     .iter()
@@ -296,8 +296,8 @@ fn a_registry_kept_under_a_migrations_folder_is_still_a_registry() {
     let item = &registration::new_items(&["db/migrations/0005-add-ferries.ts".to_string()], &t)[0];
     let sibs = registration::siblings(item, &t, None);
     assert_eq!(sibs.len(), 4);
-    let index = "import m1 from './0001-create-berths'\nimport m2 from './0002-add-slips'\n\
-                 import m3 from './0003-add-moorings'\nimport m4 from './0004-add-charters'\n\
+    let index = "import m1 from './0001-create-booths'\nimport m2 from './0002-add-slots'\n\
+                 import m3 from './0003-add-carrels'\nimport m4 from './0004-add-tours'\n\
                  export const migrations = [m1, m2, m3, m4]\n";
     let places = registration::registration_places(
         item,
@@ -307,7 +307,7 @@ fn a_registry_kept_under_a_migrations_folder_is_still_a_registry() {
     assert_eq!(places, vec![("db/migrations/index.ts".to_string(), true)]);
     let grew = History::Read {
         commits: 4,
-        earliest: "import m1 from './0001-create-berths'\nexport const migrations = [m1]\n".into(),
+        earliest: "import m1 from './0001-create-booths'\nexport const migrations = [m1]\n".into(),
     };
     assert!(registration::grew_with_kind(
         "db/migrations/index.ts",

@@ -1690,15 +1690,15 @@ mod tests {
         };
         let g = gate(
             vec![
-                q("What H1 and intro copy should each of the four marina pages use? (Default: '{Marina} Seasonal Slip Booking' plus one sentence.)"),
-                q("Which heading and intro sentence should the four marina pages show? (Default: '{Marina} Seasonal Slip Booking' plus one sentence.)"),
+                q("What H1 and intro copy should each of the four library pages use? (Default: '{Library} Seasonal Slot Booking' plus one sentence.)"),
+                q("Which heading and intro sentence should the four library pages show? (Default: '{Library} Seasonal Slot Booking' plus one sentence.)"),
             ],
             &Context::default(),
         );
         assert_eq!(g.items.len(), 1, "the same question twice is one");
         match &g.items[0].1 {
             Outcome::Decided(d) => {
-                assert!(d.chose.contains("Seasonal Slip Booking"), "{d:?}");
+                assert!(d.chose.contains("Seasonal Slot Booking"), "{d:?}");
             }
             o => panic!("{o:?}"),
         }
@@ -1708,7 +1708,7 @@ mod tests {
     fn an_irreversible_customer_facing_choice_is_one_yes_no_on_the_recommendation() {
         let a = Ask {
             kind: Kind::Question,
-            text: "Should the migration email customers whose bookings move to the new marina?"
+            text: "Should the migration email customers whose bookings move to the new library?"
                 .into(),
             options: vec!["email them once".into(), "send nothing".into()],
             ..Default::default()
@@ -1825,7 +1825,7 @@ mod tests {
     fn a_look_is_folded_into_the_review_and_owned_work_is_done() {
         let look = Ask {
             kind: Kind::Step,
-            text: "Look at Studio: the slip page document, listing Summary field".into(),
+            text: "Look at Studio: the slot page document, listing Summary field".into(),
             why_not: "how a page looks is a judgement only a person can make".into(),
             ..Default::default()
         };

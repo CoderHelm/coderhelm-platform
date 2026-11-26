@@ -3,7 +3,7 @@
 //!
 //! A spec once clicked test ids and read JSON fields of a payment vendor's
 //! page that nobody had looked at: they didn't exist, and the run said the
-//! test "covered" the checkout. Later a portal spec checked "a slip goes in
+//! test "covered" the checkout. Later a portal spec checked "a slot goes in
 //! the cart while booking is open" from strings found in the vendor's
 //! script bundle: the ids were real, the behaviour wasn't (a signed-out
 //! visitor gets the vendor's sign-in drawer and the cart stays at $0), and
@@ -621,7 +621,7 @@ export class VendorCheckout {
                             testid: "option-0".into(),
                             visible: true,
                             enabled: true,
-                            text: "Day slip (AM)".into(),
+                            text: "Day slot (AM)".into(),
                         },
                     ],
                 },
@@ -641,7 +641,7 @@ export class VendorCheckout {
         let q = quote(&r);
         assert!(q.contains("Probe of `portal.vendor.test`"));
         assert!(q.contains(
-            "After clicking `week-0`, newly visible: `option-0` (visible, \"Day slip (AM)\")"
+            "After clicking `week-0`, newly visible: `option-0` (visible, \"Day slot (AM)\")"
         ));
         assert!(q.contains("newly visible: `sign-in-drawer` (visible)"));
         let answer = format!(

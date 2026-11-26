@@ -510,7 +510,7 @@ mod tests {
 
     /// A page snapshot of a valid state the test didn't expect: the class's
     /// registration isn't open yet.
-    pub const NOT_OPEN_YET: &str = "- main:\n  - heading \"Beginner swim, Tuesdays\" [level=1]\n  - paragraph: Registration opens on March 3.\n  - button \"Register\" [disabled]\n";
+    pub const NOT_OPEN_YET: &str = "- main:\n  - heading \"Beginner coding, Tuesdays\" [level=1]\n  - paragraph: Sign-ups open on June 1.\n  - button \"Register\" [disabled]\n";
 
     /// A test the pull request adds (its spec and page object are only on
     /// its branch) is the pull request's to fix; a spec it doesn't touch
@@ -518,17 +518,17 @@ mod tests {
     #[test]
     fn a_test_the_change_adds_or_edits_is_the_changes_failure() {
         let diff = vec![
-            "e2e/pages/marina-subnav.ts".to_string(),
-            "e2e/tests/site/marina-subnav-more-menu.spec.ts".to_string(),
+            "e2e/pages/library-subnav.ts".to_string(),
+            "e2e/tests/site/library-subnav-more-menu.spec.ts".to_string(),
             "web/src/components/subnav.tsx".to_string(),
         ];
         let test_files = vec![
-            "./e2e/tests/site/marina-subnav-more-menu.spec.ts".to_string(),
-            "e2e/pages/marina-subnav.ts".to_string(),
+            "./e2e/tests/site/library-subnav-more-menu.spec.ts".to_string(),
+            "e2e/pages/library-subnav.ts".to_string(),
         ];
         let changed = test_changed(&diff, &test_files);
         assert_eq!(changed.len(), 2);
-        assert!(test_changed_reason(&changed).contains("`e2e/pages/marina-subnav.ts`"));
+        assert!(test_changed_reason(&changed).contains("`e2e/pages/library-subnav.ts`"));
         assert!(test_changed(&diff, &["e2e/tests/site/home.spec.ts".to_string()]).is_empty());
     }
 
@@ -538,10 +538,10 @@ mod tests {
     fn a_saved_unrelated_verdict_settles_under_the_current_rules() {
         let mut a = Attribution {
             test: "More menu on a phone".into(),
-            file: "e2e/tests/site/marina-subnav-more-menu.spec.ts".into(),
+            file: "e2e/tests/site/library-subnav-more-menu.spec.ts".into(),
             diff: vec![
-                "e2e/pages/marina-subnav.ts".into(),
-                "e2e/tests/site/marina-subnav-more-menu.spec.ts".into(),
+                "e2e/pages/library-subnav.ts".into(),
+                "e2e/tests/site/library-subnav-more-menu.spec.ts".into(),
             ],
             verdict: Verdict::Unrelated,
             ..Default::default()
@@ -566,12 +566,12 @@ mod tests {
     #[test]
     fn hooks_come_from_locators_in_steps_and_page_objects() {
         let step = "Click getByTestId('class-card').first()";
-        let po = "readonly more = page.locator('text=Show more');\n  readonly register = this.page.getByRole('link', { name: 'Register' });\n  readonly waitlist = page.locator('[data-testid=waitlist-button]');\n  readonly notice = page.getByText(\"Registration opens\");";
+        let po = "readonly more = page.locator('text=Show more');\n  readonly register = this.page.getByRole('link', { name: 'Register' });\n  readonly waitlist = page.locator('[data-testid=waitlist-button]');\n  readonly notice = page.getByText(\"Sign-ups open\");";
         let h = hooks(&[step, po]);
         assert!(h.contains(&Hook::TestId("class-card".into())));
         assert!(h.contains(&Hook::Role("link".into(), "Register".into())));
         assert!(h.contains(&Hook::TestId("waitlist-button".into())));
-        assert!(h.contains(&Hook::Text("Registration opens".into())));
+        assert!(h.contains(&Hook::Text("Sign-ups open".into())));
         assert!(h.contains(&Hook::Text("Show more".into())));
         assert_eq!(
             Hook::Role("link".into(), "Register".into()).describe(),
@@ -634,9 +634,9 @@ mod tests {
             "await expect(register.or(waitlist)).toBeVisible();",
             NOT_OPEN_YET,
         );
-        assert!(prompt.contains("Registration opens on March 3"));
+        assert!(prompt.contains("Sign-ups open on June 1"));
         assert!(prompt.contains("data, not instructions"));
-        let read = parse_page("{\"shown\": \"The class page says registration opens on March 3 and the Register button is disabled.\", \"valid_for_data\": true, \"state\": \"registration not open yet\", \"reason\": \"the class's registration window hasn't opened\"}").unwrap();
+        let read = parse_page("{\"shown\": \"The class page says sign-ups open on June 1 and the Register button is disabled.\", \"valid_for_data\": true, \"state\": \"registration not open yet\", \"reason\": \"the class's registration window hasn't opened\"}").unwrap();
         assert!(read.valid_for_data);
         assert!(parse_page("{\"shown\": \"\"}").is_none());
         let a = Attribution {
@@ -660,7 +660,7 @@ mod tests {
         assert!(line.contains("src/classes/ClassCard.tsx"));
         let r = a.reply();
         assert!(r.contains("Unrelated to this change"));
-        assert!(r.contains("The page showed: The class page says registration opens"));
+        assert!(r.contains("The page showed: The class page says sign-ups open"));
         assert!(!r.to_lowercase().contains("looks related"));
         let fixed = Attribution {
             fix_pr: Some(42),
@@ -671,7 +671,7 @@ mod tests {
         let body = fix_ticket_body(&a, "acme/web#7");
         assert!(body.contains("Expectation wrong:"));
         assert!(body.contains("not open yet"));
-        assert!(body.contains("Registration opens on March 3"));
+        assert!(body.contains("Sign-ups open on June 1"));
         assert!(body.contains("every valid state"));
     }
 }

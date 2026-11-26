@@ -636,11 +636,11 @@ mod tests {
 
     #[test]
     fn the_failure_comment_gives_the_test_the_error_and_the_screenshot() {
-        let comment = "## Playwright E2E results for eb32df1\n\n1 failed, 40 passed\n\n  1) [chromium] › tests/browse/slip-booking.spec.ts:88:7 › Slip booking › selecting a slip adds it to the cart while booking is open\n\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Total$0\n\n![failure](https://github.com/user-attachments/assets/shot.png)\n\n[Full report](https://reports.example.com/pr-12/index.html)";
+        let comment = "## Playwright E2E results for eb32df1\n\n1 failed, 40 passed\n\n  1) [chromium] › tests/browse/slot-booking.spec.ts:88:7 › Slot booking › selecting a slot adds it to the cart while booking is open\n\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Total$0\n\n![failure](https://github.com/user-attachments/assets/shot.png)\n\n[Full report](https://reports.example.com/pr-12/index.html)";
         let ev = evidence_of("E2E on preview", comment, "").unwrap();
         assert_eq!(
             ev.tests,
-            vec!["tests/browse/slip-booking.spec.ts › selecting a slip adds it to the cart while booking is open".to_string()]
+            vec!["tests/browse/slot-booking.spec.ts › selecting a slot adds it to the cart while booking is open".to_string()]
         );
         assert!(ev
             .error

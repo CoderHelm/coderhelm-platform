@@ -1,6 +1,6 @@
-//! rp. A data-pipeline ticket named a few charters of a booking vendor's
+//! rp. A data-pipeline ticket named a few tours of a booking vendor's
 //! system filed under the wrong activity. The pipeline already had an
-//! overrides table for exactly this, with entries for those charters. Its
+//! overrides table for exactly this, with entries for those tours. Its
 //! lookup matched exact names, and the vendor appends a "-Half Day" /
 //! "-Full Day" suffix, so the entries never matched: the lookup returned
 //! `None` for every one of the ticket's names on the base. The run's own
@@ -36,11 +36,11 @@ use crate::passes::reproduce;
 use common::repro_first::{self, Attempt};
 use common::test_env;
 
-const TICKET: &str = "Update activity categorization for summer charters\nObserved\nThe fishing filter only catches the kids fishing lesson, not the Deep Sea Fishing Charter-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Sailing, Kayak Charter-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nKayak Charter-Half Day (a0000002-0000-4000-8000-000000000002)\nKayak Charter- Full Day (a0000003-0000-4000-8000-000000000003)\nKayak Sunrise Paddle Charter (a0000004-0000-4000-8000-000000000004)";
+const TICKET: &str = "Update activity categorization for summer tours\nObserved\nThe food tasting filter only catches the kids cooking lesson, not the Old Town Food Tasting-Full Day (a0000001-0000-4000-8000-000000000001)\nWhen filtering for Reading, City Walk-Half Day (a0000002-0000-4000-8000-000000000002) shows\nExpected\nCity Walk-Half Day (a0000002-0000-4000-8000-000000000002)\nCity Walk- Full Day (a0000003-0000-4000-8000-000000000003)\nSunrise City Walk Tour (a0000004-0000-4000-8000-000000000004)";
 
 /// The call that reproduces it on the base, and what it printed.
-const CALL: &str = "cd dags && python -c \"from utils.booking_common import get_charter_activity_override as g; [print(n, g(n)) for n in ['Kayak Charter-Half Day', 'Kayak Charter-Full Day', 'Kayak Charter- Full Day', 'Deep Sea Fishing Charter-Full Day']]\"";
-const PRINTED: &str = "Kayak Charter-Half Day None\nKayak Charter-Full Day None\nKayak Charter- Full Day None\nDeep Sea Fishing Charter-Full Day None";
+const CALL: &str = "cd dags && python -c \"from utils.booking_common import get_tour_stop_override as g; [print(n, g(n)) for n in ['City Walk-Half Day', 'City Walk-Full Day', 'City Walk- Full Day', 'Old Town Food Tasting-Full Day']]\"";
+const PRINTED: &str = "City Walk-Half Day None\nCity Walk-Full Day None\nCity Walk- Full Day None\nOld Town Food Tasting-Full Day None";
 
 fn ran() -> Vec<Attempt> {
     vec![Attempt {
@@ -51,14 +51,14 @@ fn ran() -> Vec<Attempt> {
     }]
 }
 
-const REUSE: &str = "## Reuse\n- `CHARTER_ACTIVITY_OVERRIDES` and `get_charter_activity_override` in dags/utils/booking_common.py\n\n## Must not change\nOther programs' activity lookups; logging.\n\n## Measure first\nNone: the change stays inside this repository.\n";
+const REUSE: &str = "## Reuse\n- `TOUR_STOP_OVERRIDES` and `get_tour_stop_override` in dags/utils/booking_common.py\n\n## Must not change\nOther programs' activity lookups; logging.\n\n## Measure first\nNone: the change stays inside this repository.\n";
 
 /// The plan as the run wrote it.
 fn plan_as_run() -> PlanResult {
     PlanResult {
-        proposal: "## Problem\nCharters sit on the wrong activity.\n\n## Approach\nExact keys miss suffixed names, so a keyword step is added after the override, and booking programs move to the active-only activity map.".into(),
-        design: format!("{REUSE}\n## Smallest change\nAdd `resolve_charter_activity_id` and `build_activity_name_map`: the override first, then a keyword match on the charter name, for every charter the activities path loads.\n\n## Proof\n`tests/test_charter_activity.py` over 100 live charter names.\n\n## Out of scope\n- Inactive kayak charters: decided with the default: they show under the kayak filter as today\n"),
-        tasks: "- [ ] dags/utils/booking_common.py: [modify] add resolve_charter_activity_id\n- [ ] dags/charter_pipeline.py: [modify] use it for every charter\n- [ ] tests/test_charter_activity.py: [create] the test\n".into(),
+        proposal: "## Problem\nTours sit on the wrong activity.\n\n## Approach\nExact keys miss suffixed names, so a keyword step is added after the override, and booking programs move to the active-only activity map.".into(),
+        design: format!("{REUSE}\n## Smallest change\nAdd `resolve_tour_stop_id` and `build_activity_name_map`: the override first, then a keyword match on the tour name, for every tour the activities path loads.\n\n## Proof\n`tests/test_tour_stop.py` over 100 live tour names.\n\n## Out of scope\n- Inactive city walks: decided with the default: they show under the walking filter as today\n"),
+        tasks: "- [ ] dags/utils/booking_common.py: [modify] add resolve_tour_stop_id\n- [ ] dags/tour_pipeline.py: [modify] use it for every tour\n- [ ] tests/test_tour_stop.py: [create] the test\n".into(),
         ..Default::default()
     }
 }
@@ -66,9 +66,9 @@ fn plan_as_run() -> PlanResult {
 /// The plan the gates ask for.
 fn plan_right() -> PlanResult {
     PlanResult {
-        proposal: "## Problem\nCharters sit on the wrong activity.\n".into(),
-        design: format!("{REUSE}\n## Reproduce\nInputs: a0000001-0000-4000-8000-000000000001, a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003, a0000004-0000-4000-8000-000000000004; staging lookup L2 (name LIKE '%kayak charter%'): `Kayak Charter- Full Day`, `Kayak Charter-Full Day`, `Kayak Charter-Half Day`, `Summer Kayak Charter Plus`\nRan on base: `{CALL}`\nOutput:\n```\n{PRINTED}\n```\nWrong line: dags/utils/booking_common.py:99 `return CHARTER_ACTIVITY_OVERRIDES.get(normalized)` matches the whole name, suffix included.\n\n## Smallest change\nStrip a trailing `-Half Day` / `-Full Day` before `CHARTER_ACTIVITY_OVERRIDES.get` in `get_charter_activity_override`; add 2 entries.\n\n## Proof\nOne test of the four stored names; it fails on the base.\n\n## Out of scope\n- Inactive kayak charters: decided with the default: they show as today. Looked up: the summer charters page already shows a kayak chip\n"),
-        tasks: "- [ ] tests/test_charter_activity.py: [create] the stored names map to kayaking\n- [ ] dags/utils/booking_common.py: [modify] strip the suffix in get_charter_activity_override\n".into(),
+        proposal: "## Problem\nTours sit on the wrong activity.\n".into(),
+        design: format!("{REUSE}\n## Reproduce\nInputs: a0000001-0000-4000-8000-000000000001, a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003, a0000004-0000-4000-8000-000000000004; staging lookup L2 (name LIKE '%city walk%'): `City Walk- Full Day`, `City Walk-Full Day`, `City Walk-Half Day`, `Summer City Walk Plus`\nRan on base: `{CALL}`\nOutput:\n```\n{PRINTED}\n```\nWrong line: dags/utils/booking_common.py:99 `return TOUR_STOP_OVERRIDES.get(normalized)` matches the whole name, suffix included.\n\n## Smallest change\nStrip a trailing `-Half Day` / `-Full Day` before `TOUR_STOP_OVERRIDES.get` in `get_tour_stop_override`; add 2 entries.\n\n## Proof\nOne test of the four stored names; it fails on the base.\n\n## Out of scope\n- Inactive city walks: decided with the default: they show as today. Looked up: the summer tours page already shows a walking chip\n"),
+        tasks: "- [ ] tests/test_tour_stop.py: [create] the stored names map to walking\n- [ ] dags/utils/booking_common.py: [modify] strip the suffix in get_tour_stop_override\n".into(),
         ..Default::default()
     }
 }
@@ -80,7 +80,7 @@ fn the_plan_reproduces_on_the_base_and_fixes_the_lookup_it_lands_in() {
     assert!(all.contains("lacks `## Reproduce`"), "{all}");
     // The question one page load answers is looked up first.
     assert!(
-        all.contains("Inactive kayak charters") && all.contains("check_url"),
+        all.contains("Inactive city walks") && all.contains("check_url"),
         "{all}"
     );
 
@@ -98,13 +98,13 @@ fn the_plan_reproduces_on_the_base_and_fixes_the_lookup_it_lands_in() {
     // step planned beside it, goes back.
     let mut beside = plan_right();
     beside.design = beside.design.replace(
-        "Strip a trailing `-Half Day` / `-Full Day` before `CHARTER_ACTIVITY_OVERRIDES.get` in `get_charter_activity_override`; add 2 entries.",
-        "Add `resolve_charter_activity_id`: the override first, then a keyword match on the name.",
+        "Strip a trailing `-Half Day` / `-Full Day` before `TOUR_STOP_OVERRIDES.get` in `get_tour_stop_override`; add 2 entries.",
+        "Add `resolve_tour_stop_id`: the override first, then a keyword match on the name.",
     );
     let g = reproduce::plan_gaps(&beside, true, TICKET, &ran(), true, true);
     assert!(
         g.iter()
-            .any(|l| l.contains("`CHARTER_ACTIVITY_OVERRIDES`") && l.contains("doesn't change it")),
+            .any(|l| l.contains("`TOUR_STOP_OVERRIDES`") && l.contains("doesn't change it")),
         "{g:?}"
     );
     assert!(g.iter().any(|l| l.contains("keyword match")), "{g:?}");
@@ -126,18 +126,16 @@ fn patch(sign: char, lines: &[String]) -> String {
 }
 
 #[test]
-fn a_whole_path_rewrite_for_four_charters_goes_back_and_the_lookup_fix_does_not() {
-    // The run's diff, in shape: the pipeline that loads every charter rewritten.
+fn a_whole_path_rewrite_for_four_tours_goes_back_and_the_lookup_fix_does_not() {
+    // The run's diff, in shape: the pipeline that loads every tour rewritten.
     let added: Vec<String> = (0..300)
-        .map(|i| {
-            format!("    activity_id = resolve_charter_activity_id(row, names_{i}, activity_map)")
-        })
+        .map(|i| format!("    activity_id = resolve_tour_stop_id(row, names_{i}, activity_map)"))
         .collect();
     let removed: Vec<String> = (0..90)
         .map(|i| format!("    activity_id = group_activity.get(row['group_{i}'])"))
         .collect();
     let wide = vec![(
-        "dags/charter_pipeline.py".to_string(),
+        "dags/tour_pipeline.py".to_string(),
         "modified".to_string(),
         format!("{}\n{}", patch('+', &added), patch('-', &removed)),
     )];
@@ -158,10 +156,10 @@ fn a_whole_path_rewrite_for_four_charters_goes_back_and_the_lookup_fix_does_not(
         (
             "dags/utils/booking_common.py".to_string(),
             "modified".to_string(),
-            "-    normalized = re.sub(r\"\\s+\", \" \", str(name).strip().lower())\n+    normalized = re.sub(r\"\\s*-\\s*(half|full) day$\", \"\", re.sub(r\"\\s+\", \" \", str(name).strip().lower()))\n+    'summer kayak charter plus': 'b0000001-0000-4000-8000-00000000000a',\n+    'kayak sunrise paddle charter': 'b0000001-0000-4000-8000-00000000000a',".to_string(),
+            "-    normalized = re.sub(r\"\\s+\", \" \", str(name).strip().lower())\n+    normalized = re.sub(r\"\\s*-\\s*(half|full) day$\", \"\", re.sub(r\"\\s+\", \" \", str(name).strip().lower()))\n+    'summer city walk plus': 'b0000001-0000-4000-8000-00000000000a',\n+    'sunrise city walk tour': 'b0000001-0000-4000-8000-00000000000a',".to_string(),
         ),
         (
-            "tests/test_charter_activity.py".to_string(),
+            "tests/test_tour_stop.py".to_string(),
             "added".to_string(),
             patch('+', &(0..45).map(|i| format!("    assert_case({i})")).collect::<Vec<_>>()),
         ),
@@ -171,7 +169,7 @@ fn a_whole_path_rewrite_for_four_charters_goes_back_and_the_lookup_fix_does_not(
     // A reason the narrower change can't work keeps a wide one.
     assert!(minimal_change::standing(
         &minimal_change::check(&wide, &[], TICKET, false),
-        "Wider than the ticket: dags/charter_pipeline.py: the vendor gives no name for these charters"
+        "Wider than the ticket: dags/tour_pipeline.py: the vendor gives no name for these tours"
     )
     .is_empty());
 }
@@ -204,18 +202,18 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
         .expect("the test job");
     // CoderHelm's runner list knows no command here; the loop runs the file.
     assert_eq!(
-        habits_check::file_cmd(None, Some(&env), "tests/test_charter_activity.py").as_deref(),
-        Ok("python tests/test_charter_activity.py")
+        habits_check::file_cmd(None, Some(&env), "tests/test_tour_stop.py").as_deref(),
+        Ok("python tests/test_tour_stop.py")
     );
     assert!(
-        habits_check::file_cmd(None, None, "tests/test_charter_activity.py")
+        habits_check::file_cmd(None, None, "tests/test_tour_stop.py")
             .unwrap_err()
             .contains("no unit test command")
     );
     // Fails on the base with the reported names, passes on the head.
     let base = FileRun {
         code: Some(1),
-        output: "AssertionError: 'Kayak Charter-Half Day' maps to None, expected kayaking".into(),
+        output: "AssertionError: 'City Walk-Half Day' maps to None, expected walking".into(),
     };
     let head = FileRun {
         code: Some(0),
@@ -224,13 +222,13 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     assert_eq!(habits_check::verdict(&head, &base).0, Verdict::Proven);
     // A test that passes on the base goes back to the coder.
     let plan = PlanResult {
-        tasks: "- [ ] tests/test_charter_activity.py: [create] x\n".into(),
+        tasks: "- [ ] tests/test_tour_stop.py: [create] x\n".into(),
         ..Default::default()
     };
     let either = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_charter_activity.py".into(),
+            path: "tests/test_tour_stop.py".into(),
             verdict: habits_check::verdict(&head, &head).0,
             detail: String::new(),
             why: None,
@@ -244,7 +242,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     let not_run = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_charter_activity.py".into(),
+            path: "tests/test_tour_stop.py".into(),
             verdict: Verdict::NotRun,
             detail: "the sandbox gave no result for it".into(),
             why: None,
@@ -255,7 +253,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
     let proven = PrFacts {
         bug: true,
         tests: vec![TestResult {
-            path: "tests/test_charter_activity.py".into(),
+            path: "tests/test_tour_stop.py".into(),
             verdict: Verdict::Proven,
             detail: "AssertionError".into(),
             why: None,

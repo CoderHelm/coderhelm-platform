@@ -1979,12 +1979,12 @@ mod tests {
         assert_eq!(decide(&todo, &job), Next::Describe(vec!["api".into()]));
         // A refresh: new folders first, then nothing left when Floorplan
         // carried every description over (no model call at all).
-        let moved = json!({"architecture": {}, "refresh": {"next": [{"code": "assign_new_files", "text": "Give harbor-api/src/fuel a home"}, {"code": "recent_work"}]}, "build": {"ok": true, "files": {"unassignedPercent": 4.0}, "descriptions": {"complete": true}}});
+        let moved = json!({"architecture": {}, "refresh": {"next": [{"code": "assign_new_files", "text": "Give harbor-api/src/fees a home"}, {"code": "recent_work"}]}, "build": {"ok": true, "files": {"unassignedPercent": 4.0}, "descriptions": {"complete": true}}});
         assert_eq!(
             decide(&moved, &job),
             Next::Architecture {
                 job: "update_architecture",
-                item: "Give harbor-api/src/fuel a home".into()
+                item: "Give harbor-api/src/fees a home".into()
             }
         );
         let same = json!({"architecture": {}, "refresh": {"next": [{"code": "recent_work"}]}, "build": {"ok": true, "files": {"unassignedPercent": 0.0}, "descriptions": {"complete": true}}});

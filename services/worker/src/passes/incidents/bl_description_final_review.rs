@@ -69,7 +69,7 @@ fn posted_before() -> String {
 
 - Approach: decide whether this does what HARBOR-88 asks. CoderHelm's conclusion: nothing is out of the ordinary.
 - Read first: `apps/studio/schemaTypes/blocks/listing-block-validation.ts` (the largest change to code, 20 added lines); then the other 2 files.
-- See it: Studio: Slips page ({PAGE_ID}), listing Summary field.
+- See it: Studio: Slots page ({PAGE_ID}), listing Summary field.
 
 **For the reviewer**
 * **Look first:** `apps/studio/schemaTypes/blocks/listing-block-validation.ts`, the largest change to code (20 added lines).
@@ -159,7 +159,7 @@ fn the_note() -> OutsideChange {
         confirm: Some(Confirm {
             query: "*[_type == \"listingBlock\"][0]{_type, \"len\": length(summary)}".into(),
             expect: "{_type: listingBlock, len: 240}".into(),
-            page: format!("Studio: Slips page ({PAGE_ID}), listing Summary field"),
+            page: format!("Studio: Slots page ({PAGE_ID}), listing Summary field"),
             result: "[{\"_type\":\"listingBlock\",\"len\":240}]".into(),
             ..Default::default()
         }),
@@ -265,7 +265,7 @@ fn the_final_review_fixes_the_posted_description() {
         "{}",
         r.body
     );
-    assert!(end.says("See it: Studio: Slips page, listing Summary field."));
+    assert!(end.says("See it: Studio: Slots page, listing Summary field."));
 }
 
 /// 2. The run's own build: no running check as a result, rebuilt until the

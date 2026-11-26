@@ -1,5 +1,5 @@
-//! gb. A pull request that removed a link from a slip booking page had
-//! its end-to-end check fail on "selecting a slip adds it to the cart while
+//! gb. A pull request that removed a link from a slot booking page had
+//! its end-to-end check fail on "selecting a slot adds it to the cart while
 //! booking is open" with `Total$0`. Three fix attempts later the
 //! supervisor rolled several of the pull request's files back to an older
 //! green head, and other runs rolled back the same way. The test failed the
@@ -21,12 +21,12 @@ use crate::passes::push_checks;
 use crate::passes::supervisor::{self, Ending, ReplayStop};
 use common::push_gate::{self, FixLedger};
 
-const TEST: &str = "tests/browse/slip-booking.spec.ts:141:7 › Slip booking › selecting a slip adds it to the cart while booking is open";
+const TEST: &str = "tests/browse/slot-booking.spec.ts:141:7 › Slot booking › selecting a slot adds it to the cart while booking is open";
 
 fn log() -> String {
     format!(
         "2030-03-12T09:15:00.1Z   ✘  1 [chromium] › {TEST} (12.4s)\n\
-         2030-03-12T09:15:00.2Z     Error: Choosing \"Acme Day Slip (morning)\" did not add it to the portal's Booking total\n\
+         2030-03-12T09:15:00.2Z     Error: Choosing \"Acme Day Slot (morning)\" did not add it to the portal's Booking total\n\
          2030-03-12T09:15:00.3Z     Received: Total$0"
     )
 }
@@ -43,7 +43,7 @@ fn the_failing_test_is_named_and_the_rounds_stop_after_two_fixes() {
     let stop = ledger.stop(&keys).expect("stop after two fixes");
     let text = stop.text("Received: Total$0");
     assert!(
-        text.contains("selecting a slip adds it to the cart"),
+        text.contains("selecting a slot adds it to the cart"),
         "{text}"
     );
     assert!(text.contains("Total$0"));

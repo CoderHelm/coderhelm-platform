@@ -1749,7 +1749,7 @@ mod tests {
             LookupOutcome::Answered,
             "api_get",
             &input,
-            "{\n  \"id\": 7,\n  \"title\": \"Swim\"\n}",
+            "{\n  \"id\": 7,\n  \"title\": \"Atlas\"\n}",
         );
         assert_eq!(id, "T1");
         let ev = o.lookups();
@@ -1757,7 +1757,7 @@ mod tests {
         assert!(ev[0].line.starts_with("- [T1] Ran api_get: "));
         assert!(ev[0]
             .line
-            .contains("Came back: { \"id\": 7, \"title\": \"Swim\" }"));
+            .contains("Came back: { \"id\": 7, \"title\": \"Atlas\" }"));
         // An empty list and a failure are kept too, marked as what they are.
         o.remember(&source, LookupOutcome::Empty, "api_get", &input, "[]");
         o.remember(

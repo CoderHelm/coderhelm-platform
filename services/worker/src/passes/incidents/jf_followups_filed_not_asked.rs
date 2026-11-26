@@ -45,11 +45,11 @@ The ticket asks for an audit that sorts each component into (a), (b) or (c). Fol
 ## Follow-up tickets to file (additive only: no deletes, no replacements)
 1. Record in the ticket that `Hero.tsx`, `FeatureSection.tsx` and `ContactCard.tsx` are not rendered. There is no code change; any future wiring takes a required alt.
 2. Add alt-required validation to `imageWithAlt` (when an asset is set). Then run typegen and take a before-count per dataset.
-3. Add alt-required validation to skipper images. Fill in the missing alt on the production skippers with `setIfMissing`.
-4. Replace the placeholder fallbacks (`richtext`, `add-on-block`, `slip-promo`) with schema-required alt.
-5. Replace the whitespace alts (`SkippersCarousel.tsx:40` with the skipper name, `SubNavigationMenu.tsx:79` with `\"\"`).
-6. `dock-navigation-client.tsx:41`: drop the generic \"Dock icon\".
-7. Promotion alt quality: replace \"sailboat\" on `a1b2c3d4` with a real description.
+3. Add alt-required validation to writer images. Fill in the missing alt on the production writers with `setIfMissing`.
+4. Replace the placeholder fallbacks (`richtext`, `add-on-block`, `slot-promo`) with schema-required alt.
+5. Replace the whitespace alts (`WritersCarousel.tsx:40` with the writer name, `SubNavigationMenu.tsx:79` with `\"\"`).
+6. `wing-navigation-client.tsx:41`: drop the generic \"Wing icon\".
+7. Promotion alt quality: replace \"bookshelf\" on `a1b2c3d4` with a real description.
 
 ## Scope
 An audit only.
@@ -150,7 +150,7 @@ fn the_stuck_run_s_seven_drafts_come_from_its_proposal() {
     assert!(drafts[1].description.contains("before-count per dataset"));
     assert_eq!(
         drafts[5].summary,
-        "dock-navigation-client.tsx:41: drop the generic \"Dock icon\""
+        "wing-navigation-client.tsx:41: drop the generic \"Wing icon\""
     );
     // Filed once per draft for this source, whichever run files it.
     let ids: Vec<String> = drafts.iter().map(|x| ft::draft_id("ABC-123", x)).collect();

@@ -118,7 +118,7 @@ impl Composer for Recorded {
 
 fn facts() -> Facts {
     Facts::default()
-        .github_pr("acme/web", 482, "Slip map page", "open")
+        .github_pr("acme/web", 482, "Slot map page", "open")
         .github_commit("acme/web", SHA, "Merge main into coderhelm/abc-1")
         .state("the branch update is pushed")
 }

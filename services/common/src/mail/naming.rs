@@ -151,7 +151,7 @@ pub fn org_label(raw: &str) -> Option<String> {
         return None;
     }
     // Letters from scripts with Latin look-alikes (a Cyrillic "\u{0405}" for S)
-    // would slip past every word check below, so only Latin letters pass;
+    // would slot past every word check below, so only Latin letters pass;
     // accented ones ("Soci\u{e9}t\u{e9}") are checked as their plain letter.
     if !s
         .chars()
@@ -375,8 +375,8 @@ mod tests {
         );
         assert_eq!(org_label("Acme Labs").as_deref(), Some("Acme Labs"));
         assert_eq!(
-            org_label("North-Pier & Co").as_deref(),
-            Some("North-Pier & Co")
+            org_label("North-Annex & Co").as_deref(),
+            Some("North-Annex & Co")
         );
     }
 

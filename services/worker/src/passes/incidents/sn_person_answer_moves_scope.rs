@@ -1,5 +1,5 @@
 //! sn. The duplicated filter-chip ticket again (see `sl`). The plan left
-//! the `/charters/<berth>` path pages out of scope, decided with a default.
+//! the `/tours/<booth>` path pages out of scope, decided with a default.
 //! A reviewer, sam, answered on the pull request that the path pages should
 //! cover both rows. The run replied "Understood" and then reverted the
 //! path-page work as out of scope: the scope ledger was seeded from the
@@ -18,13 +18,13 @@ use crate::passes::habits_check::{self, PrFacts};
 use crate::passes::stop_judge::acceptance;
 use common::scope_ledger::{self, Ledger};
 
-const TICKET: &str = "Observed\nTwo Multi-Berth filters show\nAcceptance Criteria\nOnly one multi-berth filter to show";
-const PROPOSAL: &str = "## Problem\nTwo Multi-Berth chips.\n";
-const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/charters/<berth>` path pages (`selectedBerth`, `findNormalizedBerth`): decided with the default: one id, as today\n";
+const TICKET: &str = "Observed\nTwo Multi-Booth filters show\nAcceptance Criteria\nOnly one multi-booth filter to show";
+const PROPOSAL: &str = "## Problem\nTwo Multi-Booth chips.\n";
+const DESIGN: &str = "## Out of scope\n- Merging the two schedule API rows: a data change in another repository\n- `/tours/<booth>` path pages (`selectedBooth`, `findNormalizedBooth`): decided with the default: one id, as today\n";
 const TASKS: &str = "- [ ] apps/web/src/utils/filterMaps.ts: [modify] Add slugToIds\n";
 
 /// sam's answer on the pull request, in substance.
-const ANSWER: &str = "The `/charters/<berth>` path pages should cover both rows too, so charters from either Multi-Berth row show there.";
+const ANSWER: &str = "The `/tours/<booth>` path pages should cover both rows too, so tours from either Multi-Booth row show there.";
 
 fn ledger() -> Ledger {
     Ledger::from_ticket_and_plan(&acceptance(TICKET), PROPOSAL, DESIGN, TASKS)
@@ -37,18 +37,18 @@ fn said(text: &str) -> Vec<(String, String)> {
 /// The round that built the path pages after sam's answer.
 fn path_pages_built() -> Vec<(String, String, String)> {
     vec![(
-        "apps/web/src/services/charterService.ts".into(),
+        "apps/web/src/services/tourService.ts".into(),
         "modified".into(),
-        "+  // A /charters/<berth> path page filters by every row sharing the slug\n+  const ids = selectedBerth ? slugToIds(all, selectedBerth.slug) : [];".into(),
+        "+  // A /tours/<booth> path page filters by every row sharing the slug\n+  const ids = selectedBooth ? slugToIds(all, selectedBooth.slug) : [];".into(),
     )]
 }
 
 /// The later revert that took them out "as out of scope".
 fn path_pages_reverted() -> Vec<(String, String, String)> {
     vec![(
-        "apps/web/src/services/charterService.ts".into(),
+        "apps/web/src/services/tourService.ts".into(),
         "modified".into(),
-        "-  // A /charters/<berth> path page filters by every row sharing the slug\n-  const ids = selectedBerth ? slugToIds(all, selectedBerth.slug) : [];\n+  const ids = [];".into(),
+        "-  // A /tours/<booth> path page filters by every row sharing the slug\n-  const ids = selectedBooth ? slugToIds(all, selectedBooth.slug) : [];\n+  const ids = [];".into(),
     )]
 }
 
@@ -65,7 +65,7 @@ fn the_answer_moves_the_path_pages_in_and_a_revert_is_a_breach() {
     let e = l
         .entries
         .iter()
-        .find(|e| e.item.contains("/charters/<berth>"))
+        .find(|e| e.item.contains("/tours/<booth>"))
         .unwrap();
     assert!(!e.is_out() && e.moved_in.starts_with("sam asked for it"));
     // The other entry stays out.
@@ -102,11 +102,11 @@ fn the_answer_counts_at_seed_and_a_comment_keeping_it_out_moves_nothing() {
     // the start, never written as out of scope.
     let mut l = ledger();
     l.take_people(&said(ANSWER));
-    assert!(l.outs().all(|e| !e.item.contains("/charters/<berth>")));
+    assert!(l.outs().all(|e| !e.item.contains("/tours/<booth>")));
     // A comment that keeps the path pages out leaves them out.
     let mut l = ledger();
     let moved = l.take_people(&said(
-        "Leave the `/charters/<berth>` path pages for a separate ticket.",
+        "Leave the `/tours/<booth>` path pages for a separate ticket.",
     ));
     assert!(moved.is_empty());
     assert_eq!(l.outs().count(), 2);

@@ -8,7 +8,7 @@
 //! was trimmed, and landed on a test whose selected-chip and row-order
 //! cases the review had asked to restore. CoderHelm's own fix rounds
 //! deferred both as making no progress, and the review kept blocking. A
-//! person had answered that the `/charters/<berth>` path pages should cover
+//! person had answered that the `/tours/<booth>` path pages should cover
 //! both rows; the run reverted that work as out of scope, and a later
 //! review called it missing.
 //!
@@ -30,16 +30,15 @@ use serde_json::json;
 
 const MAPS: &str = "apps/web/src/utils/filterMaps.ts";
 const MAPS_TEST: &str = "apps/web/src/test/utils/filterMaps.test.ts";
-const GRID_TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
-const DEDUPE_TEST: &str = "apps/web/src/test/components/docks-filter-dedupe.test.tsx";
-const VALIDATION_TEST: &str =
-    "apps/web/src/test/components/charters-block-filter-validation.test.tsx";
+const GRID_TEST: &str = "apps/web/src/test/components/filter-nav-wing-grid.test.tsx";
+const DEDUPE_TEST: &str = "apps/web/src/test/components/wings-filter-dedupe.test.tsx";
+const VALIDATION_TEST: &str = "apps/web/src/test/components/tours-block-filter-validation.test.tsx";
 const PARALLEL: &str = "A parallel structure next to an existing one";
 const TEST_SIZE: &str = "A test out of proportion to the change";
 
 /// The person's answer on the ticket, the day before.
-const ANSWER: &str = "Yes: the /charters/<berth> path pages should cover both rows too, the \
-     berth chip and the charter list.";
+const ANSWER: &str = "Yes: the /tours/<booth> path pages should cover both rows too, the \
+     booth chip and the tour list.";
 
 fn finding(v: serde_json::Value) -> Finding {
     let mut base = json!({"line": 1, "severity": "blocking", "evidence": "verified-defect",
@@ -80,12 +79,12 @@ fn the_parallel_structure_that_names_nothing_never_blocks() {
     // Named and anchored, the same check blocks in a first review.
     let mut named = vec![finding(
         json!({"file": MAPS, "line": 120, "title": PARALLEL,
-        "body": "`apps/web/src/utils/filterMaps.ts` adds `dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`."}),
+        "body": "`apps/web/src/utils/filterMaps.ts` adds `dedupeWingOptionsBySlug` next to the existing `dedupeWingsBySlug`."}),
     )];
     assert!(d::judge(&mut named, &facts(&[], &[], &[])).is_empty());
     assert!(named[0].note_only.is_none());
     // The check anchors it on the new definition's line.
-    let patch = "@@ -110,3 +110,9 @@ export const x = 1;\n context\n+export function dedupeDockOptionsBySlug(o) {\n+  return o;\n+}\n";
+    let patch = "@@ -110,3 +110,9 @@ export const x = 1;\n context\n+export function dedupeWingOptionsBySlug(o) {\n+  return o;\n+}\n";
     assert_eq!(
         crate::passes::review_rules::anchor_line(patch, &named[0].body),
         111
@@ -152,19 +151,19 @@ fn a_finding_the_rounds_deferred_holds_no_more_without_new_code() {
 fn a_persons_answer_decides_scope() {
     let people = vec![ANSWER.to_string()];
     let mut out = vec![finding(
-        json!({"file": "apps/web/src/components/sanity-blocks/charters-block.tsx", "line": 30,
+        json!({"file": "apps/web/src/components/sanity-blocks/tours-block.tsx", "line": 30,
         "title": "Path-page changes are outside the ticket",
-        "body": "The /charters/<berth> path pages changes are out of scope for a day slips chip fix; revert them."}),
+        "body": "The /tours/<booth> path pages changes are out of scope for a day slots chip fix; revert them."}),
     )];
     let made = d::judge(&mut out, &facts(&[], &[], &people));
     assert_eq!(made.len(), 1);
     assert!(made[0].why.contains("a person asked for this"));
     // Called missing after the revert: it says whose answer it was.
     let mut missing = vec![finding(
-        json!({"file": "apps/web/src/components/sanity-blocks/charters-block.tsx", "line": 30,
+        json!({"file": "apps/web/src/components/sanity-blocks/tours-block.tsx", "line": 30,
         "category": "correctness", "defeats_goal": true,
         "title": "Path pages no longer cover both rows",
-        "body": "The /charters/<berth> path pages are missing the berth chip dedupe."}),
+        "body": "The /tours/<booth> path pages are missing the booth chip dedupe."}),
     )];
     d::judge(&mut missing, &facts(&[], &[], &people));
     assert!(missing[0].body.contains("A person asked for this"));
@@ -176,9 +175,9 @@ fn a_persons_answer_decides_scope() {
 #[test]
 fn the_last_round_approves_with_follow_up_notes_once_the_criteria_pass() {
     let proofs = json!([
-        {"criterion": "One Multi-Dock chip on the day slips page", "test": "e2e/slips.spec.ts › one chip",
+        {"criterion": "One Multi-Wing chip on the day slots page", "test": "e2e/slots.spec.ts › one chip",
          "record": {"head": "abcdef0123", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 1, "failed": 0}}},
-        {"criterion": "Path pages cover both rows", "test": "e2e/charters.spec.ts › both rows",
+        {"criterion": "Path pages cover both rows", "test": "e2e/tours.spec.ts › both rows",
          "record": {"head": "abcdef0123", "base": {"ran": true, "passed": 0, "failed": 1}, "change": {"ran": true, "passed": 3, "failed": 0}}}
     ])
     .to_string();
@@ -191,8 +190,8 @@ fn the_last_round_approves_with_follow_up_notes_once_the_criteria_pass() {
             "body": "`a.ts` adds `x` next to the existing `y`."})),
         size(VALIDATION_TEST),
         finding(json!({"file": MAPS, "line": 12, "category": "correctness",
-            "evidence": "unverified-concern", "title": "Inactive docks may still show",
-            "body": "Could a hidden dock still render?"})),
+            "evidence": "unverified-concern", "title": "Inactive wings may still show",
+            "body": "Could a hidden wing still render?"})),
     ];
     let f = Facts {
         criteria_proven: proven,
@@ -214,7 +213,7 @@ fn the_last_round_approves_with_follow_up_notes_once_the_criteria_pass() {
     assert!(one::check(&body).is_empty());
     // A shown defect still holds, criteria or not.
     let mut defect = vec![finding(json!({"file": MAPS, "line": 12, "category": "bug",
-        "title": "Crash on an empty dock list", "body": "`docks[0].id` throws on []."}))];
+        "title": "Crash on an empty wing list", "body": "`wings[0].id` throws on []."}))];
     assert!(d::judge(&mut defect, &f).is_empty());
     assert!(defect[0].holds_merge());
 }

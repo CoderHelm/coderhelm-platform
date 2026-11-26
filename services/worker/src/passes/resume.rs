@@ -1503,7 +1503,7 @@ mod ci_triage_tests {
     fn the_failure_excerpt_is_the_error_not_the_upload_step() {
         let logs = "2030-03-11T19:50:00.1234567Z ##[group]Upload report\n\
                     2030-03-11T19:50:00.1234567Z Uploaded 14 files\n\
-                    2030-03-11T19:49:58.1234567Z   1) [chromium] marinas.spec.ts:131 the Info heading lines up\n\
+                    2030-03-11T19:49:58.1234567Z   1) [chromium] libraries.spec.ts:131 the Info heading lines up\n\
                     2030-03-11T19:49:58.1234567Z     Error: expect(received).toBeLessThanOrEqual(expected)\n\
                     2030-03-11T19:49:58.1234567Z     Expected: <= 1\n\
                     2030-03-11T19:49:58.1234567Z     Received:    32";
@@ -1534,12 +1534,12 @@ mod ci_triage_tests {
             2,
             3,
             &["changed nothing: the log only showed the report upload".into()],
-            "--- comment by e2e-reporter[bot] ---\n1 failed: marinas.spec.ts:131",
+            "--- comment by e2e-reporter[bot] ---\n1 failed: libraries.spec.ts:131",
         );
         assert!(fb.contains("CI fix attempt 2 of 3"));
         assert!(fb.contains("Reproduce first: call run_checks"));
         assert!(fb.contains("- Attempt 1: changed nothing"));
-        assert!(fb.contains("marinas.spec.ts:131"));
+        assert!(fb.contains("libraries.spec.ts:131"));
         let checks = vec!["Deploy Preview".to_string()];
         let excerpt = "Error: expect(received).toBeLessThanOrEqual(expected) / Expected: <= 1";
         let section = ci_failing_section(

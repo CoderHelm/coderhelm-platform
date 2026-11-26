@@ -6106,14 +6106,14 @@
           "criterion": {
             "description": "The criterion, as written.",
             "examples": [
-              "Only one dock filter chip shows on /slips"
+              "Only one wing filter chip shows on /slots"
             ],
             "type": "string"
           },
           "page": {
             "description": "The site path it is about, when it names one.",
             "examples": [
-              "/slips"
+              "/slots"
             ],
             "type": "string"
           },
@@ -6132,7 +6132,7 @@
             "description": "The tests that cover it (`file` or `file › title`).",
             "examples": [
               [
-                "e2e/slips.spec.ts › shows one chip"
+                "e2e/slots.spec.ts › shows one chip"
               ]
             ],
             "items": {

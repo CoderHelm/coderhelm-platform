@@ -1,5 +1,5 @@
-//! ow. CoderHelm's own pull request fixed a dock filter that listed one
-//! dock twice. A later review of it listed findings under "Holding the
+//! ow. CoderHelm's own pull request fixed a wing filter that listed one
+//! wing twice. A later review of it listed findings under "Holding the
 //! merge" that the same review said no longer applied: the earlier thread
 //! about the dropdown, whose code the fix rounds had replaced, and two
 //! findings the review itself had kept as notes ("on code that hasn't
@@ -24,14 +24,14 @@ use crate::passes::review_policy::{self, demote, named_holding, LATE_NOTE};
 use crate::passes::review_verdict::{HoldKind, Verdict};
 
 const FILTERS: &str = "apps/web/src/utils/filterMaps.ts";
-const TEST: &str = "apps/web/src/test/components/filter-nav-dock-grid.test.tsx";
+const TEST: &str = "apps/web/src/test/components/filter-nav-wing-grid.test.tsx";
 
 /// The earlier thread: its code was replaced by the fix rounds.
 fn earlier_thread_line() -> String {
     own_review::thread_line(
         FILTERS,
         120,
-        "**Day-slip dock dropdown can now list one dock twice**\n\nTwo dock ids share a slug.",
+        "**Day-slot wing dropdown can now list one wing twice**\n\nTwo wing ids share a slug.",
     )
 }
 
@@ -41,7 +41,7 @@ fn late() -> Vec<Finding> {
         crate::passes::minimal_change::Widening {
             kind: crate::passes::minimal_change::Kind::Parallel,
             path: FILTERS.into(),
-            what: "`dedupeDockOptionsBySlug` next to the existing `dedupeDocksBySlug`".into(),
+            what: "`dedupeWingOptionsBySlug` next to the existing `dedupeWingsBySlug`".into(),
         },
         crate::passes::minimal_change::Widening {
             kind: crate::passes::minimal_change::Kind::TestSize,
@@ -56,8 +56,8 @@ fn late() -> Vec<Finding> {
 }
 
 /// The model's summary, as it wrote it.
-const SUMMARY: &str = "The fix keeps one option per dock slug. The earlier dropdown comment \
-     on `apps/web/src/utils/filterMaps.ts` about listing one dock twice no longer applies: \
+const SUMMARY: &str = "The fix keeps one option per wing slug. The earlier dropdown comment \
+     on `apps/web/src/utils/filterMaps.ts` about listing one wing twice no longer applies: \
      the new helper replaced that code.";
 
 /// The review's body from its parts, the way `review_pr` writes them.
@@ -144,7 +144,7 @@ fn resolved_and_gone_threads_never_hold() {
         path: path.into(),
         line: 120,
         outdated: false,
-        body: "**Day-slip dock dropdown can now list one dock twice**".into(),
+        body: "**Day-slot wing dropdown can now list one wing twice**".into(),
         replies: vec![],
         resolved,
         resolved_by_person: resolved,

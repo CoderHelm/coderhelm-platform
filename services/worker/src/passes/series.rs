@@ -216,8 +216,8 @@ mod tests {
         let p = |part, total| Some(Part { part, total });
         assert_eq!(marker("Title size setting (Part 4 of 4)"), p(4, 4));
         assert_eq!(marker("part 2/3: the schema"), p(2, 3));
-        assert_eq!(marker("Marina blocks [1/4]"), p(1, 4));
-        assert_eq!(marker("Marina blocks (3 of 4)"), p(3, 4));
+        assert_eq!(marker("Library blocks [1/4]"), p(1, 4));
+        assert_eq!(marker("Library blocks (3 of 4)"), p(3, 4));
         assert_eq!(marker("No series here, 4 of 4 tests pass"), None);
         assert_eq!(marker("part 5 of 4"), None);
         assert_eq!(of_ticket("Add a setting", "This is part 4 of 4."), p(4, 4));
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn the_other_parts_are_found_and_unrelated_prs_are_not() {
-        let title = "Marina page blocks: add a Title Size setting (Section / Page) (Part 4 of 4)";
+        let title = "Library page blocks: add a Title Size setting (Section / Page) (Part 4 of 4)";
         let me = of_ticket(title, "").unwrap();
         let own = series_words(title);
         assert!(!own.contains("part"));
@@ -234,7 +234,7 @@ mod tests {
             "WEB-104",
             me,
             &own,
-            "WEB-101: Marina page blocks: add the block schemas (Part 1 of 4)",
+            "WEB-101: Library page blocks: add the block schemas (Part 1 of 4)",
             "coderhelm/web-101",
             "",
         ));
@@ -243,7 +243,7 @@ mod tests {
             "WEB-104",
             me,
             &own,
-            "WEB-103: Marina page blocks title setting",
+            "WEB-103: Library page blocks title setting",
             "coderhelm/web-103",
             "",
         ));
@@ -252,7 +252,7 @@ mod tests {
             "WEB-104",
             me,
             &own,
-            "WEB-104: Marina page blocks title size (Part 4 of 4)",
+            "WEB-104: Library page blocks title size (Part 4 of 4)",
             "coderhelm/web-104",
             "",
         ));
@@ -269,7 +269,7 @@ mod tests {
             "WEB-104",
             me,
             &own,
-            "WEB-102: Marina page blocks (Part 1 of 3)",
+            "WEB-102: Library page blocks (Part 1 of 3)",
             "x",
             "",
         ));
@@ -277,7 +277,7 @@ mod tests {
             "WEB-104",
             me,
             &own,
-            "WEB-180: Marina page blocks title setting",
+            "WEB-180: Library page blocks title setting",
             "x",
             "",
         ));
@@ -293,7 +293,7 @@ mod tests {
         let pr = EarlierPr {
             repo: "a/b".into(),
             number: 12,
-            title: "WEB-101: Marina page blocks schemas (Part 1 of 4)".into(),
+            title: "WEB-101: Library page blocks schemas (Part 1 of 4)".into(),
             branch: "coderhelm/web-101".into(),
             state: "merged".into(),
             body: "Adds the block schemas.".into(),
@@ -302,7 +302,7 @@ mod tests {
         let note = planner_note(me, "a/b", &[pr]);
         assert!(note.contains("Build on what they added"), "{note}");
         assert!(
-            note.contains("- #12 \"WEB-101: Marina page blocks schemas (Part 1 of 4)\" (part 1 of 4, merged, branch `coderhelm/web-101`): Adds the block schemas."),
+            note.contains("- #12 \"WEB-101: Library page blocks schemas (Part 1 of 4)\" (part 1 of 4, merged, branch `coderhelm/web-101`): Adds the block schemas."),
             "{note}"
         );
     }

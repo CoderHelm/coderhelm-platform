@@ -1,4 +1,4 @@
-//! cn. A ticket asked to show slip descriptions without literal HTML
+//! cn. A ticket asked to show slot descriptions without literal HTML
 //! entities. The proof check before the pull request listed gaps that asked
 //! to confirm things: which stored descriptions hold entities, and whether
 //! the live page shows them. The fix round did that work: four database
@@ -42,7 +42,7 @@ fn answers() -> RunEvidence {
             "L1".into(),
             "Production database",
             LookupOutcome::Answered,
-            "SELECT count(*) FROM charter WHERE description ~ '&[a-z]+;'",
+            "SELECT count(*) FROM tour WHERE description ~ '&[a-z]+;'",
             "48 rows",
         )],
         checks: vec!["test: vitest run src/utils/html-text.test.ts: PASS".into()],

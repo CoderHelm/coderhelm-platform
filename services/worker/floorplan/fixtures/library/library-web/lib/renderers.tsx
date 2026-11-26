@@ -1,18 +1,18 @@
 import type { PageMatch } from './resolve';
 import { SignupForm } from '../components/SignupForm';
 import { CheckoutForm } from '../components/CheckoutForm';
-import { BerthCard } from '../components/BerthCard';
+import { BoothCard } from '../components/BoothCard';
 
 type Props = { match: PageMatch };
 
-/** One berth, by its number. */
-export function BerthRenderer({ match }: Props) {
-  return <BerthCard slug={match.slug} />;
+/** One booth, by its number. */
+export function BoothRenderer({ match }: Props) {
+  return <BoothCard slug={match.slug} />;
 }
 
-/** Every berth. */
-export function BerthListRenderer({ match }: Props) {
-  return <ul data-slug={match.slug}><li>Berths</li></ul>;
+/** Every booth. */
+export function BoothListRenderer({ match }: Props) {
+  return <ul data-slug={match.slug}><li>Booths</li></ul>;
 }
 
 /** The form a new member signs up with. */
@@ -25,7 +25,7 @@ export function MemberCheckoutRenderer({ match }: Props) {
   return <CheckoutForm slug={match.slug} />;
 }
 
-/** A notice to boaters. */
+/** A notice to patrons. */
 export function NoticeRenderer({ match }: Props) {
   return <article>{match.slug}</article>;
 }

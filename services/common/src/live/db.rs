@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn our_own_reads_pass_the_read_only_check() {
         // The checks run through the same rolled-back transaction, and they
-        // should be readable by the checker too, so a future edit can't slip
+        // should be readable by the checker too, so a future edit can't slot
         // a write into them.
         for sql in [ACCESS_CHECK, SCHEMA_READ] {
             check_read_only_sql(sql, &[]).unwrap_or_else(|e| panic!("{e}"));
