@@ -101,7 +101,7 @@ fn replay_spent_budget(day_spent: f64, queued: &[(i64, u32)]) -> (Vec<i64>, Endi
         let p = tr::PassEnd {
             progressed,
             by_time: false,
-            runnable: if progressed { 0 } else { 158 },
+            runnable: if progressed { 0 } else { 40 },
             retry_at: Vec::new(),
             day_spent: spent,
         };
@@ -142,7 +142,7 @@ fn a_spent_budget_queues_one_resume_at_the_reset_and_nothing_sooner() {
     end.never_says("another step is tracing the journeys");
     // The pass's own decision: nothing sooner than the reset.
     let p = tr::PassEnd {
-        runnable: 158,
+        runnable: 40,
         day_spent: tr::DAILY_BUDGET_USD - 0.1,
         ..Default::default()
     };

@@ -458,6 +458,60 @@ test('new screens are traced first, then changed code, then the rest', () => {
   assert.deepEqual([next.report.new, next.report.changed], [1, 1]);
 });
 
+test('near-identical journeys are one, and no two share a title (the cases the worker is tested on too)', () => {
+  const cases = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', 'fixtures', 'journeys-dedupe.json'), 'utf8'));
+  for (const c of cases) {
+    const out = F.dedupe(structuredClone(c.flows));
+    assert.deepEqual(out.map((f) => f.title), c.want.titles, c.name);
+    assert.deepEqual(out.map((f) => f.id), c.want.ids, c.name);
+    assert.deepEqual(out.map((f) => f.from), c.want.from, c.name);
+    assert.ok(out.every((f) => !('_fresh' in f)));
+    assert.equal(new Set(out.map((f) => F.titleWords(f.title))).size, out.length, `${c.name}: no two share a title`);
+    assert.deepEqual(F.dedupe(structuredClone(out)), out, `${c.name}: once is enough`);
+  }
+});
+
+test('a stored map with duplicate journeys is cleaned on the next build, with no model call', () => {
+  const dir = root();
+  const first = F.prepare(dir, GRAPH, null);
+  const c = F.candidates(GRAPH, F.reader(dir));
+  const store = traced(first, c);
+  // The same journey stored several times over (as an older release left it),
+  // and once more from the form's entry with one step fewer.
+  const one = store.flows[0];
+  store.flows = [0, 1, 2, 3, 4].map((n) => ({ ...structuredClone(one), id: n ? `sign-in-${n + 1}` : 'sign-in' }));
+  store.flows.push({ ...structuredClone(one), id: 'a-sign-in', title: 'A sign in', entry: 'part:harbor-web/components/LoginForm.tsx#LoginForm', steps: structuredClone(one.steps).slice(1) });
+  const again = F.prepare(root(), GRAPH, store);
+  assert.equal(again.todo, null, JSON.stringify(again.report));
+  assert.equal(again.store.flows.length, 1);
+  assert.deepEqual([again.store.flows[0].id, again.store.flows[0].title, again.store.flows[0].steps.length], ['sign-in', 'Sign in', 6]);
+  assert.deepEqual(again.store.flows[0].from, ['part:harbor-web/components/LoginForm.tsx#LoginForm', 'screen:web:/login']);
+  assert.equal(again.report.merged, 5);
+  assert.equal(again.flows.length, 1);
+});
+
+test('a journey from a catch-all route now split by type names the screens whose trace retires it', () => {
+  const route = 'harbor-web/app/[...slug]/page.tsx';
+  const dir = root({ [route]: 'export default function Page() {\n  return <Resolve />;\n}\n', 'harbor-web/components/EventPage.tsx': 'export function EventPage() {\n  return <form />;\n}\n', 'harbor-web/app/api/events/route.ts': 'export async function POST() {}\n' });
+  const ev = (file, line, token) => ({ file, line, token });
+  const list = [
+    { id: 'S1', kind: 'screen', key: 'screen:web:/[...slug]', view: 'f:' + route, file: route, evidence: [ev(route, 1, 'export default')] },
+    { id: 'S2', kind: 'screen', key: 'screen:web:/events/(event)', view: 'f:harbor-web/components/EventPage.tsx', file: 'harbor-web/components/EventPage.tsx', evidence: [ev('harbor-web/components/EventPage.tsx', 1, 'EventPage')], focus: ['EventPage'], dispatcher: route },
+    { id: 'R1', kind: 'request', key: 'req:POST /api/events', view: 'r:1', evidence: [ev('harbor-web/app/api/events/route.ts', 1, 'POST')] },
+  ];
+  const c = { list, byKey: new Map(list.map((x) => [x.key, x])), edges: new Map() };
+  const st = (x) => ({ key: x.key, kind: x.kind, view: x.view, note: 'A step.', evidence: x.evidence, linked: true });
+  const store = { flows: [{ id: 'book-an-event', title: 'Book an event', entry: 'screen:web:/[...slug]', origin: 'trace', steps: [st(list[0]), st(list[2]), st(list[1])] }] };
+  const out = F.revalidate(store, c, F.reader(dir));
+  assert.deepEqual(out.kept[0].split, ['screen:web:/events/(event)']);
+  assert.deepEqual(out.kept[0].from, ['screen:web:/[...slug]']);
+  // The renderer's own trace, with the same goal, takes its place.
+  const fresh = { id: 'book-an-event', title: 'Book an event', entry: 'screen:web:/events/(event)', origin: 'trace', _fresh: true, steps: [st(list[1]), st(list[2])] };
+  const merged = F.dedupe([out.kept[0], fresh]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].entry, 'screen:web:/events/(event)');
+});
+
 // The second round of gap closers, on a made-up marina app: an outside
 // service behind two APIs, calls written directly or through an object of
 // paths, a call through an SDK, a Next route cited at its exported method,
