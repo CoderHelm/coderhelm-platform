@@ -351,8 +351,13 @@ The causes were in the loop, not only in prompt wording:
   or closes. The run page says what it waits on and until when. The CI wait
   follows the current head (`ci_watch::for_head`). Without Actions: write no
   re-run is tried; the run says so once (`outside_exec::actions_write_missing`).
+- **No wait is left without a chain.** A hand-off clears the due check it
+  armed. A run still waiting on CI with no check due and no write for an hour
+  (`ci_watch::parked`), such as one handed off before a release changed how
+  waits end, is picked back up by the self-heal sweep with one resume, at most
+  three times (`resume::redrive_parked_waits`).
 
-(`incidents::vq_two_repo_ticket_runs_end`)
+(`incidents::vq_two_repo_ticket_runs_end`, `incidents::vr_parked_ci_wait_picked_up`)
 
 ## What is deterministic
 

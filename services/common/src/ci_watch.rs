@@ -23,6 +23,10 @@
 //!   they pass.
 //! - **One wait chain per run.** [`may_arm`]: a delayed check is armed only
 //!   when none is due, so a webhook resume never starts a second chain.
+//! - **No wait is left with no chain.** A hand-off clears the due check it
+//!   armed, so a later wait can arm its own. A run still waiting on CI with
+//!   nothing due ([`parked`]) is picked back up by the self-heal sweep, on
+//!   each release and every 15 minutes, a bounded number of times.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -153,6 +157,50 @@ pub fn may_arm(due: Option<i64>, now: i64) -> bool {
     due.is_none_or(|d| d <= now + DUE_SLACK_SECS)
 }
 
+/// How long a run waiting on CI may go with no delayed check due and no
+/// write before it counts as parked: no chain is left to look at it again.
+/// Longer than the queue's longest delay (15 minutes) plus a resume's own
+/// time, so a live chain is never taken for a parked one.
+pub const PARKED_AFTER_SECS: i64 = 3600;
+/// How many times one run is picked back up from a parked wait. Past it,
+/// the stuck-run sweep's own wall cap ends the run.
+pub const MAX_PARKED_REDRIVES: u32 = 3;
+/// The run record attribute counting those pick-ups.
+pub const REDRIVES_FIELD: &str = "ci_parked_redrives";
+/// The note on the run when it is picked back up.
+pub const REDRIVE_NOTE: &str = "The run's wait on its checks had stopped with nothing set to \
+     look again; CoderHelm picked it back up and looks at the pull request now.";
+
+/// What the parked-wait sweep reads of a run waiting on CI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitState {
+    /// When its next delayed check is due ([`DUE_FIELD`]), if one was armed.
+    pub due: Option<i64>,
+    /// Its last write (unix seconds).
+    pub updated: i64,
+    /// It waits for GitHub's limit to reset: that chain arms no check.
+    pub waits_for_github: bool,
+    /// Until when an invocation holds the run's writer slot.
+    pub writer_until: Option<i64>,
+    /// How many times it was picked back up already ([`REDRIVES_FIELD`]).
+    pub redrives: u32,
+}
+
+/// Whether a run waiting on CI is parked at `now`: no delayed check due
+/// within [`PARKED_AFTER_SECS`], no write in that long, no wait for GitHub,
+/// nothing holding it, and picked back up fewer than
+/// [`MAX_PARKED_REDRIVES`] times. A wait handed off before the hand-off
+/// cleared its due check, or one whose queued check was lost, has nothing
+/// left to look at it again; only a sweep reaches it.
+pub fn parked(w: &WaitState, now: i64) -> bool {
+    let quiet = |t: i64| t + PARKED_AFTER_SECS <= now;
+    !w.waits_for_github
+        && w.redrives < MAX_PARKED_REDRIVES
+        && w.writer_until.is_none_or(|u| u <= now)
+        && w.due.is_none_or(quiet)
+        && quiet(w.updated)
+}
+
 /// The run's note when the wait stops.
 pub fn stop_note(w: &Wait, now: i64) -> String {
     let mins = ((now - w.since).max(0) + STALL_SECS) / 60;
@@ -267,6 +315,74 @@ mod tests {
             ..old.clone()
         };
         assert!(for_head(Some(&ended), "new5678", 900).pending.is_empty());
+    }
+
+    /// A wait with no check due and no write for an hour is parked; a live
+    /// chain, a wait for GitHub, a held run, or one picked up three times
+    /// already is not.
+    #[test]
+    fn a_wait_with_nothing_due_is_parked() {
+        let now = 100_000;
+        let stale = now - PARKED_AFTER_SECS - 5;
+        let parked_wait = WaitState {
+            due: Some(stale),
+            updated: stale,
+            ..Default::default()
+        };
+        assert!(parked(&parked_wait, now));
+        assert!(parked(
+            &WaitState {
+                due: None,
+                ..parked_wait
+            },
+            now
+        ));
+        // A check due soon, or one due a few minutes ago: a live chain.
+        for due in [now + 120, now - 300] {
+            assert!(!parked(
+                &WaitState {
+                    due: Some(due),
+                    ..parked_wait
+                },
+                now
+            ));
+        }
+        // Written lately: still moving.
+        assert!(!parked(
+            &WaitState {
+                updated: now - 60,
+                ..parked_wait
+            },
+            now
+        ));
+        assert!(!parked(
+            &WaitState {
+                waits_for_github: true,
+                ..parked_wait
+            },
+            now
+        ));
+        assert!(!parked(
+            &WaitState {
+                writer_until: Some(now + 30),
+                ..parked_wait
+            },
+            now
+        ));
+        assert!(parked(
+            &WaitState {
+                writer_until: Some(now - 30),
+                ..parked_wait
+            },
+            now
+        ));
+        assert!(!parked(
+            &WaitState {
+                redrives: MAX_PARKED_REDRIVES,
+                ..parked_wait
+            },
+            now
+        ));
     }
 
     #[test]
