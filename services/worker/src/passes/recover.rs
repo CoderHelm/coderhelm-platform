@@ -656,6 +656,8 @@ pub struct SweepReport {
     pub resumed: usize,
     pub handed: usize,
     pub skipped: usize,
+    /// Runs waiting on CI with nothing set to look again, picked back up.
+    pub redriven: usize,
 }
 
 /// The first start of each release (its code version) sends one self-heal
@@ -796,6 +798,9 @@ pub fn sweep_wants(item: &HashMap<String, AttributeValue>, version: &str) -> boo
 /// is now transient or repairable is resumed from its checkpoint, through
 /// the same [`recover`] a running run takes, at most once per run per
 /// deploy (the code version the sweep resumed it at is kept on its ledger).
+/// And every run still waiting on CI that nothing will look at again (its
+/// wait was handed off by an earlier release, or its queued check was
+/// lost) gets its resume (`resume::redrive_parked_waits`).
 pub async fn self_heal_sweep(state: &WorkerState) -> SweepReport {
     let version = super::proof::checks_version();
     let mut report = SweepReport::default();
@@ -842,12 +847,15 @@ pub async fn self_heal_sweep(state: &WorkerState) -> SweepReport {
     }
     // Runs waiting for another change: their dependency read again.
     super::change_wait::check_all(state, None).await;
+    // Runs waiting on CI with no check left to look at them again.
+    report.redriven = super::resume::redrive_parked_waits(state).await;
     info!(
         failed = report.failed,
         waiting = report.waiting,
         resumed = report.resumed,
         handed = report.handed,
         skipped = report.skipped,
+        redriven = report.redriven,
         "Self-heal sweep done"
     );
     report

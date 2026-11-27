@@ -10099,13 +10099,17 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
         "the run stopped waiting after about a day of checks",
     )
     .await;
+    // The due check `send_delayed_resume` armed before it met the cap goes
+    // too: left in place, it refused the next wait's check (the review
+    // that picks the run up again), and that wait had no chain at all.
     let _ = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(&msg.run_id))
-        .update_expression("REMOVE ci_resume_polls")
+        .update_expression("REMOVE ci_resume_polls, #d")
+        .expression_attribute_names("#d", common::ci_watch::DUE_FIELD)
         .send()
         .await;
     super::add_progress_note(
@@ -10123,6 +10127,108 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&chrono::Utc));
     set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+}
+
+/// Picks back up every run still waiting on CI that nothing will look at
+/// again (`common::ci_watch::parked`): a wait handed off before the
+/// hand-off cleared its due check, or one whose queued check was lost. Each
+/// is claimed with one conditional write (its due check set to now, its
+/// poll count started again, its pick-ups counted), so two sweeps never
+/// both send it, and gets one resume now, the same message a delayed check
+/// sends. The resume reads the pull request as it stands: the outside steps'
+/// limits, the current head's checks, the review. Returns how many it sent.
+pub(crate) async fn redrive_parked_waits(state: &WorkerState) -> usize {
+    use common::ci_watch;
+    if state.config.ci_fix_queue_url.is_empty() {
+        return 0;
+    }
+    let filter = super::team_runs::Filter {
+        expr: "#s = :aw",
+        names: vec![("#s", "status")],
+        values: vec![(":aw", attr_s(common::run_status::AWAITING_CI))],
+        projection: None,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut sent = 0;
+    for item in super::team_runs::matching(state, "Parked CI waits", &filter).await {
+        let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+        let n = |k: &str| {
+            item.get(k).and_then(|v| {
+                v.as_n()
+                    .ok()
+                    .or_else(|| v.as_s().ok())
+                    .and_then(|x| x.parse::<i64>().ok())
+            })
+        };
+        let (Some(team_id), Some(run_id)) = (s("team_id"), s("run_id")) else {
+            continue;
+        };
+        let installation_id = n("installation_id").unwrap_or(0).max(0) as u64;
+        let Some(updated) = s("updated_at")
+            .or_else(|| s("created_at"))
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+            .map(|t| t.timestamp())
+        else {
+            continue;
+        };
+        let wait = ci_watch::WaitState {
+            due: n(ci_watch::DUE_FIELD),
+            updated,
+            waits_for_github: item.contains_key("github_wait"),
+            writer_until: n("writer_until"),
+            redrives: n(ci_watch::REDRIVES_FIELD).unwrap_or(0).max(0) as u32,
+        };
+        if installation_id == 0 || !ci_watch::parked(&wait, now) {
+            continue;
+        }
+        let claimed = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&team_id))
+            .key("run_id", attr_s(&run_id))
+            .update_expression("SET #d = :now REMOVE ci_resume_polls ADD #r :one")
+            .condition_expression(
+                "#s = :aw AND (attribute_not_exists(#d) OR #d <= :stale) \
+                 AND (attribute_not_exists(#r) OR #r < :max)",
+            )
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#d", ci_watch::DUE_FIELD)
+            .expression_attribute_names("#r", ci_watch::REDRIVES_FIELD)
+            .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
+            .expression_attribute_values(":now", attr_n(now.max(0) as u64))
+            .expression_attribute_values(
+                ":stale",
+                attr_n((now - ci_watch::PARKED_AFTER_SECS).max(0) as u64),
+            )
+            .expression_attribute_values(":one", attr_n(1))
+            .expression_attribute_values(":max", attr_n(ci_watch::MAX_PARKED_REDRIVES))
+            .send()
+            .await
+            .is_ok();
+        if !claimed {
+            continue;
+        }
+        let msg = ResumeMessage {
+            team_id: team_id.clone(),
+            run_id: run_id.clone(),
+            installation_id,
+            model_retries: 0,
+            github_wait: Default::default(),
+        };
+        if !send_resume_message(state, &msg, 0).await {
+            warn!(run_id, "Parked CI wait: the resume couldn't be queued");
+            continue;
+        }
+        info!(
+            run_id,
+            redrive = wait.redrives + 1,
+            "Parked CI wait: picked the run back up"
+        );
+        super::add_progress_note(state, &team_id, &run_id, ci_watch::REDRIVE_NOTE).await;
+        sent += 1;
+    }
+    sent
 }
 
 /// The delay of a resume that checks again later, given GitHub's budget:
