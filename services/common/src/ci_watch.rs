@@ -131,6 +131,23 @@ pub fn step(prev: Option<&Wait>, head: &str, pending: &[String], now: i64) -> (W
     (p.clone(), Step::Stop)
 }
 
+/// The wait for `head` with nothing pending on it: the kept wait when it is
+/// already that, else a fresh one. A wait kept for an older head, or with
+/// checks pending that have since ended, is dropped: a run once showed a
+/// day-old head's checks as still running while its pull request had
+/// moved on.
+pub fn for_head(prev: Option<&Wait>, head: &str, now: i64) -> Wait {
+    match prev {
+        Some(p) if p.head == head && p.pending.is_empty() => p.clone(),
+        _ => Wait {
+            head: head.to_string(),
+            pending: Vec::new(),
+            since: now,
+            reran: false,
+        },
+    }
+}
+
 /// Whether a delayed check may be armed now: none is due later than `now`.
 pub fn may_arm(due: Option<i64>, now: i64) -> bool {
     due.is_none_or(|d| d <= now + DUE_SLACK_SECS)
@@ -226,6 +243,30 @@ mod tests {
         assert_eq!(w2.since, STALL_SECS * 3);
         let (_, s) = step(Some(&w), "def", &p, STALL_SECS * 3);
         assert_eq!(s, Step::Wait);
+    }
+
+    /// A wait kept for an older head (its checks "in progress" for a day)
+    /// never stands for the pull request's current head.
+    #[test]
+    fn the_wait_follows_the_head_and_drops_stale_pending() {
+        let old = Wait {
+            head: "old1234".into(),
+            pending: vec!["E2E on preview (in_progress)".into()],
+            since: 10,
+            reran: false,
+        };
+        let now = for_head(Some(&old), "new5678", 500);
+        assert_eq!(now.head, "new5678");
+        assert!(now.pending.is_empty());
+        assert_eq!(now.since, 500);
+        // The same head, still nothing pending: kept as it was.
+        assert_eq!(for_head(Some(&now), "new5678", 900), now);
+        // The same head whose checks have ended: the pending list goes.
+        let ended = Wait {
+            head: "new5678".into(),
+            ..old.clone()
+        };
+        assert!(for_head(Some(&ended), "new5678", 900).pending.is_empty());
     }
 
     #[test]

@@ -245,21 +245,29 @@ pub fn infra_tasks(decision: &FixDecision, files: &[String], terms: &[String]) -
     if !oc.where_.trim().is_empty() {
         t.push_str(&format!("- [ ] Where: {}\n", oc.where_.trim()));
     }
-    t.push_str(&format!(
-        "- [ ] The resource is defined in {} (they name {}). Change it there, following this repository's AGENTS.md or CLAUDE.md, its module layout and naming.\n",
-        files
-            .iter()
-            .take(6)
-            .map(|f| format!("`{f}`"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        terms
-            .iter()
-            .map(|t| format!("`{t}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    t.push_str("- [ ] Size every new value (storage, alarm threshold, period) from the measured numbers in the evidence, and put the arithmetic in the PR description.\n");
+    if files.is_empty() {
+        // Named by the plan, not found by a search: the change's own words
+        // say where.
+        t.push_str("- [ ] Make the change in this repository, following its AGENTS.md or CLAUDE.md, its module layout and naming.\n");
+    } else {
+        t.push_str(&format!(
+            "- [ ] The resource is defined in {} (they name {}). Change it there, following this repository's AGENTS.md or CLAUDE.md, its module layout and naming.\n",
+            files
+                .iter()
+                .take(6)
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            terms
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !terms.is_empty() {
+        t.push_str("- [ ] Size every new value (storage, alarm threshold, period) from the measured numbers in the evidence, and put the arithmetic in the PR description.\n");
+    }
     if !oc.verify.trim().is_empty() {
         t.push_str(&format!("- [ ] Verify: {}\n", oc.verify.trim()));
     }
@@ -313,6 +321,110 @@ pub fn link_into_plan(
     });
     plan.fix = Some(d);
     true
+}
+
+/// Pure: the other connected, turned-on repository the plan's decision puts
+/// a change in: an end-to-end step it gives to another repository, else
+/// the one repository the outside change's words name in full
+/// (`owner/name`). `None` when it names none, several, the run's own
+/// repository, or one that is not on.
+pub fn named_other_repo(
+    decision: &FixDecision,
+    primary: &str,
+    repos: &[RepoInfo],
+) -> Option<String> {
+    let on = |name: &str| {
+        repos
+            .iter()
+            .find(|r| r.enabled && r.full_name.eq_ignore_ascii_case(name.trim()))
+            .map(|r| r.full_name.clone())
+    };
+    let not_primary = |r: &String| !r.eq_ignore_ascii_case(primary);
+    let mut by_step: Vec<String> = decision
+        .end_to_end
+        .iter()
+        .filter(|s| s.by == "other_repo")
+        .filter_map(|s| on(&s.repo))
+        .filter(not_primary)
+        .collect();
+    by_step.sort();
+    by_step.dedup();
+    if by_step.len() == 1 {
+        return by_step.pop();
+    }
+    if by_step.len() > 1 {
+        return None;
+    }
+    let oc = decision.outside_change.as_ref()?;
+    let words = format!("{} {} {}", oc.system, oc.where_, oc.change).to_ascii_lowercase();
+    let named: Vec<String> = repos
+        .iter()
+        .filter(|r| r.enabled && !r.full_name.eq_ignore_ascii_case(primary))
+        .filter(|r| {
+            let full = r.full_name.to_ascii_lowercase();
+            words.match_indices(&full).any(|(at, _)| {
+                let after = words[at + full.len()..].chars().next();
+                !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+        })
+        .map(|r| r.full_name.clone())
+        .collect();
+    match named.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// For a run whose plan puts part of the change in another connected
+/// repository (named by the plan, not found from log evidence): when the
+/// team's permissions allow it, that repository gets its own linked pull
+/// request in this run, so the change is made where it belongs instead of
+/// a note that "it has to be made there" or stand-in work here. Returns
+/// whether the plan now covers both repositories.
+#[allow(clippy::too_many_arguments)]
+pub async fn link_named_change(
+    state: &crate::WorkerState,
+    provider: &crate::agent::provider::ModelProvider,
+    msg: &crate::models::TicketMessage,
+    run_id: &str,
+    plan: &mut PlanResult,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    let primary = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let Some(decision) = plan.fix.as_ref() else {
+        return false;
+    };
+    let repos = team_repos(state, &msg.team_id).await;
+    let Some(repo) = named_other_repo(decision, &primary, &repos) else {
+        return false;
+    };
+    match may_open_pr(state, provider, &repo, deadline).await {
+        Ok(()) => {
+            if link_into_plan(plan, (&msg.repo_owner, &msg.repo_name), &repo, &[], &[]) {
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!(
+                        "The change the plan places in {repo} goes to a linked pull request there, in this run"
+                    ),
+                )
+                .await;
+                return true;
+            }
+            false
+        }
+        Err(why) => {
+            let note = format!(
+                "{repo} holds part of the change, but the team's agent permissions didn't allow a pull request there: {why}"
+            );
+            super::add_progress_note(state, &msg.team_id, run_id, &note).await;
+            if let Some(oc) = plan.fix.as_mut().and_then(|d| d.outside_change.as_mut()) {
+                oc.where_ = format!("{} {note}", oc.where_.trim()).trim().to_string();
+            }
+            false
+        }
+    }
 }
 
 /// The team's connected repositories with their roles and descriptions.
@@ -658,5 +770,106 @@ mod tests {
         assert_eq!(d.fix_location, FixLocation::Code);
         assert!(d.outside_change.is_none());
         assert!(d.end_to_end.iter().any(|s| s.in_pr("acme/deploy")));
+    }
+
+    fn harbor_repos() -> Vec<RepoInfo> {
+        vec![
+            RepoInfo {
+                full_name: "harbor/harbor".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            RepoInfo {
+                full_name: "harbor/harbor-infra".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            RepoInfo {
+                full_name: "harbor/harbor-legacy".into(),
+                enabled: false,
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn both(where_: &str, steps: Vec<EndToEndStep>) -> FixDecision {
+        FixDecision {
+            fix_location: FixLocation::Both,
+            outside_change: Some(OutsideChange {
+                system: "the CDN".into(),
+                change: "Add `theme` to the feature list".into(),
+                where_: where_.into(),
+                ..Default::default()
+            }),
+            end_to_end: steps,
+            ..Default::default()
+        }
+    }
+
+    /// A plan that put the CDN change in "a PR in the infra repo" as a note
+    /// left a CoderHelm step no executor could do, waiting a day: the repo
+    /// it names is connected, so that pull request is this run's.
+    #[test]
+    fn the_connected_repo_the_plan_names_gets_the_change() {
+        let r = harbor_repos();
+        let by_words = both(
+            "a PR in harbor/harbor-infra; CI applies it on merge",
+            vec![],
+        );
+        assert_eq!(
+            named_other_repo(&by_words, "harbor/harbor", &r).as_deref(),
+            Some("harbor/harbor-infra")
+        );
+        let by_step = both(
+            "the CDN config",
+            vec![EndToEndStep {
+                step: "Add `theme` to the feature list".into(),
+                by: "other_repo".into(),
+                owner: String::new(),
+                repo: "harbor/harbor-infra".into(),
+            }],
+        );
+        assert_eq!(
+            named_other_repo(&by_step, "harbor/harbor", &r).as_deref(),
+            Some("harbor/harbor-infra")
+        );
+        // Its own repo, one that is off, or none: no linked pull request.
+        assert_eq!(named_other_repo(&by_words, "harbor/harbor-infra", &r), None);
+        assert_eq!(
+            named_other_repo(
+                &both("a PR in harbor/harbor-legacy", vec![]),
+                "harbor/harbor",
+                &r
+            ),
+            None
+        );
+        assert_eq!(
+            named_other_repo(&both("the CDN console", vec![]), "harbor/harbor", &r),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_repo_links_without_search_evidence() {
+        let mut plan = PlanResult {
+            proposal: String::new(),
+            design: String::new(),
+            tasks: "- [ ] src/page.tsx: read `theme` on the server".into(),
+            spec: String::new(),
+            repo_tasks: vec![],
+            fix: Some(both("a PR in harbor/harbor-infra", vec![])),
+        };
+        assert!(link_into_plan(
+            &mut plan,
+            ("harbor", "harbor"),
+            "harbor/harbor-infra",
+            &[],
+            &[]
+        ));
+        let infra = &plan.repo_tasks[1].tasks;
+        assert!(infra.contains("Add `theme` to the feature list"));
+        assert!(infra.contains("Make the change in this repository"));
+        assert!(!infra.contains("The resource is defined in"));
+        assert!(!infra.contains("measured numbers"));
     }
 }

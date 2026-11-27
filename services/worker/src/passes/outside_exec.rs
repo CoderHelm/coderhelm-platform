@@ -53,6 +53,107 @@ const FIND_TRIES: u32 = 6;
 /// Failing tests named in a report.
 const MAX_FAILING: usize = 20;
 
+/// How long a started workflow may go without a run of it showing up on
+/// the branch. A label already on the pull request starts nothing when it
+/// is added again; a run once waited more than a day on such a start.
+pub const FIND_LIMIT_SECS: i64 = 30 * 60;
+/// How long a run that started may keep running before the step stops
+/// waiting on it.
+pub const RUN_LIMIT_SECS: i64 = 6 * 3600;
+/// How long an approval card may go unanswered before the step stops
+/// waiting on it.
+pub const APPROVAL_LIMIT_SECS: i64 = 24 * 3600;
+
+/// When a step under way stops being waited on: its start plus the limit
+/// for what it waits on. `None` for a step not under way, or one with no
+/// start time (it gets one the next time it is looked at).
+pub fn wait_ends(s: &NoteStep) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !outside_work::under_way(s) {
+        return None;
+    }
+    let r = s.run.as_ref()?;
+    let since = chrono::DateTime::parse_from_rfc3339(&r.started_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let limit = if r.state == WAITING_APPROVAL {
+        APPROVAL_LIMIT_SECS
+    } else if r.workflow_run_id == 0 {
+        FIND_LIMIT_SECS
+    } else {
+        RUN_LIMIT_SECS
+    };
+    Some(since + chrono::Duration::seconds(limit))
+}
+
+/// Ends a step whose wait ran past its limit at `now`: not done, with what
+/// it waited on and for how long. True when it ended.
+pub fn end_if_overdue(s: &mut NoteStep, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(ends) = wait_ends(s) else {
+        return false;
+    };
+    if now < ends {
+        return false;
+    }
+    let Some(r) = s.run.take() else {
+        return false;
+    };
+    let file = r.workflow.rsplit('/').next().unwrap_or(&r.workflow);
+    s.result = if r.state == WAITING_APPROVAL {
+        format!(
+            "not done: the approval it asked for on the Agent permissions page had no answer in {} hours; CoderHelm stopped waiting on it",
+            APPROVAL_LIMIT_SECS / 3600
+        )
+    } else if r.workflow_run_id == 0 {
+        format!(
+            "not done: no run of `{file}` started on the branch within {} minutes of starting it (a label already on the pull request starts nothing when it is added again, or the workflow skips this branch); CoderHelm stopped waiting on it",
+            FIND_LIMIT_SECS / 60
+        )
+    } else {
+        format!(
+            "not done: the `{file}` run {} was still running after {} hours; CoderHelm stopped waiting on it",
+            r.url,
+            RUN_LIMIT_SECS / 3600
+        )
+    };
+    true
+}
+
+/// Ends every step still under way, with `why` (the pull request merged or
+/// closed, or the run stopped waiting on CI). True when one ended.
+pub fn end_waits(c: &mut OutsideChange, why: &str) -> bool {
+    let mut ended = false;
+    for s in c.steps.iter_mut().filter(|s| outside_work::under_way(s)) {
+        s.run = None;
+        s.result = format!("not done: {why}; CoderHelm stopped waiting on it");
+        ended = true;
+    }
+    ended
+}
+
+/// What the run waits on, for its status: the first step under way, what
+/// it waits for, and until when. `None` when nothing is under way.
+pub fn waiting_line(c: &OutsideChange) -> Option<String> {
+    let s = c.steps.iter().find(|s| outside_work::under_way(s))?;
+    let r = s.run.as_ref()?;
+    let what = if r.state == WAITING_APPROVAL {
+        "an answer to its approval card on the Agent permissions page".to_string()
+    } else {
+        let file = r.workflow.rsplit('/').next().unwrap_or(&r.workflow);
+        if r.workflow_run_id == 0 {
+            format!("a run of `{file}` to start on the branch")
+        } else {
+            format!("the `{file}` run {} to end", r.url)
+        }
+    };
+    let until = wait_ends(s)
+        .map(|t| format!(" (it stops waiting at {} UTC)", t.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_default();
+    Some(format!(
+        "Waiting on an outside step: \"{}\" waits for {what}{until}",
+        one_line(&s.step).trim_end_matches('.')
+    ))
+}
+
 pub const RUNNING: &str = "running";
 pub const WAITING_APPROVAL: &str = "waiting_approval";
 pub const DONE: &str = "done";
@@ -225,6 +326,19 @@ pub async fn execute(
         if s.doer() != Doer::CoderHelm || s.done {
             continue;
         }
+        // A wait has an end: past its limit the step is reported not done,
+        // with what it waited on (`end_if_overdue`). One saved before the
+        // wait had a start counts from now.
+        if let Some(r) = s.run.as_mut().filter(|r| {
+            r.started_at.is_empty() && (r.state == RUNNING || r.state == WAITING_APPROVAL)
+        }) {
+            r.started_at = chrono::Utc::now().to_rfc3339();
+            p.changed = true;
+        }
+        if end_if_overdue(s, chrono::Utc::now()) {
+            p.changed = true;
+            info!(run_id = cx.run_id, result = %s.result, "Outside step stopped waiting at its limit");
+        }
         if !s.result.trim().is_empty() && !outside_work::under_way(s) {
             // Ended without being done: reported; a later step that needs
             // it doesn't run (below).
@@ -385,9 +499,18 @@ async fn act(
     match gate(cx, tool, &args, &one_line(&s.step)).await {
         Gated::Run => {}
         Gated::Waiting(id, headline) => {
+            // The wait is counted from when it first waited, not from each
+            // look (`APPROVAL_LIMIT_SECS`).
+            let started_at = s
+                .run
+                .as_ref()
+                .filter(|r| r.state == WAITING_APPROVAL && !r.started_at.is_empty())
+                .map(|r| r.started_at.clone())
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
             s.run = Some(StepRun {
                 state: WAITING_APPROVAL.to_string(),
                 approval_id: id,
+                started_at,
                 ..Default::default()
             });
             s.result = format!(
@@ -510,18 +633,70 @@ pub const NO_ACTIONS_WRITE: &str = "the GitHub app needs Actions: write to start
 pub const PERMISSION_NEEDED: &str = "permission_needed";
 
 async fn note_permission_needed(cx: &Ctx<'_>) {
-    let _ = cx
-        .state
+    actions_write_missing(cx.state, cx.team_id, cx.run_id).await;
+}
+
+/// What the run page says, once, when the GitHub app lacks Actions: write:
+/// the one install-level item and where it is lifted (the Setup checks
+/// page's "Starting workflows" check links the app's permissions page).
+pub fn actions_write_note() -> String {
+    format!(
+        "{}. Without it CoderHelm starts workflows through the labels they run on, reads the \
+         results already there, and never re-runs a failed job; only if the team wants it to, \
+         Setup checks, \"Starting workflows\", links the permission page.",
+        common::github_grants::install_item(
+            "actions",
+            "write",
+            "start workflows and re-run failed jobs"
+        )
+    )
+}
+
+/// Whether the app may write Actions on this installation (start or re-run
+/// a workflow): false once its token or a refusal said it can't, so the
+/// call is not made again and nothing polls on it.
+pub fn actions_write_allowed(installation: u64) -> bool {
+    common::github_grants::write_grant(installation, "actions")
+        != common::github_grants::Grant::Missing
+}
+
+/// Records that the app lacks Actions: write on the run, once: the run's
+/// `permission_needed` and one note on the run page, however many steps,
+/// re-runs or looks met it. A refusal is remembered for the installation
+/// too, so no other run asks GitHub again.
+pub async fn actions_write_missing(state: &WorkerState, team_id: &str, run_id: &str) {
+    let first = state
         .dynamo
         .update_item()
-        .table_name(&cx.state.config.runs_table_name)
-        .key("team_id", super::attr_s(cx.team_id))
-        .key("run_id", super::attr_s(cx.run_id))
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
         .update_expression("SET #p = :p")
+        .condition_expression("attribute_not_exists(#p) OR #p <> :p")
         .expression_attribute_names("#p", PERMISSION_NEEDED)
         .expression_attribute_values(":p", super::attr_s("actions:write"))
         .send()
-        .await;
+        .await
+        .is_ok();
+    if first {
+        warn!(
+            run_id,
+            "The GitHub app lacks Actions: write: recorded once on the run"
+        );
+        super::add_progress_note(state, team_id, run_id, &actions_write_note()).await;
+    }
+}
+
+/// A refused Actions write (a re-run, a dispatch) as GitHub answered it:
+/// true when it is the missing permission, which is then remembered for
+/// the installation.
+pub fn refused_actions_write(installation: u64, error: &str) -> bool {
+    if common::flaky_checks::rerun_refused_for_permission(error) {
+        common::github_grants::refused_write(installation, "actions");
+        true
+    } else {
+        false
+    }
 }
 
 /// Starts the route (dispatch, or its label), finds the run it started and
@@ -1592,7 +1767,8 @@ pub enum OnResume {
     /// Nothing under way.
     Idle,
     /// A step waits on an approval or a workflow: the run isn't finished.
-    Waiting,
+    /// Carries what it waits on, and until when ([`waiting_line`]).
+    Waiting(String),
     /// A started end-to-end run failed: it goes to the CI fix round.
     Failed(FailedRun),
 }
@@ -1642,8 +1818,40 @@ pub async fn on_resume(
         msg.installation_id,
         &state.http,
     ) else {
-        return OnResume::Waiting;
+        return OnResume::Waiting(
+            waiting_line(c).unwrap_or_else(|| "Waiting on an outside step".to_string()),
+        );
     };
+    // A pull request that merged or closed ends every wait on it: the
+    // workflow or approval it waited for no longer decides anything here.
+    if let Ok(pr) = github.get_pull_request(owner, repo, place.pr_number).await {
+        let merged = pr["merged"].as_bool().unwrap_or(false) || !pr["merged_at"].is_null();
+        if merged || pr["state"].as_str() == Some("closed") {
+            let why = if merged {
+                format!(
+                    "the pull request #{} merged before it ended",
+                    place.pr_number
+                )
+            } else {
+                format!(
+                    "the pull request #{} closed before it ended",
+                    place.pr_number
+                )
+            };
+            if end_waits(c, &why) {
+                info!(run_id = msg.run_id, why = %why, "Outside steps stop waiting: the pull request ended");
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &format!("Outside steps: {why}; CoderHelm stopped waiting on them"),
+                )
+                .await;
+                save(state, &msg.team_id, &msg.run_id, &d).await;
+            }
+            return OnResume::Idle;
+        }
+    }
     let env = super::load_codegen_env(state, &msg.team_id, owner, repo).await;
     let staging_write = super::feature::load_connection(state, &msg.team_id, &place.repo)
         .await
@@ -1688,9 +1896,42 @@ pub async fn on_resume(
         return OnResume::Failed(f);
     }
     if p.waiting {
-        OnResume::Waiting
+        OnResume::Waiting(
+            d.outside_change
+                .as_ref()
+                .and_then(waiting_line)
+                .unwrap_or_else(|| {
+                    "Waiting on an outside step: a workflow's result on the pull request's head"
+                        .to_string()
+                }),
+        )
     } else {
         OnResume::Idle
+    }
+}
+
+/// Ends the outside steps still under way on the run, with `why`, and
+/// saves them: for a run that stops waiting (its CI wait reached its end).
+pub async fn end_all_waits(state: &WorkerState, team_id: &str, run_id: &str, why: &str) {
+    let record = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let Some(mut d) = decision_of(&record) else {
+        return;
+    };
+    let Some(c) = d.outside_change.as_mut() else {
+        return;
+    };
+    if end_waits(c, why) {
+        save(state, team_id, run_id, &d).await;
     }
 }
 
@@ -1896,5 +2137,120 @@ mod tests {
         assert!(blocks_later(&step("migration", "staging", "Run it")));
         assert!(!blocks_later(&step("e2e", "staging", "Run the e2e")));
         assert!(!blocks_later(&step("verify", "staging", "Confirm")));
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// A label added to a pull request that already had it starts nothing;
+    /// the step once waited for that run for more than a day. Every wait
+    /// now has an end and says what it waited on.
+    #[test]
+    fn every_outside_wait_has_an_end_and_says_what_it_waited_on() {
+        let mut never_found = NoteStep {
+            run: Some(StepRun {
+                state: RUNNING.into(),
+                workflow: ".github/workflows/deploy-staging.yml".into(),
+                started_at: "2026-01-05T10:00:00Z".into(),
+                ..Default::default()
+            }),
+            ..step("e2e", "staging", "Run the e2e on the preview")
+        };
+        let c = OutsideChange {
+            steps: vec![never_found.clone()],
+            ..Default::default()
+        };
+        let line = waiting_line(&c).unwrap();
+        assert!(
+            line.contains("a run of `deploy-staging.yml` to start"),
+            "{line}"
+        );
+        assert!(line.contains("2026-01-05 10:30 UTC"), "{line}");
+        assert!(!end_if_overdue(
+            &mut never_found,
+            at("2026-01-05T10:20:00Z")
+        ));
+        assert!(end_if_overdue(&mut never_found, at("2026-01-05T10:31:00Z")));
+        assert!(!outside_work::under_way(&never_found));
+        assert!(never_found
+            .result
+            .contains("no run of `deploy-staging.yml` started"));
+
+        let mut long = NoteStep {
+            run: Some(StepRun {
+                state: RUNNING.into(),
+                workflow: "e2e.yml".into(),
+                workflow_run_id: 42,
+                url: "https://example.test/runs/42".into(),
+                started_at: "2026-01-05T10:00:00Z".into(),
+                ..Default::default()
+            }),
+            ..step("e2e", "staging", "Run the e2e")
+        };
+        assert!(!end_if_overdue(&mut long, at("2026-01-05T15:00:00Z")));
+        assert!(end_if_overdue(&mut long, at("2026-01-05T16:01:00Z")));
+        assert!(long.result.contains("still running after 6 hours"));
+
+        let mut card = NoteStep {
+            run: Some(StepRun {
+                state: WAITING_APPROVAL.into(),
+                approval_id: "a1".into(),
+                started_at: "2026-01-05T10:00:00Z".into(),
+                ..Default::default()
+            }),
+            ..step("deploy", "staging", "Deploy staging")
+        };
+        assert!(!end_if_overdue(&mut card, at("2026-01-06T09:00:00Z")));
+        assert!(end_if_overdue(&mut card, at("2026-01-06T10:01:00Z")));
+        assert!(card.result.contains("had no answer in 24 hours"));
+    }
+
+    #[test]
+    fn a_merged_or_closed_pull_request_ends_the_waits() {
+        let mut c = OutsideChange {
+            steps: vec![
+                NoteStep {
+                    run: Some(StepRun {
+                        state: RUNNING.into(),
+                        started_at: "2026-01-05T10:00:00Z".into(),
+                        ..Default::default()
+                    }),
+                    ..step("e2e", "staging", "Run the e2e")
+                },
+                step("verify", "staging", "Confirm"),
+            ],
+            ..Default::default()
+        };
+        assert!(end_waits(
+            &mut c,
+            "the pull request #7 merged before it ended"
+        ));
+        assert!(waiting_line(&c).is_none());
+        assert!(c.steps[0].result.contains("merged before it ended"));
+        assert!(c.steps[1].result.is_empty(), "a step not started is left");
+        assert!(!end_waits(&mut c, "again"));
+    }
+
+    #[test]
+    fn the_missing_actions_permission_is_one_install_item() {
+        let n = actions_write_note();
+        assert!(n.contains("Actions: write"), "{n}");
+        assert!(n.contains("re-run failed jobs"), "{n}");
+        assert!(n.contains(common::github_grants::INSTALL_LEVEL), "{n}");
+        assert!(n.contains("Starting workflows"), "{n}");
+        let i = 990_777;
+        assert!(actions_write_allowed(i));
+        assert!(refused_actions_write(
+            i,
+            "HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/o/r/actions/runs/1/rerun-failed-jobs)"
+        ));
+        assert!(!actions_write_allowed(i));
+        assert!(!refused_actions_write(
+            990_778,
+            "HTTP status server error (502)"
+        ));
     }
 }

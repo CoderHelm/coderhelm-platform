@@ -110,6 +110,31 @@ pub fn next_round(
     r
 }
 
+/// A round's refusals split into the files a review fix settled (the round
+/// was refused for undoing that fix, `round_agree::UNDO_MARK`) and every
+/// other refusal.
+pub fn split_undone(refused: &[Refusal]) -> (Vec<Refusal>, Vec<Refusal>) {
+    refused
+        .iter()
+        .cloned()
+        .partition(|r| r.why.starts_with(super::round_agree::UNDO_MARK))
+}
+
+/// `items` without the planned work in a file a review fix settled: the
+/// review decided that file, so the plan's version of it is not work left.
+pub fn drop_settled(items: Vec<String>, settled: &[Refusal]) -> Vec<String> {
+    if settled.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|i| {
+            let paths = super::stack::named_paths(i);
+            !settled.iter().any(|s| paths.contains(&s.path))
+        })
+        .collect()
+}
+
 /// What follows a planned-work round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -341,6 +366,41 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A round refused for undoing a review fix met the review's decision:
+    /// the planned work in that file is dropped and the round is not a
+    /// stall, so the plan and the review never stop the run between them.
+    #[test]
+    fn work_a_review_fix_settled_is_dropped_not_stalled_on() {
+        let refusal =
+            crate::passes::round_agree::undo_refusal(&[crate::passes::round_agree::Undo {
+                sha: "abc1234def".into(),
+                path: "e2e/theme.spec.ts".into(),
+                lines: vec!["test('three cases')".into(); 3],
+            }]);
+        let refused: Vec<Refusal> = crate::passes::round_agree::undone_files(&refusal)
+            .into_iter()
+            .map(|t| Refusal {
+                path: t.path,
+                why: format!("{} ({})", crate::passes::round_agree::UNDO_MARK, t.sha),
+            })
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].path, "e2e/theme.spec.ts");
+        let (settled, other) = split_undone(&refused);
+        assert_eq!((settled.len(), other.len()), (1, 0));
+        let items = vec![
+            "The task for e2e/theme.spec.ts is only partly done: Test 2 and Test 3 are missing"
+                .to_string(),
+        ];
+        let after = drop_settled(items.clone(), &settled);
+        assert!(after.is_empty());
+        let r = first_round(&unfinished_section(&[planned(&items[0])]), now()).unwrap();
+        assert_eq!(next(&items, Some(&after), 0, &other, &r), Next::Ready);
+        // Work in another file stays.
+        let elsewhere = vec!["`src/page.tsx` is not written.".to_string()];
+        assert_eq!(drop_settled(elsewhere.clone(), &settled), elsewhere);
     }
 
     #[test]

@@ -1917,13 +1917,26 @@ pub async fn run(
             send_delayed_resume(state, &msg, 0).await;
             return Ok(());
         }
-        super::outside_exec::OnResume::Waiting
+        super::outside_exec::OnResume::Waiting(line)
             if !events.iter().any(|e| e.event_type == "ci_failed") =>
         {
             info!(
                 run_id = msg.run_id,
+                waiting = %line,
                 "An outside step waits on an approval or a workflow run — checking again later"
             );
+            // The run's status says what it waits on and until when (the
+            // same words each look stay one note).
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
+            // The CI wait follows the head while the outside step waits: it
+            // once kept a day-old head's pending checks while the pull
+            // request had moved on, because this wait returned before CI
+            // was ever looked at again.
+            if track_ci_for_head(state, &msg, &run_record, branch_head.as_deref(), created_at).await
+            {
+                mark_events_processed(state, &msg.run_id, &events).await;
+                return Ok(());
+            }
             send_delayed_resume(state, &msg, 120).await;
             return Ok(());
         }
@@ -5073,6 +5086,17 @@ async fn run_fix_round(
                     Ok(RoundEnd::Done { files: 0 })
                 }
                 super::round::Landed::Refused(why) => {
+                    // A planned-work round refused for undoing a review fix
+                    // met the review's decision on those files: the check
+                    // after it follows that decision (`after_planned_round`).
+                    if round.kind == run_round::Kind::PlannedWork {
+                        refused.extend(super::round_agree::undone_files(&why).into_iter().map(
+                            |t| super::write_guard::Refusal {
+                                path: t.path,
+                                why: format!("{} ({})", super::round_agree::UNDO_MARK, t.sha),
+                            },
+                        ));
+                    }
                     round_fault(
                         state,
                         msg,
@@ -5703,14 +5727,16 @@ async fn start_planned_work(
     let taken = if items.is_empty() {
         Vec::new()
     } else {
-        super::round_agree::read(
+        let mut t = super::round_agree::read(
             &ctx.github,
             pr.owner,
             pr.repo,
             pr.number,
             &ctx.ticket_msg.base_branch,
         )
-        .await
+        .await;
+        t.extend(review_settled(state, msg).await);
+        t
     };
     let sorted = super::round_agree::sort(
         &items,
@@ -5828,7 +5854,7 @@ async fn recheck_planned_work(
     .map(|f| super::proof::drop_settled_generated(f, &settled))?;
     // What a review took out is not planned work left, unless the ticket
     // asks for it (`round_agree`): the rounds never undo each other.
-    let taken = super::round_agree::read(
+    let mut taken = super::round_agree::read(
         &ctx.github,
         pr.owner,
         pr.repo,
@@ -5836,6 +5862,9 @@ async fn recheck_planned_work(
         &ctx.ticket_msg.base_branch,
     )
     .await;
+    // Nor what CoderHelm's own review asked for less of: the plan follows
+    // the review's decision (`round_agree::settled_by_review`).
+    taken.extend(review_settled(state, msg).await);
     // Nor what the plan decided is out of scope (`common::scope_ledger`).
     let found = match super::scope_ledger::load_with_people(
         state,
@@ -5903,6 +5932,17 @@ async fn recheck_planned_work(
     Some(found)
 }
 
+/// The files CoderHelm's own review settled as a whole (it asked for less
+/// there), as take-outs for `round_agree::sort`.
+async fn review_settled(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+) -> Vec<super::round_agree::TakenOut> {
+    let ledger = super::own_review_ledger::load(state, &msg.team_id, &msg.run_id).await;
+    let items: Vec<String> = ledger.findings.iter().map(|t| t.item.clone()).collect();
+    super::round_agree::settled_by_review(&items)
+}
+
 /// After a planned-work round: judge the branch again, rewrite the "Not
 /// finished" section to what is left, and go on (another round), finish
 /// (ready) or stop (two rounds without progress) as `finish_planned` says.
@@ -5940,6 +5980,29 @@ async fn after_planned_round(
         .await
         .map(|f| super::proof::unfinished_section(&f));
     let after = section.as_deref().map(finish_planned::listed);
+    // The files a review fix settled, which this round was refused for
+    // undoing: planned work in them is the review's decision, not work left.
+    // A plan and a review that disagree end in the review's favour, never in
+    // two stalled rounds and a stop.
+    let (settled, refused) = finish_planned::split_undone(refused);
+    let after = after.map(|a| finish_planned::drop_settled(a, &settled));
+    let refused = refused.as_slice();
+    if !settled.is_empty() {
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &format!(
+                "Planned work in {} follows the review fix there: not built again",
+                settled
+                    .iter()
+                    .map(|r| format!("`{}`", r.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .await;
+    }
     // The description says what is still not done, never the earlier list.
     if let Some(section) = &section {
         if !body.is_empty() {
@@ -6461,6 +6524,12 @@ async fn try_rerun_once(
     }
     let mut started = false;
     let mut refused = false;
+    // Without Actions: write a re-run is never tried (`outside_exec::
+    // actions_write_allowed`): the run says so once and goes on.
+    if !super::outside_exec::actions_write_allowed(gh.installation_id()) {
+        super::outside_exec::actions_write_missing(state, &msg.team_id, &msg.run_id).await;
+        return Some(rerun_result(false, true));
+    }
     for e in &failed {
         let Some(wf_run) = e.payload["workflow_run_id"].as_u64() else {
             continue;
@@ -6468,8 +6537,15 @@ async fn try_rerun_once(
         match gh.rerun_failed_jobs(owner, name, wf_run).await {
             Ok(()) => started = true,
             Err(err) => {
-                refused |= common::flaky_checks::rerun_refused_for_permission(&err.to_string());
-                warn!(run_id = msg.run_id, workflow_run_id = wf_run, error = %err, "Could not re-run failed jobs")
+                warn!(run_id = msg.run_id, workflow_run_id = wf_run, error = %err, "Could not re-run failed jobs");
+                if common::flaky_checks::rerun_refused_for_permission(&err.to_string()) {
+                    // Remembered for the installation: no later re-run asks.
+                    common::github_grants::refused_write(gh.installation_id(), "actions");
+                    refused = true;
+                    super::outside_exec::actions_write_missing(state, &msg.team_id, &msg.run_id)
+                        .await;
+                    break;
+                }
             }
         }
     }
@@ -7957,13 +8033,25 @@ async fn rerun_unrelated(
     mut s: common::ci_unrelated::Standing,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut started = false;
-    for id in failed_runs {
-        match github.rerun_failed_jobs(pr.owner, pr.repo, *id).await {
-            Ok(()) => started = true,
-            Err(e) => {
-                warn!(run_id = msg.run_id, workflow_run_id = id, error = %e, "Could not re-run the failed jobs")
+    if super::outside_exec::actions_write_allowed(github.installation_id()) {
+        for id in failed_runs {
+            match github.rerun_failed_jobs(pr.owner, pr.repo, *id).await {
+                Ok(()) => started = true,
+                Err(e) => {
+                    warn!(run_id = msg.run_id, workflow_run_id = id, error = %e, "Could not re-run the failed jobs");
+                    if super::outside_exec::refused_actions_write(
+                        github.installation_id(),
+                        &e.to_string(),
+                    ) {
+                        break;
+                    }
+                }
             }
         }
+    }
+    if !started && !super::outside_exec::actions_write_allowed(github.installation_id()) {
+        // One status for the missing permission, never one per run id.
+        super::outside_exec::actions_write_missing(state, &msg.team_id, &msg.run_id).await;
     }
     if !started {
         s.rerun = common::ci_unrelated::Rerun::CouldNot;
@@ -9747,6 +9835,82 @@ async fn resume_multi_repo(
     Ok(())
 }
 
+/// The CI wait kept for the pull request's current head while something
+/// else (an outside step) holds the run: a head with nothing pending
+/// replaces whatever an older head left (its pending checks are dropped);
+/// one with checks still running goes through [`ci_wait_watchdog`], so the
+/// wait has its end. Returns true when the run finished.
+async fn track_ci_for_head(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    run_record: &RunRecord,
+    head: Option<&str>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    use common::ci_watch;
+    let text = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let repo_full = text("repo");
+    let branch = text("branch");
+    let Some((owner, repo)) = repo_full.split_once('/') else {
+        return false;
+    };
+    let head = head.map(str::to_string).unwrap_or(branch);
+    if head.is_empty() {
+        return false;
+    }
+    let pr_number = run_record
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let Ok(github) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) else {
+        return false;
+    };
+    let Ok(checks) = github.list_ci_for_ref(owner, repo, &head).await else {
+        return false;
+    };
+    let pending = ci_watch::pending_of(&checks);
+    if pending.is_empty() {
+        let prev =
+            ci_watch::from_json(&run_text(state, &msg.team_id, &msg.run_id, ci_watch::FIELD).await);
+        let fresh = ci_watch::for_head(prev.as_ref(), &head, chrono::Utc::now().timestamp());
+        if prev.as_ref() != Some(&fresh) {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(&msg.run_id))
+                .update_expression("SET #w = :w")
+                .expression_attribute_names("#w", ci_watch::FIELD)
+                .expression_attribute_values(":w", attr_s(&ci_watch::to_json(&fresh)))
+                .send()
+                .await;
+        }
+        return false;
+    }
+    ci_wait_watchdog(
+        state,
+        msg,
+        &github,
+        (owner, repo, pr_number),
+        &head,
+        created_at,
+    )
+    .await
+}
+
 /// One look at a CI wait with no result yet (`common::ci_watch`): the
 /// pending set is kept with when it last changed; an hour without progress
 /// re-runs the stuck checks' workflows once, and a second hour stops the
@@ -9783,10 +9947,24 @@ async fn ci_wait_watchdog(
         Step::Wait => false,
         Step::Rerun => {
             let mut started = 0;
-            for id in ci_watch::pending_run_ids(&checks) {
-                if github.rerun_workflow_run(owner, repo, id).await.is_ok() {
-                    started += 1;
+            if super::outside_exec::actions_write_allowed(github.installation_id()) {
+                for id in ci_watch::pending_run_ids(&checks) {
+                    match github.rerun_workflow_run(owner, repo, id).await {
+                        Ok(_) => started += 1,
+                        Err(e) => {
+                            if super::outside_exec::refused_actions_write(
+                                github.installation_id(),
+                                &e.to_string(),
+                            ) {
+                                break;
+                            }
+                        }
+                    }
                 }
+            }
+            if started == 0 && !super::outside_exec::actions_write_allowed(github.installation_id())
+            {
+                super::outside_exec::actions_write_missing(state, &msg.team_id, &msg.run_id).await;
             }
             warn!(run_id = msg.run_id, pending = ?wait.pending, started, "CI made no progress for an hour: re-running the stuck checks once");
             super::add_progress_note(
@@ -9800,6 +9978,13 @@ async fn ci_wait_watchdog(
         }
         Step::Stop => {
             warn!(run_id = msg.run_id, pending = ?wait.pending, "CI made no progress after a re-run: the wait stops");
+            super::outside_exec::end_all_waits(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                "the run stopped waiting on CI that made no progress",
+            )
+            .await;
             if pr_number > 0 {
                 mark_pr_ready(state, &msg.team_id, github, owner, repo, pr_number).await;
             }
@@ -9902,6 +10087,27 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
             }
         }
     }
+    // What the run still waited on outside the code stops with it, and the
+    // poll count starts again for a later wait (a review picking the pull
+    // request up again): a count that never reset handed the run off at
+    // its first look every time it was picked up, while its outside step
+    // kept it waiting again.
+    super::outside_exec::end_all_waits(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        "the run stopped waiting after about a day of checks",
+    )
+    .await;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("REMOVE ci_resume_polls")
+        .send()
+        .await;
     super::add_progress_note(
         state,
         &msg.team_id,

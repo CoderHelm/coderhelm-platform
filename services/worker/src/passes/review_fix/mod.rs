@@ -506,12 +506,18 @@ async fn scope_step(
 ) {
     let hunks = staged.hunks();
     let total = hunks.len();
-    let Some(verdicts) = judge_scope(round, &hunks, usage).await else {
+    let Some(mut verdicts) = judge_scope(round, &hunks, usage).await else {
         out.evidence.push(format!(
             "Scope: the check could not read the {total} hunk(s) against the comments; nothing taken out"
         ));
         return;
     };
+    let kept = scope::keep_asked_removals(&mut verdicts, &hunks, &round.requests);
+    if kept > 0 {
+        out.evidence.push(format!(
+            "Scope: kept {kept} hunk(s) that shorten a file a comment asks to cut down"
+        ));
+    }
     let ids = scope::out_of_scope(&verdicts);
     if ids.is_empty() {
         out.evidence.push(format!(

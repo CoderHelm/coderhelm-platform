@@ -591,13 +591,45 @@ pub fn requester_command(texts: &[&str]) -> Option<String> {
                 .join("\n");
             let one_word = !span.contains(char::is_whitespace);
             let bare = matches!(span.as_str(), "pytest" | "tox" | "nox" | "rspec");
-            if span.len() > 600 || (one_word && !bare) || !testy.is_match(&span) {
+            if span.len() > 600
+                || (one_word && !bare)
+                || !testy.is_match(&span)
+                || !reads_as_command(&span)
+            {
                 continue;
             }
             return Some(span);
         }
     }
     None
+}
+
+/// Whether a quoted span reads as a shell command and not as words: its
+/// first word (after any `NAME=value` settings) is a program or a path,
+/// lower case, never a label ending in `:`, and it carries no `<...>`
+/// placeholder. A review comment once quoted CoderHelm's own template
+/// line `Wider than the ticket: <path>: <why>`; its path held the word
+/// "tests", so the line ran as the round's test command and broke as bash.
+pub fn reads_as_command(span: &str) -> bool {
+    static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+    static PROGRAM: OnceLock<Regex> = OnceLock::new();
+    let placeholder = re(&PLACEHOLDER, r"<[A-Za-z][A-Za-z0-9 _-]*>");
+    let program = re(&PROGRAM, r"^[a-z0-9_./~][a-z0-9_./+~-]*$");
+    if placeholder.is_match(span) {
+        return false;
+    }
+    let first_line = span.lines().next().unwrap_or("");
+    first_line
+        .split_whitespace()
+        .find(|w| {
+            !(w.contains('=')
+                && w.split('=').next().is_some_and(|k| {
+                    !k.is_empty()
+                        && k.chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                }))
+        })
+        .is_some_and(|w| program.is_match(w))
 }
 
 /// The simplest command that runs the repository's tests, from the files
@@ -816,6 +848,27 @@ mod tests {
             None
         );
         assert_eq!(requester_command(&["no commands here"]), None);
+    }
+
+    /// CoderHelm's own template line, quoted in a review finding, is no
+    /// command: its path holds "tests", and it ran as bash and broke.
+    #[test]
+    fn a_quoted_template_line_is_never_the_test_command() {
+        let finding = "A test out of proportion to the change. If the ticket truly needs it, \
+                       say why on a line `Wider than the ticket: e2e/tests/site/theme.spec.ts: <why>`.";
+        assert_eq!(requester_command(&[finding]), None);
+        let fenced = "```\nWider than the ticket: e2e/tests/a.spec.ts: <why>\n```";
+        assert_eq!(requester_command(&[fenced]), None);
+        // A real command after it is still found.
+        let both = format!("{finding} Run `npx playwright test e2e/tests/site/theme.spec.ts`.");
+        assert_eq!(
+            requester_command(&[&both]).unwrap(),
+            "npx playwright test e2e/tests/site/theme.spec.ts"
+        );
+        assert!(reads_as_command("CI=1 npm test"));
+        assert!(reads_as_command("./scripts/run-tests.sh unit"));
+        assert!(!reads_as_command("Run the tests: npm test"));
+        assert!(!reads_as_command("npm test -- <file>"));
     }
 
     #[test]

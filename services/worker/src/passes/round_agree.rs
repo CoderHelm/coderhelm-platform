@@ -34,6 +34,10 @@ pub struct TakenOut {
     pub sha: String,
     /// The removed lines, trimmed.
     pub lines: Vec<String>,
+    /// The review settled the file as a whole (it asked for less there, or
+    /// a later round was refused for undoing its fix): any planned work in
+    /// the file is the review's, whatever code it quotes.
+    pub whole_file: bool,
 }
 
 /// Fewer removed lines than this in a file is a trim, not taking work out.
@@ -95,6 +99,7 @@ pub fn taken_out(
                 path: path.clone(),
                 sha: sha.to_string(),
                 lines,
+                whole_file: false,
             });
         }
     }
@@ -122,7 +127,9 @@ pub fn undone_by_review<'a>(item: &str, taken: &'a [TakenOut]) -> Option<&'a Tak
     let code = quoted_code(item);
     taken.iter().find(|t| {
         paths.contains(&t.path)
-            && (code.is_empty() || code.iter().any(|c| t.lines.iter().any(|l| l.contains(c))))
+            && (t.whole_file
+                || code.is_empty()
+                || code.iter().any(|c| t.lines.iter().any(|l| l.contains(c))))
     })
 }
 
@@ -157,8 +164,8 @@ pub struct Sorted {
 /// The line added to an item the ticket keeps over a review's take-out.
 pub fn kept_line(sha: &str, criterion: &str) -> String {
     format!(
-        "(A review took this out in {}; the ticket's acceptance criterion \"{}\" asks for it, so it stays. Say so in the reply to that review finding.)",
-        common::truncate_str(sha, 7),
+        "(A review took this out {}; the ticket's acceptance criterion \"{}\" asks for it, so it stays. Say so in the reply to that review finding.)",
+        by_review(sha),
         common::truncate_str(criterion.trim(), 160)
     )
 }
@@ -211,15 +218,96 @@ pub fn sort_findings(
     (keep, skipped)
 }
 
+/// Where a take-out came from, for a note: `in <short sha>` for a review
+/// commit, or the words of a review that settled a whole file.
+fn by_review(sha: &str) -> String {
+    if sha.contains(' ') {
+        sha.to_string()
+    } else {
+        format!("in {}", common::truncate_str(sha, 7))
+    }
+}
+
+/// What CoderHelm's own review settled as a whole file, from the findings
+/// it raised (`Title (`path:line`)`): a finding that asks for less there (a
+/// test out of proportion, a change wider than the ticket) decides that
+/// file's size, so the plan's fuller version of it is not built again. A
+/// review once cut a planned test down to one case; the planned-work check
+/// asked for the plan's three cases again, the round that tried was refused
+/// for undoing the review's fix, and the run stopped after two rounds with
+/// no progress.
+pub fn settled_by_review(findings: &[String]) -> Vec<TakenOut> {
+    let mut out: Vec<TakenOut> = Vec::new();
+    for f in findings {
+        let Some((title, at)) = f.rsplit_once("(`") else {
+            continue;
+        };
+        let title = title.trim();
+        if !super::review_fix::scope::asks_for_less(title) {
+            continue;
+        }
+        let at = at.trim_end().trim_end_matches(')').trim_end_matches('`');
+        let path = at.split(':').next().unwrap_or(at).trim().to_string();
+        if path.is_empty() || out.iter().any(|t| t.path == path) {
+            continue;
+        }
+        out.push(TakenOut {
+            path,
+            sha: format!("by CoderHelm's review (\"{title}\")"),
+            lines: Vec::new(),
+            whole_file: true,
+        });
+    }
+    out
+}
+
+/// The files a round's landing was refused for undoing a review fix in
+/// (`undo_refusal`'s words): the review settled them, so planned work in
+/// them is not asked for again.
+pub fn undone_files(refusal: &str) -> Vec<TakenOut> {
+    let Some(at) = refusal.find(UNDO_MARK) else {
+        return Vec::new();
+    };
+    let rest = &refusal[at + UNDO_MARK.len()..];
+    let rest = rest.split(". Keep that fix").next().unwrap_or(rest);
+    let mut out: Vec<TakenOut> = Vec::new();
+    for part in rest.split("; ") {
+        let mut ticks = part.split('`');
+        let (Some(_), Some(path)) = (ticks.next(), ticks.next()) else {
+            continue;
+        };
+        let sha = part
+            .split(" in ")
+            .nth(1)
+            .and_then(|x| x.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+        if path.trim().is_empty() || out.iter().any(|t| t.path == path) {
+            continue;
+        }
+        out.push(TakenOut {
+            path: path.trim().to_string(),
+            sha: if sha.is_empty() {
+                "by an earlier review fix".to_string()
+            } else {
+                sha
+            },
+            lines: Vec::new(),
+            whole_file: true,
+        });
+    }
+    out
+}
+
 /// The run's note for the items not built again.
 pub fn skipped_note(skipped: &[(String, String)]) -> String {
     let list: Vec<String> = skipped
         .iter()
         .map(|(i, sha)| {
             format!(
-                "- {} (taken out by the review in {})",
+                "- {} (taken out by the review {})",
                 common::truncate_str(i, 200),
-                common::truncate_str(sha, 7)
+                by_review(sha)
             )
         })
         .collect();
@@ -416,5 +504,30 @@ mod undo_tests {
         // A change elsewhere undoes nothing.
         let other = vec![("src/other.tsx".to_string(), ours[0].1.clone())];
         assert!(undoes(&fix, &other).is_empty());
+    }
+
+    /// The review asked for a smaller test: the plan's fuller test in that
+    /// file is not asked for again, whatever code the check quotes.
+    #[test]
+    fn a_review_that_asked_for_less_settles_the_file() {
+        let taken = settled_by_review(&[
+            "A test out of proportion to the change (`e2e/theme.spec.ts:1`)".to_string(),
+            "A missing null check (`src/page.tsx:12`)".to_string(),
+        ]);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].path, "e2e/theme.spec.ts");
+        let item = "The task for e2e/theme.spec.ts is only partly done: not Test 2 \
+                    (`?theme=dark` turns on Dark)";
+        let sorted = sort(
+            &[item.to_string(), "`src/page.tsx` is not written".into()],
+            &taken,
+            &[],
+        );
+        assert_eq!(sorted.skipped.len(), 1);
+        assert_eq!(
+            sorted.build,
+            vec!["`src/page.tsx` is not written".to_string()]
+        );
+        assert!(skipped_note(&sorted.skipped).contains("by CoderHelm's review"));
     }
 }
