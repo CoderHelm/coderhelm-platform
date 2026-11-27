@@ -376,6 +376,36 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
       const l = both[0] || (byCode.length ? specific(byCode) : byName.length === 1 ? byName[0] : null);
       if (l) x.loader = { file: l.d.file, line: l.d.line, symbol: l.d.symbol, table: { file: l.h.file, line: l.h.line } };
     }
+    // A type whose content lives at a fixed path (the resolver pairs its type with that path:
+    // `doc.kind === 'front' && doc.path === '/'`, or its URL rule pins the whole path), and whether
+    // its renderer draws nothing of its own (no component of the app, nothing from what it is
+    // handed): a fallback. The caller folds such a type into the file route that owns that path.
+    const typeOfKey = new Map();
+    for (const x of screens) typeOfKey.set(norm(x.type), x);
+    for (const l of loaders) for (const x of screens) if (x.loader && x.loader.file === l.d.file && x.loader.symbol === l.d.symbol) typeOfKey.set(norm(l.h.type), x);
+    const LITQ = `(["'\`])([\\w-]{1,80})\\1`;
+    const PATHQ = `(["'\`])(\\/[^"'\`\\s]{0,120})\\3`;
+    const PAIR = new RegExp(`${ID}(?:\\??\\.${ID})*\\s*===?\\s*${LITQ}\\s*&&\\s*${ID}(?:\\??\\.${ID})*\\s*===?\\s*${PATHQ}`, 'g');
+    const PAIR_REV = new RegExp(`${ID}(?:\\??\\.${ID})*\\s*===?\\s*(["'\`])(\\/[^"'\`\\s]{0,120})\\1\\s*&&\\s*${ID}(?:\\??\\.${ID})*\\s*===?\\s*(["'\`])([\\w-]{1,80})\\3`, 'g');
+    for (const f of files) {
+      const s = get(f); const L = lineIndex(s);
+      const pin = (lit, at, m) => { const x = typeOfKey.get(norm(lit)); if (x && !x.servedAt) x.servedAt = { path: at.replace(/(.)\/$/, '$1'), file: f, line: L(m.index) }; };
+      for (const m of s.matchAll(PAIR)) pin(m[2], m[4], m);
+      for (const m of s.matchAll(PAIR_REV)) pin(m[4], m[2], m);
+    }
+    const optional = /\[\[\.\.\./.test(page);
+    for (const x of screens) {
+      if (!x.servedAt && x.urlFrom && !/[*:(]/.test(x.url)) x.servedAt = { path: x.url, file: x.urlFrom.file, line: x.urlFrom.line };
+      // the catch-all can't serve its own base path (`[...slug]` needs one segment at least)
+      if (x.servedAt) x.unreachable = !optional && x.servedAt.path === (route.base || '/');
+      const text = fileSet.has(x.file) ? declText({ file: x.file, line: x.line }) : '';
+      const po = text.indexOf('('); const pc = po >= 0 ? closeOf(text, po) : -1;
+      if (pc > po) {
+        const params = text.slice(po + 1, pc), body = text.slice(pc + 1);
+        const bound = [...params.matchAll(/(?:^|[{,(]\s*)(?:[\w$]+\s*:\s*)?([A-Za-z_$][\w$]*)\s*(?=[,})=]|$)/g)].map((m) => m[1]).filter((n) => !n.startsWith('_'));
+        x.stub = !/<[A-Z]/.test(body) && !/\b(?:createElement|h)\(\s*[A-Z]/.test(body) && !bound.some((n) => new RegExp(`\\b${n.replace(/\$/g, '\\$')}\\b`).test(body));
+      }
+    }
     // two types with the same URL pattern and renderer are one screen; two different screens never share a URL
     const byUrl = new Map();
     for (const x of screens) {

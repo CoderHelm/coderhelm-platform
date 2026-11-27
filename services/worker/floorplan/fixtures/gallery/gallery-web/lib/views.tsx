@@ -6,9 +6,9 @@ import { TicketForm } from '../components/TicketForm';
 
 type Props = { doc: Doc };
 
-/** The front page, built from blocks. */
-export function HomeView({ doc }: Props) {
-  return <Blocks blocks={(doc.data as { blocks: unknown[] }).blocks} />;
+/** The front page has a route of its own (app/page.tsx): this only answers if a link ever lands here. */
+export function HomeView({ doc: _doc }: Props) {
+  return <p>See the front page</p>;
 }
 
 /** One room of the gallery. */

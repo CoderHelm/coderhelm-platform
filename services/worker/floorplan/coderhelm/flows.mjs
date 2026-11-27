@@ -193,15 +193,22 @@ export function spans(ix, r, file, names) {
   return r.once('spans:' + [...names].sort().join(','), file, () => {
     const lines = r.lines(file) || [];
     const rg = ranges(ix, r, file);
-    const own = r.once('decls', file, () => [...new Set(lines.map((l) => /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|const\s+|let\s+|var\s+|class\s+)([A-Za-z_$][\w$]*)/.exec(l)?.[1]).filter(Boolean))]);
-    const of = (n) => rg.get(n) || bodyRange(lines, n);
+    // the file's top-level declarations, name to 0-based line, read once
+    const at = r.once('decls', file, () => {
+      const m = new Map();
+      lines.forEach((l, i) => { const d = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|const\s+|let\s+|var\s+|class\s+)([A-Za-z_$][\w$]*)/.exec(l); if (d && !m.has(d[1])) m.set(d[1], i); });
+      return m;
+    });
+    const own = [...at.keys()];
+    const of = (n) => rg.get(n) || (at.has(n) ? [at.get(n) + 1, braceEnd(lines, at.get(n))] : null);
     const want = new Set(names);
     const out = [];
     const take = (n) => { const x = of(n); if (x) out.push(x); };
     for (const n of want) take(n);
     for (let k = 0; k < 8 && out.length; k++) {
       const text = out.map(([a, b]) => lines.slice(a - 1, b).join('\n')).join('\n');
-      const more = own.filter((d) => !want.has(d) && new RegExp('(^|[^\\w$.])' + esc(d) + '\\b').test(text));
+      const used = new Set([...text.matchAll(/(?<![\w$.])[A-Za-z_$][\w$]*/g)].map((m) => m[0]));
+      const more = own.filter((d) => !want.has(d) && used.has(d));
       if (!more.length) break;
       for (const d of more) { want.add(d); take(d); }
     }
@@ -1164,6 +1171,8 @@ export function candidates(graph, read) {
     const loader = focus && s.nav?.loader?.file && ix.files.has(s.nav.loader.file) && s.nav.loader.symbol ? { file: s.nav.loader.file, symbol: s.nav.loader.symbol } : null;
     const c = add({ kind: 'screen', key: s.id, view, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}), ...(focus && s.nav?.dispatcher ? { dispatcher: s.nav.dispatcher } : {}), ...(loader ? { loader } : {}) });
     if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
+    // a page a catch-all knew by type, folded into this route: what stood on it stands here
+    if (c) for (const b of s.byType || []) if (b?.was && !byKey.has(b.was)) byKey.set(b.was, c);
     return c;
   };
   for (const s of graph.screens || []) screenAt(s);
@@ -1592,6 +1601,8 @@ export function revalidate(store, c, read) {
       let cand = c.byKey.get(st.key);
       let key = st.key;
       let kind = st.kind;
+      // a key this build knows under another name (a type folded into the route that owns its path)
+      if (cand && cand.key !== st.key) { key = cand.key; kind = cand.kind; repointed += 1; }
       if (!cand && !String(st.key).startsWith('code:')) {
         cand = repoint(c, st, ev);
         if (cand) { key = cand.key; kind = cand.kind; repointed += 1; }

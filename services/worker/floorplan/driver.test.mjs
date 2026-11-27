@@ -19,7 +19,9 @@
 // - on the made-up gallery website in fixtures/gallery, whose catch-all loads
 //   each kind of page with a function of its own, each kind's screen shows
 //   what its own branch renders and loads (its blocks, its query, the content
-//   store), and its journeys go through that branch, stored ones included.
+//   store), and its journeys go through that branch, stored ones included; a
+//   kind whose view only falls back for the front page's own route is folded
+//   into that route's screen, which shows what the front page loads.
 //
 //   node --test services/worker/floorplan/
 import test from 'node:test';
@@ -244,16 +246,22 @@ test('each page a catch-all picks by type shows what its own branch renders and 
   const sym = (file, name) => `s:${file}#${graph.files.find((f) => f.p === file).s.findIndex((x) => x[0] === name)}`;
   const typed = graph.screens.filter((s) => s.fw === 'dispatch');
   const at = (url) => typed.find((s) => s.url === url) || assert.fail(url);
-  // each kind's view, and the resolver's function that loads it (keyed `frontDoc`, it gives `home`)
+  // each kind's view, and the resolver's function that loads it; the front page kind is not one:
+  // its view only falls back, and its document lives at the root, which a route of its own serves
   assert.deepEqual(typed.map((s) => [s.url, s.nav.renderer, s.nav.loader?.symbol]).sort(), [
     ['/(event)/*', 'EventView', 'loadEvent'],
-    ['/(home)/*', 'HomeView', 'loadHome'],
     ['/(room)/*', 'RoomView', 'loadRoom'],
   ]);
+  // that route's screen knows the kind, and shows what the front page loads: the page builder and
+  // its blocks, the query it asks for, the content store's client and the store
+  const front = graph.screens.find((s) => s.url === '/');
+  assert.deepEqual(front.byType.map((b) => [b.type, b.renderer, b.loader?.symbol, b.fallback, b.was]), [['home', 'HomeView', 'loadHome', true, 'screen:site:/(home)/*']]);
+  assert.deepEqual(front.byType[0].evidence.map((e) => e.file), [V, R]);
+  const ids = front.behind.map((b) => b.id);
+  for (const id of ['f:gallery-web/app/page.tsx', comp('Blocks'), comp('blocks/Hero'), comp('blocks/ArtworkGrid'), sym(Q, 'homeQuery'), 'f:' + C, 'n:ext-contentful']) assert.ok(ids.includes(id), `${id} in ${ids}`);
   const tickets = graph.routes.findIndex((r) => r.p === '/api/tickets');
-  // the screen is its view's own card; behind it, the page builder and blocks it renders, the
-  // function that loads it, the query it asks for, the content store's client and the store
-  assert.deepEqual(at('/(home)/*').behind.map((b) => b.id), [sym(V, 'HomeView'), comp('Blocks'), comp('blocks/Hero'), comp('blocks/ArtworkGrid'), 'f:' + R, sym(Q, 'homeQuery'), 'f:' + C, 'f:' + ROUTE, 'n:ext-contentful']);
+  // the screen is its view's own card; behind it, the components it renders, the function that
+  // loads it, the query it asks for, the content store's client and the store
   // a component its view draws through a helper of its own file (RoomBody) is on it too
   assert.deepEqual(at('/(room)/*').behind.map((b) => b.id), [sym(V, 'RoomView'), comp('RoomLayout'), comp('Blocks'), comp('OpeningHours'), comp('blocks/Hero'), comp('blocks/ArtworkGrid'), 'f:' + R, sym(Q, 'roomQuery'), 'f:' + C, 'f:' + ROUTE, 'n:ext-contentful']);
   assert.deepEqual(at('/(event)/*').behind.map((b) => b.id), [sym(V, 'EventView'), comp('TicketForm'), 'f:' + R, sym(Q, 'eventQuery'), 'f:' + C, 'f:' + ROUTE, 'r:' + tickets, 'f:gallery-web/app/api/tickets/route.ts', 'n:ext-contentful']);
@@ -270,6 +278,10 @@ test('each page a catch-all picks by type shows what its own branch renders and 
   assert.deepEqual(room.loader, { file: R, symbol: 'loadRoom' });
   assert.deepEqual(next(room), [['n:ext-contentful', 'the page loads its content from it']]);
   assert.deepEqual(next(event).sort(), [['n:ext-contentful', 'the page loads its content from it'], ['req:POST /api/tickets', 'the screen makes this request']]);
+  // the front page's journeys start on its route, which reaches the content store
+  const home = c.list.find((x) => x.key === 'screen:site:/');
+  assert.ok(next(home).some(([k]) => k === 'n:ext-contentful'), JSON.stringify(next(home)));
+  assert.equal(c.byKey.get('screen:site:/(home)/*'), home);
 
   // a journey stored before this release stands on the shared file: the next build moves its
   // steps onto the event view's card, with no new trace
@@ -286,7 +298,17 @@ test('each page a catch-all picks by type shows what its own branch renders and 
   assert.equal(spawnSync('tar', ['xzf', 'state.tgz', '-C', 'root'], { cwd: second }).status, 0);
   fs.mkdirSync(path.join(second, 'root', 'floorplan', 'coderhelm'), { recursive: true });
   fs.writeFileSync(path.join(second, 'root', flows.STORE), JSON.stringify(store));
+  // and one stored on the front page kind's old screen moves to the front page route
+  const outside = c.list.find((x) => x.key === 'n:ext-contentful');
+  store.flows.push({ id: 'see-the-front-page', title: 'See the front page', entry: 'screen:site:/(home)/*', origin: 'trace', steps: [
+    { key: 'screen:site:/(home)/*', kind: 'screen', view: 'f:' + V, note: 'The visitor opens the front page.', evidence: [{ file: V, line: lines.findIndex((l) => l.includes('function HomeView')) + 1, token: 'HomeView' }], linked: true },
+    { key: outside.key, kind: 'outside', view: outside.view, note: 'Its blocks come from the content store.', evidence: outside.evidence, linked: true },
+    { key: room.key, kind: 'screen', view: room.view, note: 'The visitor opens a room.', evidence: room.evidence, linked: true },
+  ] });
+  fs.writeFileSync(path.join(second, 'root', flows.STORE), JSON.stringify(store));
   const again = drive(second);
-  assert.equal(again.result.flows.kept.length, 1, JSON.stringify(again.result.flows.report));
+  assert.equal(again.result.flows.kept.length, 2, JSON.stringify(again.result.flows.report));
   assert.deepEqual(again.graph.flows.find((f) => f.id === 'book-a-seat').steps.map((s) => s.ref), [sym(V, 'EventView'), sym(V, 'EventView'), 'r:' + tickets]);
+  const moved = again.result.flows.kept.find((f) => f.title === 'See the front page');
+  assert.deepEqual([moved.entry, moved.steps[0].key, moved.steps[0].view], ['screen:site:/', 'screen:site:/', 'f:gallery-web/app/page.tsx']);
 });

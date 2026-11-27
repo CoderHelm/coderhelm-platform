@@ -35,6 +35,9 @@ const LOADERS = {
   event: loadEvent,
 } as const;
 
+/** The front page document lives at the site's root, which the front page route serves. */
+export const isFront = (doc: { docType: string; path: string }) => doc.docType === 'frontDoc' && doc.path === '/';
+
 /** What an address is, and its content. */
 export async function resolveDoc(parts: string[]): Promise<Doc | null> {
   const slug = '/' + parts.join('/');

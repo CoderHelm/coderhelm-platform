@@ -4,6 +4,9 @@
 //! alone: the screen itself and nothing else, never the blocks, the data
 //! fetch or the requests of that kind of page. Its journeys stood on the
 //! same shared file, so every journey through those pages looked alike.
+//! The front page's type was a screen of its own, though its renderer there
+//! only falls back and the front page has a route of its own, whose screen
+//! never showed the content it loads.
 //!
 //! Guarantee: a screen a route picks by type stands on its own renderer
 //! (the map's symbol for it, `s:<file>#<index>`), and what is behind it is
@@ -13,7 +16,11 @@
 //! symbol and count it as its file for impact. Journey candidates for the
 //! screen stand on the renderer's card and reach what its loader fetches,
 //! and a stored journey's steps inside that renderer move onto its card on
-//! the next build, with no new trace.
+//! the next build, with no new trace. A type whose document lives at a path
+//! a file route owns, and that the catch-all can't serve or only falls back
+//! for, is folded into that route's screen (`byType`), journeys stored on it
+//! move there, and every route screen shows what it fetches through a
+//! shared helper.
 
 use serde_json::Value;
 
@@ -84,4 +91,8 @@ fn a_page_picked_by_type_shows_its_own_renderer_and_what_it_reaches() {
     let flows = include_str!("../../../floorplan/coderhelm/flows.mjs");
     assert!(flows.contains("'the page loads its content from it'"));
     assert!(flows.contains("cand = { view: spanView(c, ev) || st.view };"));
+    assert!(screens.contains("const owner = k.servedAt && (k.stub || k.unreachable)"));
+    assert!(flows.contains(
+        "if (cand && cand.key !== st.key) { key = cand.key; kind = cand.kind; repointed += 1; }"
+    ));
 }
