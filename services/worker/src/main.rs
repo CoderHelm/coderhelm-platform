@@ -264,6 +264,14 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                 continue;
             }
         }
+        // A run's GitHub-heavy step starts when what it is expected to spend
+        // fits the installation's live budget, in arrival order; otherwise it
+        // is sent to wait its turn (`github_admission`). Before the step's
+        // time counts as work.
+        let admitted = passes::github_admission::admit(&state, &message, &body).await;
+        if !admitted.go {
+            continue;
+        }
         // Every model call made while handling this message is counted under
         // the message's feature (spawned tasks fall back to "other").
         let feature = message.usage_feature();
@@ -277,6 +285,9 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             ),
         ))
         .await;
+        if let Some(step) = &admitted.step {
+            passes::github_admission::release(&state, step).await;
+        }
         // A loop stopped because agents were paused mid-run: keep the work
         // (as the same run) to pick up again when the pause ends.
         if let (Some((common::agent_policy::Stop::Paused { .. }, run_id)), Some((team, label, _))) =
