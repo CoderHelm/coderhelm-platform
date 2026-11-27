@@ -282,6 +282,9 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     // A pull request in a repository other than the ticket's (a fix that
     // also needs the infrastructure code changed).
     ("open_pull_request", Risk::Write),
+    // CoderHelm closing its own pull request (one a retry or a newer plan
+    // left in a repo the work is no longer in).
+    ("close_pull_request", Risk::Write),
     ("confluence_append", Risk::Write),
     // Release steps CoderHelm runs after a pull request (see the worker's
     // release_run): staging writes and deploys, then production's.

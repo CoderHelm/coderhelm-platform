@@ -340,6 +340,13 @@ The causes were in the loop, not only in prompt wording:
   if the team's agent permissions allow it (`infra_repo::link_named_change`).
   An outside step that asks for a pull request elsewhere is never run against
   this pull request; it says why (`outside_work::other_repo_pr`).
+- **A retry starts in the ticket's repo.** No repo switch, after planning or
+  before implementing, leaves the repo the ticket names
+  (`repo_pick::switch_blocked`). A Retry of a run that worked in another repo
+  plans again here and keeps the ticket's branch already here; CoderHelm's own
+  pull request that run left in the other repo is closed once, after the
+  agent-permission check, with a short note (`repo_pick::retry_start`,
+  `incidents::vs_retry_starts_in_the_named_repo`).
 - **Review and plan agree.** Hunks that shorten a file a review comment asks to
   cut down are kept by the scope check. A quoted template line is never a test
   command. Planned work in a file CoderHelm's review asked for less of, or in a

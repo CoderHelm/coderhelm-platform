@@ -179,6 +179,56 @@ pub enum Guard {
 }
 
 impl TicketHistory {
+    /// The repo an earlier run's record holds (where it ended up working),
+    /// empty when the run isn't among the ticket's earlier runs.
+    pub fn run_repo(&self, run_id: &str) -> &str {
+        self.runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .map(|r| r.repo.as_str())
+            .unwrap_or("")
+    }
+
+    /// CoderHelm's own pull requests still open in `repo` that the earlier
+    /// run `run_id` opened (or continued). Only that run's: a pull request
+    /// another run linked there on purpose is never one of them.
+    pub fn own_open_prs_of_run(&self, run_id: &str, repo: &str) -> Vec<EarlierPr> {
+        let Some(run) = self.runs.iter().find(|r| r.run_id == run_id) else {
+            return Vec::new();
+        };
+        let mut numbers: Vec<u64> = run
+            .pr_list
+            .iter()
+            .filter(|p| p.repo.eq_ignore_ascii_case(repo))
+            .map(|p| p.pr_number)
+            .collect();
+        if run.pr_number > 0 && run.repo.eq_ignore_ascii_case(repo) {
+            numbers.push(run.pr_number);
+        }
+        self.prs
+            .iter()
+            .filter(|p| {
+                p.state == "open"
+                    && p.repo.eq_ignore_ascii_case(repo)
+                    && numbers.contains(&p.number)
+                    && super::is_own_login(&p.author)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// `repo#number` was closed by this run: nothing later in the run reads
+    /// it as open (and closes or notes it a second time).
+    pub fn mark_closed(&mut self, repo: &str, number: u64) {
+        for p in self
+            .prs
+            .iter_mut()
+            .filter(|p| p.number == number && p.repo.eq_ignore_ascii_case(repo))
+        {
+            p.state = "closed".into();
+        }
+    }
+
     /// Whether an earlier run of this ticket opened `repo#number`.
     fn opened_by_run(&self, repo: &str, number: u64) -> bool {
         self.runs.iter().any(|r| {
@@ -1736,6 +1786,41 @@ mod tests {
         assert!(h
             .own_open_prs_elsewhere(&["acme/web".into(), "acme/api".into()])
             .is_empty());
+    }
+
+    /// A retry that starts over in the named repo closes only what the
+    /// retried run itself left open in the other repo; once closed, nothing
+    /// later in the run reads it as open again.
+    #[test]
+    fn a_retry_finds_only_the_retried_runs_open_pull_requests() {
+        let mut a = run_with_prs("01A", &[("acme/web", 4)]);
+        a.repo = "acme/web".into();
+        let mut b = run_with_prs("01B", &[("acme/web", 9)]);
+        b.repo = "acme/web".into();
+        let mut h = TicketHistory {
+            runs: vec![a, b],
+            prs: vec![
+                earlier("acme/web", 4, "coderhelm[bot]", "open", "2026-10-01"),
+                earlier("acme/web", 9, "coderhelm[bot]", "open", "2026-10-02"),
+                earlier("acme/web", 11, "pat", "open", "2026-10-03"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(h.run_repo("01B"), "acme/web");
+        assert_eq!(h.run_repo("01Z"), "");
+        let left = h.own_open_prs_of_run("01B", "ACME/web");
+        assert_eq!(left.iter().map(|p| p.number).collect::<Vec<_>>(), [9]);
+        assert!(h.own_open_prs_of_run("01B", "acme/api").is_empty());
+        assert!(h.own_open_prs_of_run("01Z", "acme/web").is_empty());
+        h.mark_closed("acme/web", 9);
+        assert!(h.own_open_prs_of_run("01B", "acme/web").is_empty());
+        assert_eq!(
+            h.own_open_prs_elsewhere(&["acme/api".to_string()])
+                .iter()
+                .map(|p| p.number)
+                .collect::<Vec<_>>(),
+            [4]
+        );
     }
 
     /// The planner's decision on the rerun: a code change that forces one
