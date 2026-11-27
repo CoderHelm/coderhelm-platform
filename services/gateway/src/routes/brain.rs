@@ -52,8 +52,8 @@ use super::chat_agent::{self, Called, Sink, Toolbox};
 use super::chat_code;
 use super::plan_chat_tools::{ChatScope, Used, WorkerTools};
 use super::plans::{
-    compact_tool_result_for_model, invoke_mcp_tool, is_empty_tool_result, load_enabled_plugins,
-    load_mcp_tool_cache, summarize_tool_result,
+    invoke_mcp_tool, is_empty_tool_result, load_enabled_plugins, load_mcp_tool_cache,
+    summarize_tool_result,
 };
 use crate::models::Claims;
 use crate::AppState;
@@ -267,6 +267,13 @@ pub fn kind_of_tool(name: &str) -> &'static str {
     }
 }
 
+/// A tool that reads a live system (metrics, logs, a connected monitoring
+/// app or data source): a diagnosis's evidence.
+pub fn is_live_tool(name: &str) -> bool {
+    name != super::chat_policy::SIGN_IN_TOOL
+        && matches!(kind_of_tool(name), "data_sources" | "connections")
+}
+
 const KNOWLEDGE_TOOL: &str = "search_knowledge";
 const MEMORY_TOOL: &str = "search_memories";
 
@@ -333,6 +340,104 @@ pub struct Message {
     /// and, when it fits, the mini map of them (`graph`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub map: Option<Value>,
+    /// An answer still being checked in the background: replaced in place
+    /// by the finished one (`Keeper`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+/// Where a thread's records are kept.
+#[async_trait::async_trait]
+pub(crate) trait Keep: Send + Sync {
+    async fn keep(&self, team_id: &str, sk: &str, item: Value) -> Result<(), String>;
+}
+
+/// The settings table.
+pub(crate) struct DynamoKeep(pub Arc<AppState>);
+
+#[async_trait::async_trait]
+impl Keep for DynamoKeep {
+    async fn keep(&self, team_id: &str, sk: &str, item: Value) -> Result<(), String> {
+        put(&self.0, team_id, sk, &item).await
+    }
+}
+
+/// Keeps one exchange: the question, the answer (at `seq + 1`, so a later
+/// keep of the same exchange replaces it in place) and the thread.
+pub(crate) async fn keep_exchange(
+    store: &dyn Keep,
+    team_id: &str,
+    thread: &Thread,
+    question: &Message,
+    answer: &Message,
+) -> Result<(), String> {
+    let mut thread = thread.clone();
+    thread.messages = question.seq + 2;
+    thread.updated_at = now();
+    store
+        .keep(
+            team_id,
+            &message_sk(&thread.id, question.seq),
+            serde_json::to_value(question).unwrap_or_default(),
+        )
+        .await?;
+    store
+        .keep(
+            team_id,
+            &message_sk(&thread.id, answer.seq),
+            serde_json::to_value(answer).unwrap_or_default(),
+        )
+        .await?;
+    store
+        .keep(
+            team_id,
+            &thread_sk(&thread.id),
+            serde_json::to_value(&thread).unwrap_or_default(),
+        )
+        .await
+}
+
+/// An answer that goes on in the background is kept as pending, with its
+/// question, so the thread shows it; the finished answer replaces it in
+/// place ([`keep_exchange`] at the same `seq`).
+pub(crate) struct Keeper<'a> {
+    pub store: &'a dyn Keep,
+    pub team_id: String,
+    pub thread: Thread,
+    pub question: Message,
+}
+
+impl Keeper<'_> {
+    /// The answer at its place in the thread.
+    pub fn answer_msg(&self, text: &str, pending: bool) -> Message {
+        Message {
+            seq: self.question.seq + 1,
+            role: "assistant".into(),
+            content: text.to_string(),
+            grounded: !pending,
+            at: now(),
+            pending,
+            ..Default::default()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl chat_agent::Background for Keeper<'_> {
+    async fn started(&self, holding: &str) {
+        let pending = self.answer_msg(holding, true);
+        if let Err(e) = keep_exchange(
+            self.store,
+            &self.team_id,
+            &self.thread,
+            &self.question,
+            &pending,
+        )
+        .await
+        {
+            error!(error = %e, "Chat pending answer not kept");
+        }
+    }
 }
 
 /// Largest mini map kept with a message (a message is one stored record);
@@ -1352,6 +1457,8 @@ Check before you claim:
 How to work:
 - Research before you answer a question about the team's code, docs or work. You can take many steps: look a repository over, list folders, read files, search the code, follow imports, read more. Keep going until you can answer from what you read. Most code questions need several reads. Small talk needs no lookups.
 - The team's repositories are listed below. When the question names one, by its full or short name however it is written, it means that repository. Open it with github__repo_overview; don't search the code or the code graph for the repository's own name.
+- An alert, an error or an incident (a pasted alarm, "why is X failing, slow or down"): the live evidence decides it, so get it before you read code. Read, together in one turn, the metric behind the alarm or error around when it fired with the traffic on the same target (request count), the service's logs for that window, and the service's resource metrics (CPU, memory). Read the alarm's definition or the code only to find the names those lookups need, and afterwards to explain what the evidence shows. Lead with the cause the evidence supports; say plainly what you couldn't check.
+- A result marked as cut off is not all of it: narrow the lookup (a shorter time window, a filter, fewer fields, the next page) and read the rest before you answer from it.
 - "How is X put together?" (built, structured, organized): look it over, then read the entry points and the files that tie it together (app or server setup, routing, main modules, configuration). Explain the main parts, what each does, and how a request or a job moves through them.
 - "Where is X handled?": search the code for the words and the likely names, read the matching files to confirm, and name the file and the function.
 - "What does file Y do?": read it (in ranges when it is long) and the files it leans on when that matters.
@@ -2018,7 +2125,14 @@ async fn run_tool(
                     false,
                 );
             }
-            let passage = compact_tool_result_for_model(&result);
+            // A long result keeps its head and tail and says what was cut
+            // and how to read it (`chat_agent::fit_result`).
+            let passage = chat_agent::fit_result(
+                &result
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| result.to_string()),
+            );
             let id = reg.add(SourceRef {
                 kind: match kind {
                     "connections" => "connection",
@@ -2534,7 +2648,7 @@ pub async fn brain_stream(
     }
 
     // The thread: the asker's own, or a new one.
-    let (mut thread, history) = match body.thread_id.as_deref().filter(|s| !s.is_empty()) {
+    let (thread, history) = match body.thread_id.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => {
             let t = get_thread_record(&state, &claims.team_id, id)
                 .await
@@ -2782,19 +2896,8 @@ pub async fn brain_stream(
             sink.send("done", json!({})).await;
             return;
         }
-        let Some((fin, used, map)) =
-            answer(&run, &sink, &user_id, &question, &history, &attachments).await
-        else {
-            // The model couldn't be reached: the error was sent, nothing is kept.
-            sink.send("done", json!({})).await;
-            return;
-        };
-        sink.send(
-            "answer",
-            json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded, "map": map }),
-        )
-        .await;
-        // Keep the exchange.
+        // The exchange's place in the thread: an answer that goes on in the
+        // background is kept there as pending, and replaced in place.
         let seq = thread.messages;
         let names: Vec<String> = attachments
             .iter()
@@ -2811,37 +2914,43 @@ pub async fn brain_stream(
             at: now(),
             ..Default::default()
         };
+        let store = DynamoKeep(run.state.clone());
+        let keeper = Keeper {
+            store: &store,
+            team_id: run.team_id.clone(),
+            thread: thread.clone(),
+            question: user_msg,
+        };
+        let Some((fin, used, map)) = answer(
+            &run,
+            &sink,
+            &keeper,
+            &user_id,
+            &question,
+            &history,
+            &attachments,
+        )
+        .await
+        else {
+            // The model couldn't be reached: the error was sent, nothing is kept.
+            sink.send("done", json!({})).await;
+            return;
+        };
+        sink.send(
+            "answer",
+            json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded, "map": map }),
+        )
+        .await;
+        // Keep the exchange: the finished answer replaces a pending one in
+        // place.
         let bot_msg = Message {
-            seq: seq + 1,
-            role: "assistant".into(),
-            content: fin.text.clone(),
             citations: fin.citations.clone(),
             grounded: fin.grounded,
             used,
-            at: now(),
             map: kept_map(map),
-            ..Default::default()
+            ..keeper.answer_msg(&fin.text, false)
         };
-        thread.messages = seq + 2;
-        thread.updated_at = now();
-        let saved = async {
-            put(
-                &run.state,
-                &run.team_id,
-                &message_sk(&thread.id, seq),
-                &user_msg,
-            )
-            .await?;
-            put(
-                &run.state,
-                &run.team_id,
-                &message_sk(&thread.id, seq + 1),
-                &bot_msg,
-            )
-            .await?;
-            put(&run.state, &run.team_id, &thread_sk(&thread.id), &thread).await
-        }
-        .await;
+        let saved = keep_exchange(&store, &run.team_id, &thread, &keeper.question, &bot_msg).await;
         if let Err(e) = saved {
             error!(error = %e, "Chat answer not saved");
         }
@@ -2969,6 +3078,7 @@ pub fn mention_note(repos: &[RepoInfo], question: &str) -> String {
 async fn answer(
     run: &Run,
     sink: &chat_agent::ChannelSink,
+    keeper: &Keeper<'_>,
     user_id: &str,
     question: &str,
     history: &[Message],
@@ -3059,6 +3169,7 @@ async fn answer(
     // an orientation's in the team's setup, a correction's in a check made
     // now: an answer that didn't look there goes back once.
     let must_look = understood.must_look(&offered, question);
+    let evidence = understood.evidence_first(&offered);
     notes.push_str(&run.run_note);
     if !problems.is_empty() {
         notes.push_str(&format!(
@@ -3101,9 +3212,12 @@ async fn answer(
         system: system_prompt(&run.code_repos, run.github_token.is_some()),
         messages,
         question,
-        limits: chat_agent::LIMITS,
+        limits: understood.limits(),
         must_look,
         uncited_ok: understood.uncited_ok(),
+        evidence,
+        background: Some(keeper),
+        firm: understood.intent().evidence_first(),
     };
     info!(team_id = %run.team_id, intent = understood.intent().key(), "Chat: the question reads");
     let out = chat_agent::run(&model, &mut toolbox, sink, &mut reg, ask)
@@ -3137,6 +3251,72 @@ mod tests {
             shared,
             ..Default::default()
         }
+    }
+
+    #[derive(Default)]
+    struct MemKeep(std::sync::Mutex<HashMap<String, Value>>);
+
+    #[async_trait::async_trait]
+    impl Keep for MemKeep {
+        async fn keep(&self, team_id: &str, sk: &str, item: Value) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(format!("{team_id}|{sk}"), item);
+            Ok(())
+        }
+    }
+
+    /// An answer that goes on in the background is kept as pending at its
+    /// place in the thread, and the finished answer replaces it there.
+    #[tokio::test]
+    async fn a_background_answer_is_kept_pending_and_replaced_in_place() {
+        use chat_agent::Background;
+        let store = MemKeep::default();
+        let t = thread("u1", false);
+        let keeper = Keeper {
+            store: &store,
+            team_id: "team1".into(),
+            thread: Thread {
+                messages: 4,
+                ..t.clone()
+            },
+            question: Message {
+                seq: 4,
+                role: "user".into(),
+                content: "why does the p99 alarm keep firing?".into(),
+                ..Default::default()
+            },
+        };
+        keeper.started(chat_agent::STILL_CHECKING).await;
+        let key = format!("team1|{}", message_sk(&t.id, 5));
+        {
+            let kept = store.0.lock().unwrap();
+            let pending: Message = serde_json::from_value(kept[&key].clone()).unwrap();
+            assert!(pending.pending && pending.role == "assistant");
+            assert_eq!(pending.content, chat_agent::STILL_CHECKING);
+            let th: Thread =
+                serde_json::from_value(kept[&format!("team1|{}", thread_sk(&t.id))].clone())
+                    .unwrap();
+            assert_eq!(th.messages, 6);
+        }
+        let done = Message {
+            grounded: true,
+            ..keeper.answer_msg("One path is slow all day [S1].", false)
+        };
+        keep_exchange(&store, "team1", &keeper.thread, &keeper.question, &done)
+            .await
+            .unwrap();
+        let kept = store.0.lock().unwrap();
+        // Same place: three records (question, answer, thread), the answer replaced.
+        assert_eq!(kept.len(), 3);
+        let fin: Message = serde_json::from_value(kept[&key].clone()).unwrap();
+        assert!(!fin.pending);
+        assert_eq!(fin.seq, 5);
+        assert!(fin.content.starts_with("One path is slow all day"));
+        let th: Thread =
+            serde_json::from_value(kept[&format!("team1|{}", thread_sk(&t.id))].clone()).unwrap();
+        assert_eq!(th.messages, 6);
     }
 
     #[test]

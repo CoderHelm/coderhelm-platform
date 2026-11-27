@@ -2,6 +2,16 @@
 //! again (bounded) until it answers; then check the answer doesn't hand the
 //! person work its tools could have done, and finalize the citations.
 //!
+//! The budget fits the kind of question ([`limits_for`]): a diagnosis (an
+//! alert, an error, an incident) gets more turns under the same ceiling on
+//! calls, and its live evidence (the alarm's metric and traffic, the
+//! service's logs for the window, its resource metrics) before the code
+//! ([`EvidenceFirst`]): a code read past a small allowance, before that
+//! evidence is in, is answered with where to look instead of being run. A
+//! tool result too long to send whole keeps its head and tail and says what
+//! was cut ([`fit_result`]); an answer given over a cut-off result it never
+//! narrowed goes back once to read the rest.
+//!
 //! Two checks run in code before the model's check: an answer that says it
 //! found nothing, to a question about the team's work (a ticket, a pull
 //! request, a run, "what's the latest"), when it never looked in the
@@ -20,6 +30,10 @@ use common::usage::UsageMeter;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tracing::{error, info};
+
+pub use common::chat_evidence::{
+    evidence_first_note, fit_result, read_the_rest, was_cut, EvidenceFirst,
+};
 
 /// Where the answer's events go (`text_delta`, `tool_start`, ...).
 #[async_trait::async_trait]
@@ -79,22 +93,63 @@ pub trait Toolbox: Send {
     ) -> Called;
 }
 
-/// How far one answer may go.
+/// How far one answer may go. No count decides when an answer stops: it
+/// stops when the model answers and the checks in code pass. These are a
+/// ceiling on cost and time that a normal question, a diagnosis included,
+/// never reaches.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Model turns.
+    /// Model turns, at most.
     pub turns: usize,
-    /// Tool calls, all turns together.
+    /// Tool calls, all turns together, at most.
     pub tool_calls: usize,
-    /// Times an answer that handed work back is sent back to the tools.
+    /// Times an answer that handed work back (or left a result cut off) is
+    /// sent back to the tools.
     pub retries: usize,
+    /// After this long the answer goes on in the background: the asker is
+    /// told it is still being checked and the answer is kept as pending, to
+    /// be replaced in place when it finishes ([`Background`]).
+    pub foreground: std::time::Duration,
+    /// The whole answer's time, at most. Under the streaming function's own
+    /// limit, so the finished answer is always kept.
+    pub ceiling: std::time::Duration,
 }
 
 pub const LIMITS: Limits = Limits {
-    turns: 12,
-    tool_calls: 30,
+    turns: 60,
+    tool_calls: 120,
     retries: 1,
+    foreground: std::time::Duration::from_secs(90),
+    ceiling: std::time::Duration::from_secs(270),
 };
+
+/// A diagnosis: one more send-back covers a result left cut off.
+pub const DIAGNOSIS_LIMITS: Limits = Limits {
+    retries: 2,
+    ..LIMITS
+};
+
+/// The budget for a kind of question.
+pub fn limits_for(intent: common::chat_intent::Intent) -> Limits {
+    match intent {
+        common::chat_intent::Intent::Diagnosis => DIAGNOSIS_LIMITS,
+        _ => LIMITS,
+    }
+}
+
+/// Where an answer that outlasts [`Limits::foreground`] goes on: told once,
+/// with the holding line the asker sees, so it can keep the answer as
+/// pending; the finished answer replaces it in place.
+#[async_trait::async_trait]
+pub trait Background: Send + Sync {
+    async fn started(&self, holding: &str);
+}
+
+/// What the asker sees while the answer goes on in the background.
+pub const STILL_CHECKING: &str = "Still checking: the lookups that decide this are running. This answer updates here when they finish.";
+
+/// The note sent back when an answer stops short of checks it can still run.
+pub const FINISH_THE_CHECKS: &str = "<check>Your answer lists checks you didn't run. There is no lookup limit: run those checks now with your tools (together in one turn when they are independent), then answer from what they show, with citations. Name a check as not done only when it ran and failed, with the reason it gave.</check>";
 
 /// One question for the loop.
 pub struct Ask<'a> {
@@ -106,6 +161,13 @@ pub struct Ask<'a> {
     pub must_look: Option<MustLook>,
     /// A reply that cites nothing is kept as written (small talk only).
     pub uncited_ok: bool,
+    /// A diagnosis: the live evidence before the code.
+    pub evidence: Option<EvidenceFirst>,
+    /// Where an answer that outlasts the foreground goes on.
+    pub background: Option<&'a dyn Background>,
+    /// A diagnosis: an answer that hedges instead of concluding goes back
+    /// to run the lookup that settles it.
+    pub firm: bool,
 }
 
 /// The tools a question's answer lives in (a status question: the tickets,
@@ -199,9 +261,10 @@ pub struct Answered {
     pub calls: Vec<String>,
 }
 
-/// What the model is told on the turn it must answer.
+/// What the model is told on the turn it must answer: only at the ceiling
+/// on cost and time, which a normal question never reaches.
 pub const ANSWER_NOW: &str =
-    "You have used all the lookups this answer may make. Answer now from what you read, with citations, and say what you didn't get to check.";
+    "Answer now, from what you read, with citations: lead with the conclusion the evidence supports. For a check that ran and failed, name it with the reason it gave.";
 
 /// The note added when an answer handed work back.
 pub fn nudge(what: &str) -> String {
@@ -282,18 +345,41 @@ pub async fn run(
         limits,
         must_look,
         uncited_ok,
+        evidence,
+        background,
+        firm,
     } = ask;
+    let mut firmed = 0;
+    let started = std::time::Instant::now();
+    let mut handed_back = false;
     let mut used: Vec<Value> = Vec::new();
     let mut calls: Vec<String> = Vec::new();
+    // A result that came back cut off and no later call of the same tool
+    // narrowed: `(tool, label)`.
+    let mut cut: Vec<(String, String)> = Vec::new();
     let mut last_text = String::new();
     let mut retries = 0;
     let has_tools = !tools.defs().is_empty();
 
     for turn in 0..limits.turns {
-        // The last turn (or a spent tool budget) must answer. The tools stay
-        // defined (the history holds tool calls), and the model is told to
-        // answer now; a tool call on this turn is not run.
-        let must_answer = turn + 1 == limits.turns || calls.len() >= limits.tool_calls;
+        let elapsed = started.elapsed();
+        // Past the foreground, the answer goes on in the background: the
+        // asker is told once and the answer is kept as pending.
+        if turn > 0 && !handed_back && elapsed >= limits.foreground {
+            if let Some(b) = background {
+                handed_back = true;
+                info!("Chat: the answer goes on in the background");
+                sink.send("pending", json!({ "text": STILL_CHECKING }))
+                    .await;
+                b.started(STILL_CHECKING).await;
+            }
+        }
+        // Only at the ceiling on cost and time must the turn answer. The
+        // tools stay defined (the history holds tool calls), and the model
+        // is told to answer now; a tool call on this turn is not run.
+        let must_answer = turn + 1 == limits.turns
+            || calls.len() >= limits.tool_calls
+            || elapsed >= limits.ceiling;
         if must_answer && turn > 0 {
             if let Some(content) = messages
                 .last_mut()
@@ -331,13 +417,38 @@ pub async fn run(
             .cloned()
             .collect();
         if t.stop != "tool_use" || tool_uses.is_empty() || must_answer {
+            // An answer that stops short of checks it can still run goes
+            // back to run them: no count ends an answer early.
+            if has_tools && !must_answer && super::chat_hints::says_unfinished(&text) {
+                info!("Chat: the answer stopped short, it runs the checks it listed");
+                messages.push(
+                    json!({ "role": "user", "content": [{"type": "text", "text": FINISH_THE_CHECKS}] }),
+                );
+                sink.send("text_reset", json!({})).await;
+                continue;
+            }
+            // A diagnosis that hedges runs the lookup that settles it.
+            if has_tools
+                && firm
+                && !must_answer
+                && firmed < 2
+                && common::chat_evidence::says_hedged(&text)
+            {
+                firmed += 1;
+                info!("Chat: the diagnosis hedged, it runs the lookup that settles it");
+                messages.push(json!({ "role": "user", "content": [{"type": "text", "text": common::chat_evidence::FIRM_UP}] }));
+                sink.send("text_reset", json!({})).await;
+                continue;
+            }
             // An answer. Check it doesn't hand back work the tools can do.
             if has_tools && retries < limits.retries && !must_answer && !text.trim().is_empty() {
                 // In code first; the model's check only when that passes;
                 // then an answer that cites nothing (it would be replaced by
                 // the plain no-source line) looks once with its tools.
                 let cited = uncited_ok || finalize(&text, reg).grounded;
-                let note = match checked_in_code(&text, must_look.as_ref(), &calls, tools.defs()) {
+                let left_cut = cut.first().map(|(_, label)| read_the_rest(label));
+                let in_code = checked_in_code(&text, must_look.as_ref(), &calls, tools.defs());
+                let note = match in_code.or(left_cut) {
                     Some(note) => Some(note),
                     None => model
                         .ask(check_body(model.check_id(), question, &text, tools.defs()))
@@ -367,14 +478,25 @@ pub async fn run(
         for tu in &tool_uses {
             let name = tu["name"].as_str().unwrap_or("");
             let input = &tu["input"];
+            let held = evidence.as_ref().is_some_and(|e| e.holds(name, &calls));
             calls.push(name.to_string());
+            // Another call of the same tool follows a cut-off result up.
+            cut.retain(|(t, _)| t != name);
             let before = reg.len();
             let (text, label, summary, is_error, kind) = if calls.len() > limits.tool_calls {
                 (
-                    "Error: this answer has used all its lookups. Answer from what you read."
+                    "Not run: this answer is at its ceiling on cost and time. Answer from what you read."
                         .to_string(),
                     name.replace('_', " "),
                     "Skipped".to_string(),
+                    true,
+                    String::new(),
+                )
+            } else if let Some(e) = evidence.as_ref().filter(|_| held) {
+                (
+                    evidence_first_note(&e.live),
+                    name.replace('_', " "),
+                    "Live evidence first".to_string(),
                     true,
                     String::new(),
                 )
@@ -398,6 +520,9 @@ pub async fn run(
                     }
                 }
             };
+            if !is_error && was_cut(&text) {
+                cut.push((name.to_string(), label.clone()));
+            }
             // What this call registered, so the answer's citations show as
             // it streams.
             let found: Vec<_> = (before + 1..=reg.len())
@@ -705,6 +830,7 @@ mod tests {
     use super::*;
     use crate::routes::chat_code::{OVERVIEW, READ_FILE, SEARCH_CODE};
     use common::repo_read::{MemHost, RepoInfo};
+    use std::sync::Mutex;
 
     fn host() -> MemHost {
         MemHost::default().with_repo(
@@ -732,6 +858,9 @@ mod tests {
             limits: LIMITS,
             must_look: None,
             uncited_ok: false,
+            evidence: None,
+            background: None,
+            firm: false,
         }
     }
 
@@ -849,23 +978,335 @@ mod tests {
         let model = Scripted::new(steps, vec![]);
         let sink = Recorder::default();
         let mut reg = Registry::default();
-        let limits = Limits {
-            turns: 4,
-            tool_calls: 30,
-            retries: 1,
-        };
+        let limits = Limits { turns: 4, ..LIMITS };
         let a = Ask { limits, ..ask("q") };
         run(&model, &mut tb, &sink, &mut reg, a).await.unwrap();
         let bodies = model.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 4);
         // The last turn is told to answer; the tools stay defined for the history.
-        assert!(bodies[3]["messages"]
-            .to_string()
-            .contains("used all the lookups"));
+        assert!(bodies[3]["messages"].to_string().contains(ANSWER_NOW));
         assert!(bodies[3]["tools"].is_array());
-        assert!(!bodies[2]["messages"]
-            .to_string()
-            .contains("used all the lookups"));
+        assert!(!bodies[2]["messages"].to_string().contains(ANSWER_NOW));
+    }
+
+    // ── A diagnosis finishes ────────────────────────────────────────────────
+
+    const METRICS: &str = "metrics_query";
+    const LOGS: &str = "logs_search";
+
+    /// A made-up service's live tools and its code: metrics, logs, and a
+    /// code search. A metrics read asked with `"big": true` comes back long.
+    struct DiagBox {
+        defs: Vec<Value>,
+    }
+
+    impl DiagBox {
+        fn new() -> Self {
+            let def =
+                |n: &str| json!({"name": n, "description": n, "input_schema": {"type": "object"}});
+            DiagBox {
+                defs: vec![def(METRICS), def(LOGS), def(SEARCH_CODE)],
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Toolbox for DiagBox {
+        fn defs(&self) -> &[Value] {
+            &self.defs
+        }
+        async fn call(
+            &mut self,
+            reg: &mut Registry,
+            _sink: &dyn Sink,
+            name: &str,
+            input: &Value,
+        ) -> Called {
+            let body = match name {
+                METRICS if input["big"] == true => {
+                    format!("p99 by minute: {}", "02:41 3.9s 104 req; ".repeat(1_000))
+                }
+                METRICS => format!("quayside-api p99 {} (sample)", input["what"]),
+                LOGS => "02:41 GET /v1/tides/forecast 3.8s upstream".to_string(),
+                _ => "alarms.tf: p99 > 2s for 3 of 3 periods".to_string(),
+            };
+            let id = reg.add(common::knowledge::answer::SourceRef {
+                kind: "data_source".into(),
+                title: format!("{name} {}", input["what"]),
+                passage: body.clone(),
+                ..Default::default()
+            });
+            let text = fit_result(&reg.render_with(&id, &body));
+            Called::Done {
+                text,
+                label: name.replace('_', " "),
+                summary: "Read".into(),
+                is_error: false,
+                kind: "data_sources".into(),
+            }
+        }
+    }
+
+    fn diagnosis(q: &str) -> Ask<'_> {
+        Ask {
+            evidence: EvidenceFirst::over(vec![METRICS.into(), LOGS.into()]),
+            firm: true,
+            limits: DIAGNOSIS_LIMITS,
+            ..ask(q)
+        }
+    }
+
+    /// The case that went wrong: an alert that needs more lookups than the
+    /// old fixed count (12 turns) still ends with a conclusion, and the
+    /// model is never told to stop.
+    #[tokio::test]
+    async fn an_alert_diagnosis_past_the_old_count_finishes_with_a_conclusion() {
+        let mut tb = DiagBox::new();
+        let mut steps: Vec<Step> = (0..16)
+            .map(|i| -> Step {
+                Box::new(move |_| {
+                    calls(
+                        &format!("m{i}"),
+                        METRICS,
+                        json!({"what": format!("window {i}")}),
+                    )
+                })
+            })
+            .collect();
+        steps.push(Box::new(|_| {
+            say("One path is slow all day and the alarm fires only when traffic is low [S1, S16].")
+        }));
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let out = run(
+            &model,
+            &mut tb,
+            &sink,
+            &mut reg,
+            diagnosis("why is the p99 alarm firing?"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.calls.len(), 16);
+        assert!(
+            out.fin.text.starts_with("One path is slow all day"),
+            "{}",
+            out.fin.text
+        );
+        let bodies = model.bodies.lock().unwrap();
+        assert!(bodies
+            .iter()
+            .all(|b| !b["messages"].to_string().contains(ANSWER_NOW)));
+    }
+
+    /// No answer lists checks it didn't run while it could still run them:
+    /// "Not checked (I ran out of lookups)" goes back to run them.
+    #[tokio::test]
+    async fn an_answer_that_stops_short_runs_the_checks_it_listed() {
+        let mut tb = DiagBox::new();
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("m", METRICS, json!({"what": "p99 and requests"}))),
+                Box::new(|_| {
+                    say("Likely a slow upstream [S1].\n\n**Not checked (I ran out of lookups)**\n- the service logs around 02:40")
+                }),
+                Box::new(|b| {
+                    assert!(b["messages"]
+                        .to_string()
+                        .contains("There is no lookup limit"));
+                    calls("l", LOGS, json!({"what": "02:35-02:50"}))
+                }),
+                Box::new(|_| {
+                    say("The forecast call is slow at 02:41 [S2], and traffic is low then [S1].")
+                }),
+            ],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let a = Ask {
+            limits: Limits {
+                retries: 0,
+                ..LIMITS
+            },
+            ..diagnosis("why did it fire?")
+        };
+        let out = run(&model, &mut tb, &sink, &mut reg, a).await.unwrap();
+        assert_eq!(out.calls, [METRICS, LOGS]);
+        assert!(
+            !common::chat_evidence::says_unfinished(&out.fin.text),
+            "{}",
+            out.fin.text
+        );
+        assert!(out.fin.text.starts_with("The forecast call is slow"));
+    }
+
+    /// A diagnosis reads its live evidence before more code: the third code
+    /// read waits, and is told where to look.
+    #[tokio::test]
+    async fn a_diagnosis_reads_the_live_evidence_before_more_code() {
+        let mut tb = DiagBox::new();
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("c1", SEARCH_CODE, json!({"query": "alarm"}))),
+                Box::new(|_| calls("c2", SEARCH_CODE, json!({"query": "p99"}))),
+                Box::new(|_| calls("c3", SEARCH_CODE, json!({"query": "threshold"}))),
+                Box::new(|b| {
+                    let r = last_result(b);
+                    assert!(
+                        r.contains("Not run: this is a diagnosis") && r.contains(METRICS),
+                        "{r}"
+                    );
+                    calls("m", METRICS, json!({"what": "p99"}))
+                }),
+                Box::new(|_| say("The p99 crossed 2 s at 02:41 on 104 requests [S3].")),
+            ],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let out = run(
+            &model,
+            &mut tb,
+            &sink,
+            &mut reg,
+            diagnosis("why did the alarm fire?"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.calls, [SEARCH_CODE, SEARCH_CODE, SEARCH_CODE, METRICS]);
+        assert_eq!(out.used[2]["summary"], "Live evidence first");
+    }
+
+    /// A cut-off result is narrowed and read, never answered from in part.
+    #[tokio::test]
+    async fn a_cut_off_result_is_narrowed_before_the_answer() {
+        let mut tb = DiagBox::new();
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("m1", METRICS, json!({"what": "all night", "big": true}))),
+                Box::new(|b| {
+                    assert!(last_result(b).contains("[cut off:"));
+                    say("The p99 was high overnight [S1].")
+                }),
+                Box::new(|b| {
+                    assert!(b["messages"].to_string().contains("was cut off"));
+                    calls("m2", METRICS, json!({"what": "02:35-02:50"}))
+                }),
+                Box::new(|_| say("The p99 crossed 2 s at 02:41 on 104 requests [S2].")),
+            ],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let out = run(
+            &model,
+            &mut tb,
+            &sink,
+            &mut reg,
+            diagnosis("why did the alarm fire?"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.calls, [METRICS, METRICS]);
+        assert!(out.rechecked);
+        assert!(out.fin.text.contains("02:41"));
+    }
+
+    /// A diagnosis that hedges runs the lookup that settles it.
+    #[tokio::test]
+    async fn a_hedged_diagnosis_runs_the_lookup_that_settles_it() {
+        let mut tb = DiagBox::new();
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("m1", METRICS, json!({"what": "p99"}))),
+                Box::new(|_| say("Probably one or two slow requests at night [S1].")),
+                Box::new(|b| {
+                    assert!(b["messages"]
+                        .to_string()
+                        .contains("break the metric down by path"));
+                    calls("m2", METRICS, json!({"what": "by path"}))
+                }),
+                Box::new(|_| say("GET /v1/tides/forecast is slow all day [S2].")),
+            ],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let out = run(
+            &model,
+            &mut tb,
+            &sink,
+            &mut reg,
+            diagnosis("why did the alarm fire?"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.calls, [METRICS, METRICS]);
+        assert!(!common::chat_evidence::says_hedged(&out.fin.text));
+    }
+
+    #[derive(Default)]
+    struct Kept(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Background for Kept {
+        async fn started(&self, holding: &str) {
+            self.0.lock().unwrap().push(holding.to_string());
+        }
+    }
+
+    /// Past the foreground the answer goes on: the asker is told once, the
+    /// answer is kept as pending, and it still finishes with the conclusion.
+    #[tokio::test]
+    async fn past_the_foreground_the_answer_goes_on_and_finishes() {
+        let mut tb = DiagBox::new();
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("m1", METRICS, json!({"what": "p99"}))),
+                Box::new(|_| calls("m2", METRICS, json!({"what": "requests"}))),
+                Box::new(|_| calls("l", LOGS, json!({"what": "window"}))),
+                Box::new(|_| {
+                    say("The forecast path is slow all day; at night it sets the p99 [S1, S2, S3].")
+                }),
+            ],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let sink = Recorder::default();
+        let mut reg = Registry::default();
+        let kept = Kept::default();
+        let a = Ask {
+            limits: Limits {
+                foreground: std::time::Duration::ZERO,
+                ..DIAGNOSIS_LIMITS
+            },
+            background: Some(&kept),
+            ..diagnosis("why did the alarm fire?")
+        };
+        let out = run(&model, &mut tb, &sink, &mut reg, a).await.unwrap();
+        assert_eq!(*kept.0.lock().unwrap(), [STILL_CHECKING]);
+        assert_eq!(sink.kinds().iter().filter(|k| *k == "pending").count(), 1);
+        assert_eq!(out.calls, [METRICS, METRICS, LOGS]);
+        assert!(out
+            .fin
+            .text
+            .starts_with("The forecast path is slow all day"));
+    }
+
+    #[test]
+    fn no_count_ends_an_answer_and_a_diagnosis_has_room_to_finish() {
+        use common::chat_intent::Intent;
+        // The ceiling is far past what a diagnosis takes, and the same for
+        // every kind of question; a diagnosis gets one more send-back.
+        assert!(LIMITS.turns >= 50 && LIMITS.tool_calls >= 100);
+        assert!(LIMITS.ceiling > LIMITS.foreground);
+        // Under the streaming function's five minutes, so the answer is kept.
+        assert!(LIMITS.ceiling < std::time::Duration::from_secs(300));
+        assert_eq!(limits_for(Intent::Diagnosis).retries, 2);
+        assert_eq!(limits_for(Intent::Lookup).turns, LIMITS.turns);
+        assert!(!ANSWER_NOW.contains("didn't get to"));
+        assert!(!ANSWER_NOW.to_lowercase().contains("lookups"));
     }
 
     #[test]

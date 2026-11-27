@@ -1,9 +1,11 @@
 //! Chat's replay evals: does Chat understand what a person asks, and answer
-//! that? The cases (`chat_eval_cases.json`) are real conversations, made
-//! anonymous and moved onto the made-up library team of `chat_eval`, and
-//! variants that cover every kind of question: an orientation, what Chat can
-//! do, what needs me, a status, a how-to, a lookup, a judgement, a
-//! correction of Chat itself, and small talk. Some carry the thread before
+//! that? The cases (`chat_eval_cases.json`) are all written for the made-up
+//! team of `chat_eval`; none quotes a person. Those named `incident:` keep
+//! the shape of a question Chat once answered badly, in new words. Together
+//! they cover every kind of question: an orientation, what Chat can do, what
+//! needs me, a status, a how-to, a lookup, a judgement, a diagnosis (an
+//! alert, an error, an incident), a correction of Chat itself, and small
+//! talk. Some carry the thread before
 //! the question (a correction needs the answer it corrects).
 //!
 //! Each case runs through the real answer loop, prepared exactly as
@@ -29,7 +31,7 @@ use serde_json::{json, Value};
 
 use super::brain::{mention_note, system_prompt, Message};
 use super::chat_agent::testing::{CodeBox, Recorder};
-use super::chat_agent::{self, Answered, Ask, Called, MustLook, Sink, Toolbox, LIMITS};
+use super::chat_agent::{self, Answered, Ask, Called, MustLook, Sink, Toolbox};
 use super::chat_eval::{fixture, work_store, WorkBox, WorkStore, TEAM};
 use super::chat_work as work;
 
@@ -37,7 +39,8 @@ use super::chat_work as work;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplayCase {
     pub name: String,
-    /// `real` (from a real conversation, anonymous) or `variant`.
+    /// `variant`: written for the made-up team. Every case is one; no case
+    /// quotes a person's words.
     pub origin: String,
     /// The kind of question it is (`common::chat_intent::Intent::key`).
     pub intent: String,
@@ -151,6 +154,35 @@ pub const KNOWLEDGE: &[(&str, &str, &str)] = &[
 const KB_NAME: &str = "Member handbook";
 pub const KNOWLEDGE_TOOL: &str = "search_knowledge";
 pub const LOGS_TOOL: &str = "logs_search";
+pub const METRICS_TOOL: &str = "metrics_query";
+
+/// quayside-api's target group (a made-up service): its p99 and traffic
+/// over a day. The p99 crosses the alarm's 2 s only overnight, when traffic
+/// is low.
+pub const QUAYSIDE_P99: &str = "quayside-api target group, last 24 h, per 5 minutes (UTC):\n\
+00:00-05:00  p99 3.5-4.1 s   requests 96-124\n\
+05:00-09:00  p99 1.1-1.9 s   requests 900-4,100\n\
+09:00-18:00  p99 0.7-0.9 s   requests 8,200-9,700\n\
+18:00-24:00  p99 0.9-2.6 s   requests 300-6,800\n\
+Alarm prod-quayside-api-p99 (p99 > 2.0 s, 3 of 3 periods) was in ALARM 23:10-05:05 on each of the last 7 nights.";
+
+/// The same day, by path: one path is slow all day.
+pub const QUAYSIDE_BY_PATH: &str = "quayside-api latency by path, last 24 h:\n\
+GET /v1/tides/forecast (calls the Tidewatch API): average 3.4 s, 41-55 calls over 2 s every hour, day and night\n\
+GET /v1/berths: average 0.11 s, no calls over 2 s\n\
+POST /v1/bookings: average 0.29 s, 0-1 calls over 2 s an hour\n\
+GET /v1/health: average 0.01 s";
+
+/// Its resources: nothing near a limit.
+pub const QUAYSIDE_RESOURCES: &str =
+    "quayside-api service, last 24 h: CPU 14-22%, memory 38-41%, 3 tasks, no restarts.";
+
+/// Its logs for the alarm's window: the slow calls are all one path.
+pub const QUAYSIDE_LOGS: &str = "quayside-api logs 02:30-02:50 UTC, calls over 2 s:\n\
+02:31:07 GET /v1/tides/forecast 3.9 s upstream=tidewatch\n\
+02:36:44 GET /v1/tides/forecast 3.3 s upstream=tidewatch\n\
+02:41:12 GET /v1/tides/forecast 4.2 s upstream=tidewatch\n\
+02:47:58 GET /v1/tides/forecast 3.6 s upstream=tidewatch";
 pub const SKILL_TOOL: &str = "read_skill";
 
 fn words(text: &str) -> Vec<String> {
@@ -194,7 +226,7 @@ fn add_passages(reg: &mut Registry, found: &[(&str, &str, &str)]) -> Vec<String>
 }
 
 const LOG_LINES: &str = "Searched harbor-web's log group over the last 14 days.\n\
-26,599 matching lines, all from task 7f3a91c0 (started 2026-11-15 17:54 UTC), the first at 2026-11-18 04:44 UTC and the latest a minute ago.\n\
+18,240 matching lines, all from task 7f3a91c0 (started 2026-11-15 17:54 UTC), the first at 2026-11-18 04:44 UTC and the latest a minute ago.\n\
 2026-11-18T04:44:10Z [7f3a91c0] Failed to update prerender cache: ENOSPC: no space left on device, open '/app/.next/cache/fetch-cache/3f9a...'\n\
 2026-11-18T09:12:51Z [7f3a91c0] ENOSPC: no space left on device, write\n\
 Other tasks in the window ran a few hours to a day before they were replaced; none logged ENOSPC.";
@@ -316,6 +348,13 @@ impl<'a> ReplayBox<'a> {
             }, "required": ["query"]}
         }));
         defs.push(json!({
+            "name": METRICS_TOOL,
+            "description": "Read the team's CloudWatch metrics (read only): a metric's statistic over a window, by a dimension such as path.",
+            "input_schema": {"type": "object", "properties": {
+                "metric": {"type": "string"}, "by": {"type": "string"}, "hours": {"type": "integer"}
+            }, "required": ["metric"]}
+        }));
+        defs.push(json!({
             "name": SKILL_TOOL,
             "description": "Read the team's skills (written guidance and helpers) by name, or list them with no name.",
             "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -396,6 +435,28 @@ impl Toolbox for ReplayBox<'_> {
                     "knowledge",
                 )
             }
+            METRICS_TOOL => {
+                let m = input["metric"].as_str().unwrap_or("").to_lowercase();
+                let by = input["by"].as_str().unwrap_or("").to_lowercase();
+                let (title, text) = if m.contains("cpu") || m.contains("memory") {
+                    ("Read quayside-api's resource metrics", QUAYSIDE_RESOURCES)
+                } else if by.contains("path") || by.contains("route") {
+                    ("Read quayside-api's latency by path", QUAYSIDE_BY_PATH)
+                } else {
+                    ("Read quayside-api's p99 and requests", QUAYSIDE_P99)
+                };
+                let text = one(reg, "data_source", title, text);
+                done(text, title, "Read", "data_sources")
+            }
+            LOGS_TOOL if input["query"].as_str().unwrap_or("").contains("quayside") => {
+                let text = one(
+                    reg,
+                    "data_source",
+                    "Searched the logs in quayside-api",
+                    QUAYSIDE_LOGS,
+                );
+                done(text, "Searched the logs", "4 lines", "data_sources")
+            }
             LOGS_TOOL => {
                 let q = input["query"].as_str().unwrap_or("").to_lowercase();
                 if ["enospc", "space", "disk", "cache"]
@@ -408,7 +469,7 @@ impl Toolbox for ReplayBox<'_> {
                         "Searched the logs in harbor-web",
                         LOG_LINES,
                     );
-                    done(text, "Searched the logs", "26,599 lines", "data_sources")
+                    done(text, "Searched the logs", "18,240 lines", "data_sources")
                 } else {
                     done(
                         "No results found.".into(),
@@ -443,15 +504,26 @@ pub fn side_tools() -> Vec<Value> {
     vec![super::chat_setup::def()]
 }
 
+/// A question prepared for the loop, as `brain::answer` prepares it.
+pub struct Prepared {
+    pub notes: String,
+    pub must_look: Option<MustLook>,
+    pub uncited_ok: bool,
+    pub limits: chat_agent::Limits,
+    pub evidence: Option<chat_agent::EvidenceFirst>,
+    pub firm: bool,
+}
+
 /// What `brain::answer` does before the loop: read the question with the
-/// thread, order the tools, write the notes, decide where it must look and
-/// whether an uncited reply stands. Returns `(notes, must_look, uncited_ok)`.
+/// thread, order the tools, write the notes, decide where it must look,
+/// whether an uncited reply stands, the budget and, for a diagnosis, the
+/// live evidence to read first.
 pub fn prepare(
     question: &str,
     history: &[Message],
     tb: &mut ReplayBox<'_>,
     repos: &[RepoInfo],
-) -> (String, Option<MustLook>, bool) {
+) -> Prepared {
     let understood = super::chat_understand::read(question, history);
     tb.work.needs_shape = understood.needs_shape();
     understood.order(&mut tb.defs, question);
@@ -461,11 +533,14 @@ pub fn prepare(
     notes.push_str(&format!(
         "\nThe team's own tools for this question:\n{SKILLS}\n"
     ));
-    (
+    Prepared {
         notes,
-        understood.must_look(&offered, question),
-        understood.uncited_ok(),
-    )
+        must_look: understood.must_look(&offered, question),
+        uncited_ok: understood.uncited_ok(),
+        limits: understood.limits(),
+        evidence: understood.evidence_first(&offered),
+        firm: understood.intent().evidence_first(),
+    }
 }
 
 /// The model's input, as `brain::build_messages` writes it: the thread,
@@ -530,9 +605,9 @@ pub async fn replay_with(
         &mut reg,
         &search_knowledge(&super::brain::retrieval_query(&case.question, &history)),
     );
-    let (notes, must_look, uncited_ok) = prepare(&case.question, &history, &mut tb, repos);
+    let p = prepare(&case.question, &history, &mut tb, repos);
     let sink = Recorder::default();
-    let msgs = messages(&history, &reg.render(&first), &notes, &case.question);
+    let msgs = messages(&history, &reg.render(&first), &p.notes, &case.question);
     let out = chat_agent::run(
         model,
         &mut tb,
@@ -542,9 +617,12 @@ pub async fn replay_with(
             system: system_prompt(repos, true),
             messages: msgs,
             question: &case.question,
-            limits: LIMITS,
-            must_look,
-            uncited_ok,
+            limits: p.limits,
+            must_look: p.must_look,
+            uncited_ok: p.uncited_ok,
+            evidence: p.evidence,
+            background: None,
+            firm: p.firm,
         },
     )
     .await
@@ -645,6 +723,7 @@ async fn eval_model_access() -> String {
 mod tests {
     use super::*;
     use crate::routes::chat_agent::testing::{calls, say, Scripted, Step};
+    use crate::routes::chat_agent::Turn;
     use crate::routes::chat_setup::SETUP;
     use crate::routes::chat_work_needs::{ANSWER_SHAPE, NOT_THE_LIST};
 
@@ -659,7 +738,18 @@ mod tests {
             assert!(u.about_app(), "{}", c.name);
         }
         assert!(all.len() >= 40, "{}", all.len());
-        assert!(all.iter().filter(|c| c.origin == "real").count() >= 8);
+        // Every case is written for the made-up team; the incident shapes
+        // are kept in new words.
+        assert!(
+            all.iter().all(|c| c.origin == "variant"),
+            "a case that isn't synthetic"
+        );
+        assert!(
+            all.iter()
+                .filter(|c| c.name.starts_with("incident: "))
+                .count()
+                >= 8
+        );
         let mut wrong = Vec::new();
         for c in &all {
             let read = super::super::chat_understand::read(&c.question, &history_of(c));
@@ -682,6 +772,7 @@ mod tests {
             "how_to",
             "lookup",
             "judgement",
+            "diagnosis",
             "correction",
             "small_talk",
         ] {
@@ -731,7 +822,8 @@ mod tests {
     /// without its shape, the answer must look the setup up, and it does.
     #[tokio::test]
     async fn offline_the_newcomer_gets_an_orientation_not_the_to_do_list() {
-        let c = case("real: a new leader asks what could be useful to them");
+        let c =
+            case("incident: a senior engineering leader new to Coderhelm asks for an orientation");
         let (host, repos) = replay_fixture();
         let store = work_store();
         let steps: Vec<Step> = vec![
@@ -757,7 +849,7 @@ mod tests {
                     .unwrap();
                 let what =
                     super::super::chat_agent::testing::id_for(&r, "What Coderhelm does").unwrap();
-                say(&format!("Coderhelm already works for your team: 3 runs in the last 30 days across harbor-web and harbor-api [{team}]. For a CTO: ask “Where are we on the checkout redesign?” for status, “Which critical findings are open?” for risk [{what}]."))
+                say(&format!("Coderhelm already works for your team: 3 runs in the last 30 days across harbor-web and harbor-api [{team}]. For an engineering director: ask “Where are we on the checkout redesign?” for status, “Which critical findings are open?” for risk [{what}]."))
             }),
         ];
         let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
@@ -781,7 +873,7 @@ mod tests {
         assert_eq!(bodies[0]["tools"][0]["name"], SETUP);
         let first = bodies[0]["messages"].to_string();
         assert!(
-            first.contains("an orientation") && first.contains("the cto"),
+            first.contains("an orientation") && first.contains("the engineering director"),
             "{first}"
         );
         assert!(!first.contains("Call work_needs_me first"), "{first}");
@@ -791,7 +883,7 @@ mod tests {
     /// earlier answer's words.
     #[tokio::test]
     async fn offline_a_correction_checks_again_before_it_answers() {
-        let c = case("real: the leader questions a claim that Jira isn't connected");
+        let c = case("incident: the leader questions a claim that Jira isn't connected");
         let (host, repos) = replay_fixture();
         let store = work_store();
         let steps: Vec<Step> = vec![
@@ -814,6 +906,83 @@ mod tests {
         );
         assert!(
             first.contains("Jira isn't connected to Coderhelm, so your Jira tickets"),
+            "{first}"
+        );
+    }
+
+    /// The nightly alarm, replayed with a made-up service. One path is slow
+    /// all day; the p99 crosses the threshold only overnight, when traffic is
+    /// low. The answer that went wrong compared slow-call counts with the
+    /// daytime and hedged ("probably one or two slow requests"): that answer
+    /// goes back, the latency is broken down by path and lined up with the
+    /// traffic, and the answer concludes with the fixes. A senior asker's
+    /// note asks for the conclusion first at expert depth.
+    #[tokio::test]
+    async fn offline_a_nightly_p99_alarm_is_traced_to_one_slow_path_and_low_traffic() {
+        let c = case("diagnosis: a nightly p99 alarm, asked by a senior leader");
+        let (host, repos) = replay_fixture();
+        let store = work_store();
+        let steps: Vec<Step> = vec![
+            // The live evidence first, together: the metric and its
+            // traffic, the logs for the window, the resources.
+            Box::new(|b| {
+                assert_eq!(b["tools"][0]["name"], LOGS_TOOL);
+                Turn {
+                    content: vec![
+                        json!({"type": "tool_use", "id": "p", "name": METRICS_TOOL, "input": {"metric": "TargetResponseTime p99 and RequestCount"}}),
+                        json!({"type": "tool_use", "id": "l", "name": LOGS_TOOL, "input": {"query": "quayside-api calls over 2 s", "hours": 1}}),
+                        json!({"type": "tool_use", "id": "r", "name": METRICS_TOOL, "input": {"metric": "CPU and memory"}}),
+                    ],
+                    stop: "tool_use".into(),
+                }
+            }),
+            // The answer that went wrong: counts against the daytime, hedged.
+            Box::new(|_| {
+                say("The upstream wasn't slow: its slow-call count overnight is below the daytime count [S1]. Probably one or two slow requests at night [S2].")
+            }),
+            // Sent back: break it down by path, line it up with traffic.
+            Box::new(|b| {
+                let sent = b["messages"].to_string();
+                assert!(sent.contains("break the metric down by path"), "{sent}");
+                calls(
+                    "b",
+                    METRICS_TOOL,
+                    json!({"metric": "TargetResponseTime", "by": "path"}),
+                )
+            }),
+            Box::new(|b| {
+                let r = super::super::chat_agent::testing::last_result(b);
+                assert!(r.contains("GET /v1/tides/forecast"), "{r}");
+                say("One path is slow all day, and the alarm fires only when traffic is low. GET /v1/tides/forecast, which calls the Tidewatch API, averages 3.4 s with 41-55 calls over 2 s every hour, day and night [S4]; every slow call in the alarm's window is on it [S2]. In the day those calls are under 1% of 8,200-9,700 requests per 5 minutes, so the p99 stays at 0.7-0.9 s; overnight traffic drops to 96-124 requests per 5 minutes and those few calls become the p99, 3.5-4.1 s, so the alarm fires every night [S1]. CPU and memory are nowhere near a limit [S3].\n\nFixes: cache the forecast response or speed up the Tidewatch call (a timeout with a cached fallback), and add a minimum request count to the alarm so a quiet night's handful of calls can't set it off.")
+            }),
+        ];
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, _) = replay(&model, &host, &repos, &store, &c).await;
+        assert_eq!(
+            out.calls,
+            [METRICS_TOOL, LOGS_TOOL, METRICS_TOOL, METRICS_TOOL]
+        );
+        let text = &out.fin.text;
+        assert!(
+            text.starts_with(
+                "One path is slow all day, and the alarm fires only when traffic is low"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("GET /v1/tides/forecast"), "{text}");
+        assert!(
+            text.contains("cache") && text.contains("minimum request count"),
+            "{text}"
+        );
+        assert!(!common::chat_evidence::says_hedged(text), "{text}");
+        assert!(!common::chat_evidence::says_unfinished(text), "{text}");
+        let bodies = model.bodies.lock().unwrap();
+        let first = bodies[0]["messages"].to_string();
+        // How the question reads: a diagnosis, from a senior leader.
+        assert!(first.contains("a diagnosis"), "{first}");
+        assert!(first.contains("break the metric down by path"), "{first}");
+        assert!(
+            first.contains("expert depth") && first.contains("never more hedging"),
             "{first}"
         );
     }
@@ -1066,7 +1235,7 @@ mod tests {
         add_passages(&mut reg, &search_knowledge("How can I cancel a booking?"));
         let b = judge_body(
             "m",
-            &case("real: how to cancel a booking (from a knowledge page)"),
+            &case("incident: how to cancel a booking (from a knowledge page)"),
             "a",
             &reg,
         );

@@ -11,6 +11,11 @@
 //! - an orientation looks the team's setup up, and a correction checks the
 //!   disputed point again, before either may answer ([`Understood::must_look`]);
 //! - an uncited reply is kept only for small talk;
+//! - the answer's budget fits the question ([`Understood::limits`]), and a
+//!   diagnosis (an alert, an error, an incident) gets its live evidence
+//!   first: the live tools go first, the note says which evidence decides
+//!   it, an answer that never read it goes back, and code reads wait for it
+//!   past a small allowance ([`Understood::evidence_first`]);
 //! - a question about how the app fits together reaches for the app map
 //!   first (`common::app_map`), then the code for exact lines; with no map
 //!   built, the answer says so in one line and reads the code.
@@ -23,7 +28,7 @@ use common::chat_intent::{self, Intent, Reading, Signals};
 use serde_json::Value;
 
 use super::brain::Message;
-use super::chat_agent::MustLook;
+use super::chat_agent::{EvidenceFirst, Limits, MustLook};
 use super::chat_hints::{self, Hints};
 use super::chat_setup::SETUP;
 
@@ -41,6 +46,12 @@ pub const MAP_FIRST: &str = "start from the app map (map_find or map_overview, t
 
 /// The note for a map question when the team has no map yet.
 pub const NO_MAP: &str = "the team has no app map yet. Say so in one line first (it can be built on the App map page, /app-map), then answer from the code with your code tools.";
+
+/// The note for a diagnosis when live tools are offered (`{live}`: their names).
+pub const EVIDENCE_FIRST: &str = "the live evidence decides it, so get it before you read code, calling the independent lookups together in one turn: (1) the metric behind the alarm or error, its statistic (such as p99) a few minutes either side of when it fired, and the traffic on the same target (request count); (2) the service's logs for that window; (3) the service's resource metrics (CPU, memory). Use {live}. For latency or errors, break the metric down by path (route or downstream call) and line it up with request volume, over the alarm's window and the same hours on a normal day: a percentile over little traffic is set by a handful of slow calls, so a path slow all day can fire the alarm only when traffic is low. Compare like with like (a rate with a rate, never a count with a busier hour's count). Read the alarm's definition or the code only to find the names those lookups need, and afterwards to explain what the evidence shows. A result marked as cut off is narrowed (a shorter window, a filter) and read, never answered from in part.";
+
+/// The note for a diagnosis when no live tool is offered.
+pub const NO_LIVE: &str = "no live metrics or logs are connected for this question. Say so in one line, then answer from the alerts Coderhelm recorded, the code and the configuration, and say which live reading would settle it.";
 
 /// Words that put a disputed point on Coderhelm's own setup.
 const SETUP_WORDS: &[&str] = &[
@@ -115,9 +126,29 @@ impl Understood {
         self.reading.about_app || self.from_map
     }
 
+    /// How far the answer may go: a diagnosis's evidence takes more turns.
+    pub fn limits(&self) -> Limits {
+        super::chat_agent::limits_for(self.intent())
+    }
+
+    /// For a diagnosis: the live tools to read before the code.
+    pub fn evidence_first(&self, offered: &[&str]) -> Option<EvidenceFirst> {
+        if !self.intent().evidence_first() {
+            return None;
+        }
+        EvidenceFirst::over(live_of(offered))
+    }
+
     /// Puts the tool that holds the answer first.
     pub fn order(&self, tools: &mut [Value], question: &str) {
         super::chat_work::put_first(tools, &self.hints);
+        if self.intent().evidence_first() {
+            tools.sort_by_key(|t| {
+                usize::from(!super::brain::is_live_tool(
+                    t["name"].as_str().unwrap_or(""),
+                ))
+            });
+        }
         if self.about_app() {
             tools.sort_by_key(|t| usize::from(!am::is_tool(t["name"].as_str().unwrap_or(""))));
         }
@@ -137,7 +168,23 @@ impl Understood {
         let mut out = super::chat_work::hint_note(&self.hints, offered);
         out.push_str(&self.reading.note());
         out.push_str(&self.map_note(offered));
+        out.push_str(&self.evidence_note(offered));
         out
+    }
+
+    /// For a diagnosis: the evidence that decides it, and where to read it.
+    pub fn evidence_note(&self, offered: &[&str]) -> String {
+        if !self.intent().evidence_first() {
+            return String::new();
+        }
+        let live = live_of(offered);
+        if live.is_empty() {
+            return format!("- It is a diagnosis, and {NO_LIVE}\n");
+        }
+        format!(
+            "- It is a diagnosis: {}\n",
+            EVIDENCE_FIRST.replace("{live}", &live.join(", "))
+        )
     }
 
     /// For a question about how the app fits together: the app map first,
@@ -180,6 +227,12 @@ impl Understood {
                     always: true,
                 })
             }
+            // A diagnosis that never read the live evidence goes back once.
+            Intent::Diagnosis if !live_of(offered).is_empty() => Some(MustLook {
+                tools: live_of(offered),
+                what: "the live evidence: the alarm's metric and its traffic, the service's logs for that window, its resource metrics".into(),
+                always: true,
+            }),
             _ => super::chat_work::must_look(&self.hints, offered).or_else(|| {
                 // A map question that says it found nothing looks at the map.
                 let map: Vec<String> = offered
@@ -195,6 +248,15 @@ impl Understood {
             }),
         }
     }
+}
+
+/// The live tools among those offered (metrics, logs, connected apps).
+fn live_of(offered: &[&str]) -> Vec<String> {
+    offered
+        .iter()
+        .filter(|t| super::brain::is_live_tool(t))
+        .map(|t| t.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -213,10 +275,10 @@ mod tests {
 
     const OFFERED: &[&str] = &[SETUP, NEEDS_ME, TICKETS, work::PULL_REQUESTS, RUNS];
 
-    /// The first question of the report: an orientation, never the list.
+    /// A senior leader new to Coderhelm: an orientation, never the list.
     #[test]
     fn a_newcomer_gets_an_orientation_from_the_setup_not_the_to_do_list() {
-        let q = "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me";
+        let q = "Hello! I just started using Coderhelm and I'm the engineering director here. Which features would help someone like me most?";
         let u = read(q, &[]);
         assert_eq!(u.intent(), Intent::Orientation);
         assert!(!u.needs_shape());
@@ -224,7 +286,7 @@ mod tests {
         assert!(m.always && m.tools == [SETUP], "{m:?}");
         let notes = u.notes(OFFERED);
         assert!(notes.contains("an orientation"), "{notes}");
-        assert!(notes.contains("the cto"), "{notes}");
+        assert!(notes.contains("the engineering director"), "{notes}");
         assert!(!notes.contains("Call work_needs_me first"), "{notes}");
         let mut tools = vec![
             json!({"name": NEEDS_ME}),
@@ -239,10 +301,10 @@ mod tests {
     #[test]
     fn a_correction_about_a_connection_must_check_the_setup_again() {
         let history = vec![
-            msg("user", "first time here, what can you do for me?"),
+            msg("user", "I just joined, what can you do for me?"),
             msg("assistant", "Welcome. 24 items need you. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list."),
         ];
-        let q = "what do you mean that jira isn't connected? i see atlassian in the integrations";
+        let q = "You said Jira isn't connected, but the integrations page lists Atlassian as connected. Which is right?";
         let u = read(q, &history);
         assert_eq!(u.intent(), Intent::Correction);
         let m = u.must_look(OFFERED, q).unwrap();

@@ -1,14 +1,17 @@
 //! What a Chat question asks for, read before the model answers: an
 //! orientation ("I'm new, what can you do for me"), whether Chat can do
 //! something, what is waiting on the person, where something stands, how to
-//! do something, a lookup, a judgement call, small talk, or a correction of
-//! something Chat said. Also the role the person says they hold.
+//! do something, a lookup, a judgement call, a diagnosis (an alert, an error
+//! or an incident), small talk, or a correction of something Chat said. Also
+//! the role the person says they hold.
 //!
 //! The reading decides only what code would otherwise force on every
 //! answer: a fixed answer shape is used only for the question it was made
 //! for ([`Intent::fixed_shape`]), an uncited reply is kept only for small
 //! talk ([`Intent::uncited_ok`]), and a correction or an orientation must
-//! look something up this turn before it answers. The model is told the
+//! look something up this turn before it answers, and a diagnosis gets the
+//! live evidence before it reads code ([`Intent::evidence_first`]). The
+//! model is told the
 //! reading as a note it checks against the question itself
 //! ([`Reading::note`]): when the question asks something else, it answers
 //! what the question asks.
@@ -34,6 +37,9 @@ pub enum Intent {
     Lookup,
     /// A verdict: is it right, should we, is it safe.
     Judgement,
+    /// Why something is failing, slow or alarming: a pasted alert, an error,
+    /// an incident.
+    Diagnosis,
     /// The person says something Chat said was wrong, or asks what it meant.
     Correction,
     /// A greeting, thanks or acknowledgement.
@@ -51,6 +57,7 @@ impl Intent {
             Intent::HowTo => "how to do something",
             Intent::Lookup => "a specific fact",
             Intent::Judgement => "your judgement on something",
+            Intent::Diagnosis => "a diagnosis: why something is failing, slow or alarming (an alert, an error or an incident), decided by the live evidence",
             Intent::Correction => "a correction: they question something you said",
             Intent::SmallTalk => "small talk",
         }
@@ -66,6 +73,7 @@ impl Intent {
             Intent::HowTo => "how_to",
             Intent::Lookup => "lookup",
             Intent::Judgement => "judgement",
+            Intent::Diagnosis => "diagnosis",
             Intent::Correction => "correction",
             Intent::SmallTalk => "small_talk",
         }
@@ -83,6 +91,12 @@ impl Intent {
         self == Intent::SmallTalk
     }
 
+    /// The answer rests on live evidence (metrics, logs), read before the
+    /// code: a diagnosis.
+    pub fn evidence_first(self) -> bool {
+        self == Intent::Diagnosis
+    }
+
     /// How the answer is sized and laid out.
     pub fn shape(self) -> &'static str {
         match self {
@@ -93,6 +107,7 @@ impl Intent {
             Intent::HowTo => "Give the shortest way to do it first, as numbered steps, from the team's own docs or code (cited), then any exceptions.",
             Intent::Lookup => "Lead with the answer in a sentence or two, then only the detail that supports it.",
             Intent::Judgement => "Give your verdict first (yes, no, or what it depends on), then the evidence you checked this turn, then what would settle what you couldn't check.",
+            Intent::Diagnosis => "Lead with the cause the live evidence read in this answer shows (cited), stated plainly. For latency or errors, break the metric down by path (route or downstream call) and line it up with request volume over the alarm's window and the same hours on a normal day: a percentile over little traffic is set by a handful of slow calls, so a path that is slow all day can fire an alarm only when traffic is low. Then the evidence (the metric and its traffic, the service's logs for the window, its resource metrics), then the concrete fix: for the slow call (cache it, speed it up) and for the alarm when it fires on low traffic (a minimum request count). Never present a guess as the cause; run the lookup that settles it.",
             Intent::Correction => "Check the disputed point again now with a tool, never from the earlier answer's words. Say in the first sentence whether you were wrong and what is right, plainly, then answer what they asked. Don't guess at causes you can't see.",
             Intent::SmallTalk => "Reply in a sentence or two, with no lookups. If it fits, offer one thing you can do.",
         }
@@ -117,6 +132,8 @@ pub struct Reading {
     pub role: Option<String>,
     /// They say they are new to Coderhelm.
     pub newcomer: bool,
+    /// The role they hold is a senior technical leader's.
+    pub senior: bool,
     /// The sentences of Chat's last answer the person questions.
     pub disputed: Vec<String>,
     /// It asks how the app fits together: how something works, what
@@ -280,6 +297,104 @@ const HOW_TO: &[&str] = &[
     "how does someone",
 ];
 
+/// Words of a pasted alarm, a page or an outage: always a diagnosis.
+const ALERT: &[&str] = &[
+    "alarm",
+    "alarms",
+    "in alarm",
+    "threshold",
+    "thresholds",
+    "datapoint",
+    "datapoints",
+    "firing",
+    "p99",
+    "p95",
+    "p90",
+    "paged",
+    "pagerduty",
+    "opsgenie",
+    "outage",
+    "sev1",
+    "sev2",
+    "sev-1",
+    "sev-2",
+];
+
+/// Words of something going wrong in a running system.
+const TROUBLE: &[&str] = &[
+    "error",
+    "errors",
+    "exception",
+    "exceptions",
+    "failing",
+    "fails",
+    "failed",
+    "failure",
+    "failures",
+    "crash",
+    "crashes",
+    "crashing",
+    "crashed",
+    "timeout",
+    "timeouts",
+    "timing out",
+    "slow",
+    "slowness",
+    "latency",
+    "5xx",
+    "500s",
+    "502",
+    "502s",
+    "503",
+    "503s",
+    "504",
+    "504s",
+    "5xxs",
+    "oom",
+    "out of memory",
+    "enospc",
+    "spike",
+    "spiking",
+    "incident",
+    "throttled",
+    "throttling",
+    "degraded",
+    "broken",
+    "down",
+    "stack trace",
+    "traceback",
+    "panic",
+    "alert",
+    "alerts",
+];
+
+/// Words asking for a cause.
+const CAUSE: &[&str] = &[
+    "why",
+    "what caused",
+    "cause",
+    "causing",
+    "root cause",
+    "what's wrong",
+    "what is wrong",
+    "what's going on",
+    "what is going on",
+    "what happened",
+    "debug",
+    "investigate",
+    "diagnose",
+    "look into",
+    "figure out",
+    "explain",
+    "fix",
+];
+
+/// A pasted alert, or trouble in a running system with a cause asked for.
+pub fn is_diagnosis(question: &str) -> bool {
+    let q = plain(question);
+    has(&q, ALERT) || (has(&q, TROUBLE) && has(&q, CAUSE))
+}
+
 /// The person says Chat got something wrong, or asks what it meant.
 const CORRECTION: &[&str] = &[
     "what do you mean",
@@ -440,6 +555,33 @@ static ROLE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Words of a senior technical leader's role.
+const SENIOR: &[&str] = &[
+    "cto",
+    "cio",
+    "ciso",
+    "chief",
+    "vp",
+    "svp",
+    "evp",
+    "vice president",
+    "head",
+    "director",
+    "principal",
+    "staff",
+    "distinguished",
+    "fellow",
+    "founder",
+    "co-founder",
+    "cofounder",
+    "architect",
+];
+
+/// The role is a senior technical leader's.
+pub fn is_senior(role: &str) -> bool {
+    has(&plain(role), SENIOR)
+}
+
 /// Words that never name a role ("I'm the one who", "as a result").
 const NOT_ROLES: &[&str] = &[
     "one", "result", "reminder", "test", "matter", "way", "first", "only", "same", "person",
@@ -559,10 +701,12 @@ pub fn read(question: &str, last_answer: Option<&str>, s: Signals) -> Reading {
         Intent::Correction
     } else if s.needs_me {
         Intent::NeedsMe
-    } else if (newcomer || has(&q, OFFER)) && !s.names_work {
+    } else if (newcomer || has(&q, OFFER)) && !s.names_work && !is_diagnosis(question) {
         Intent::Orientation
     } else if is_small_talk(question) {
         Intent::SmallTalk
+    } else if is_diagnosis(question) {
+        Intent::Diagnosis
     } else if has(&q, CAPABILITY) {
         Intent::Capability
     } else if has(&q, JUDGEMENT) {
@@ -576,6 +720,7 @@ pub fn read(question: &str, last_answer: Option<&str>, s: Signals) -> Reading {
     };
     Reading {
         intent,
+        senior: role.as_deref().is_some_and(is_senior),
         role,
         newcomer,
         disputed: if intent == Intent::Correction {
@@ -598,6 +743,9 @@ impl Reading {
             out.push_str(&format!(
                 "- They say they are the {r}: answer for what someone in that role needs.\n"
             ));
+        }
+        if self.senior && self.intent != Intent::SmallTalk {
+            out.push_str("- They are a senior technical leader: give the conclusion first, then the evidence and the concrete fix, at expert depth; don't explain basics. Read as widely as their access allows (every source offered), not the narrowest view. Senior means more depth and a firmer conclusion, never more hedging.\n");
         }
         if self.newcomer {
             out.push_str("- They are new to Coderhelm.\n");
@@ -626,10 +774,10 @@ mod tests {
 
     #[test]
     fn a_newcomer_asking_what_helps_them_wants_an_orientation() {
-        let q = "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me";
+        let q = "Hello! I just started using Coderhelm and I'm the engineering director here. Which features would help someone like me most?";
         let reading = read(q, None, Signals::default());
         assert_eq!(reading.intent, Intent::Orientation);
-        assert_eq!(reading.role.as_deref(), Some("cto"));
+        assert_eq!(reading.role.as_deref(), Some("engineering director"));
         assert!(reading.newcomer);
         for q in [
             "What can you do?",
@@ -666,7 +814,7 @@ mod tests {
     #[test]
     fn every_intent_reads_from_its_own_words() {
         assert_eq!(
-            r("are you able to run skills in the web repo"),
+            r("Are you able to use our team skills inside the web repo?"),
             Intent::Capability
         );
         assert_eq!(r("Can you see our production logs?"), Intent::Capability);
@@ -677,9 +825,10 @@ mod tests {
             Intent::Judgement
         );
         assert_eq!(r("should we roll back the last deploy?"), Intent::Judgement);
-        assert_eq!(r("what caused the enospc error?"), Intent::Lookup);
+        assert_eq!(r("what caused the enospc error?"), Intent::Diagnosis);
+        assert_eq!(r("where is the retry limit set?"), Intent::Lookup);
         assert_eq!(
-            r("what does B7 mean in reference to crawlers"),
+            r("What is crawler B7 in our firewall rules?"),
             Intent::Lookup
         );
         let st = Signals {
@@ -706,7 +855,7 @@ mod tests {
     #[test]
     fn a_correction_names_what_it_questions_in_the_last_answer() {
         let last = "Welcome. Three runs are waiting on you. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list. Ask me for a DORA report.";
-        let q = "what do you mean that jira isn't connected? i see atlassian in the integrations";
+        let q = "You said Jira isn't connected, but the integrations page lists Atlassian as connected. Which is right?";
         let reading = read(q, Some(last), Signals::default());
         assert_eq!(reading.intent, Intent::Correction);
         assert_eq!(
@@ -742,6 +891,7 @@ mod tests {
             Intent::HowTo,
             Intent::Lookup,
             Intent::Judgement,
+            Intent::Diagnosis,
             Intent::Correction,
             Intent::SmallTalk,
         ] {
@@ -751,6 +901,38 @@ mod tests {
         assert!(Intent::NeedsMe.fixed_shape());
         assert!(Intent::SmallTalk.uncited_ok());
         assert!(!Intent::Orientation.uncited_ok() && !Intent::Correction.uncited_ok());
+    }
+
+    /// A pasted alarm, an error or an incident is a diagnosis: its answer
+    /// rests on live evidence, read before the code.
+    #[test]
+    fn an_alert_an_error_or_an_incident_reads_as_a_diagnosis() {
+        for q in [
+            "ALARM: \"prod-quayside-api-p99\" in US East. Threshold Crossed: 1 datapoint [3.2] was greater than the threshold (2.0). TargetResponseTime p99 for the quayside-api target group.",
+            "the p99 latency alarm on quayside-api is firing again",
+            "why is quayside-api throwing 502s since this morning?",
+            "what caused the enospc error?",
+            "can you look into the timeouts on the checkout service and figure out what's going on",
+            "we had an outage on the booking page, what happened?",
+            "I'm new here, why is the p95 alarm firing?",
+        ] {
+            let reading = read(q, None, Signals::default());
+            assert_eq!(reading.intent, Intent::Diagnosis, "{q}");
+            assert!(reading.intent.evidence_first(), "{q}");
+            assert!(!reading.about_app, "{q}");
+            assert!(reading.note().contains("the live evidence"), "{q}");
+        }
+        // Trouble words with no cause asked for, or a list of past alerts,
+        // are not a diagnosis.
+        for q in [
+            "What alerts came in this week and what was done about them?",
+            "Can you read the error logs?",
+            "is it safe to bump express in harbor-api to fix CVE-2026-5678?",
+            "Is CVE-2026-1234 fixed in harbor-web?",
+        ] {
+            assert_ne!(r(q), Intent::Diagnosis, "{q}");
+        }
+        assert!(!Intent::Lookup.evidence_first());
     }
 
     #[test]
@@ -779,6 +961,40 @@ mod tests {
         ] {
             assert!(!read(q, None, Signals::default()).about_app, "{q}");
         }
+    }
+
+    /// A senior asker gets the conclusion first at expert depth, never
+    /// more hedging; anyone else gets no such note.
+    #[test]
+    fn a_senior_asker_gets_the_conclusion_first_at_expert_depth() {
+        let q =
+            "I'm the VP of engineering. Why is the p99 alarm on quayside-api firing every night?";
+        let reading = read(q, None, Signals::default());
+        assert_eq!(reading.intent, Intent::Diagnosis);
+        assert!(reading.senior, "{reading:?}");
+        let note = reading.note();
+        assert!(note.contains("conclusion first"), "{note}");
+        assert!(note.contains("expert depth"), "{note}");
+        assert!(note.contains("never more hedging"), "{note}");
+        assert!(note.contains("as widely as their access allows"), "{note}");
+        for role in [
+            "cto",
+            "head of platform",
+            "staff engineer",
+            "engineering director",
+        ] {
+            assert!(is_senior(role), "{role}");
+        }
+        for role in ["backend engineer", "product manager", "intern"] {
+            assert!(!is_senior(role), "{role}");
+        }
+        let junior = read(
+            "I'm a backend engineer. Why is the p99 alarm firing?",
+            None,
+            Signals::default(),
+        );
+        assert!(!junior.senior);
+        assert!(!junior.note().contains("expert depth"));
     }
 
     #[test]
