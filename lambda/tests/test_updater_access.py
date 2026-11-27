@@ -463,10 +463,12 @@ class ReaderUpdate(Base):
             {"Key": "access.json", "Dest": "releases/v1.0.0/access.json", "Sha256": hashlib.sha256(self.body).hexdigest()}]}}}}
         u.fetch_template = lambda url, opener=None: self.body
 
-    def stack(self, with_reader):
+    def stack(self, with_reader, reader=None):
+        """The admin's access stack; with the release's own reader update, or `reader` in its place."""
         self.cfn.access_stack = {"StackId": "arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/x", "StackName": "coderhelm-prod-access", "StackStatus": "UPDATE_COMPLETE"}
+        mine = reader if reader is not None else self.access_json()["Resources"]["Reader"]
         self.cfn.access_template = {"Metadata": {"CoderHelm": {"version": "v0.9.0", "kind": "access"}},
-                                    "Resources": {"Access": {}, **({"Reader": {}} if with_reader else {})}}
+                                    "Resources": {"Access": {}, **({"Reader": mine} if with_reader else {})}}
 
     def test_an_access_stack_without_the_reader_update_is_asked_for_once(self):
         self.stack(with_reader=False)
@@ -481,6 +483,17 @@ class ReaderUpdate(Base):
         v = u.access_compute(self.env)
         self.assertNotIn("Reader", v["resources"])
         self.assertNotIn(u.READER_LINE, v["summary"])
+
+    def test_an_access_stack_running_an_older_reader_update_reads_pending_not_applied(self):
+        # The incident: an access stack left at an older release kept an older
+        # reader update, and the card said nothing was needed.
+        self.stack(with_reader=True, reader={"Type": "AWS::Lambda::Function", "Properties": {"FunctionName": {"Fn::Sub": "CoderHelmReader-${Stage}"}, "Code": {"ZipFile": "older"}}})
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "pending")
+        self.assertIn("Reader", v["resources"])
+        self.assertIn(u.READER_CHANGED_LINE, v["summary"])
+        self.assertEqual(v["apply"], "update")
+        self.assertNotIn("reader_parts", v["existing"], "the card carries no template")
 
     def test_an_install_without_an_access_stack_gets_it_with_the_one_link(self):
         v = u.access_compute(self.env)

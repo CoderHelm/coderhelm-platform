@@ -84,7 +84,8 @@ export const ACCESS_SHAPE = {
 
 /**
  * The reader update's own permissions: read the install's stack (its release
- * and switches), find CoderHelmLogReader, and create, update or remove the
+ * and switches), find CoderHelmLogReader, list the names of the read-only
+ * database users' secrets (the databases an admin chose), and create, update or remove the
  * one stack CoderHelmLogReaderUpdate-release, only from a release's update
  * template; that stack's inline policy on the role is written only through
  * CloudFormation. No other IAM call, no other stack, no other role.
@@ -99,6 +100,10 @@ export function readerPolicy(): Json {
       { Sid: "FindTheReader", Effect: "Allow", Action: "iam:GetRole", Resource: role },
       // A template's parameter names, so only the ones it declares are given.
       { Sid: "TemplateParameters", Effect: "Allow", Action: "cloudformation:GetTemplateSummary", Resource: "*" },
+      // The databases an AWS admin chose: the names of the setup script's
+      // read-only user secrets (coderhelm-readonly-<cluster>), never a value.
+      // ListSecrets has no resource to name.
+      { Sid: "ChosenDatabases", Effect: "Allow", Action: "secretsmanager:ListSecrets", Resource: "*" },
       {
         Sid: "ReleaseTemplateOnly",
         Effect: "Allow",

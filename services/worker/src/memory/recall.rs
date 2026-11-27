@@ -267,6 +267,11 @@ pub async fn for_agent(
     b
 }
 
+/// One agent's reads of a repository's memories on one day. `reads` is a
+/// DynamoDB reserved word, so it is named through `#reads`: written bare,
+/// DynamoDB refused this update on every run (common::dynamo_names).
+const AGENT_USE_UPDATE: &str = "ADD #reads :one, memories :n SET last_at = :now, #ttl = :ttl";
+
 /// Counts that `agent` was handed the memories `ids`: each memory's use
 /// (`common::memory_meta::usage_sk`, what the memory list shows) and the
 /// agent's reads for the day (`agent_use_sk`, what "Who uses memory"
@@ -312,7 +317,12 @@ pub async fn record(
             .send()
             .await;
         if let Err(e) = res {
-            warn!(run_ref, error = %e, "Could not count a memory's use");
+            warn!(
+                run_ref,
+                error_kind = %common::aws_error::kind(&e),
+                error = %common::aws_error::detail(&e),
+                "Could not count a memory's use"
+            );
         }
     }
     let day = now.format("%Y-%m-%d").to_string();
@@ -331,7 +341,8 @@ pub async fn record(
                 &day,
             )),
         )
-        .update_expression("ADD reads :one, memories :n SET last_at = :now, #ttl = :ttl")
+        .update_expression(AGENT_USE_UPDATE)
+        .expression_attribute_names("#reads", "reads")
         .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_values(":one", AttributeValue::N("1".into()))
         .expression_attribute_values(":n", AttributeValue::N(ids.len().to_string()))
@@ -340,7 +351,12 @@ pub async fn record(
         .send()
         .await;
     if let Err(e) = res {
-        warn!(run_ref, error = %e, "Could not count the agent's memory reads");
+        warn!(
+            run_ref,
+            error_kind = %common::aws_error::kind(&e),
+            error = %common::aws_error::detail(&e),
+            "Could not count the agent's memory reads"
+        );
     }
 }
 
@@ -376,7 +392,12 @@ pub async fn flag_out_of_date(
         .send()
         .await;
     if let Err(e) = res {
-        warn!(memory_id, error = %e, "Could not flag an out-of-date memory");
+        warn!(
+            memory_id,
+            error_kind = %common::aws_error::kind(&e),
+            error = %common::aws_error::detail(&e),
+            "Could not flag an out-of-date memory"
+        );
     }
 }
 
@@ -450,6 +471,15 @@ pub async fn learn_from_feedback(
 mod tests {
     use super::*;
     use mentedb_core::memory::MemoryType;
+
+    #[test]
+    fn the_agent_read_count_names_no_reserved_word_bare() {
+        // Written as "ADD reads ...", DynamoDB refused it on every run.
+        assert!(common::dynamo_names::bare_reserved(AGENT_USE_UPDATE).is_empty());
+        assert!(AGENT_USE_UPDATE.contains("#reads"));
+        let src = include_str!("recall.rs");
+        assert!(src.contains(".expression_attribute_names(\"#reads\", \"reads\")"));
+    }
 
     fn p(id: &str, kind: PickKind, content: &str) -> Picked {
         Picked {
