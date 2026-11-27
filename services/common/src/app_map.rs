@@ -1716,6 +1716,17 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
         if let Some(r) = graph["routes"].get(i) {
             return json!({"id": id, "method": r["m"], "path": r["p"], "name": r["name"], "description": r["d"], "file": r["f"]});
         }
+    } else if let Some((p, i)) = id
+        .strip_prefix("s:")
+        .and_then(|x| x.rsplit_once('#'))
+        .and_then(|(p, i)| Some((p, i.parse::<usize>().ok()?)))
+    {
+        // one symbol of a file (`s:<path>#<index>`): a page's own renderer in a file that holds several
+        if let Some(f) = arr(graph, "files").find(|f| f["p"] == p) {
+            if let Some(sym) = f["s"].get(i) {
+                return json!({"id": id, "path": p, "symbol": sym[0], "kind": sym[1], "line": sym[2], "description": sym[4], "part": f["n"]});
+            }
+        }
     }
     json!({ "id": id })
 }
@@ -1742,7 +1753,7 @@ fn screen_json(s: &Value) -> Value {
                 "route_file": route,
                 "url_from": nav["urlFrom"],
             });
-            keep(&mut out["dispatch"], nav, &["types"]);
+            keep(&mut out["dispatch"], nav, &["types", "loader"]);
         }
     }
     out
@@ -2216,6 +2227,9 @@ pub fn impact(graph: &Value, target: &str) -> Option<Value> {
     let only_endpoints = matches!(t, Target::Endpoints(_));
     let inside = |id: &str| -> bool {
         if let Some(p) = id.strip_prefix("f:") {
+            return paths.contains(p);
+        }
+        if let Some((p, _)) = id.strip_prefix("s:").and_then(|x| x.rsplit_once('#')) {
             return paths.contains(p);
         }
         if let Some(n) = id.strip_prefix("n:") {

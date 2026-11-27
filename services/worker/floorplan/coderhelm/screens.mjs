@@ -100,7 +100,8 @@ export function detect(root, repos, { screens = [] } = {}) {
       // gives its type (route = null when only the route's own pattern is known), and where the
       // dispatch and the URL were read
       const r = run('dispatch', () => DISPATCH.detect(dir, { routes }));
-      for (const c of r?.dispatchers || []) for (const k of c.screens) add(repo, { fw: 'dispatch', url: k.url, target: k.file, name: k.name, kind: 'screen', nav: { navigator: c.route, group: 'dispatched', gate: null, route: k.urlFrom ? k.url : null, type: k.type, types: k.types, renderer: k.renderer, dispatcher: `${repo}/${c.file}`, urlFrom: k.urlFrom ? k.urlFrom.how : 'route', file: `${repo}/${k.file}`, line: k.line, also: [[`${repo}/${k.table.file}`, k.table.line, 0.9], ...(k.urlFrom ? [[`${repo}/${k.urlFrom.file}`, k.urlFrom.line, 0.85]] : [])] } });
+      // (and the resolver function that loads its content, when it has one of its own)
+      for (const c of r?.dispatchers || []) for (const k of c.screens) add(repo, { fw: 'dispatch', url: k.url, target: k.file, name: k.name, kind: 'screen', nav: { navigator: c.route, group: 'dispatched', gate: null, route: k.urlFrom ? k.url : null, type: k.type, types: k.types, renderer: k.renderer, dispatcher: `${repo}/${c.file}`, urlFrom: k.urlFrom ? k.urlFrom.how : 'route', loader: k.loader ? { file: `${repo}/${k.loader.file}`, symbol: k.loader.symbol, line: k.loader.line } : undefined, file: `${repo}/${k.file}`, line: k.line, also: [[`${repo}/${k.table.file}`, k.table.line, 0.9], ...(k.urlFrom ? [[`${repo}/${k.urlFrom.file}`, k.urlFrom.line, 0.85]] : []), ...(k.loader ? [[`${repo}/${k.loader.file}`, k.loader.line, 0.85]] : [])] } });
     }
     if (sig.flutter) {
       const r = run('flutter', () => FLUTTER.detect(dir));
@@ -194,8 +195,8 @@ export function mergeScreens({ graph, scan, root, found }) {
     s.source = 'coderhelm';
     s.nav = { app: h.repo, ...Object.fromEntries(Object.entries(nav).filter(([, v]) => v !== undefined)), evidence };
     if (s.nav.navigators && s.nav.navigators.length < 2) delete s.nav.navigators;
-    // what is behind a dispatched screen is what its renderer uses, not its whole file
-    if (h.fw === 'dispatch' && h.nav.renderer) { try { s.behind = focusedBehind(graph, root, s.file, h.nav.renderer); } catch { /* Floorplan's walk stays */ } }
+    // what is behind a dispatched screen is what its own branch renders and loads, not its whole file
+    if (h.fw === 'dispatch' && h.nav.renderer) { try { s.behind = focusedBehind(graph, root, s.file, h.nav.renderer, { loader: h.nav.loader, route: h.nav.dispatcher }); } catch { /* Floorplan's walk stays */ } }
     added.push(s);
   }
   graph.screens.push(...added);
@@ -249,110 +250,189 @@ function navEdges(graph, found, added) {
 }
 
 /**
- * What is behind one renderer of a file that holds several (a dispatched screen): the files its own
- * code uses (followed only through the names it uses, a few levels down), the requests made inside
- * those parts, the server code that handles them and the outside services they reach. Same items
- * and notes as Floorplan's own walk.
+ * What is behind one page of a file that holds several (a screen a route dispatches to by type):
+ * what its own branch renders and loads, nothing another type's branch does. From its renderer
+ * (and, when the resolver loads its content in a function of its own, from that loader): the
+ * files their code uses, followed only through the names it uses, a few levels down; the
+ * requests made inside those parts, the server code that handles them and the outside services
+ * they reach. The screen itself is its renderer's own symbol where the map lists it, so the page
+ * shows that renderer and not the file every type shares. Same item kinds and notes as
+ * Floorplan's own walk.
+ *
+ * @param opts.loader {file, symbol} the resolver's function for this type, or null
+ * @param opts.route  the route file that picks the page by its type, or null
  */
-export function focusedBehind(graph, root, file, symbol, { depth = 3, cap = 60 } = {}) {
+export function focusedBehind(graph, root, file, symbol, { depth = 3, cap = 60, loader = null, route = null } = {}) {
   const files = new Map(graph.files.map((f) => [f.p, f]));
   const routes = graph.routes || [];
   const outLinks = new Map();
   for (const l of graph.links || []) { if (!outLinks.has(l.a)) outLinks.set(l.a, []); outLinks.get(l.a).push(l); }
   const lines = new Map();
   const linesOf = (p) => { if (!lines.has(p)) { const t = read(root, p); lines.set(p, t == null ? null : t.split('\n')); } return lines.get(p); };
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  /** The lines of each focused name: a symbol the map lists runs to the next one it lists; any other, from its declaration to the next top-level line. */
   const rangesOf = (p, focus) => {
     if (!focus) return null;
     const s = (files.get(p)?.s || []).map((x) => ({ name: x[0], line: x[2] })).sort((a, b) => a.line - b.line);
-    const n = linesOf(p)?.length || 0;
+    const ls = linesOf(p) || [];
     const rs = [];
-    s.forEach((x, i) => { if (focus.has(x.name)) rs.push([x.line, (s[i + 1]?.line || n + 1) - 1]); });
-    if (!rs.length) {
-      // a symbol Floorplan does not list: from its declaration to the next top-level line
-      const ls = linesOf(p) || [];
-      for (const name of focus) {
-        const at = ls.findIndex((l) => new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function|const|let|var|class)\\s*\\*?\\s*${name.replace(/\$/g, '\\$')}\\b`).test(l));
-        if (at < 0) continue;
-        let end = at + 1;
-        while (end < ls.length && !/^(?:export\s|function\s|const\s|let\s|var\s|class\s|async\s)/.test(ls[end])) end++;
-        rs.push([at + 1, end]);
-      }
+    for (const name of focus) {
+      const i = s.findIndex((x) => x.name === name);
+      if (i >= 0) { rs.push([s[i].line, (s.slice(i + 1).find((x) => x.line > s[i].line)?.line || ls.length + 1) - 1]); continue; }
+      const at = ls.findIndex((l) => new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function|const|let|var|class)\\s*\\*?\\s*${esc(name)}\\b`).test(l));
+      if (at < 0) continue;
+      let end = at + 1;
+      while (end < ls.length && !/^(?:export\s|function\s|const\s|let\s|var\s|class\s|async\s)/.test(ls[end])) end++;
+      rs.push([at + 1, end]);
     }
     return rs.length ? rs : null;
   };
   const textOf = (p, rs) => { const ls = linesOf(p); if (!ls) return ''; return rs ? rs.map(([a, b]) => ls.slice(a - 1, b).join('\n')).join('\n') : ls.join('\n'); };
   const inRanges = (line, rs) => !rs || rs.some(([a, b]) => line >= a && line <= b);
-  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const stem = (p) => { const b = path.posix.basename(p).replace(/\.[^.]+$/, ''); return b === 'index' ? path.posix.basename(path.posix.dirname(p)) : b; };
-
-  const seen = new Map([[file, { d: 0, focus: new Set([symbol]), parent: null }]]);
-  const queue = [file];
-  while (queue.length) {
-    const p = queue.shift();
-    const v = seen.get(p);
-    if (v.d >= depth) continue;
-    const rs = rangesOf(p, v.focus);
-    const text = textOf(p, rs);
-    const whole = v.focus ? textOf(p, null) : text;
-    for (const l of outLinks.get('f:' + p) || []) {
-      if (l.k !== 'import' || !l.b.startsWith('f:')) continue;
-      const to = l.b.slice(2);
-      if (!files.has(to) || isTest(to) || to === file) continue;
-      const names = (l.names || []).filter((n) => n !== 'default' && n !== '*');
-      let used = names.filter((n) => new RegExp(`(^|[^\\w$.])${esc(n)}\\b`).test(text));
-      let focus = used.length ? new Set(used) : null;
-      if (!used.length) {
-        // a default or namespace import: the local name it is imported as, used in the text
-        const st = esc(stem(to));
-        const alias = [...whole.matchAll(new RegExp(`import\\s+(?:\\*\\s+as\\s+)?([A-Za-z_$][\\w$]*)[^;]*?from\\s*["'][^"']*${st}(?:\\.\\w+)?["']`, 'g'))].map((m) => m[1]);
-        if (!alias.some((a) => new RegExp(`\\b${esc(a)}\\b`).test(text))) continue;
-        focus = null;
-      }
-      const had = seen.get(to);
-      if (had) {
-        if (had.focus && (!focus || [...focus].some((n) => !had.focus.has(n)))) { had.focus = focus ? new Set([...had.focus, ...focus]) : null; queue.push(to); }
-        continue;
-      }
-      if (seen.size >= cap) continue;
-      seen.set(to, { d: v.d + 1, focus, parent: p });
-      queue.push(to);
+  /** Names a file imports only as types (`import type { A }`, `{ type B }`): using them runs nothing. */
+  const typeOnly = new Map();
+  const typeNames = (p) => {
+    if (typeOnly.has(p)) return typeOnly.get(p);
+    const out = new Set();
+    const t = (linesOf(p) || []).join('\n');
+    for (const m of t.matchAll(/\bimport\s+type\s+(?:\{([^}]*)\}|([A-Za-z_$][\w$]*))/g)) for (const n of (m[1] || m[2]).split(',')) { const x = n.trim().split(/\s+as\s+/).pop(); if (x) out.add(x); }
+    for (const m of t.matchAll(/\bimport\s*\{([^}]*)\}\s*from/g)) for (const n of m[1].split(',')) { const x = /^\s*type\s+([\w$]+)(?:\s+as\s+([\w$]+))?/.exec(n); if (x) out.add(x[2] || x[1]); }
+    typeOnly.set(p, out);
+    return out;
+  };
+  /** A file's top-level declarations, by name. */
+  const decls = new Map();
+  const declsOf = (p) => {
+    if (!decls.has(p)) decls.set(p, [...new Set((linesOf(p) || []).map((l) => /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|const\s+|let\s+|var\s+|class\s+)([A-Za-z_$][\w$]*)/.exec(l)?.[1]).filter(Boolean))]);
+    return decls.get(p);
+  };
+  /** Focused names and the file's own top-level code they call (a renderer's local helper, a
+   *  loader's shared fetch function), until nothing new is called. */
+  const expand = (p, focus) => {
+    if (!focus) return null;
+    const out = new Set(focus);
+    for (let k = 0; k < 8; k++) {
+      const text = textOf(p, rangesOf(p, out));
+      const more = declsOf(p).filter((d) => !out.has(d) && new RegExp(`(^|[^\\w$.])${esc(d)}\\b`).test(text));
+      if (!more.length) break;
+      for (const d of more) out.add(d);
     }
-  }
+    return out;
+  };
+  /** The files a start's code reaches: path to {d, focus, parent, at (where the start's text first names it)}. */
+  const walk = (start, startSymbol) => {
+    const seen = new Map([[start, { d: 0, focus: new Set([startSymbol]), parent: null, at: 0 }]]);
+    const queue = [start];
+    while (queue.length) {
+      const p = queue.shift();
+      const v = seen.get(p);
+      v.focus = expand(p, v.focus);
+      if (v.d >= depth) continue;
+      const text = textOf(p, rangesOf(p, v.focus));
+      const whole = v.focus ? textOf(p, null) : text;
+      const types = typeNames(p);
+      for (const l of outLinks.get('f:' + p) || []) {
+        if (l.k !== 'import' || !l.b.startsWith('f:')) continue;
+        const to = l.b.slice(2);
+        if (!files.has(to) || isTest(to) || to === start) continue;
+        const names = (l.names || []).filter((n) => n !== 'default' && n !== '*' && !types.has(n));
+        const hit = (n) => new RegExp(`(^|[^\\w$.])${esc(n)}\\b`).exec(text);
+        let used = names.filter((n) => hit(n));
+        let focus = used.length ? new Set(used) : null;
+        let at = used.length ? Math.min(...used.map((n) => hit(n).index)) : -1;
+        if (!used.length) {
+          // a default or namespace import: the local name it is imported as, used in the text
+          const st = esc(stem(to));
+          const alias = [...whole.matchAll(new RegExp(`import\\s+(?!type\\b)(?:\\*\\s+as\\s+)?([A-Za-z_$][\\w$]*)[^;]*?from\\s*["'][^"']*${st}(?:\\.\\w+)?["']`, 'g'))].map((m) => m[1]);
+          const a = alias.map((x) => new RegExp(`\\b${esc(x)}\\b`).exec(text)).filter(Boolean);
+          if (!a.length) continue;
+          focus = null;
+          at = Math.min(...a.map((m) => m.index));
+        }
+        const had = seen.get(to);
+        if (had) {
+          if (had.focus && (!focus || [...focus].some((n) => !had.focus.has(n)))) { had.focus = focus ? new Set([...had.focus, ...focus]) : null; queue.push(to); }
+          continue;
+        }
+        if (seen.size >= cap) continue;
+        seen.set(to, { d: v.d + 1, focus, parent: p, at: v.d === 0 ? at : v.at });
+        queue.push(to);
+      }
+    }
+    return seen;
+  };
+  const symRef = (p, name) => { const i = (files.get(p)?.s || []).findIndex((x) => x[0] === name); return i >= 0 ? `s:${p}#${i}` : null; };
   const nameOf = (p) => files.get(p)?.name || stem(p);
-  const items = [{ id: 'f:' + file, note: 'The screen itself', kind: 'screen' }];
+  const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   // shared building blocks (a UI kit, type files, helpers half the app imports) are not this screen's parts
   const indeg = new Map();
   for (const l of graph.links || []) if (l.k === 'import' && l.b.startsWith('f:')) indeg.set(l.b, (indeg.get(l.b) || 0) + 1);
   const appFiles = graph.files.filter((f) => f.n === files.get(file)?.n).length;
   const noise = (p) => /(^|\/)(ui|icons?|primitives|types?)\//i.test(p) || /\.(d|types?)\.[jt]sx?$|(^|\/)(types?|utils?|constants?)\.[jt]sx?$/i.test(p) || (indeg.get('f:' + p) || 0) >= Math.max(6, Math.round(appFiles * 0.05));
-  const parts = [...seen.entries()].filter(([p]) => p !== file && !noise(p))
-    .sort((a, b) => a[1].d - b[1].d || (files.get(b[0])?.loc || 0) - (files.get(a[0])?.loc || 0));
-  for (const [p, v] of parts.slice(0, 4)) {
+  const partNote = (p, v, own) => {
     const b = path.posix.basename(p);
     const http = (outLinks.get('f:' + p) || []).some((l) => l.k === 'http');
-    const note = /^use[A-Z]/.test(b) || /(^|\/)hooks?\//.test(p) ? 'Logic this screen uses'
-      : /^[a-z]/.test(b) && /\.(ts|js|mjs)$/.test(b) ? (http ? 'Talks to the server for this screen' : 'Helper code this screen uses')
+    return /^use[A-Z]/.test(b) || /(^|\/)hooks?\//.test(p) ? 'Logic this screen uses'
+      : /^[a-z]/.test(b) && /\.(ts|js|mjs)$/.test(b) ? (http ? 'Talks to the server for this screen' : own)
         : v.d <= 1 ? 'A component on this screen' : `Part of ${nameOf(v.parent)}`;
-    items.push({ id: 'f:' + p, note, kind: 'part' });
+  };
+
+  const shown = new Set();
+  const items = [];
+  const push = (id, note, kind) => { if (!id || shown.has(id)) return; shown.add(id); items.push({ id, note, kind }); };
+  push(symRef(file, symbol) || 'f:' + file, 'The screen itself', 'screen');
+  shown.add('f:' + file);
+  // what its branch renders: the parts its renderer uses, in the order it uses them
+  const drawn = walk(file, symbol);
+  const parts = [...drawn.entries()].filter(([p]) => p !== file && !noise(p))
+    .sort((a, b) => a[1].d - b[1].d || a[1].at - b[1].at || (files.get(b[0])?.loc || 0) - (files.get(a[0])?.loc || 0));
+  // the queries a part runs for this page, by name where the map lists them (a shared query file is one card per query)
+  const QUERY = /quer(y|ies)|gql|sql/i;
+  const queriesOf = (p, v) => (/\.(tsx|jsx|vue|svelte)$/.test(p) ? [] : [...(v.focus || [])].filter((x) => QUERY.test(x)).map((x) => symRef(p, x)).filter(Boolean));
+  let np = 0;
+  for (const [p, v] of parts) {
+    if (np >= (loader ? 5 : 6)) break;
+    const qs = queriesOf(p, v);
+    if (qs.length) for (const q of qs.slice(0, 2)) push(q, 'What this page asks for', 'part');
+    else push('f:' + p, partNote(p, v, 'Helper code this screen uses'), 'part');
+    np++;
   }
+  // what it loads: the resolver's function for this type, and what that reaches
+  const loaded = loader && files.has(loader.file) ? walk(loader.file, loader.symbol) : new Map();
+  if (loaded.size) {
+    push(symRef(loader.file, loader.symbol) || 'f:' + loader.file, 'Loads what this page shows', 'part');
+    shown.add('f:' + loader.file);
+    // the queries it runs, and the code that sends them to an outside service (a content store's client)
+    let n = 0;
+    for (const [p, v] of [...loaded.entries()].filter(([p]) => p !== loader.file && !noise(p)).sort((a, b) => a[1].d - b[1].d || a[1].at - b[1].at)) {
+      if (n >= 3) break;
+      const qs = queriesOf(p, v);
+      if (qs.length) { for (const q of qs.slice(0, 2)) push(q, 'What this page asks for', 'part'); n++; continue; }
+      const ext = (outLinks.get('f:' + p) || []).find((l) => l.b.startsWith('n:') && nodes.get(l.b.slice(2))?.kind === 'external');
+      if (ext) { push('f:' + p, `Fetches this page's content from ${nodes.get(ext.b.slice(2)).label}`, 'part'); n++; }
+    }
+  }
+  if (route && files.has(route) && route !== file) push('f:' + route, 'The route that picks this page by its type', 'part');
   const reqs = [];
   const exts = new Map();
-  for (const [p, v] of [...seen.entries()].sort((a, b) => a[1].d - b[1].d)) {
-    const rs = rangesOf(p, v.focus);
-    for (const l of outLinks.get('f:' + p) || []) {
-      if (l.k === 'http') for (const [ri, line] of l.calls || []) { if (ri != null && routes[ri] && inRanges(line, rs) && !reqs.includes(ri)) reqs.push(ri); }
-      if (l.b.startsWith('n:') && !exts.has(l.b)) exts.set(l.b, p);
+  for (const seen of [drawn, loaded]) {
+    for (const [p, v] of [...seen.entries()].sort((a, b) => a[1].d - b[1].d)) {
+      const rs = rangesOf(p, v.focus);
+      for (const l of outLinks.get('f:' + p) || []) {
+        if (l.k === 'http') for (const [ri, line] of l.calls || []) { if (ri != null && routes[ri] && inRanges(line, rs) && !reqs.includes(ri)) reqs.push(ri); }
+        if (l.b.startsWith('n:') && !exts.has(l.b)) exts.set(l.b, p);
+      }
     }
   }
   const routeName = (r) => String(r.name || `${r.m || ''} ${r.p || ''}`).trim();
-  for (const ri of reqs.slice(0, 6)) items.push({ id: 'r:' + ri, note: `Asks the server for ${routeName(routes[ri]).replace(/^./, (c) => c.toLowerCase())}`, kind: 'request' });
+  for (const ri of reqs.slice(0, 6)) push('r:' + ri, `Asks the server for ${routeName(routes[ri]).replace(/^./, (c) => c.toLowerCase())}`, 'request');
   const servers = new Map();
   for (const ri of reqs.slice(0, 6)) { const f = routes[ri].f; if (f && files.has(f) && !servers.has(f)) servers.set(f, routeName(routes[ri])); }
   for (const [f, n] of [...servers].slice(0, 4)) {
-    items.push({ id: 'f:' + f, note: `Server code that handles ${n.replace(/^./, (c) => c.toLowerCase())}`, kind: 'server' });
+    push('f:' + f, `Server code that handles ${n.replace(/^./, (c) => c.toLowerCase())}`, 'server');
     for (const l of outLinks.get('f:' + f) || []) if (l.b.startsWith('n:') && !exts.has(l.b)) exts.set(l.b, f);
   }
-  const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
-  for (const [id, via] of [...exts].filter(([id]) => nodes.get(id.slice(2))?.kind === 'external').slice(0, 3)) items.push({ id, note: `Outside service, used by ${nameOf(via)}`, kind: 'outside' });
+  for (const [id, via] of [...exts].filter(([id]) => nodes.get(id.slice(2))?.kind === 'external').slice(0, 3)) push(id, `Outside service, used by ${nameOf(via)}`, 'outside');
   return items;
 }

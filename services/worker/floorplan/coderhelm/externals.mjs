@@ -146,6 +146,9 @@ export function ownTokens(root, repos, extra = []) {
   return toks;
 }
 
+/** A file that makes an SDK's client (createClient(...), new ExampleClient(...)). */
+const CLIENT_RE = /\b(?:create\w*Client|new\s+[A-Z]\w*(?:Client|Sdk|SDK|Api|API)\b|initializeApp)\s*\(/;
+
 /**
  * @param root   the map root (one folder per repository)
  * @param repos  repository folder names
@@ -264,7 +267,11 @@ export function findServices(root, repos, { scan = null, own = [] } = {}) {
   }
   const services = {}, otherHosts = [];
   for (const [k, n] of nodes) {
-    const evidence = [...new Map(n.evidence.filter(([f]) => f && !isTest(f)).map(([f, l]) => [`${f}:${l}`, [f, l]])).values()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1])).slice(0, 12);
+    // the code that uses it before manifests and env files (the links to it are made from the first
+    // ones), and among the code the files that make its client first: a large app lists more
+    // manifest and env lines than are kept, and the client that fetches would get no link
+    const rank = ([f]) => (CODE_EXT.has(path.extname(f)) ? (CLIENT_RE.test(read(root, f) || '') ? 0 : 1) : 2);
+    const evidence = [...new Map(n.evidence.filter(([f]) => f && !isTest(f)).map(([f, l]) => [`${f}:${l}`, [f, l]])).values()].map((e) => [...e, rank(e)]).sort((a, b) => a[2] - b[2] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1])).slice(0, 12).map(([f, l]) => [f, l]);
     if (!evidence.length) continue;
     if (k.startsWith('host:')) { otherHosts.push({ host: k.slice(5), hosts: [...n.hosts].sort().slice(0, 8), evidence: evidence.slice(0, 4).map(([f, l]) => ev(f, l, 'inferred', 0.2)) }); continue; }
     const cat = CATALOG[k];

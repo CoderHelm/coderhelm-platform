@@ -394,8 +394,62 @@ test('dispatch: a catch-all over 32 types is 32 screens on the map, each its own
   const first = added.find((s) => s.nav.type === 'kind-a');
   assert.deepEqual([first.url, first.kind, first.file, first.nav.route, first.nav.renderer], ['/first', 'screen', 'web/lib/renderers.tsx', '/first', 'KindARenderer']);
   assert.deepEqual(first.nav.evidence.map((e) => [e.file, e.line]), [['web/lib/renderers.tsx', 2], ['web/app/[...slug]/page.tsx', 4], ['web/lib/resolve.ts', 2]]);
-  assert.deepEqual(first.behind.map((b) => b.id), ['f:web/lib/renderers.tsx', 'f:web/components/Part0.tsx']);
+  assert.deepEqual(first.behind.map((b) => b.id), ['s:web/lib/renderers.tsx#0', 'f:web/components/Part0.tsx', 'f:web/app/[...slug]/page.tsx']);
   const last = added.find((s) => s.nav.type === types[31]);
-  assert.deepEqual(last.behind.map((b) => b.id), ['f:web/lib/renderers.tsx', 'f:web/components/Part31.tsx']);
+  assert.deepEqual(last.behind.map((b) => b.id), ['s:web/lib/renderers.tsx#31', 'f:web/components/Part31.tsx', 'f:web/app/[...slug]/page.tsx']);
   assert.equal(last.url, `/(${types[31]})/*`);
+});
+
+test('outside services: the code that makes the client comes before manifests and env files, so it gets the link', () => {
+  // more manifest and env lines than the 12 places kept, all sorted before the code by path
+  const env = Array.from({ length: 14 }, (_, i) => `CONTENTFUL_KEY_${String.fromCharCode(65 + i)}=x`).join('\n');
+  const root = tree({
+    'site/package.json': JSON.stringify({ dependencies: { contentful: '10.15.0' } }),
+    'site/.env.example': env + '\n',
+    'site/src/cms/client.ts': "import { createClient } from 'contentful';\nexport const cms = createClient({ space: 'a', accessToken: 'b' });\n",
+    'site/src/cms/types.ts': "import type { Entry } from 'contentful';\nexport type Doc = Entry;\n",
+  });
+  const { services } = findServices(root, ['site']);
+  const files = services.contentful.evidence.map((e) => e.file);
+  assert.equal(files.length, 12);
+  assert.deepEqual(files.slice(0, 2), ['site/src/cms/client.ts', 'site/src/cms/types.ts']);
+});
+
+test('dispatch: each type names the resolver function that loads it, and icons a switch picks are not pages', () => {
+  const root = tree({
+    'web/app/[...slug]/page.tsx': `import { resolve } from '../../lib/resolve';
+import { ParkView, LakeView, TrailView } from '../../lib/views';
+const views = { park: ParkView, lake: LakeView, trail: TrailView };
+export default async function P({ params }) { const doc = await resolve(params.slug); const V = views[doc.kind]; return <V doc={doc} />; }
+`,
+    'web/lib/views.tsx': 'export function ParkView() { return null; }\nexport function LakeView() { return null; }\nexport function TrailView() { return null; }\n',
+    'web/lib/resolve.ts': `export const KINDS = { PARK: 'park', LAKE: 'lake' } as const;
+const fetchPark = async (slug) => ({ kind: KINDS.PARK, slug });
+const fetchLake = async (slug) => ({ kind: KINDS.LAKE, slug });
+const fetchTrail = async (slug) => ({ kind: 'trail', slug });
+// keyed by the content store's own names, not the views'
+const FETCHERS = { parkPage: fetchPark, lakeDoc: fetchLake, trail: fetchTrail };
+export async function resolve(parts) { const docType = parts[0]; return FETCHERS[docType](parts.join('/')); }
+`,
+    'web/components/SkyBadge.tsx': `import { SunIcon, MoonIcon } from './icons';
+export function SkyBadge({ type }) {
+  switch (type) {
+    case 'day':
+      return <SunIcon />;
+    case 'night':
+      return <MoonIcon />;
+  }
+}
+`,
+    'web/components/icons.tsx': 'export const SunIcon = () => null;\nexport const MoonIcon = () => null;\n',
+  });
+  const d = only(DISPATCH.detect(root), 'web/app/[...slug]/page.tsx');
+  assert.deepEqual(d.screens.map((k) => [k.type, k.renderer, k.loader?.symbol, k.loader?.file]), [
+    ['park', 'ParkView', 'fetchPark', 'web/lib/resolve.ts'],
+    ['lake', 'LakeView', 'fetchLake', 'web/lib/resolve.ts'],
+    ['trail', 'TrailView', 'fetchTrail', 'web/lib/resolve.ts'],
+  ]);
+  assert.deepEqual(d.screens[0].loader, { file: 'web/lib/resolve.ts', line: 2, symbol: 'fetchPark', table: { file: 'web/lib/resolve.ts', line: 6 } });
+  const icons = DISPATCH.detect(tree({ 'web/app/sky/[time]/page.tsx': "import { SkyBadge } from '../../../components/SkyBadge';\nexport default function P({ params }) { return <SkyBadge type={params.time} />; }\n", 'web/components/SkyBadge.tsx': 'import { SunIcon, MoonIcon } from "./icons";\nexport function SkyBadge({ type }) {\n  switch (type) {\n    case "day":\n      return <SunIcon />;\n    case "night":\n      return <MoonIcon />;\n  }\n}\n', 'web/components/icons.tsx': 'export const SunIcon = () => null;\nexport const MoonIcon = () => null;\n' }));
+  assert.deepEqual(icons.dispatchers.flatMap((x) => x.screens), []);
 });
