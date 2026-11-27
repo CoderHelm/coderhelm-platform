@@ -1,5 +1,6 @@
 """Tests for auto_release.py. Run: python3 -m unittest discover -s .github/scripts"""
 
+import json
 import os
 import subprocess
 import sys
@@ -164,31 +165,87 @@ def beta(tag, hours=30, attested=True, draft=False, commit=None):
             "draft": draft, "attested": attested}
 
 
-def promote(betas, tags=None, stables=("v0.8.37",), blockers=(), version=None):
+def report(watch="healthy", runs=2, answers=1, chat=True):
+    return {"watch": watch, "runs": runs, "answers": answers, "chat": chat}
+
+
+def proven(*tags):
+    """Evidence: one live install that ran and answered on each of these betas."""
+    return {t: [report()] for t in tags}
+
+
+def promote(betas, tags=None, stables=("v0.8.37",), blockers=(), version=None, evidence=None):
     names = list(tags if tags is not None else list(stables) + [b["tag"] for b in betas])
-    return ar.plan_promote(betas, names, list(stables), NOW, None if blockers is None else list(blockers), version)
+    if evidence is None:
+        evidence = proven(*[b["tag"] for b in betas])
+    return ar.plan_promote(betas, names, list(stables), None if blockers is None else list(blockers),
+                           None if evidence == "unreadable" else evidence, version)
+
+
+B38, B39, B40 = "v0.8.38-beta.20261104", "v0.8.39-beta.20261105", "v0.8.40-beta.20261106"
 
 
 class Promote(unittest.TestCase):
-    def test_the_beta_out_for_a_day_becomes_stable(self):
-        r = promote([beta("v0.8.38-beta.20261105", hours=25)])
-        self.assertEqual((r["skip"], r["tag"], r["beta"]), (False, "v0.8.38", "v0.8.38-beta.20261105"))
+    def test_a_beta_proven_on_a_live_install_becomes_stable_whatever_its_age(self):
+        for hours in (1, 30):
+            r = promote([beta(B38, hours=hours)])
+            self.assertEqual((r["skip"], r["tag"], r["beta"]), (False, "v0.8.38", B38))
+            self.assertEqual((r["proof"]["ready"], r["proof"]["runs"], r["proof"]["answers"]), (1, 2, 1))
 
-    def test_too_young_waits(self):
-        r = promote([beta("v0.8.38-beta.20261105", hours=23)])
+    def test_age_alone_never_promotes(self):
+        # The old rule: out for a day, no issue filed. A beta no install ever ran stays a beta.
+        r = promote([beta(B38, hours=500)], evidence={})
         self.assertTrue(r["skip"])
-        self.assertIn("out for 23h of the 24h", r["reason"])
+        self.assertIn("no live install has reported it installed", r["reason"])
 
-    def test_the_newest_ready_beta_wins_and_a_young_newer_one_stays_beta(self):
-        r = promote([beta("v0.8.38-beta.20261104", hours=50), beta("v0.8.39-beta.20261105", hours=25), beta("v0.8.40-beta.20261106", hours=1)])
-        self.assertEqual((r["tag"], r["beta"]), ("v0.8.39", "v0.8.39-beta.20261105"))
-        self.assertIn("v0.8.40-beta.20261106: out for 1h", r["reason"])
+    def test_each_blocking_condition(self):
+        cases = [
+            ({B38: [report(watch="rolled_back", runs=0, answers=0)]}, "1 install(s) rolled it back"),
+            ({B38: [report(), report(watch="rolled_back")]}, "a regression was found in it"),
+            ({B38: [report(watch="watching")]}, "no install's post-update watch has ended healthy"),
+            ({B38: [report(runs=0)]}, "no run has finished on it yet"),
+            ({B38: [report(answers=0)]}, "no Chat answer has finished on it"),
+            ("unreadable", "release reports couldn't be read"),
+        ]
+        for ev, why in cases:
+            r = promote([beta(B38)], evidence=ev)
+            self.assertTrue(r["skip"], why)
+            self.assertIn(why, r["reason"])
+        # Chat is asked of an install only when that install uses Chat.
+        r = promote([beta(B38)], evidence={B38: [report(answers=0, chat=False)]})
+        self.assertFalse(r["skip"])
+        # One install has to show all of it: one healthy with no run and another that ran but rolled back is not proof.
+        r = promote([beta(B38)], evidence={B38: [report(runs=0, answers=0, chat=False), report(watch="watching", runs=5)]})
+        self.assertTrue(r["skip"])
+
+    def test_the_newest_proven_beta_wins_and_an_unproven_newer_one_stays_beta(self):
+        b = [beta(B38), beta(B39), beta(B40, hours=1)]
+        r = promote(b, evidence=proven(B38, B39))
+        self.assertEqual((r["tag"], r["beta"]), ("v0.8.39", B39))
+        self.assertIn(B40 + ": no live install has reported it installed", r["reason"])
+        # Once the newest is proven, it goes, young as it is.
+        self.assertEqual(promote(b)["tag"], "v0.8.40")
+
+    def test_a_regression_found_in_a_beta_promotes_the_newer_beta_that_fixes_it_never_the_broken_one(self):
+        # An older beta looked fine for a day (its watch was healthy, runs finished) but Chat broke on it:
+        # the install that uses Chat never answered on it. The newer beta carries the fix and answered.
+        ev = {B38: [report(answers=0)], B39: [report()]}
+        r = promote([beta(B38, hours=40), beta(B39, hours=2)], evidence=ev)
+        self.assertEqual(r["beta"], B39)
+        # Before the fix is proven, the broken one is not promoted in its place.
+        r = promote([beta(B38, hours=40), beta(B39, hours=2)], evidence={B38: [report(answers=0)]})
+        self.assertTrue(r["skip"])
+        self.assertIn(B38 + ": installed and healthy with runs, but no Chat answer", r["reason"])
+        # A rolled back or reported beta is never promoted, even with proof from another install.
+        ev = {B38: [report(), report(watch="rolled_back")], B39: [report(runs=0)]}
+        self.assertTrue(promote([beta(B38), beta(B39)], evidence=ev)["skip"])
 
     def test_a_reported_problem_holds_it(self):
-        b = [beta("v0.8.38-beta.20261104", hours=50), beta("v0.8.39-beta.20261105", hours=25)]
+        b = [beta(B38, hours=50), beta(B39, hours=25)]
         for text in ("Update to v0.8.39-beta.20261105 rolled back", "v0.8.39 fails to apply"):
             r = promote(b, blockers=[{"number": 12, "text": text}])
             self.assertEqual(r["tag"], "v0.8.38", "the older clean beta instead")
+            self.assertIn("a regression was found in it: issue #12", r["reason"])
         r = promote(b, blockers=[{"number": 12, "text": "v0.8.390 is unrelated, and v0.8.3"}])
         self.assertEqual(r["tag"], "v0.8.39")
         r = promote(b, blockers=None)
@@ -197,7 +254,7 @@ class Promote(unittest.TestCase):
 
     def test_never_behind_a_stable_release(self):
         # An urgent v0.8.40 went out: the older betas can't become stable any more.
-        r = promote([beta("v0.8.38-beta.20261104", hours=50), beta("v0.8.39-beta.20261105", hours=25)], stables=("v0.8.37", "v0.8.40"))
+        r = promote([beta(B38, hours=50), beta(B39, hours=25)], stables=("v0.8.37", "v0.8.40"))
         self.assertTrue(r["skip"])
         self.assertIn("v0.8.40 is out", r["reason"])
         r = promote([beta("v0.8.38-beta.20261105")], stables=("v0.8.37", "v0.8.38"))
@@ -212,18 +269,43 @@ class Promote(unittest.TestCase):
         self.assertIn("isn't published", promote([beta("v0.8.38-beta.20261105", hours=None)])["reason"])
         self.assertIn("none on main", promote([])["reason"])
 
-    def test_by_hand(self):
-        b = [beta("v0.8.38-beta.20261104", hours=50), beta("v0.8.39-beta.20261105", hours=1)]
-        for v in ("v0.8.39-beta.20261105", "v0.8.39"):
+    def test_by_hand_needs_the_same_evidence(self):
+        b = [beta(B38, hours=50), beta(B39, hours=1)]
+        for v in (B39, "v0.8.39"):
             r = promote(b, version=v)
-            self.assertEqual((r["skip"], r["tag"]), (False, "v0.8.39"), "an urgent fix doesn't wait the day")
-        r = promote(b, version="v0.8.38")
-        self.assertEqual(r["tag"], "v0.8.38")
+            self.assertEqual((r["skip"], r["tag"]), (False, "v0.8.39"))
+        self.assertEqual(promote(b, version="v0.8.38")["tag"], "v0.8.38")
         r = promote(b, version="v0.8.41")
         self.assertTrue(r["skip"] and r["error"])
         r = promote(b, version="v0.8.39", blockers=[{"number": 3, "text": "v0.8.39"}])
         self.assertTrue(r["error"])
         self.assertIn("issue #3", r["reason"])
+        r = promote(b, version="v0.8.39", evidence=proven(B38))
+        self.assertTrue(r["error"])
+        self.assertIn("no live install has reported it installed", r["reason"])
+
+    def test_the_evidence_as_the_workflow_reads_it(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "evidence.json")
+        item = lambda v, w, runs, answers, chat: {"pk": {"S": "RELEASE_EVIDENCE"}, "sk": {"S": v + "#i"}, "version": {"S": v},  # noqa: E731
+                                                  "watch": {"S": w}, "runs": {"N": str(runs)}, "answers": {"N": str(answers)},
+                                                  "chat": {"BOOL": chat}}
+        with open(path, "w") as f:
+            json.dump({"Items": [item(B38, "healthy", 3, 0, False), item(B38, "rolled_back", 0, 0, True), item("junk", "healthy", 1, 1, True)]}, f)
+        ev = ar.read_evidence(path)
+        self.assertEqual(ev, {B38: [report(runs=3, answers=0, chat=False), report(watch="rolled_back", runs=0, answers=0, chat=True)]})
+        self.assertIsNone(ar.read_evidence(os.path.join(d, "missing.json")), "no file: nothing is promoted")
+        with open(path, "w") as f:
+            f.write("not json")
+        self.assertIsNone(ar.read_evidence(path))
+        self.assertIsNone(ar.read_evidence(""))
+
+    def test_the_notes_carry_the_evidence(self):
+        p = ar.proof([report(runs=4, answers=2), report(runs=0, answers=0, chat=False)])
+        n = ar.evidence_notes(B39, p)
+        self.assertIn("Promoted from %s on evidence from live installs" % B39, n)
+        self.assertIn("2 install(s) reported it installed with a healthy post-update watch, 1 of them", n)
+        self.assertIn("(4 run(s) and 2 Chat answer(s))", n)
 
 
 class Notes(unittest.TestCase):
@@ -288,10 +370,60 @@ class Wiring(unittest.TestCase):
         self.assertEqual(sign["if"], "matrix.kind != 'promote'")
         self.assertIn("CODERHELM STABLE ATTESTATION", tag)
         self.assertIn("compare/$COMMIT...main", tag)
-        # The promotion runs hours after the nightly beta, so last night's beta is a full day old by then.
+        # The nightly beta, and the promotion's backstop.
         crons = [s["cron"] for s in on["schedule"]]
         self.assertEqual(crons, ["17 6 * * *", "17 10 * * *"])
         self.assertIn('[ "$SCHEDULE" = "17 10 * * *" ]; then mode=promote', guard)
+
+    def test_promotion_never_waits_on_the_schedule(self):
+        _, doc = self.load("auto-release.yml")
+        steps = doc["jobs"]["publish"]["steps"]
+        last = steps[-1]
+        # Every published beta starts the promotion right away; the 10:17 schedule is only a backstop.
+        self.assertEqual(last["if"], "matrix.kind == 'beta'")
+        self.assertIn("gh workflow run auto-release.yml", last["run"])
+        self.assertIn("-f mode=promote", last["run"])
+        self.assertIn("--ref main", last["run"])
+        self.assertEqual(doc["jobs"]["publish"]["permissions"]["actions"], "write")
+        # Twice is harmless: one at a time, and an existing stable tag is never re-cut.
+        self.assertEqual(doc["concurrency"]["cancel-in-progress"], False)
+        tag = doc["jobs"]["tag"]["steps"][0]["run"]
+        self.assertIn('a release tag is never re-cut or moved', tag)
+
+    def test_a_promotion_reads_the_installs_reports(self):
+        _, doc = self.load("auto-release.yml")
+        ev = doc["jobs"]["evidence"]
+        self.assertEqual(ev["environment"], "release-auto")
+        self.assertEqual(ev["permissions"], {"id-token": "write"})
+        self.assertIn("inputs.mode == 'promote'", ev["if"])
+        self.assertIn("github.event.schedule == '17 10 * * *'", ev["if"])
+        run = ev["steps"][-1]["run"]
+        self.assertIn('"RELEASE_EVIDENCE"', run)
+        self.assertNotIn("sk", run.split("--projection-expression")[1].split("\n")[0], "never the install ids")
+        self.assertTrue(any("release-evidence" in str(st.get("with", {}).get("role-to-assume", "")) for st in ev["steps"]))
+        plan = doc["jobs"]["plan"]
+        self.assertEqual(plan["needs"], "evidence")
+        self.assertEqual(plan["if"], "${{ !cancelled() }}")
+        step = next(st for st in plan["steps"] if st.get("id") == "plan")
+        self.assertEqual(step["env"]["REPORTS"], "${{ needs.evidence.outputs.reports }}")
+        self.assertIn("--evidence", step["run"])
+
+    def test_the_stable_tag_is_created_with_a_token_that_may_and_a_refusal_says_why(self):
+        _, doc = self.load("auto-release.yml")
+        steps = doc["jobs"]["tag"]["steps"]
+        app = next(st for st in steps if st.get("id") == "app")
+        self.assertTrue(app["uses"].startswith("actions/create-github-app-token@"))
+        self.assertEqual(app["with"]["permission-workflows"], "write")
+        self.assertEqual(app["with"]["permission-contents"], "write")
+        create = next(st for st in steps if st.get("name") == "Create the tag")
+        self.assertEqual(create["env"]["REF_TOKEN"], "${{ steps.app.outputs.token || github.token }}")
+        self.assertIn('GH_TOKEN="$REF_TOKEN" call "Creating refs/tags/$TAG"', create["run"])
+        self.assertIn("gh api -i", create["run"], "the refusal's headers (the permissions GitHub wanted) are printed")
+        # A tag the App created starts release.yml by its push: the publish waits for a run of either event.
+        start = next(st for st in steps if st.get("name") == "Start the release")
+        self.assertIn("Release started by the tag's push", start["run"])
+        wait = doc["jobs"]["publish"]["steps"][0]["run"]
+        self.assertNotIn("--event workflow_dispatch", wait)
 
     def test_the_stable_block_never_reads_as_the_release_attestation(self):
         # Installs find the release attestation by exact lines; a beta's second block must not match them.
@@ -348,11 +480,12 @@ class WithGit(unittest.TestCase):
             ar._release = lambda repo, tag: {"draft": False, "published_at": published[tag]}
             ar._blockers = lambda repo: []
             try:
-                now = ar.datetime(2026, 11, 6, 7, 0, tzinfo=ar.timezone.utc)
-                r = ar.git_promote("o/r", None, now)
+                ev = {"v0.7.0-beta.20261105": [report()]}
+                r = ar.git_promote("o/r", None, ev)
                 self.assertEqual((r["skip"], r["tag"], r["beta"], r["commit"], r["previous"]), (False, "v0.7.0", "v0.7.0-beta.20261105", code, "v0.6.0"))
-                r = ar.git_promote("o/r", None, now - ar.timedelta(hours=2))
+                r = ar.git_promote("o/r", None, {})
                 self.assertTrue(r["skip"])
+                self.assertIn("v0.7.0-beta.20261105: no live install has reported it installed", r["reason"])
                 self.assertIn("v0.6.1-beta.20261101: its tag carries no signed statement", r["reason"])
             finally:
                 ar._release, ar._blockers = real_release, real_blockers

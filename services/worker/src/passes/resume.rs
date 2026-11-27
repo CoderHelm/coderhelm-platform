@@ -9457,6 +9457,16 @@ async fn end_run(
     // The team's counters already have these tokens: each model call is
     // counted as it happens (common::usage).
     info!(run_id, status, "Run completed");
+    // One more finished run on the release this install runs (only the count:
+    // the release evidence stable promotion waits for, common::release_use).
+    if status == common::run_status::COMPLETED {
+        common::release_use::record(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            common::release_use::Done::Run,
+        )
+        .await;
+    }
     // The pull request's ready decision runs before this write: a hold it
     // recorded makes the finished run `needs_input`, never plain completed.
     if status == common::run_status::COMPLETED {

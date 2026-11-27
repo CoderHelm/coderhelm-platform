@@ -2842,8 +2842,18 @@ pub async fn brain_stream(
             put(&run.state, &run.team_id, &thread_sk(&thread.id), &thread).await
         }
         .await;
-        if let Err(e) = saved {
-            error!(error = %e, "Chat answer not saved");
+        match saved {
+            // One more Chat answer on the release this install runs (only
+            // the count: the release evidence, common::release_use).
+            Ok(_) => {
+                common::release_use::record(
+                    &run.state.dynamo,
+                    &run.state.config.settings_table_name,
+                    common::release_use::Done::Answer,
+                )
+                .await
+            }
+            Err(e) => error!(error = %e, "Chat answer not saved"),
         }
         if !run.kb_ids.is_empty() {
             use common::knowledge::usage;

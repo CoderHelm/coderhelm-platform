@@ -740,6 +740,41 @@ export class WorkerStack extends cdk.Stack {
         latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: latestKeys, conditions: { Null: { "s3:if-match": "false" } } }));
         new cdk.CfnOutput(this, "ReleaseLatestRoleArn", { value: latest.roleArn });
 
+        // Release evidence (services/gateway/src/routes/hybrid_release.rs):
+        // a promotion reads how each beta did on live installs before it
+        // makes one stable. auto-release.yml on main, in release-auto, may
+        // Query the one partition those reports live in, and nothing else
+        // in the table (no Scan, no GetItem, no other key).
+        const evidence = new iam.Role(this, "ReleaseEvidenceRole", {
+          roleName: `${prefix}-release-evidence`,
+          description: "auto-release.yml on main (release-auto): reads the RELEASE_EVIDENCE partition of the settings table, to promote a beta only on evidence from live installs",
+          maxSessionDuration: cdk.Duration.hours(1),
+          // The one way in: autoReleaseTrust's conditions, as the role's only trust statement.
+          assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
+            StringEquals: {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:environment:release-auto`,
+              "token.actions.githubusercontent.com:job_workflow_ref": `${RELEASE_REPO}/.github/workflows/auto-release.yml@refs/heads/main`,
+              "token.actions.githubusercontent.com:ref": "refs/heads/main",
+            },
+          }),
+        });
+        evidence.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ["dynamodb:Query"],
+            resources: [props.settingsTable.tableArn],
+            conditions: { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["RELEASE_EVIDENCE"] } },
+          }),
+        );
+        evidence.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ["kms:Decrypt"],
+            resources: [props.encryptionKey.keyArn],
+            conditions: { StringEquals: { "kms:ViaService": `dynamodb.${this.region}.amazonaws.com` } },
+          }),
+        );
+        new cdk.CfnOutput(this, "ReleaseEvidenceRoleArn", { value: evidence.roleArn });
+
         // The Jira app's release (jira-app-release.yml, main's copy, run on
         // main) publishes the production version it deployed as
         // launch/jira-app.json. The gateway reads it without credentials to

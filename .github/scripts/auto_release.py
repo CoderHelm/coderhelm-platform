@@ -2,7 +2,8 @@
 """Plans the automatic self-host releases (.github/workflows/auto-release.yml).
 
     python3 .github/scripts/auto_release.py plan --repo OWNER/NAME --mode MODE \\
-        [--commit SHA] [--version vX.Y.Z] --notes-dir DIR [--github-output "$GITHUB_OUTPUT"]
+        [--commit SHA] [--version vX.Y.Z] [--evidence FILE] --notes-dir DIR \\
+        [--github-output "$GITHUB_OUTPUT"]
 
 Run in a full clone of main (all tags fetched). Two update channels
 (docs/self-host/updates.md, "Channels"):
@@ -24,15 +25,30 @@ Modes:
   stable    the stable release for SHA, or a skip (the same reasons, counted
             from the last stable release);
   promote   the newest beta that is ready (below), as a stable release; with
-            --version (a beta tag, or the stable vX.Y.Z it would become), that
-            one beta, ready or not by age.
+            --version (a beta tag, or the stable vX.Y.Z it would become),
+            that one beta, and only when it is ready too.
 
-A beta is ready to promote when its GitHub release has been published for
-at least PROMOTE_AFTER_HOURS, no open issue labelled RELEASE_BLOCKER names it
-(or the stable version it would become), its stable version doesn't exist
-yet and sorts above every stable release, and its tag carries the stable
-statement. Only the open issues count as reports of a failed update or
-rollback: installs send nothing back to CoderHelm about their updates.
+A beta is ready to promote on evidence, never on age. Live installs whose
+admin turned the release report on tell CoderHelm how each release did
+there (services/gateway/src/routes/hybrid_release.rs): how the post-update
+watch ended, and how many runs and Chat answers finished on it. --evidence
+is those reports (a DynamoDB Query of the RELEASE_EVIDENCE partition, as the
+workflow reads it). A beta is ready when:
+
+  - one live install reports it installed with a healthy watch, at least
+    one finished run on it, and at least one Chat answer on it when that
+    install uses Chat;
+  - no regression was found in it: no install rolled it back, and no open
+    issue labelled RELEASE_BLOCKER names it (or the stable version it
+    would become);
+  - its stable version doesn't exist yet and sorts above every stable
+    release, its GitHub release is published, and its tag carries the
+    stable statement.
+
+The newest ready beta is promoted: a newer beta that carries the fix for a
+regression found in an older one is ready on its own evidence, and the
+older one never is. Reports that can't be read promote nothing. The notes
+of the stable release say what the evidence was.
 
 The version (the stable number, X.Y.Z): the highest of the last stable
 release and the last beta's X.Y.Z on SHA's history, bumped:
@@ -63,13 +79,12 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 STABLE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 BETA = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-beta\.(\d{8})$")
 FEATURE_TITLE = re.compile(r"^feat(\([^)]*\))?!?:", re.IGNORECASE)
 FEATURE_LABELS = {"enhancement", "feature"}
-PROMOTE_AFTER_HOURS = 24
 RELEASE_BLOCKER = "release-blocker"
 # The block in a beta's tag message holding the signed statement for its
 # stable tag (the same format as the release attestation installs read).
@@ -229,18 +244,52 @@ def plan(commit, tags, tags_at_commit, is_ancestor, changed_paths, merged_prs, f
             "tag": name(version), "previous": since, "prs": prs, "stable_tag": fmt(version)}
 
 
-def plan_promote(betas, tags, stables, now, blockers, version=None, after_hours=PROMOTE_AFTER_HOURS):
-    """The beta to promote to stable: {skip, reason, tag, beta, commit, error}.
+def proof(rows):
+    """What the reports say about one beta: {healthy, ready, rolled_back, runs, answers}.
+
+    rows  [{watch, runs, answers, chat}], one per install that reported it.
+    ready counts the installs that show it working: a healthy watch, a
+    finished run, and a Chat answer when that install uses Chat.
+    """
+    rows = rows or []
+    n = lambda r, k: max(0, int(r.get(k) or 0))  # noqa: E731
+    healthy = [r for r in rows if r.get("watch") == "healthy"]
+    ready = [r for r in healthy if n(r, "runs") >= 1 and (n(r, "answers") >= 1 or not r.get("chat"))]
+    return {"installs": len(rows), "healthy": len(healthy), "ready": len(ready),
+            "rolled_back": sum(1 for r in rows if r.get("watch") == "rolled_back"),
+            "runs": sum(n(r, "runs") for r in healthy), "answers": sum(n(r, "answers") for r in healthy),
+            "chat": sum(1 for r in healthy if r.get("chat"))}
+
+
+def unproven(p):
+    """Why the evidence `p` (proof) doesn't make a beta ready, or None."""
+    if p["rolled_back"]:
+        return "a regression was found in it: %d install(s) rolled it back" % p["rolled_back"]
+    if p["ready"]:
+        return None
+    if not p["installs"]:
+        return "no live install has reported it installed"
+    if not p["healthy"]:
+        return "no install's post-update watch has ended healthy on it yet"
+    if not p["runs"]:
+        return "installed and healthy, but no run has finished on it yet"
+    return "installed and healthy with runs, but no Chat answer has finished on it on an install that uses Chat"
+
+
+def plan_promote(betas, tags, stables, blockers, evidence, version=None):
+    """The beta to promote to stable: {skip, reason, tag, beta, commit, error, proof}.
 
     betas     [{tag, commit, published_at (datetime or None), draft, attested}],
               the beta tags on main;
     tags      every tag name in the repository;
     stables   the stable release tags on main;
-    now       the time (UTC);
     blockers  [{number, text}]: the open issues labelled RELEASE_BLOCKER, or
               None when they couldn't be read (then nothing is promoted);
+    evidence  {beta tag: [{watch, runs, answers, chat}]}: the installs'
+              reports, or None when they couldn't be read (then nothing is
+              promoted);
     version   a beta tag, or the stable vX.Y.Z it would become: that beta,
-              promoted now whatever its age (an error when it can't be).
+              only when it is ready (an error when it can't be).
     """
     names = set(tags)
     top = max((parse(t) for t in stables if parse(t)), default=None)
@@ -253,7 +302,7 @@ def plan_promote(betas, tags, stables, now, blockers, version=None, after_hours=
                 return i
         return None
 
-    def why_not(b, manual):
+    def why_not(b):
         t = target(b["tag"])
         if fmt(t) in names:
             return "%s exists already" % fmt(t)
@@ -267,31 +316,66 @@ def plan_promote(betas, tags, stables, now, blockers, version=None, after_hours=
             return "the open %s issues couldn't be read" % RELEASE_BLOCKER
         i = blocked_by(b)
         if i:
-            return "issue #%s (%s) reports a problem with it" % (i.get("number"), RELEASE_BLOCKER)
-        age = now - b["published_at"]
-        if not manual and age < timedelta(hours=after_hours):
-            return "out for %dh of the %dh before promotion" % (age.total_seconds() // 3600, after_hours)
-        return None
+            return "a regression was found in it: issue #%s (%s)" % (i.get("number"), RELEASE_BLOCKER)
+        if evidence is None:
+            return "the installs' release reports couldn't be read"
+        return unproven(proof(evidence.get(b["tag"])))
 
     ordered = sorted(betas, key=lambda b: order(b["tag"]), reverse=True)
     if version:
         pick = [b for b in ordered if version in (b["tag"], fmt(target(b["tag"])))]
         if not pick:
             return {"skip": True, "error": True, "reason": "%s is not a beta on main" % version}
-        reason = why_not(pick[0], manual=True)
+        reason = why_not(pick[0])
         if reason:
             return {"skip": True, "error": True, "reason": "%s can't be promoted: %s" % (pick[0]["tag"], reason)}
         ordered = pick
     passed = []
     for b in ordered:
-        reason = why_not(b, manual=bool(version))
+        reason = why_not(b)
         if not reason:
             return {"skip": False, "reason": "%s promoted%s" % (b["tag"], ("; " + "; ".join(passed)) if passed else ""),
-                    "tag": fmt(target(b["tag"])), "beta": b["tag"], "commit": b["commit"]}
+                    "tag": fmt(target(b["tag"])), "beta": b["tag"], "commit": b["commit"],
+                    "proof": proof(evidence.get(b["tag"]))}
         passed.append("%s: %s" % (b["tag"], reason))
         if fmt(target(b["tag"])) in names or (top and target(b["tag"]) <= top):
             break  # every older beta is behind the newest stable release too
     return {"skip": True, "reason": "no beta to promote" + ((": " + "; ".join(passed)) if passed else " (none on main)")}
+
+
+def evidence_notes(beta, p):
+    """The notes' paragraph on what made `beta` stable (counts only)."""
+    chat = (" and %d Chat answer(s)" % p["answers"]) if p["chat"] else ""
+    return ("## Why it is stable\n\n"
+            "Promoted from %s on evidence from live installs, not on age: %d install(s) reported it installed "
+            "with a healthy post-update watch, %d of them with real work finished on it (%d run(s)%s), and no "
+            "install rolled it back.\n\n" % (beta, p["healthy"], p["ready"], p["runs"], chat))
+
+
+def read_evidence(path):
+    """{beta tag: [rows]} from a DynamoDB Query's JSON (aws dynamodb query), or None."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            items = json.load(f).get("Items")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    out = {}
+    for i in items:
+        v = lambda k, t: (i.get(k) or {}).get(t)  # noqa: E731
+        tag = v("version", "S") or ""
+        if not parse_beta(tag) and not parse(tag):
+            continue
+        try:
+            row = {"watch": v("watch", "S") or "", "runs": int(v("runs", "N") or 0), "answers": int(v("answers", "N") or 0),
+                   "chat": bool(v("chat", "BOOL"))}
+        except ValueError:
+            continue
+        out.setdefault(tag, []).append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +459,7 @@ def _release(repo, tag):
         return None
 
 
-def git_promote(repo, version=None, now=None):
+def git_promote(repo, version=None, evidence=None):
     tags = [t for t in _run("git", "tag", "-l", "v*").split() if t]
     main = _main_ref("HEAD")
     betas = []
@@ -388,7 +472,7 @@ def git_promote(repo, version=None, now=None):
         betas.append({"tag": t, "commit": commit, "published_at": _when(r.get("published_at")), "draft": bool(r.get("draft", True)),
                       "attested": STABLE_BEGIN in text.split("\n") and STABLE_END in text.split("\n")})
     stable_on_main = [t for t in tags if parse(t) and _is_ancestor(t, main)]
-    r = plan_promote(betas, tags, stable_on_main, now or datetime.now(timezone.utc), _blockers(repo), version)
+    r = plan_promote(betas, tags, stable_on_main, _blockers(repo), evidence, version)
     if not r["skip"]:
         # The notes: everything since the stable release before it on that commit's history.
         prior = sorted((t for t in stable_on_main if _is_ancestor(t, r["commit"])), key=parse)
@@ -405,6 +489,7 @@ def main(argv):
     p.add_argument("--mode", choices=("stable", "beta", "promote"), default="stable")
     p.add_argument("--commit", help="the deployed commit (stable, beta)")
     p.add_argument("--version", help="promote: a beta tag, or the stable version it would become")
+    p.add_argument("--evidence", help="promote: the installs' release reports (a DynamoDB Query's JSON)")
     p.add_argument("--notes-dir", required=True)
     p.add_argument("--github-output")
     a = ap.parse_args(argv)
@@ -422,12 +507,14 @@ def main(argv):
 
     def keep(kind, channel, r, tag, commit):
         with open(os.path.join(a.notes_dir, tag + ".md"), "w", encoding="utf-8") as f:
+            if r.get("proof"):
+                f.write(evidence_notes(r["beta"], r["proof"]))
             f.write(notes(a.repo, tag, r.get("previous"), r.get("prs") or []))
         out.append({"kind": kind, "channel": channel, "tag": tag, "commit": commit, "previous": r.get("previous") or "",
                     "stable_tag": r.get("stable_tag") if kind == "beta" else "", "beta": r.get("beta") or ""})
 
     if a.mode == "promote":
-        r = git_promote(a.repo, a.version, now)
+        r = git_promote(a.repo, a.version, read_evidence(a.evidence))
         lines.append("promote: " + r["reason"])
         failed = failed or bool(r.get("error"))
         if not r["skip"]:
