@@ -1716,6 +1716,17 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
         if let Some(r) = graph["routes"].get(i) {
             return json!({"id": id, "method": r["m"], "path": r["p"], "name": r["name"], "description": r["d"], "file": r["f"]});
         }
+    } else if let Some((p, i)) = id
+        .strip_prefix("s:")
+        .and_then(|x| x.rsplit_once('#'))
+        .and_then(|(p, i)| Some((p, i.parse::<usize>().ok()?)))
+    {
+        // one symbol of a file (`s:<path>#<index>`): a page's own renderer in a file that holds several
+        if let Some(f) = arr(graph, "files").find(|f| f["p"] == p) {
+            if let Some(sym) = f["s"].get(i) {
+                return json!({"id": id, "path": p, "symbol": sym[0], "kind": sym[1], "line": sym[2], "description": sym[4], "part": f["n"]});
+            }
+        }
     }
     json!({ "id": id })
 }
@@ -1742,8 +1753,24 @@ fn screen_json(s: &Value) -> Value {
                 "route_file": route,
                 "url_from": nav["urlFrom"],
             });
-            keep(&mut out["dispatch"], nav, &["types"]);
+            keep(&mut out["dispatch"], nav, &["types", "loader"]);
         }
+    }
+    // a page a catch-all knows by a type, folded into this route because the type's document
+    // lives at this route's path and its renderer there only falls back: the type, that
+    // renderer and the function that loads it
+    if let Some(b) = s["byType"].as_array().filter(|b| !b.is_empty()) {
+        out["by_type"] = json!(b
+            .iter()
+            .map(|x| json!({
+                "type": x["type"],
+                "renderer": x["renderer"],
+                "renderer_at": format!("{}:{}", x["file"].as_str().unwrap_or(""), x["line"].as_u64().unwrap_or(0)),
+                "route_file": x["route"],
+                "loader": x["loader"],
+                "fallback": x["fallback"],
+            }))
+            .collect::<Vec<_>>());
     }
     out
 }
@@ -2216,6 +2243,9 @@ pub fn impact(graph: &Value, target: &str) -> Option<Value> {
     let only_endpoints = matches!(t, Target::Endpoints(_));
     let inside = |id: &str| -> bool {
         if let Some(p) = id.strip_prefix("f:") {
+            return paths.contains(p);
+        }
+        if let Some((p, _)) = id.strip_prefix("s:").and_then(|x| x.rsplit_once('#')) {
             return paths.contains(p);
         }
         if let Some(n) = id.strip_prefix("n:") {
@@ -3618,6 +3648,33 @@ mod tests {
         // a screen nothing dispatches carries no dispatch record
         let slot = listed.iter().find(|s| s["url"] == "/slots/:id").unwrap();
         assert!(slot.get("dispatch").is_none());
+    }
+
+    /// A page a catch-all knows by a type it only falls back for, folded
+    /// into the route that owns the type's path: that screen names the type,
+    /// its renderer and its loader.
+    #[test]
+    fn a_route_screen_names_the_type_folded_into_it() {
+        let mut g = harbor();
+        let slot = g["screens"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s["url"] == "/slots/:id")
+            .unwrap();
+        slot["byType"] = json!([{"type": "slot", "renderer": "SlotView", "file": "harbor-web/lib/slots.ts", "line": 2,
+            "route": "harbor-web/app/[...slug]/page.tsx", "loader": {"file": "harbor-web/lib/slots.ts", "symbol": "loadSlot", "line": 1},
+            "fallback": true, "was": "screen:web:/(slot)/*"}]);
+        let v = screen_view(&g, "/slots/:id").unwrap();
+        let t = &v["screen"]["by_type"][0];
+        assert_eq!(t["type"], "slot");
+        assert_eq!(t["renderer_at"], "harbor-web/lib/slots.ts:2");
+        assert_eq!(t["loader"]["symbol"], "loadSlot");
+        assert_eq!(t["fallback"], true);
+        // a screen with nothing folded into it says nothing
+        assert!(screen_view(&harbor(), "/slots/:id").unwrap()["screen"]
+            .get("by_type")
+            .is_none());
     }
 
     /// The harbor map with one journey through the booking.

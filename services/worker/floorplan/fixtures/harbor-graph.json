@@ -181,12 +181,6 @@
    ],
    "evidence": [
     {
-     "file": "harbor-api/package.json",
-     "line": 1,
-     "how": "code",
-     "confidence": 0.95
-    },
-    {
      "file": "harbor-api/src/billing.js",
      "line": 1,
      "how": "code",
@@ -213,6 +207,12 @@
     {
      "file": "harbor-api/src/webhooks.js",
      "line": 8,
+     "how": "code",
+     "confidence": 0.95
+    },
+    {
+     "file": "harbor-api/package.json",
+     "line": 1,
      "how": "code",
      "confidence": 0.95
     }
@@ -287,13 +287,13 @@
    "env": [],
    "evidence": [
     {
-     "file": "harbor-api/package.json",
+     "file": "harbor-api/src/entities/slot.entity.ts",
      "line": 1,
      "how": "code",
      "confidence": 0.95
     },
     {
-     "file": "harbor-api/src/entities/slot.entity.ts",
+     "file": "harbor-api/package.json",
      "line": 1,
      "how": "code",
      "confidence": 0.95
@@ -331,13 +331,13 @@
    "env": [],
    "evidence": [
     {
-     "file": "harbor-api/package.json",
+     "file": "harbor-api/src/receipts/index.js",
      "line": 1,
      "how": "code",
      "confidence": 0.95
     },
     {
-     "file": "harbor-api/src/receipts/index.js",
+     "file": "harbor-api/package.json",
      "line": 1,
      "how": "code",
      "confidence": 0.95
@@ -418,7 +418,7 @@
    "loc": 6,
    "name": "Card charges",
    "d": "Charges a patron's card through Stripe for a slot booking.",
-   "h": "fd5a61a79231",
+   "h": "6eec60aefa38",
    "sig": "bf9c021a1595",
    "s": [
     [
@@ -458,8 +458,8 @@
    "loc": 8,
    "name": "Slot record",
    "d": "The stored slot: its id and name.",
-   "h": "7298b9ab2006",
-   "sig": "47a2fbdede73",
+   "h": "3c75c38a614d",
+   "sig": "4334fa93256d",
    "s": [
     [
      "Slot",
@@ -489,7 +489,7 @@
    "loc": 7,
    "name": "Booking service start",
    "d": "Starts the booking service and sends slot requests to the bookings code.",
-   "h": "3528e13bf0b8",
+   "h": "2d2d2da0034e",
    "sig": "04e9fed06a2f"
   },
   {
@@ -500,7 +500,7 @@
    "loc": 6,
    "name": "Tide lookup",
    "d": "Asks the tide service for the water level at a slot.",
-   "h": "f0c1b5c2208a",
+   "h": "5a5b54bf09ca",
    "sig": "bf9c021a1595",
    "s": [
     [
@@ -540,8 +540,8 @@
    "loc": 4,
    "name": "Nightly slot load",
    "d": "Copies the day's slots into the booking database each night.",
-   "h": "b9206fe1200e",
-   "sig": "805a2effaaeb",
+   "h": "009958c1df25",
+   "sig": "0b5f9e713523",
    "s": [
     [
      "load_slots",
@@ -611,7 +611,7 @@
    "loc": 21,
    "name": "App screens",
    "d": "Lists the app's screens: sign in when signed out, the slots when signed in.",
-   "h": "7c3f97edba4a",
+   "h": "5d63c1125239",
    "sig": "206910fa60d6",
    "s": [
     [
@@ -631,7 +631,7 @@
    "loc": 4,
    "name": "Sign in",
    "d": "Signs the patron in and opens the slots.",
-   "h": "ff435d50b6c6",
+   "h": "f726f8409ae2",
    "sig": "e3a1c6342e8b",
    "s": [
     [
@@ -651,8 +651,8 @@
    "loc": 6,
    "name": "Slot",
    "d": "Shows one slot with a button to book it.",
-   "h": "33596162548f",
-   "sig": "233ad78d138e",
+   "h": "7c67c7004efe",
+   "sig": "6c43c0708f32",
    "s": [
     [
      "SlotDetail",
@@ -671,8 +671,8 @@
    "loc": 10,
    "name": "Slots",
    "d": "Lists slots; tapping one opens it.",
-   "h": "18990fb68b09",
-   "sig": "59f4fe7c2d28",
+   "h": "2e93bf65f97e",
+   "sig": "06ce9daf28e8",
    "s": [
     [
      "Slots",
@@ -691,8 +691,8 @@
    "loc": 4,
    "name": "Slot page",
    "d": "Shows one slot with a button to book it.",
-   "h": "b7e0894ff4a4",
-   "sig": "7816c41cd764",
+   "h": "4bb5cf2eec20",
+   "sig": "4836e9fab1d3",
    "s": [
     [
      "SlotPage",
@@ -711,8 +711,8 @@
    "loc": 4,
    "name": "Booking request",
    "d": "Sends the booking for a slot to the booking service.",
-   "h": "28a5a30879a7",
-   "sig": "595abd0dce03",
+   "h": "af85f3c47b34",
+   "sig": "f5fe3211e774",
    "s": [
     [
      "bookSlot",

@@ -27,6 +27,16 @@ export const libraryAnswers = () => ({
   },
 });
 
+/** The answers for the gallery fixture: one website whose catch-all route loads each kind of page
+ *  with a function of its own and draws it with a view of its own. */
+export const galleryAnswers = () => ({
+  'floorplan/architecture.json': {
+    $schema: 'floorplan/architecture@1',
+    project: { name: 'Gallery', summary: 'A website where visitors see the rooms and book a seat at an event.' },
+    nodes: [{ id: 'site', label: 'Gallery website', kind: 'ui', summary: 'The rooms, the events and the front page, from the content store.', paths: ['gallery-web'] }],
+  },
+});
+
 export function workdir(answers, mode, extra = {}, fixture = 'harbor') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'app-map-'));
   fs.cpSync(path.join(HERE, 'fixtures', fixture), path.join(dir, 'root'), { recursive: true });

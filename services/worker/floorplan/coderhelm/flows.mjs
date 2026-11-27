@@ -133,6 +133,13 @@ function cite(r, file, line, hints) {
 
 const strip = (ref) => (typeof ref === 'string' && ref.startsWith('f:') ? ref.slice(2) : null);
 
+/** The map's id for a symbol it lists (`s:<file>#<index>`), or null. */
+export function symRef(graph, file, name) {
+  const f = (graph.files || []).find((x) => x.p === file);
+  const i = (f?.s || []).findIndex((x) => x[0] === name);
+  return i >= 0 ? `s:${file}#${i}` : null;
+}
+
 function index(graph) {
   const files = new Set((graph.files || []).map((f) => f.p));
   const syms = new Map((graph.files || []).map((f) => [f.p, (f.s || []).map(([name, kind, line]) => ({ name, kind, line })).sort((a, b) => a.line - b.line)]));
@@ -175,13 +182,38 @@ function slice(r, file, names, ix) {
 
 function sliceOf(r, file, names, ix, t) {
   const lines = r.lines(file) || t.split('\n');
-  const rg = ranges(ix, r, file);
-  const parts = [];
-  for (const n of names) {
-    const x = rg.get(n);
-    if (x) parts.push(lines.slice(x[0] - 1, x[1]).join('\n'));
-  }
+  const parts = spans(ix, r, file, names).map(([a, b]) => lines.slice(a - 1, b).join('\n'));
   return parts.length ? parts.join('\n') : t;
+}
+
+/** The lines `names` run in a file: each name's own lines (a symbol the map lists to the next one
+ * it lists, any other from its declaration to its closing brace), and the file's own top-level
+ * code they call (a renderer's local helper, a loader's shared fetch function). */
+export function spans(ix, r, file, names) {
+  return r.once('spans:' + [...names].sort().join(','), file, () => {
+    const lines = r.lines(file) || [];
+    const rg = ranges(ix, r, file);
+    // the file's top-level declarations, name to 0-based line, read once
+    const at = r.once('decls', file, () => {
+      const m = new Map();
+      lines.forEach((l, i) => { const d = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*|const\s+|let\s+|var\s+|class\s+)([A-Za-z_$][\w$]*)/.exec(l); if (d && !m.has(d[1])) m.set(d[1], i); });
+      return m;
+    });
+    const own = [...at.keys()];
+    const of = (n) => rg.get(n) || (at.has(n) ? [at.get(n) + 1, braceEnd(lines, at.get(n))] : null);
+    const want = new Set(names);
+    const out = [];
+    const take = (n) => { const x = of(n); if (x) out.push(x); };
+    for (const n of want) take(n);
+    for (let k = 0; k < 8 && out.length; k++) {
+      const text = out.map(([a, b]) => lines.slice(a - 1, b).join('\n')).join('\n');
+      const used = new Set([...text.matchAll(/(?<![\w$.])[A-Za-z_$][\w$]*/g)].map((m) => m[0]));
+      const more = own.filter((d) => !want.has(d) && used.has(d));
+      if (!more.length) break;
+      for (const d of more) { want.add(d); take(d); }
+    }
+    return out;
+  });
 }
 
 // ── Gap closer: dependency injection and dynamic imports ──────────────────
@@ -410,12 +442,7 @@ export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = nu
 
 function inUse(ix, r, file, names, line) {
   if (!names) return true;
-  const rg = ranges(ix, r, file);
-  for (const n of names) {
-    const x = rg.get(n);
-    if (x && line >= x[0] && line <= x[1]) return true;
-  }
-  return false;
+  return spans(ix, r, file, names).some(([a, b]) => line >= a && line <= b);
 }
 
 // ── Requests ──────────────────────────────────────────────────────────────
@@ -644,7 +671,11 @@ export function pageSteps(text) {
   // `case Forms.Login:` then the first component its branch renders
   // (`return <LoginForm` or `content = (<LoginForm`), before the next case.
   const cases = [...text.matchAll(/\bcase\s+((?:\w+\.)?\w+|['"][\w-]+['"])\s*:/g)];
+  // (a page builder's switch over its content's blocks or sections draws parts of one page, not steps)
+  const switches = [...text.matchAll(/\bswitch\s*\(([^)]{1,100})\)/g)];
+  const blocky = (i) => /block|section|slice|widget|module/i.test(switches.filter((x) => x.index < i).pop()?.[1] || '');
   cases.forEach((m, k) => {
+    if (blocky(m.index)) return;
     const end = Math.min(k + 1 < cases.length ? cases[k + 1].index : text.length, m.index + 1500);
     const body = text.slice(m.index, end);
     const d = body.search(/\bdefault\s*:/);
@@ -1133,9 +1164,15 @@ export function candidates(graph, read) {
     // a screen a route dispatches to is one renderer of its file: its journeys start from that code only
     const focus = s.nav?.renderer && s.fw === 'dispatch' ? [s.nav.renderer] : null;
     // the lines its renderer spans, so a traced step inside them lands on this screen and not a neighbour
-    const span = focus ? ranges(ix, r, file).get(focus[0]) : null;
-    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}), ...(focus && s.nav?.dispatcher ? { dispatcher: s.nav.dispatcher } : {}) });
+    const span = focus ? ranges(ix, r, file).get(focus[0]) || bodyRange(r.lines(file) || [], focus[0]) : null;
+    // drawn as its renderer's own card where the map lists it, not the file every type shares
+    const view = (focus && symRef(graph, file, focus[0])) || 'f:' + file;
+    // the resolver's function that loads this type's content: its fetches are this screen's too
+    const loader = focus && s.nav?.loader?.file && ix.files.has(s.nav.loader.file) && s.nav.loader.symbol ? { file: s.nav.loader.file, symbol: s.nav.loader.symbol } : null;
+    const c = add({ kind: 'screen', key: s.id, view, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev], ...(focus ? { focus } : {}), ...(span ? { span } : {}), ...(focus && s.nav?.dispatcher ? { dispatcher: s.nav.dispatcher } : {}), ...(loader ? { loader } : {}) });
     if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
+    // a page a catch-all knew by type, folded into this route: what stood on it stands here
+    if (c) for (const b of s.byType || []) if (b?.was && !byKey.has(b.was)) byKey.set(b.was, c);
     return c;
   };
   for (const s of graph.screens || []) screenAt(s);
@@ -1202,9 +1239,21 @@ export function candidates(graph, read) {
   const visit = (s) => {
     if (done.has(s.id)) return;
     done.add(s.id);
-    // (a renderer the map lists no symbol for is read as its whole file)
-    const focus = s.focus && s.focus.some((n) => ranges(ix, r, s.file).has(n)) ? { names: new Set(s.focus) } : {};
+    // (a renderer the map lists no symbol for, and whose declaration can't be found, is read as its whole file)
+    const focus = s.focus && spans(ix, r, s.file, s.focus).length ? { names: new Set(s.focus) } : {};
     const files = closure(ix, r, classes, s.file, focus);
+    // What the resolver loads for this type, before the page renders: its requests and the outside
+    // services it fetches from (a content store) are this screen's, in that order.
+    if (s.loader) {
+      for (const [f, v] of closure(ix, r, classes, s.loader.file, { names: new Set([s.loader.symbol]) })) {
+        const first = (line) => ({ d: v.d, at: [0, ...(v.at || []), line || 0] });
+        for (const x of callsByFile.get(f) || []) if (made(x) && (x.line == null || inUse(ix, r, f, v.names, x.line))) link(s, x.c, 'the page loads its content with this request', first(x.line));
+        for (const x of ix.ext.get(f) || []) {
+          if (routes.some((rt) => rt.f === f)) continue;
+          link(s, outside(x.node, f, x.link), 'the page loads its content from it', first(x.link?.evidence?.[0]?.line));
+        }
+      }
+    }
     for (const [f, v] of files) {
       for (const x of callsByFile.get(f) || []) if (made(x) && (x.line == null || inUse(ix, r, f, v.names, x.line))) link(s, x.c, 'the screen makes this request', at(v, x.line));
       for (const x of ix.ext.get(f) || []) {
@@ -1239,7 +1288,8 @@ export function candidates(graph, read) {
         // A step is a component of the app's own (not a text or layout
         // component from a package).
         const to = names.get(st.comp);
-        if (!to) continue;
+        // (a button, an icon or a drawer from the app's UI kit is drawn by a step, never a step)
+        if (!to || NOISE_DIR.test('/' + to) || /(^|\/)icons?\.[jt]sx?$/.test(to) || /(?:Icon|Svg|Glyph|Logo|Badge|Spinner)$/.test(st.comp)) continue;
         // The step is cited where its component is declared; where the page
         // renders it is the fallback.
         const decl = (ix.syms.get(to) || []).find((x) => x.name === st.comp);
@@ -1260,10 +1310,14 @@ export function candidates(graph, read) {
       // Forms the screen renders that no router registers.
       const usedText = v.names ? slice(r, f, v.names, ix) : null;
       for (const e of ix.imports.get(f) || []) {
-        if (!/\.(tsx|jsx)$/.test(e.to) || isTest(e.to) || screenOf.has(e.to)) continue;
+        if (!/\.(tsx|jsx)$/.test(e.to) || isTest(e.to)) continue;
         if (usedText != null && !(e.names || []).some((n) => new RegExp('\\b' + esc(n) + '\\b').test(usedText))) continue;
         const base = path.posix.basename(e.to).replace(/\.\w+$/, '');
         const comp = (e.names || []).find((n) => /^[A-Z]/.test(n)) || base;
+        // a form another screen showed first is this screen's too (two pages one route picks by type, a test copy of a route)
+        const shownBefore = (screenOf.get(e.to) || []).find((x) => x.part && x.name === comp);
+        if (shownBefore) { link(s, shownBefore, 'the screen shows this form'); continue; }
+        if (screenOf.has(e.to)) continue;
         if (!/(Form|Step\w*|Modal|Drawer|Sheet|Page|View|Screen)$/.test(comp) && !/(form|step)/i.test(base)) continue;
         if (!Object.values(WORDS).some((w) => w.test(comp) || w.test(base))) continue;
         const sy = (ix.syms.get(e.to) || []).find((x) => x.name === comp) || (ix.syms.get(e.to) || [])[0];
@@ -1510,6 +1564,15 @@ export function repoint(c, st, ev) {
   return c.list.find((x) => x.kind !== 'screen' && x.evidence.some((e) => files.has(e.file) && ev.some((v) => v.file === e.file && v.token === e.token))) || null;
 }
 
+/** The view of the screen whose renderer's lines hold a step's first cited line, when its file
+ * holds several (the screens a route dispatches to by type); null otherwise. */
+function spanView(c, ev) {
+  const e = ev[0];
+  if (!e) return null;
+  const on = c.list.filter((x) => x.kind === 'screen' && x.span && x.file === e.file && e.line >= x.span[0] && e.line <= x.span[1]);
+  return on.sort((a, b) => (a.span[1] - a.span[0]) - (b.span[1] - b.span[0]))[0]?.view || null;
+}
+
 /** Re-checks stored journeys against this build's code and candidates.
  * Returns the journeys kept (re-lined, and re-pointed where the candidates
  * were renamed or split), the ones dropped with why, the entries a journey
@@ -1538,6 +1601,8 @@ export function revalidate(store, c, read) {
       let cand = c.byKey.get(st.key);
       let key = st.key;
       let kind = st.kind;
+      // a key this build knows under another name (a type folded into the route that owns its path)
+      if (cand && cand.key !== st.key) { key = cand.key; kind = cand.kind; repointed += 1; }
       if (!cand && !String(st.key).startsWith('code:')) {
         cand = repoint(c, st, ev);
         if (cand) { key = cand.key; kind = cand.kind; repointed += 1; }
@@ -1549,8 +1614,10 @@ export function revalidate(store, c, read) {
           repointed += 1;
         }
       }
-      // A traced step the map has no node for stands on its cited line.
-      if (!cand && String(st.key).startsWith('code:')) cand = { view: st.view };
+      // A traced step the map has no node for stands on its cited line: inside one renderer of a
+      // file that holds several, on that renderer's card (not the file every type shares).
+      if (!cand && String(st.key).startsWith('code:')) cand = { view: spanView(c, ev) || st.view };
+      else if (cand && String(key).startsWith('code:')) cand = { view: spanView(c, ev) || cand.view };
       if (!cand) { gone += 1; continue; }
       if (i === 0 && st.key === fl.entry) entry = key;
       steps.push({ ...st, key, kind, evidence: ev, view: cand.view });

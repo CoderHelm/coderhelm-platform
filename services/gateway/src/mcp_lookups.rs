@@ -2621,9 +2621,9 @@ mod tests {
             "id": "join-the-library", "title": "Join the library", "custom": true,
             "coderhelm": {"entry": "screen:site:/members/join", "linked": [true, true, true]},
             "steps": [
-                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/join", "note": "The patron fills in the sign-up form.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 19}]},
+                {"ref": "s:library-web/lib/renderers.tsx#2", "screen": "screen:site:/members/join", "note": "The patron fills in the sign-up form.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 19}]},
                 {"ref": "r:1", "note": "The form saves the new member.", "evidence": [{"file": "library-web/components/SignupForm.tsx", "line": 7}, {"file": "library-web/app/api/members/route.ts", "line": 1}]},
-                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/checkout", "note": "The patron pays for the season.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 24}]},
+                {"ref": "s:library-web/lib/renderers.tsx#3", "screen": "screen:site:/members/checkout", "note": "The patron pays for the season.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 24}]},
             ],
         }]);
         g
@@ -2708,6 +2708,12 @@ mod tests {
                 .collect();
             assert!(behind.contains(&"f:library-web/components/SignupForm.tsx"));
             assert!(!behind.contains(&"f:library-web/components/CheckoutForm.tsx"));
+            // the screen itself is its renderer, not the file every page type shares
+            let own = &v["behind"][0];
+            assert_eq!(own["step"], "screen", "{q}");
+            assert_eq!(own["symbol"], "MemberSignupRenderer");
+            assert_eq!(own["path"], "library-web/lib/renderers.tsx");
+            assert_eq!(own["line"], 19);
         }
         // a pattern only the route gives says so
         let v = library_tool(MAP_SCREEN, json!({ "screen": "/(notice)/*" }));
@@ -2760,6 +2766,9 @@ mod tests {
             .map(|s| s["screen"]["name"].as_str().unwrap_or("-"))
             .collect();
         assert_eq!(on, vec!["Member signup", "-", "Member checkout"]);
+        // each screen step stands on its own renderer
+        assert_eq!(j["steps"][0]["symbol"], "MemberSignupRenderer");
+        assert_eq!(j["steps"][2]["symbol"], "MemberCheckoutRenderer");
         assert_eq!(j["steps"][2]["screen"]["url"], "/members/checkout");
         assert_eq!(
             j["steps"][2]["cites"][0],

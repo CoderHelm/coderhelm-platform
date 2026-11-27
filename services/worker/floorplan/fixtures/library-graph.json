@@ -63,7 +63,7 @@
    "name": "Slug detail page",
    "d": "",
    "auto": true,
-   "h": "240ea94a533c",
+   "h": "81f43d45c201",
    "sig": "f36e73540e3b",
    "s": [
     [
@@ -126,7 +126,7 @@
    "name": "Library web page",
    "d": "",
    "auto": true,
-   "h": "d14a5585d1f0",
+   "h": "bb55f5c65fda",
    "sig": "d73184793b61",
    "s": [
     [
@@ -147,8 +147,8 @@
    "name": "Booth card",
    "d": "",
    "auto": true,
-   "h": "59f54d44b761",
-   "sig": "9e434fe7fe38",
+   "h": "fab4e7e6c14c",
+   "sig": "18962798925e",
    "s": [
     [
      "BoothCard",
@@ -210,8 +210,8 @@
    "name": "Renderers",
    "d": "",
    "auto": true,
-   "h": "0c666cc253a0",
-   "sig": "4fc73bf5b534",
+   "h": "098ac72562c8",
+   "sig": "f90cd22fdd70",
    "s": [
     [
      "BoothRenderer",
@@ -259,7 +259,7 @@
    "name": "Resolve",
    "d": "",
    "auto": true,
-   "h": "4ec83fe8d856",
+   "h": "7dc9600736df",
    "sig": "36101eeb2b1e",
    "s": [
     [
@@ -575,9 +575,14 @@
    "description": "",
    "behind": [
     {
-     "id": "f:library-web/lib/renderers.tsx",
+     "id": "s:library-web/lib/renderers.tsx#1",
      "note": "The screen itself",
      "kind": "screen"
+    },
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The route that picks this page by its type",
+     "kind": "part"
     }
    ],
    "kind": "screen",
@@ -618,9 +623,14 @@
    "description": "",
    "behind": [
     {
-     "id": "f:library-web/lib/renderers.tsx",
+     "id": "s:library-web/lib/renderers.tsx#4",
      "note": "The screen itself",
      "kind": "screen"
+    },
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The route that picks this page by its type",
+     "kind": "part"
     }
    ],
    "kind": "screen",
@@ -661,13 +671,18 @@
    "description": "",
    "behind": [
     {
-     "id": "f:library-web/lib/renderers.tsx",
+     "id": "s:library-web/lib/renderers.tsx#0",
      "note": "The screen itself",
      "kind": "screen"
     },
     {
      "id": "f:library-web/components/BoothCard.tsx",
      "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The route that picks this page by its type",
      "kind": "part"
     }
    ],
@@ -715,13 +730,18 @@
    "description": "",
    "behind": [
     {
-     "id": "f:library-web/lib/renderers.tsx",
+     "id": "s:library-web/lib/renderers.tsx#3",
      "note": "The screen itself",
      "kind": "screen"
     },
     {
      "id": "f:library-web/components/CheckoutForm.tsx",
      "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The route that picks this page by its type",
      "kind": "part"
     },
     {
@@ -779,13 +799,18 @@
    "description": "",
    "behind": [
     {
-     "id": "f:library-web/lib/renderers.tsx",
+     "id": "s:library-web/lib/renderers.tsx#2",
      "note": "The screen itself",
      "kind": "screen"
     },
     {
      "id": "f:library-web/components/SignupForm.tsx",
      "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The route that picks this page by its type",
      "kind": "part"
     },
     {

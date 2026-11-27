@@ -14,6 +14,10 @@
 //
 // Tables of blocks or sections (parts of a page, not pages) are kept apart.
 //
+// Where the resolver loads each type's content with a function of its own (a table from type to
+// handleRoom or loadRoom), each screen also names that function (`loader`): what the page shows
+// comes from there, so its data fetches belong to that screen alone.
+//
 // detect(root, { routes }) -> { dispatchers: [{ file, route, base, screens: [...], sections: [...] }] }
 import path from 'node:path';
 import { listFiles, read, stripComments, closeOf, objectEntries, lineIndex, makeResolver, isTest } from '../lib/text.mjs';
@@ -25,6 +29,9 @@ const TYPEY = /(_type|\btype|Type|blockType|__typename|\bkind|Kind|component|con
 const SECTIONY = /block|section|module|slice|widget|component(s)?Map|layout|builder|portable|serializer/i;
 const ID = '[A-Za-z_$][\\w$]*';
 const LIT = /^(["'`])([^"'`]{1,80})\1$/;
+/** A resolver's table value: the function that loads one type's content (handleRoom, loadRoom, fetchRoom). */
+const LOADER = /^(?:handle|load|fetch)[A-Z]\w*$/;
+const ICONISH = /^[A-Z][\w$]*(?:Icon|Svg|Glyph|Logo|Badge|Spinner)$/;
 
 export const norm = (n) => String(n).toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -200,7 +207,24 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
     if (!ident) return null;
     return { ident: ident.split('.').pop(), decl: componentAt(f, ident) };
   };
-  const compish = (v) => /^[A-Z][\w$.]*$/.test(v) || /^[a-z_$][\w$]*\.[A-Z][\w$]*$/.test(v) || /^(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>\s*\(?\s*</.test(v) || /^(?:\w+\.)?(?:dynamic|lazy|loadable|defineAsyncComponent)\(/.test(v) || /^(?:memo|observer|withRouter|React\.memo)\(\s*[A-Z]/.test(v) || /^handle[A-Z]\w*$/.test(v);
+  const compish = (v) => /^[A-Z][\w$.]*$/.test(v) || /^[a-z_$][\w$]*\.[A-Z][\w$]*$/.test(v) || /^(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>\s*\(?\s*</.test(v) || /^(?:\w+\.)?(?:dynamic|lazy|loadable|defineAsyncComponent)\(/.test(v) || /^(?:memo|observer|withRouter|React\.memo)\(\s*[A-Z]/.test(v) || LOADER.test(v);
+  /** The text of a top-level declaration: from its line to the next top-level one. */
+  const declText = (d) => {
+    const lines = get(d.file).split('\n');
+    let end = d.line;
+    while (end < lines.length && !/^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:const|let|var|function|class|type|interface|enum)\b/.test(lines[end])) end++;
+    return lines.slice(d.line - 1, end).join('\n');
+  };
+  /** The types a resolver's loader says it gives (`createMatch(KINDS.ROOM, ...)`, `{ type: 'room' }`), normalised. */
+  const loaderTypes = (h, d) => {
+    const out = new Set();
+    const text = declText(d);
+    for (const m of text.matchAll(new RegExp(`(${ID}\\.${ID})|(["'\`])([\\w-]{1,80})\\2`, 'g'))) {
+      const k = m[1] ? keyText(m[1], [d.file, h.file]) : m[3];
+      if (k) out.add(norm(k));
+    }
+    return out;
+  };
 
   const out = [];
   for (const [page, route] of entries) {
@@ -214,7 +238,8 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
     }
     const files = [...seen.keys()];
     const kinds = [], sections = [], typePaths = new Map(), segRules = [];
-    const push = (kind, item) => (kind === 'page' ? kinds : sections).push(item);
+    // an icon or a badge picked by a type (a weather badge's sun icon) is a part of a page, never a page
+    const push = (kind, item) => (kind === 'page' ? (ICONISH.test(String(item.value).split('.').pop()) ? null : kinds) : sections)?.push(item);
     for (const [f, depth] of seen) {
       const s = get(f); const L = lineIndex(s);
       // 1) tables: const X = { key: Component, ... } read as X[type] (or typed Record<Type, ...>), and new Map([[key, Component]]) read with .get(type)
@@ -243,7 +268,7 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
         if (!used && !typed) continue;
         const keyExpr = (used?.[1] || used?.[2] || '').replace(/\s+as\s+.*$/s, '');
         const kind = SECTIONY.test(name) || /blockType|_key|blocks?\b|section/i.test(keyExpr) ? 'section' : (TYPEY.test(keyExpr) || typed ? 'page' : 'section');
-        const handlers = comps.every((e) => /^handle[A-Z]/.test(e.value));
+        const handlers = comps.every((e) => LOADER.test(e.value));
         for (const e of ents) {
           if (!compish(e.value)) continue;
           const k = keyText(e.key, [f]);
@@ -332,6 +357,54 @@ export function detect(root, { routes = [], maxDepth = 3, maxFiles = 40000 } = {
         urlFrom,
         table: { file: k.file, line: k.line, name: k.table, how: k.how },
       });
+    }
+    // the function that loads each type's content, from the resolver's handler table: the one whose
+    // code gives that type (`createMatch(KINDS.ROOM, ...)`), else the one keyed or named by it
+    const loaders = kinds.filter((k) => k.handler).map((h) => {
+      const d = componentAt(h.file, h.value);
+      if (!d || !fileSet.has(d.file) || d.symbol === 'default') return null;
+      return { h, d, types: loaderTypes(h, d), names: new Set([norm(h.type), norm(h.value.replace(/^(?:handle|load|fetch)/, ''))]) };
+    }).filter(Boolean);
+    const rendered = new Set(screens.map((x) => norm(x.type)));
+    for (const x of screens) {
+      const n = norm(x.type);
+      const byCode = loaders.filter((l) => l.types.has(n));
+      const byName = loaders.filter((l) => l.names.has(n));
+      const both = byCode.filter((l) => byName.includes(l));
+      // the most specific: a loader that gives one type before one that names several
+      const specific = (ls) => ls.slice().sort((a, b) => [...a.types].filter((t) => rendered.has(t)).length - [...b.types].filter((t) => rendered.has(t)).length)[0];
+      const l = both[0] || (byCode.length ? specific(byCode) : byName.length === 1 ? byName[0] : null);
+      if (l) x.loader = { file: l.d.file, line: l.d.line, symbol: l.d.symbol, table: { file: l.h.file, line: l.h.line } };
+    }
+    // A type whose content lives at a fixed path (the resolver pairs its type with that path:
+    // `doc.kind === 'front' && doc.path === '/'`, or its URL rule pins the whole path), and whether
+    // its renderer draws nothing of its own (no component of the app, nothing from what it is
+    // handed): a fallback. The caller folds such a type into the file route that owns that path.
+    const typeOfKey = new Map();
+    for (const x of screens) typeOfKey.set(norm(x.type), x);
+    for (const l of loaders) for (const x of screens) if (x.loader && x.loader.file === l.d.file && x.loader.symbol === l.d.symbol) typeOfKey.set(norm(l.h.type), x);
+    const LITQ = `(["'\`])([\\w-]{1,80})\\1`;
+    const PATHQ = `(["'\`])(\\/[^"'\`\\s]{0,120})\\3`;
+    const PAIR = new RegExp(`${ID}(?:\\??\\.${ID})*\\s*===?\\s*${LITQ}\\s*&&\\s*${ID}(?:\\??\\.${ID})*\\s*===?\\s*${PATHQ}`, 'g');
+    const PAIR_REV = new RegExp(`${ID}(?:\\??\\.${ID})*\\s*===?\\s*(["'\`])(\\/[^"'\`\\s]{0,120})\\1\\s*&&\\s*${ID}(?:\\??\\.${ID})*\\s*===?\\s*(["'\`])([\\w-]{1,80})\\3`, 'g');
+    for (const f of files) {
+      const s = get(f); const L = lineIndex(s);
+      const pin = (lit, at, m) => { const x = typeOfKey.get(norm(lit)); if (x && !x.servedAt) x.servedAt = { path: at.replace(/(.)\/$/, '$1'), file: f, line: L(m.index) }; };
+      for (const m of s.matchAll(PAIR)) pin(m[2], m[4], m);
+      for (const m of s.matchAll(PAIR_REV)) pin(m[4], m[2], m);
+    }
+    const optional = /\[\[\.\.\./.test(page);
+    for (const x of screens) {
+      if (!x.servedAt && x.urlFrom && !/[*:(]/.test(x.url)) x.servedAt = { path: x.url, file: x.urlFrom.file, line: x.urlFrom.line };
+      // the catch-all can't serve its own base path (`[...slug]` needs one segment at least)
+      if (x.servedAt) x.unreachable = !optional && x.servedAt.path === (route.base || '/');
+      const text = fileSet.has(x.file) ? declText({ file: x.file, line: x.line }) : '';
+      const po = text.indexOf('('); const pc = po >= 0 ? closeOf(text, po) : -1;
+      if (pc > po) {
+        const params = text.slice(po + 1, pc), body = text.slice(pc + 1);
+        const bound = [...params.matchAll(/(?:^|[{,(]\s*)(?:[\w$]+\s*:\s*)?([A-Za-z_$][\w$]*)\s*(?=[,})=]|$)/g)].map((m) => m[1]).filter((n) => !n.startsWith('_'));
+        x.stub = !/<[A-Z]/.test(body) && !/\b(?:createElement|h)\(\s*[A-Z]/.test(body) && !bound.some((n) => new RegExp(`\\b${n.replace(/\$/g, '\\$')}\\b`).test(body));
+      }
     }
     // two types with the same URL pattern and renderer are one screen; two different screens never share a URL
     const byUrl = new Map();
