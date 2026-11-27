@@ -1,66 +1,66 @@
 [
   {
-    "name": "real: what caused a disk-full error",
-    "origin": "real",
-    "intent": "lookup",
-    "question": "what caused the ENOSPC error?",
+    "name": "incident: why the web app hits a disk-full error",
+    "origin": "variant",
+    "intent": "diagnosis",
+    "question": "Why does the web app keep logging ENOSPC errors?",
     "wants": "The cause of the 'no space left on device' errors the web app logs, from the logs and code, and whether it is still happening."
   },
   {
-    "name": "real: can you run skills in a repository",
-    "origin": "real",
+    "name": "incident: can Chat use the team's skills in a repository",
+    "origin": "variant",
     "intent": "capability",
-    "question": "are you able to run skills in the harbor-web repo",
+    "question": "Are you able to use our team skills inside harbor-web?",
     "wants": "A yes or no on whether Chat can run the team's skills in that repository, and what it can do instead."
   },
   {
-    "name": "real: is a linked pull request comment accurate",
-    "origin": "real",
+    "name": "incident: is a linked pull request comment accurate",
+    "origin": "variant",
     "intent": "judgement",
-    "question": "is this comment accurate https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001",
+    "question": "Could you check whether this Coderhelm comment is accurate? https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001",
     "wants": "A verdict on whether Coderhelm's comment on pull request 88 is accurate, from what can be checked about that pull request (its checks and runs), saying plainly that the comment's own text couldn't be read if so."
   },
   {
-    "name": "real: the same comment, pasted after a non-answer",
-    "origin": "real",
+    "name": "incident: the same comment, pasted after a non-answer",
+    "origin": "variant",
     "intent": "judgement",
     "history": [
-      ["user", "is this comment accurate https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001"],
+      ["user", "Could you check whether this Coderhelm comment is accurate? https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001"],
       ["assistant", "I looked through your team's code and knowledge and found nothing that answers this, so I won't guess. If it lives in a document Coderhelm can't see yet, add it to Knowledge or attach it to your question."]
     ],
-    "question": "on pr https://github.com/northwind/harbor-web/pull/88 coderhelm left this comment: Post-merge health check FAILED, the merge introduced NEW check failure(s): e2e. A human should decide on a rollback. Is it accurate?",
+    "question": "Here is the comment Coderhelm posted on https://github.com/northwind/harbor-web/pull/88: \"Post-merge health check FAILED, the merge introduced NEW check failure(s): e2e. A human should decide on a rollback.\" Is that accurate?",
     "wants": "A verdict on whether the e2e failure after merging pull request 88 is new and real, from the pull request's checks and runs, and what to look at before deciding on a rollback."
   },
   {
-    "name": "real: how to cancel a booking (from a knowledge page)",
-    "origin": "real",
+    "name": "incident: how to cancel a booking (from a knowledge page)",
+    "origin": "variant",
     "intent": "how_to",
-    "question": "How can I cancel a booking?",
+    "question": "How do I cancel a slot booking?",
     "wants": "The steps and rules for cancelling a slot booking, from the team's own policy documents."
   },
   {
-    "name": "real: a new leader asks what could be useful to them",
-    "origin": "real",
+    "name": "incident: a senior engineering leader new to Coderhelm asks for an orientation",
+    "origin": "variant",
     "intent": "orientation",
-    "question": "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me",
-    "wants": "An orientation for a CTO new to Coderhelm: what Coderhelm already does for their team (from real data) and a few things it can do for someone in their role. Not a to-do list."
+    "question": "Hello! I just started using Coderhelm and I'm the engineering director here. Which features would help someone like me most?",
+    "wants": "An orientation for an engineering director new to Coderhelm: what Coderhelm already does for their team (from real data) and a few things it can do for someone in their role. Not a to-do list."
   },
   {
-    "name": "real: the leader questions a claim that Jira isn't connected",
-    "origin": "real",
+    "name": "incident: the leader questions a claim that Jira isn't connected",
+    "origin": "variant",
     "intent": "correction",
     "history": [
-      ["user", "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me"],
+      ["user", "Hello! I just started using Coderhelm and I'm the engineering director here. Which features would help someone like me most?"],
       ["assistant", "Welcome. Here are the things I think will matter most to you, starting with something already waiting on you.\n\n## 1. Questions only you can answer\nI checked what's waiting on you: **4 items: 2 need you now, 1 today, 1 when you can.** The first is [ABC-1 Retry the export job](/runs/detail?id=01A), which stopped on a question about its retry limit. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list.\n\n## 2. Status of any piece of work\nAsk things like \"where are we on HAR-27?\".\n\n## 3. Getting work done by Coderhelm\nAdd the coderhelm label to a Jira ticket."]
     ],
-    "question": "what do you mean that jira isn't connected? i see atlassian in the integrations",
+    "question": "You said Jira isn't connected, but the integrations page lists Atlassian as connected. Which is right?",
     "wants": "A re-check of the Jira connection made now, a plain admission that the earlier claim was wrong (Jira is connected), and the right answer about what that means for their list."
   },
   {
-    "name": "real: what a crawler's name means",
-    "origin": "real",
+    "name": "incident: what a crawler's name means",
+    "origin": "variant",
     "intent": "lookup",
-    "question": "what does B7 mean in reference to crawlers",
+    "question": "What is crawler B7 in our firewall rules?",
     "wants": "What 'B7' names in the team's firewall setup, from the code that defines it."
   },
   {
@@ -405,5 +405,26 @@
     "intent": "lookup",
     "question": "How do refunds get to Stripe?",
     "wants": "How a refund travels from the app to Stripe as the app map shows it, and plainly what the map doesn't show; the code for exact lines only if needed."
+  },
+  {
+    "name": "diagnosis: a nightly p99 alarm, asked by a senior leader",
+    "origin": "variant",
+    "intent": "diagnosis",
+    "question": "I'm the VP of engineering. ALARM: \"prod-quayside-api-p99\" in US East. Threshold Crossed: 3 datapoints were greater than the threshold (2.0). TargetResponseTime p99 for the quayside-api target group. Why does this keep firing?",
+    "wants": "The cause, first and firmly: one path (GET /v1/tides/forecast, which calls the Tidewatch API) is slow all day, and the alarm fires only overnight because traffic drops to about a hundred requests per 5 minutes, so those slow calls become the p99. Evidence from latency broken down by path and lined up with request volume, the logs for the window and the resource metrics. The fixes: cache or speed up that call, and a minimum request count on the alarm. Expert depth, no basics, no hedging such as \"probably one or two slow requests\"."
+  },
+  {
+    "name": "diagnosis: 502s since the morning",
+    "origin": "variant",
+    "intent": "diagnosis",
+    "question": "why is quayside-api returning 502s since this morning?",
+    "wants": "The cause of the 502s from the live metrics and logs for that window, read before the code, with the fix."
+  },
+  {
+    "name": "diagnosis: timeouts on a service",
+    "origin": "variant",
+    "intent": "diagnosis",
+    "question": "the checkout service is timing out, can you figure out what's going on?",
+    "wants": "What the live metrics, traffic and logs show about the timeouts, the cause they support, and the fix."
   }
 ]

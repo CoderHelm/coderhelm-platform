@@ -20,20 +20,22 @@
 use common::chat_intent::{read, Intent, Signals};
 use common::knowledge::answer::{finalize_reply, Registry, NO_SOURCE_ANSWER};
 
-const FIRST: &str = "first time here with coderhelm. i'm the cto at my company. what are a few things that could be useful to me?";
+/// A made-up first question: a senior engineering leader, new to
+/// Coderhelm, asks for an orientation.
+const FIRST: &str = "Hello! I just started using Coderhelm and I'm the engineering director here. Which features would help someone like me most?";
 
 /// The answer as it was given (shortened): the list first, then a claim
 /// no check made in that answer supported.
 const GIVEN: &str = "Welcome. Here are the things I think will matter most to you, starting with something already waiting on you.\n## 1. Questions only you can answer\nI checked what's waiting on your GitHub account: 9 items: 5 need you now, 3 today, 1 when you can. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list.";
 
-const NEXT: &str =
-    "what do you mean jira isn't connected? atlassian shows up on my integrations page";
+const NEXT: &str = "You said Jira isn't connected, but the integrations page lists Atlassian as connected. Which is right?";
 
 #[test]
-fn the_first_question_is_an_orientation_for_a_cto_and_never_the_list() {
+fn the_first_question_is_an_orientation_for_a_senior_leader_and_never_the_list() {
     let r = read(FIRST, None, Signals::default());
     assert_eq!(r.intent, Intent::Orientation);
-    assert_eq!(r.role.as_deref(), Some("cto"));
+    assert_eq!(r.role.as_deref(), Some("engineering director"));
+    assert!(r.senior);
     assert!(r.newcomer);
     // The list's fixed shape is not this question's.
     assert!(!r.intent.fixed_shape());

@@ -285,6 +285,8 @@ pub fn says_it_guessed(answer: &str) -> bool {
     })
 }
 
+pub use common::chat_evidence::says_unfinished;
+
 #[cfg(test)]
 mod tests {
     use super::*;

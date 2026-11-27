@@ -364,6 +364,9 @@ pub async fn ask(
             limits: LIMITS,
             must_look: None,
             uncited_ok: false,
+            evidence: None,
+            background: None,
+            firm: false,
         },
     )
     .await
@@ -809,6 +812,7 @@ pub async fn ask_work(
     let offered: Vec<&str> = tb.defs.iter().filter_map(|t| t["name"].as_str()).collect();
     let notes = understood.notes(&offered);
     let must_look = understood.must_look(&offered, case.question);
+    let evidence = understood.evidence_first(&offered);
     let sink = Recorder::default();
     let mut reg = Registry::default();
     let (_, repos) = fixture();
@@ -822,9 +826,12 @@ pub async fn ask_work(
             messages: vec![json!({"role": "user", "content": [{"type": "text", "text":
                 format!("<sources>\n(no knowledge passages matched this question)</sources>\n{notes}\nQuestion: {}", case.question)}]})],
             question: case.question,
-            limits: LIMITS,
+            limits: understood.limits(),
             must_look,
             uncited_ok: understood.uncited_ok(),
+            evidence,
+            background: None,
+            firm: understood.intent().evidence_first(),
         },
     )
     .await
@@ -1176,6 +1183,9 @@ mod tests {
                 limits: LIMITS,
                 must_look: None,
                 uncited_ok: false,
+                evidence: None,
+                background: None,
+                firm: false,
             },
         )
         .await
