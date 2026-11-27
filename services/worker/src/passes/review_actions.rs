@@ -184,6 +184,14 @@ pub fn should_merge(
     true
 }
 
+/// Whether a merge into `base_branch` is a release. Releases come from the
+/// default branch only: a merge into a feature or integration branch is not
+/// released, or its tag would deploy that branch in place of the default
+/// branch. An unknown default branch is not a release. Pure, unit-tested.
+pub fn releases_from(base_branch: &str, default_branch: Option<&str>) -> bool {
+    default_branch == Some(base_branch)
+}
+
 /// Compute the next patch release tag from existing tags. Parses tags shaped
 /// `[prefix]MAJOR.MINOR.PATCH[-...]` (a bare `v` prefix is also tolerated),
 /// finds the highest version, and bumps PATCH. With no existing semver tag it
@@ -395,9 +403,27 @@ pub(crate) async fn post_merge_actions(
     // Release tag. In batch mode we do NOT tag here — we arm a single coalesced
     // sweep for the repo, so several merges in the window share one release tag
     // (and one prod deploy). In immediate mode (window = 0) we tag now, but
-    // idempotently (skip if this commit is already tagged).
-    let batched_tag = cfg.auto_tag && cfg.tag_batch_minutes > 0;
-    if cfg.auto_tag {
+    // idempotently (skip if this commit is already tagged). Only a merge into
+    // the default branch is released (see `releases_from`).
+    let release = if cfg.auto_tag {
+        let default_branch = github.get_default_branch(owner, repo).await.ok();
+        let release = releases_from(base_branch, default_branch.as_deref());
+        if !release {
+            lines.push(match default_branch {
+                Some(d) => format!(
+                    "🏷️ No release tag: `{base_branch}` is not the default branch (`{d}`), and releases are cut from the default branch only."
+                ),
+                None => format!(
+                    "🏷️ No release tag: I couldn't read the default branch, so I didn't tag `{base_branch}`. The next merge into the default branch releases this change with it."
+                ),
+            });
+        }
+        release
+    } else {
+        false
+    };
+    let batched_tag = release && cfg.tag_batch_minutes > 0;
+    if release {
         if batched_tag {
             schedule_tag_sweep(
                 state,
@@ -1333,6 +1359,20 @@ async fn clear_failure(state: &WorkerState, team_id: &str, owner: &str, repo: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_merge_into_the_default_branch_is_released() {
+        assert!(releases_from("main", Some("main")));
+        assert!(!releases_from("feat/new-checkout", Some("main")));
+        assert!(!releases_from("main", Some("trunk")));
+        assert!(!releases_from("main", None));
+        // The merge gate checks it before it tags or arms a release window.
+        let src = include_str!("review_actions.rs");
+        let post = &src[src.find("async fn post_merge_actions(").unwrap()..];
+        let gate = post.find("releases_from(base_branch").unwrap();
+        assert!(gate < post.find("schedule_tag_sweep(").unwrap());
+        assert!(gate < post.find("cut_tag_if_new(").unwrap());
+    }
 
     #[test]
     fn a_failed_release_backs_off_then_is_recorded() {
