@@ -10,7 +10,7 @@
 //! open pull request (#40) "under new hashes", and stopped before the pull
 //! request step: first "rebasing onto that branch didn't apply cleanly",
 //! then "too many commits to replay", then "neither did merging #40's
-//! branch in". Five runs over three days stopped the same way, each on the
+//! branch in". Several runs stopped the same way, each on the
 //! same kept branch with the same four commits, until a person stepped in.
 //!
 //! Today the branch's own change is rebuilt on #40's branch and the run
@@ -43,7 +43,7 @@ const OWN: &str = "coderhelm/harbor-41";
 fn open_pr(n: u64, head: &str, base: &str) -> Value {
     json!({
         "number": n,
-        "title": format!("HARBOR-{n}: dock card shows the slip photo"),
+        "title": format!("HARBOR-{n}: wing card shows the slot photo"),
         "head": {"ref": head, "repo": {"full_name": "harbor/web"}},
         "base": {"ref": base},
     })
@@ -70,10 +70,10 @@ fn a_reused_pull_request_moves_onto_the_branch_the_run_is_stacked_on() {
     // A fork's branch is never a base.
     let fork = vec![json!({
         "number": 39,
-        "head": {"ref": "dock-photo", "repo": {"full_name": "someone/web"}},
+        "head": {"ref": "wing-photo", "repo": {"full_name": "someone/web"}},
         "base": {"ref": "main"},
     })];
-    assert_eq!(stack_base(own, "dock-photo", &fork, "harbor", "web"), None);
+    assert_eq!(stack_base(own, "wing-photo", &fork, "harbor", "web"), None);
 }
 
 fn copy(commits: &[&str], shared: &[&str]) -> Copy {
@@ -86,7 +86,7 @@ fn copy(commits: &[&str], shared: &[&str]) -> Copy {
         },
         commits: commits.iter().map(|s| s.to_string()).collect(),
         shared: shared.iter().map(|s| s.to_string()).collect(),
-        own: vec!["HARBOR-41: dock card shows the slip photo".into()],
+        own: vec!["HARBOR-41: wing card shows the slot photo".into()],
         files: BTreeMap::new(),
     }
 }

@@ -1,6 +1,6 @@
 # dh. `dh_criteria_traced_to_proof`
 
-**What happened:** A ticket had two acceptance criteria: one filter chip per sport on a camps page, and the page view tracked there. The pull request changed the chip code and added an end-to-end spec for the chip, and its two-way proof passed. Its description listed the files and the checks, but nothing tied either one to the criteria. The tracking criterion had changed code and no test, and neither the description, the run page nor the API said so.
+**What happened:** A ticket had two acceptance criteria: one filter chip per wing on a slots page, and the page view tracked there. The pull request changed the chip code and added an end-to-end spec for the chip, and its two-way proof passed. Its description listed the files and the checks, but nothing tied either one to the criteria. The tracking criterion had changed code and no test, and neither the description, the run page nor the API said so.
 
 **The guarantee:** Every build of the description traces each criterion (the ticket's, else the plan's criteria map) to three things, all in `common::trace`:
 

@@ -864,6 +864,105 @@ pub fn next(findings: Option<&[Finding]>, rounds_done: u32, has_time: bool) -> N
     }
 }
 
+/// The run record attribute holding the one verdict on planned work per
+/// head. The proof check and the planned-work round's check both read it
+/// first and write it when they judge, so on one head they never disagree:
+/// one said "1 planned task still not done" while the other had just said
+/// "no planned work left", and the run continued until its ceiling.
+pub const PLANNED_FIELD: &str = "planned_verdict";
+
+/// What is left of the planned work on one head.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+pub struct PlannedVerdict {
+    pub head: String,
+    /// The `planned_work` findings left (empty: none left).
+    pub left: Vec<Finding>,
+}
+
+/// The planned work left on `head`, when a check already judged it there.
+pub fn planned_on<'a>(v: Option<&'a PlannedVerdict>, head: &str) -> Option<&'a [Finding]> {
+    v.filter(|v| !head.is_empty() && v.head == head)
+        .map(|v| v.left.as_slice())
+}
+
+/// `findings` with their planned work replaced by `left`.
+pub fn with_planned(findings: Vec<Finding>, left: &[Finding]) -> Vec<Finding> {
+    let mut out: Vec<Finding> = findings
+        .into_iter()
+        .filter(|f| f.point.trim() != "planned_work")
+        .collect();
+    out.extend(left.iter().cloned());
+    out
+}
+
+pub async fn load_planned(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> Option<PlannedVerdict> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .projection_expression("#p")
+        .expression_attribute_names("#p", PLANNED_FIELD)
+        .send()
+        .await
+        .ok()?
+        .item?;
+    serde_json::from_str(item.get(PLANNED_FIELD)?.as_s().ok()?).ok()
+}
+
+pub async fn save_planned(state: &WorkerState, team_id: &str, run_id: &str, v: &PlannedVerdict) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .update_expression("SET #p = :v")
+        .expression_attribute_names("#p", PLANNED_FIELD)
+        .expression_attribute_values(
+            ":v",
+            super::attr_s(&serde_json::to_string(v).unwrap_or_default()),
+        )
+        .send()
+        .await;
+}
+
+/// The proof check's findings against the one planned verdict on `head`:
+/// a verdict already there replaces the check's own planned work; none, and
+/// the check's planned work becomes the verdict.
+pub async fn settle_planned(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    head: &str,
+    findings: Option<Vec<Finding>>,
+) -> Option<Vec<Finding>> {
+    let findings = findings?;
+    let stored = load_planned(state, team_id, run_id).await;
+    if let Some(left) = planned_on(stored.as_ref(), head) {
+        return Some(with_planned(findings, left));
+    }
+    if !head.is_empty() {
+        let left: Vec<Finding> = planned_work(&findings).into_iter().cloned().collect();
+        save_planned(
+            state,
+            team_id,
+            run_id,
+            &PlannedVerdict {
+                head: head.to_string(),
+                left,
+            },
+        )
+        .await;
+    }
+    Some(findings)
+}
+
 /// The findings that are planned work not done: never Open items.
 pub fn planned_work(findings: &[Finding]) -> Vec<&Finding> {
     findings
@@ -1921,6 +2020,10 @@ pub async fn prove(
                 w.plan.fix.as_ref(),
                 &format!("{}/{}", w.msg.repo_owner, w.msg.repo_name),
             );
+            // One verdict on planned work per head (`planned_verdict`): what
+            // the planned-work round's check already said on this head
+            // stands; otherwise this check's own is kept for it.
+            let findings = settle_planned(w.state, &w.msg.team_id, w.run_id, &head, findings).await;
             super::write_pass_trace(
                 w.state,
                 &w.msg.team_id,
@@ -2805,7 +2908,7 @@ mod tests {
         assert!(!top.contains("Run terraform"));
         // A green CI clears them, and the section with them, from the
         // bottom of the description.
-        let rest = "Source ticket: OPS-1\n\n**Problem** x";
+        let rest = "Source ticket: HARBOR-1\n\n**Problem** x";
         let body = crate::passes::completeness::assemble(
             rest,
             &crate::passes::completeness::Owned {

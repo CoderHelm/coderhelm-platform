@@ -1886,6 +1886,12 @@ async fn handle_pull_request(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
+    // A public repository's pull request text changed (opened, edited, a
+    // push): the customer details guard reads it again and sets its check.
+    if guards_customer_details(payload) {
+        queue_customer_guard(state, payload, installation_id, team_id).await;
+    }
+
     // A security fix's pull request closed or reopened (CoderHelm's, or a
     // bot's it adopted): its findings follow at once, before any return
     // below. The worker's sweep catches a delivery that never arrives.
@@ -1993,6 +1999,15 @@ async fn handle_pull_request(
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
     if action != "closed" {
         return Ok(StatusCode::OK);
+    }
+    // Runs waiting for another change to merge read their dependency again
+    // (`common::change_wait`): a merge resumes them, a close stops them for
+    // a person. The worker does nothing for a team with no waiting run.
+    let check = WorkerMessage::ChangeWaitCheck(common::messages::ChangeWaitCheckMessage {
+        team_id: team_id.to_string(),
+    });
+    if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &check).await {
+        warn!(error = ?e, "Could not ask waiting runs to read their dependency again");
     }
     // CoderHelm's review bodies on it become one line each, its resolved
     // threads hidden (any pull request it reviewed, not only its own).
@@ -4135,6 +4150,39 @@ fn restack_message(
     })
 }
 
+/// The release a push to the default branch joins: its head commit, for
+/// the worker to fold into the repository's waiting release window. None for
+/// a deleted branch or a push that moved nothing.
+fn release_on_push(
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Option<crate::models::TagSweepMessage> {
+    let after = payload["after"].as_str().unwrap_or("");
+    if payload["deleted"].as_bool().unwrap_or(false)
+        || after.is_empty()
+        || after.bytes().all(|b| b == b'0')
+        || payload["before"].as_str() == Some(after)
+    {
+        return None;
+    }
+    let branch = payload["ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .unwrap_or("");
+    Some(crate::models::TagSweepMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        base_branch: branch.to_string(),
+        merged_sha: after.to_string(),
+        ..Default::default()
+    })
+}
+
 async fn handle_push(
     state: &AppState,
     payload: &Value,
@@ -4177,6 +4225,17 @@ async fn handle_push(
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
         return Ok(StatusCode::OK);
+    }
+    // Commits merged into the default branch, by CoderHelm or by people:
+    // the repository's release (its batched tag) covers them. The worker
+    // reads the team's release settings and does nothing when they are off.
+    if let Some(m) = release_on_push(payload, installation_id, team_id, owner, name) {
+        let _ = send_to_queue(
+            state,
+            &state.config.ticket_queue_url,
+            &WorkerMessage::TagSweep(m),
+        )
+        .await;
     }
     // Knowledge sources reading this repository's docs sync now.
     super::knowledge_sources::on_push(state, team_id, &format!("{owner}/{name}")).await;
@@ -4758,6 +4817,40 @@ async fn queue_review_tidy(
     }
 }
 
+/// Pure: does this pull request event start the customer details guard:
+/// its text or head changed, on a repository GitHub says is public.
+fn guards_customer_details(payload: &Value) -> bool {
+    let action = payload["action"].as_str().unwrap_or("");
+    matches!(action, "opened" | "edited" | "synchronize" | "reopened")
+        && payload["repository"]["private"].as_bool() == Some(false)
+        && payload["pull_request"]["number"].as_u64().is_some()
+}
+
+/// Queues the customer details guard for one pull request. The message
+/// carries no text: the worker reads the pull request fresh.
+async fn queue_customer_guard(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) {
+    let repo = &payload["repository"];
+    let msg = WorkerMessage::CustomerGuard(common::messages::CustomerGuardMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
+        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
+        pr_number: payload["pull_request"]["number"].as_u64().unwrap_or(0),
+        attempt: 0,
+    });
+    if send_to_queue(state, &state.config.ticket_queue_url, &msg)
+        .await
+        .is_err()
+    {
+        warn!("Could not queue the customer details guard; the pull request stays unmerged until its next event");
+    }
+}
+
 pub(crate) async fn send_to_queue(
     state: &AppState,
     queue_url: &str,
@@ -5029,6 +5122,34 @@ pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String>
     .await
     .ok()?;
     limits.reached(&totals).map(|hit| limit_reason(&hit))
+}
+
+#[cfg(test)]
+mod release_on_push_tests {
+    use super::release_on_push;
+    use serde_json::json;
+
+    #[test]
+    fn a_merge_into_the_default_branch_joins_the_release() {
+        let p = json!({
+            "ref": "refs/heads/main",
+            "before": "1111111111111111111111111111111111111111",
+            "after": "2222222222222222222222222222222222222222",
+        });
+        let m = release_on_push(&p, 7, "TEAM#t", "o", "r").unwrap();
+        assert_eq!(m.merged_sha, "2222222222222222222222222222222222222222");
+        assert_eq!(m.base_branch, "main");
+        assert_eq!((m.repo_owner.as_str(), m.repo_name.as_str()), ("o", "r"));
+        assert!(!m.manual && m.sweep_id.is_empty() && m.delay_remaining_secs == 0);
+    }
+
+    #[test]
+    fn a_deleted_or_unmoved_branch_releases_nothing() {
+        let deleted = json!({"ref": "refs/heads/main", "deleted": true, "after": "0000000000000000000000000000000000000000"});
+        assert!(release_on_push(&deleted, 7, "T", "o", "r").is_none());
+        let same = json!({"ref": "refs/heads/main", "before": "abc", "after": "abc"});
+        assert!(release_on_push(&same, 7, "T", "o", "r").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -5511,7 +5632,7 @@ mod merge_control_command_tests {
 
     #[test]
     fn only_safe_repo_names_reach_the_permission_path() {
-        for ok in ["web", "terraform_devops", "my.repo", "a-b"] {
+        for ok in ["web", "harbor_infra", "my.repo", "a-b"] {
             assert!(valid_repo_name(ok), "{ok}");
         }
         let long = "x".repeat(101);
@@ -6075,5 +6196,53 @@ mod command_after_merge_tests {
             command_after_merge(false, "pat", "/coderhelm go"),
             (false, None)
         );
+    }
+}
+
+#[cfg(test)]
+mod customer_guard_tests {
+    use super::guards_customer_details;
+    use serde_json::json;
+
+    fn event(action: &str, private: bool) -> serde_json::Value {
+        json!({
+            "action": action,
+            "repository": {"private": private, "name": "tool", "owner": {"login": "example-oss"}},
+            "pull_request": {"number": 7},
+        })
+    }
+
+    #[test]
+    fn a_public_pull_requests_text_changes_start_the_guard() {
+        for a in ["opened", "edited", "synchronize", "reopened"] {
+            assert!(guards_customer_details(&event(a, false)), "{a}");
+            assert!(
+                !guards_customer_details(&event(a, true)),
+                "{a} on a private repo"
+            );
+        }
+        for a in ["closed", "labeled", "review_requested"] {
+            assert!(!guards_customer_details(&event(a, false)), "{a}");
+        }
+        // No `private` field: not known to be public, so nothing is published.
+        let mut e = event("opened", false);
+        e["repository"].as_object_mut().unwrap().remove("private");
+        assert!(!guards_customer_details(&e));
+    }
+
+    /// The guard is queued before any other pull request handling can
+    /// return early, and the message carries no text.
+    #[test]
+    fn the_guard_is_queued_first_and_without_text() {
+        let src = include_str!("github_webhook.rs");
+        let handler = src.split("async fn handle_pull_request(").nth(1).unwrap();
+        let first_return = handler.find("return ").unwrap();
+        let guard = handler.find("queue_customer_guard(").unwrap();
+        assert!(guard < first_return);
+        let queue = src.split("async fn queue_customer_guard(").nth(1).unwrap();
+        let queue = &queue[..queue.find("\n}\n").unwrap()];
+        for field in ["\"title\"", "\"body\""] {
+            assert!(!queue.contains(field), "{field}");
+        }
     }
 }

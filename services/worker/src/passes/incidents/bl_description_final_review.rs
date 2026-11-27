@@ -1,8 +1,8 @@
-//! bl. A ticket asked for a Studio warning when a hero subtitle runs past
-//! 160 characters. CoderHelm made the change and opened the pull request,
+//! bl. A ticket asked for a Studio warning when a listing summary runs past
+//! 200 characters. CoderHelm made the change and opened the pull request,
 //! and its description read:
 //!
-//! - six checks as "Not run: still running when this was written", in the
+//! - several checks as "Not run: still running when this was written", in the
 //!   results table, never changed when they finished;
 //! - "Needed from you: give CoderHelm the deploy credentials for this
 //!   environment or run `cd apps/studio && npm run deploy:staging` once ...
@@ -48,14 +48,14 @@ use crate::passes::outside_work::{self as ow, Abilities, Confirm, NoteStep, Rout
 use crate::passes::pr_risk;
 use crate::passes::reviewer_guide::{Check, State};
 
-const HEAD: &str = "6de2414a0b1c2d3e4f5061728394a5b6c7d8e9f0";
+const HEAD: &str = "abc1234a0b1c2d3e4f5061728394a5b6c7d8e9f0";
 const PAGE_ID: &str = "0f3c2a1b-9d8e-4c7b-a6f5-e4d3c2b1a0f9";
 const DEPLOY: &str = "cd apps/studio && npm run deploy:staging";
 
 /// The description as it was posted (names made up), lead and old block.
 fn posted_before() -> String {
     format!(
-        "Adds a Studio warning on the Hero block subtitle when it is longer than 160 characters (OPS-88).
+        "Adds a Studio warning on the listing block summary when it is longer than 200 characters (HARBOR-88).
 
 ### Needed from you
 
@@ -67,14 +67,14 @@ fn posted_before() -> String {
 
 ### Review focus
 
-- Approach: decide whether this does what OPS-88 asks. CoderHelm's conclusion: nothing is out of the ordinary.
-- Read first: `apps/studio/schemaTypes/blocks/hero-block-validation.ts` (the largest change to code, 20 added lines); then the other 2 files.
-- See it: Studio: Events page ({PAGE_ID}), hero Sub Title field.
+- Approach: decide whether this does what HARBOR-88 asks. CoderHelm's conclusion: nothing is out of the ordinary.
+- Read first: `apps/studio/schemaTypes/blocks/listing-block-validation.ts` (the largest change to code, 20 added lines); then the other 2 files.
+- See it: Studio: Slots page ({PAGE_ID}), listing Summary field.
 
 **For the reviewer**
-* **Look first:** `apps/studio/schemaTypes/blocks/hero-block-validation.ts`, the largest change to code (20 added lines).
+* **Look first:** `apps/studio/schemaTypes/blocks/listing-block-validation.ts`, the largest change to code (20 added lines).
 * **Roll back:** revert this pull request; nothing outside the code changes with it.
-* **Not verified on `6de2414`:** `Test Coverage Report` (still running); `E2E after staging deploy` (did not run).
+* **Not verified on `abc1234`:** `Test Coverage Report` (still running); `E2E after staging deploy` (did not run).
 
 **Risk:** Low. One schema file and its test.
 
@@ -82,7 +82,7 @@ fn posted_before() -> String {
 
 ### Verification
 
-On 6de2414 (head of this PR):
+On abc1234 (head of this PR):
 
 | Check | Result |
 |---|---|
@@ -105,17 +105,17 @@ fn files() -> Vec<(String, String, String)> {
     let patch = |n: usize| format!("@@ -1 +1,{n} @@\n{}", "+line\n".repeat(n));
     vec![
         (
-            "apps/studio/schemaTypes/blocks/hero-block-validation.ts".into(),
+            "apps/studio/schemaTypes/blocks/listing-block-validation.ts".into(),
             "added".into(),
             patch(20),
         ),
         (
-            "apps/studio/schemaTypes/blocks/hero-block.ts".into(),
+            "apps/studio/schemaTypes/blocks/listing-block.ts".into(),
             "modified".into(),
             patch(3),
         ),
         (
-            "apps/studio/schemaTypes/blocks/hero-block-validation.test.ts".into(),
+            "apps/studio/schemaTypes/blocks/listing-block-validation.test.ts".into(),
             "added".into(),
             patch(12),
         ),
@@ -129,7 +129,6 @@ fn checks(state: State) -> Vec<Check> {
         "Type check",
         "Unit tests",
         "Build",
-        "Studio build",
     ]
     .iter()
     .map(|n| Check {
@@ -158,10 +157,10 @@ fn the_note() -> OutsideChange {
             ..Default::default()
         }],
         confirm: Some(Confirm {
-            query: "*[_type == \"heroBlock\"][0]{_type, \"len\": length(subTitle)}".into(),
-            expect: "{_type: heroBlock, len: 392}".into(),
-            page: format!("Studio: Events page ({PAGE_ID}), hero Sub Title field"),
-            result: "[{\"_type\":\"heroBlock\",\"len\":392}]".into(),
+            query: "*[_type == \"listingBlock\"][0]{_type, \"len\": length(summary)}".into(),
+            expect: "{_type: listingBlock, len: 240}".into(),
+            page: format!("Studio: Slots page ({PAGE_ID}), listing Summary field"),
+            result: "[{\"_type\":\"listingBlock\",\"len\":240}]".into(),
             ..Default::default()
         }),
         ..Default::default()
@@ -181,7 +180,7 @@ fn the_repo() -> Abilities {
     }
 }
 
-const WRITTEN: &str = "## Description\n\nAdds a Studio warning on the Hero block subtitle past 160 characters.\n\n## Changes\n\n* `apps/studio/schemaTypes/blocks/hero-block-validation.ts`: the length rule.\n* `apps/studio/schemaTypes/blocks/hero-block.ts`: uses it.\n\n## Type of change\n\n- [x] New feature\n";
+const WRITTEN: &str = "## Description\n\nAdds a Studio warning on the listing block summary past 200 characters.\n\n## Changes\n\n* `apps/studio/schemaTypes/blocks/listing-block-validation.ts`: the length rule.\n* `apps/studio/schemaTypes/blocks/listing-block.ts`: uses it.\n\n## Type of change\n\n- [x] New feature\n";
 
 const TEMPLATE: &str = "## Description\n<!-- What and why -->\n\n## Type of change\n- [ ] Bug fix\n- [ ] New feature\n\n## How has this been tested?\n\n## Checklist\n- [ ] I have read the contributing guide\n";
 
@@ -200,8 +199,8 @@ fn built(state: State, template: Option<&str>) -> (String, common::pr_facts::Fac
         floor: &floor,
         checks: Some(&checks),
         why: Some(Why {
-            reference: "OPS-88".into(),
-            title: "Warn on long hero subtitles".into(),
+            reference: "HARBOR-88".into(),
+            title: "Warn on long listing summaries".into(),
             url: String::new(),
         }),
         dependency: None,
@@ -213,7 +212,7 @@ fn built(state: State, template: Option<&str>) -> (String, common::pr_facts::Fac
     });
     let shaped = description_facts::shape_for(
         WRITTEN,
-        "OPS-88: Warn on long hero subtitles",
+        "HARBOR-88: Warn on long listing summaries",
         f,
         None,
         template,
@@ -254,7 +253,7 @@ fn the_final_review_fixes_the_posted_description() {
         end.never_says(old);
     }
     assert!(end.says("| Lint (CI) | Running; updated here when it ends |"));
-    assert!(end.says("**Still running on `6de2414`:** `Test Coverage Report`"));
+    assert!(end.says("**Still running on `abc1234`:** `Test Coverage Report`"));
     assert_eq!(
         r.body
             .matches("revert this pull request; nothing outside")
@@ -266,7 +265,7 @@ fn the_final_review_fixes_the_posted_description() {
         "{}",
         r.body
     );
-    assert!(end.says("See it: Studio: Events page, hero Sub Title field."));
+    assert!(end.says("See it: Studio: Slots page, listing Summary field."));
 }
 
 /// 2. The run's own build: no running check as a result, rebuilt until the
@@ -291,7 +290,7 @@ fn the_description_is_built_with_nothing_frozen_doable_or_said_twice() {
         "{body}"
     );
     assert!(
-        end.says("6 checks are still running on this head"),
+        end.says("5 checks are still running on this head"),
         "{body}"
     );
     // Built while checks ran: not current, so the next reconcile (the
@@ -367,7 +366,7 @@ fn outside_work_never_stops_the_change_or_the_pull_request() {
         outside_change: Some(the_note()),
         ..Default::default()
     };
-    let tasks = "- [ ] apps/studio/schemaTypes/blocks/hero-block-validation.ts: the length rule";
+    let tasks = "- [ ] apps/studio/schemaTypes/blocks/listing-block-validation.ts: the length rule";
     assert_eq!(
         fix_location::route_for_plan(Some(&outside), tasks),
         Way::CodeAndOutside,
@@ -515,7 +514,7 @@ fn the_deploy_step_is_executed_not_only_reworded() {
         "polled again"
     );
     // Ended: recorded, done, nothing left.
-    let run = serde_json::json!({"id": 4242, "html_url": "https://github.com/acme/site/actions/runs/4242", "head_sha": "6de2414"});
+    let run = serde_json::json!({"id": 4242, "html_url": "https://github.com/acme/site/actions/runs/4242", "head_sha": "abc1234"});
     assert!(record_end(&mut c.steps[0], &route, &run, "success", vec![]).is_none());
     let s = &c.steps[0];
     assert!(s.done);
@@ -563,7 +562,7 @@ fn feedback_naming_outside_work_keeps_the_code_change() {
     let d = fix_location::with_outside_part(
         Some(&coded),
         "the CMS",
-        "Set the limit field on the hero type",
+        "Set the limit field on the listing type",
     );
     assert_eq!(d.fix_location, FixLocation::Both);
     assert_eq!(fix_location::route(Some(&d)), Way::CodeAndOutside);

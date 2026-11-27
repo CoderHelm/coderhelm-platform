@@ -1,0 +1,1230 @@
+[
+ {
+  "name": "five overlapping journeys from different entries are one, the most complete",
+  "flows": [
+   {
+    "id": "book-a-booth",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
+      "kind": "screen",
+      "view": "f:harbor-web/components/BoothForm.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/components/BoothForm.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:GET /api/booths",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pick",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pick/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/quote",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/hold",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "hook:POST /stripe/webhook",
+      "kind": "outside",
+      "view": "f:harbor-api/src/webhook.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/webhook.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "book-a-booth-2",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
+      "kind": "screen",
+      "view": "f:harbor-web/components/BoothForm.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/components/BoothForm.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:GET /api/booths",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pick",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pick/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/hold",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "hook:POST /stripe/webhook",
+      "kind": "outside",
+      "view": "f:harbor-api/src/webhook.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/webhook.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "book-a-booth-3",
+    "title": "Book a booth",
+    "entry": "screen:web:/booths/pick",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths/pick",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pick/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/quote",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/hold",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "hook:POST /stripe/webhook",
+      "kind": "outside",
+      "view": "f:harbor-api/src/webhook.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/webhook.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "code:harbor-api/src/mail.ts#sendReceipt",
+      "kind": "outside",
+      "view": "f:harbor-api/src/mail.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/mail.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "a-book-a-booth",
+    "title": "A book a booth",
+    "entry": "part:harbor-web/components/BoothForm.tsx#BoothForm",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
+      "kind": "screen",
+      "view": "f:harbor-web/components/BoothForm.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/components/BoothForm.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:GET /api/booths",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pick",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pick/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/quote",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/hold",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "hook:POST /stripe/webhook",
+      "kind": "outside",
+      "view": "f:harbor-api/src/webhook.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/webhook.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "a-book-a-booth-2",
+    "title": "The Book a booth",
+    "entry": "screen:web:/booths",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "part:harbor-web/components/BoothForm.tsx#BoothForm",
+      "kind": "screen",
+      "view": "f:harbor-web/components/BoothForm.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/components/BoothForm.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:GET /api/booths",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pick",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pick/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pick/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/quote",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/booths/hold",
+      "kind": "request",
+      "view": "f:harbor-api/src/booths.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/booths.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "hook:POST /stripe/webhook",
+      "kind": "outside",
+      "view": "f:harbor-api/src/webhook.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/webhook.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "code:harbor-api/src/audit.ts#log",
+      "kind": "outside",
+      "view": "f:harbor-api/src/audit.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/audit.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "code:harbor-api/src/mail.ts#sendReceipt",
+      "kind": "outside",
+      "view": "f:harbor-api/src/mail.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/mail.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/account",
+      "kind": "screen",
+      "view": "f:harbor-web/app/account/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/account/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   }
+  ],
+  "want": {
+   "titles": [
+    "The Book a booth"
+   ],
+   "ids": [
+    "the-book-a-booth"
+   ],
+   "from": [
+    [
+     "part:harbor-web/components/BoothForm.tsx#BoothForm",
+     "screen:web:/booths",
+     "screen:web:/booths/pick"
+    ]
+   ]
+  }
+ },
+ {
+  "name": "one title on two different paths: titled by where each starts",
+  "flows": [
+   {
+    "id": "sign-in",
+    "title": "Sign in",
+    "entry": "screen:web:/login",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/login",
+      "kind": "screen",
+      "view": "f:harbor-web/app/login/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/login/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/session",
+      "kind": "request",
+      "view": "f:harbor-web/app/api/session/route.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/api/session/route.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:okta",
+      "kind": "outside",
+      "view": "f:harbor-api/src/auth.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/auth.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "sign-in-2",
+    "title": "Sign in",
+    "entry": "screen:mobile:SignIn",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:mobile:SignIn",
+      "kind": "screen",
+      "view": "f:harbor-mobile/src/SignIn.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-mobile/src/SignIn.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /auth/login",
+      "kind": "request",
+      "view": "f:harbor-api/src/auth.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/auth.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:okta",
+      "kind": "outside",
+      "view": "f:harbor-api/src/auth.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/auth.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:mobile:Home",
+      "kind": "screen",
+      "view": "f:harbor-mobile/src/Home.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-mobile/src/Home.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   }
+  ],
+  "want": {
+   "titles": [
+    "Sign in from web /login",
+    "Sign in from mobile SignIn"
+   ],
+   "ids": [
+    "sign-in-from-web-login",
+    "sign-in-from-mobile-signin"
+   ],
+   "from": [
+    [
+     "screen:web:/login"
+    ],
+    [
+     "screen:mobile:SignIn"
+    ]
+   ]
+  }
+ },
+ {
+  "name": "a split catch-all journey is retired by its renderer's fresh trace",
+  "flows": [
+   {
+    "id": "book-an-event",
+    "title": "Book an event",
+    "entry": "screen:web:/[...slug]",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/[...slug]",
+      "kind": "screen",
+      "view": "f:harbor-web/app/[...slug]/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/[...slug]/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:GET /api/events",
+      "kind": "request",
+      "view": "f:harbor-api/src/events.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/events.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/events/book",
+      "kind": "request",
+      "view": "f:harbor-api/src/events.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/events.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/events/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/events/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/events/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "code:harbor-api/src/a.ts#a",
+      "kind": "outside",
+      "view": "f:harbor-api/src/a.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/a.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "code:harbor-api/src/b.ts#b",
+      "kind": "outside",
+      "view": "f:harbor-api/src/b.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/b.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ],
+    "split": [
+     "screen:web:/events/(class)",
+     "screen:web:/events/(event)"
+    ]
+   },
+   {
+    "id": "book-an-event",
+    "title": "Book an event",
+    "entry": "screen:web:/events/(event)",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/events/(event)",
+      "kind": "screen",
+      "view": "f:harbor-web/components/EventPage.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/components/EventPage.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/events/book",
+      "kind": "request",
+      "view": "f:harbor-api/src/events.controller.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/events.controller.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:stripe",
+      "kind": "outside",
+      "view": "f:harbor-api/src/pay.service.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/pay.service.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/events/booked",
+      "kind": "screen",
+      "view": "f:harbor-web/app/events/booked/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/events/booked/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ],
+    "_fresh": true
+   }
+  ],
+  "want": {
+   "titles": [
+    "Book an event"
+   ],
+   "ids": [
+    "book-an-event"
+   ],
+   "from": [
+    [
+     "screen:web:/[...slug]",
+     "screen:web:/events/(event)"
+    ]
+   ]
+  }
+ },
+ {
+  "name": "one title from one start on two paths: titled by the step only it takes",
+  "flows": [
+   {
+    "id": "pay",
+    "title": "Pay for a booth",
+    "entry": "screen:web:/booths/pay",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/card",
+      "kind": "request",
+      "view": "f:harbor-api/src/card.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/card.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:adyen",
+      "kind": "outside",
+      "view": "f:harbor-api/src/card.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/card.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/paid",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/paid/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/paid/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   },
+   {
+    "id": "pay-2",
+    "title": "Pay for a booth",
+    "entry": "screen:web:/booths/pay",
+    "origin": "trace",
+    "steps": [
+     {
+      "key": "screen:web:/booths/pay",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/pay/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/pay/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "req:POST /api/wallet",
+      "kind": "request",
+      "view": "f:harbor-api/src/wallet.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/wallet.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "n:wallet",
+      "kind": "outside",
+      "view": "f:harbor-api/src/wallet.ts",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-api/src/wallet.ts",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     },
+     {
+      "key": "screen:web:/booths/wallet-done",
+      "kind": "screen",
+      "view": "f:harbor-web/app/booths/wallet-done/page.tsx",
+      "note": "A step.",
+      "evidence": [
+       {
+        "file": "harbor-web/app/booths/wallet-done/page.tsx",
+        "line": 3,
+        "token": "x"
+       }
+      ],
+      "linked": true
+     }
+    ]
+   }
+  ],
+  "want": {
+   "titles": [
+    "Pay for a booth through POST /api/card",
+    "Pay for a booth through POST /api/wallet"
+   ],
+   "ids": [
+    "pay-for-a-booth-through-post-api-card",
+    "pay-for-a-booth-through-post-api-wallet"
+   ],
+   "from": [
+    [
+     "screen:web:/booths/pay"
+    ],
+    [
+     "screen:web:/booths/pay"
+    ]
+   ]
+  }
+ }
+]

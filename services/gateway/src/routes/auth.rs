@@ -2341,7 +2341,17 @@ pub(crate) async fn github_sign_in_with_token(
         // by its team's Okta rule. A session that no longer counts links
         // nothing and is not renewed here.
         claims = super::oidc_signin::mark_session(claims, &existing_proof);
-        if sign_in::check_member_session(state, &claims).await.is_err() {
+        if let Err(r) = sign_in::check_member_session(state, &claims).await {
+            // A member record that couldn't be read is our failure, not an
+            // ended session.
+            if r.status().is_server_error() {
+                return Err(SignInFailure::new(
+                    P,
+                    Reason::Server,
+                    "connect",
+                    "GitHub connect: the member record couldn't be read",
+                ));
+            }
             return Err(SignInFailure::new(
                 P,
                 Reason::Expired,

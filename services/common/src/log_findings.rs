@@ -17,7 +17,8 @@
 //!   `LOG_FIX_CARD#<finding hash>` (the fix PR card posted, so it posts once
 //!   and its merged or closed follow-up posts once).
 //! - Where findings and fix PR cards post: `REC_NOTIFY` when a person saved
-//!   it, otherwise the team's alert channel (`ALERT_NOTIFY`), see
+//!   it, otherwise the team channel that takes their kind (an incident is an
+//!   alert; findings and fix PRs are updates; see `notify::route`), see
 //!   [`effective_mode`].
 //!
 //! Every rule that decides whether a run may start is here, so the gateway
@@ -2246,9 +2247,9 @@ pub async fn teams_with_setting(
 // ─── Chat ───────────────────────────────────────────────────────────────────
 
 /// Pure: the findings' notify mode in effect. A setting never saved (no
-/// `REC_NOTIFY`, or no `notify_mode` on it) follows the team's alert channel,
-/// so findings and their fix PRs post where production alerts post; a saved
-/// "off" or "custom" stands. The log analyzer Lambda has the same rule
+/// `REC_NOTIFY`, or no `notify_mode` on it) follows the team's channels by
+/// kind (`notify::route`): an incident goes where production alerts go,
+/// findings and fix PRs where updates go; a saved "off" or "custom" stands. The log analyzer Lambda has the same rule
 /// (`effective_mode` in `lambda/log-analyzer/handler.py`).
 pub fn effective_mode(saved: &str) -> &str {
     match saved.trim() {
@@ -2258,7 +2259,8 @@ pub fn effective_mode(saved: &str) -> &str {
 }
 
 /// Pure: where findings post, from the findings setting (`notify_mode`) and
-/// the team's alert channel (`enabled`), each already opened.
+/// the team's channel for the message's kind (`team_enabled`: one takes
+/// it), each already opened.
 pub fn pick_channels(mode: &str, own: Channels, team: Channels, team_enabled: bool) -> Channels {
     match effective_mode(mode) {
         crate::alert_notify::MODE_CUSTOM => own,
@@ -2277,7 +2279,9 @@ pub struct PostsTo {
     pub saved: bool,
     /// The chat apps it posts to ("Microsoft Teams", "Slack"); empty = none.
     pub channels: Vec<&'static str>,
-    /// The team's alert channel is on and has a channel set.
+    /// A team channel takes findings (the updates channel, or an alert
+    /// channel set to take updates) and has an app set. The name is kept
+    /// for the pages that read it.
     pub team_alerts: bool,
 }
 
@@ -2289,25 +2293,18 @@ fn kinds_set(item: &Item) -> Vec<&'static str> {
         .collect()
 }
 
-fn enabled(item: &Item) -> bool {
-    item.get("enabled")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false)
-}
-
-/// Pure: [`PostsTo`] from the findings' setting and the team's alert channel.
-pub fn posts_to(own: Option<&Item>, team: Option<&Item>) -> PostsTo {
+/// Pure: [`PostsTo`] from the findings' setting and the team's channels
+/// (`notify::route`): findings are updates.
+pub fn posts_to(own: Option<&Item>, team: &[(&str, Item)]) -> PostsTo {
     let empty = Item::new();
     let own_item = own.unwrap_or(&empty);
-    let team_item = team.unwrap_or(&empty);
     let saved_mode = s(own_item, "notify_mode");
     let mode = effective_mode(&saved_mode).to_string();
-    let team_kinds = if enabled(team_item) {
-        kinds_set(team_item)
-    } else {
-        vec![]
-    };
+    let team_kinds: Vec<&'static str> =
+        crate::notify::route::apps(crate::notify::route::Kind::Update, team)
+            .iter()
+            .map(|k| k.label())
+            .collect();
     let channels = match mode.as_str() {
         crate::alert_notify::MODE_CUSTOM => kinds_set(own_item),
         crate::alert_notify::MODE_TEAM => team_kinds.clone(),
@@ -2321,58 +2318,60 @@ pub fn posts_to(own: Option<&Item>, team: Option<&Item>) -> PostsTo {
     }
 }
 
-/// The findings' notify setting and the team's alert channel, as stored.
+/// The findings' notify setting and the team's channels, as stored.
 async fn notify_items(
     dynamo: &DynamoClient,
     settings_table: &str,
     team_id: &str,
-) -> (Option<Item>, Option<Item>) {
-    let get = |sk: &'static str| {
-        dynamo
-            .get_item()
-            .table_name(settings_table)
-            .key("pk", attr(team_id))
-            .key("sk", attr(sk))
-            .send()
-    };
+) -> (Option<Item>, Vec<(&'static str, Item)>) {
+    let own = dynamo
+        .get_item()
+        .table_name(settings_table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(REC_NOTIFY_SK))
+        .send();
     let (own, team) = tokio::join!(
-        get(REC_NOTIFY_SK),
-        get(crate::alert_notify::TEAM_SETTINGS_SK)
+        own,
+        crate::notify::route::load(dynamo, settings_table, team_id)
     );
-    (
-        own.ok().and_then(|o| o.item().cloned()),
-        team.ok().and_then(|o| o.item().cloned()),
-    )
+    (own.ok().and_then(|o| o.item().cloned()), team)
 }
 
 /// Where findings post, in words, for the Logs page.
 pub async fn load_posts_to(dynamo: &DynamoClient, settings_table: &str, team_id: &str) -> PostsTo {
     let (own, team) = notify_items(dynamo, settings_table, team_id).await;
-    posts_to(own.as_ref(), team.as_ref())
+    posts_to(own.as_ref(), &team)
 }
 
-/// The channels new findings post to (Teams, Slack), opened. Empty = none.
-/// Every sender of a findings message (the repo check, the fix PR card and
-/// its follow-up, AWS permission notes) reads its channels here.
+/// The channels a findings message of `kind` posts to (Teams, Slack),
+/// opened. Empty = none. Every sender of a findings message (an incident,
+/// the fix PR card and its follow-up) reads its channels here. With the
+/// team's channels, an incident (an alert) goes where alerts go and a fix
+/// PR (an update) where updates go: never to an alert channel that takes
+/// alerts only.
 pub async fn channels(
     dynamo: &DynamoClient,
     cipher: &dyn crate::mcp_credentials::Cipher,
     settings_table: &str,
     team_id: &str,
+    kind: crate::notify::route::Kind,
 ) -> Channels {
     let (own, team) = notify_items(dynamo, settings_table, team_id).await;
     let own = own.unwrap_or_default();
-    let team = team.unwrap_or_default();
     let mode = s(&own, "notify_mode");
-    let team_on = enabled(&team);
-    let opened =
-        |item: Item| async move { crate::notify::store::open_all(cipher, team_id, &item).await };
     match effective_mode(&mode) {
-        crate::alert_notify::MODE_CUSTOM => {
-            pick_channels(&mode, opened(own).await, Channels::default(), team_on)
-        }
-        crate::alert_notify::MODE_TEAM if team_on => {
-            pick_channels(&mode, Channels::default(), opened(team).await, team_on)
+        crate::alert_notify::MODE_CUSTOM => pick_channels(
+            &mode,
+            crate::notify::store::open_all(cipher, team_id, &own).await,
+            Channels::default(),
+            false,
+        ),
+        crate::alert_notify::MODE_TEAM => {
+            let team = crate::notify::route::TeamChannels::open(cipher, team_id, team)
+                .await
+                .get(kind);
+            let on = !team.is_empty();
+            pick_channels(&mode, Channels::default(), team, on)
         }
         _ => Channels::default(),
     }
@@ -3154,16 +3153,16 @@ mod tests {
     fn an_open_finding_says_when_it_resolves_on_its_own() {
         let mut f = Finding {
             status: "pending".into(),
-            last_seen_at: "2026-10-31T03:38:10Z".into(),
+            last_seen_at: "2030-03-02T03:38:10Z".into(),
             ..Default::default()
         };
         // A burst that stopped (no history) gets the analyzer's default.
         assert_eq!(f.quiet_days(), DEFAULT_QUIET_DAYS);
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T03:38:10Z"));
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-05T03:38:10Z"));
         // Back 4 days after it was resolved: twice that.
-        f.last_resolved_at = "2026-10-27T03:48:40.472966+00:00".into();
-        f.reopened_at = "2026-10-31T03:48:51.255562+00:00".into();
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+        f.last_resolved_at = "2030-02-26T03:48:40.472966+00:00".into();
+        f.reopened_at = "2030-03-02T03:48:51.255562+00:00".into();
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-10T03:38:10Z"));
         f.status = "resolved".into();
         assert_eq!(f.resolves_at(), None);
         f.status = "dismissed".into();
@@ -3180,13 +3179,13 @@ mod tests {
     fn came_back_and_acknowledged() -> Finding {
         Finding {
             status: "pending".into(),
-            acknowledged_at: "2026-11-03T06:44:39.346874173+00:00".into(),
-            last_seen_at: "2026-10-31T03:38:10.248+00:00".into(),
-            last_resolved_at: "2026-10-27T03:48:40.472966+00:00".into(),
-            reopened_at: "2026-10-31T03:48:51.255562+00:00".into(),
+            acknowledged_at: "2030-03-05T06:44:39.346874173+00:00".into(),
+            last_seen_at: "2030-03-02T03:38:10.248+00:00".into(),
+            last_resolved_at: "2030-02-26T03:48:40.472966+00:00".into(),
+            reopened_at: "2030-03-02T03:48:51.255562+00:00".into(),
             reopen_count: 1,
             daily_lines: vec![Counted {
-                name: "2026-10-31".into(),
+                name: "2030-03-02".into(),
                 lines: 6296,
             }],
             ..Default::default()
@@ -3226,26 +3225,26 @@ mod tests {
 
     #[test]
     fn a_stale_stored_quiet_period_never_moves_the_date() {
-        // The page used the stored value (missing: 3 days, Nov 3) while the
-        // sweep used 8 (Nov 8). Now both work it out the same way.
+        // The page used the stored value (missing: 3 days, Mar 5) while the
+        // sweep used 8 (Mar 10). Now both work it out the same way.
         let mut f = came_back_and_acknowledged();
         assert_eq!(f.quiet_days(), 8);
         f.quiet_days = Some(3);
         assert_eq!(f.quiet_days(), 8);
-        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+        assert_eq!(f.resolves_at().as_deref(), Some("2030-03-10T03:38:10Z"));
     }
 
     #[test]
     fn a_resolve_date_still_ahead_is_a_plain_date() {
         let f = came_back_and_acknowledged();
         let ok = Analysis {
-            last_ok_at: "2026-11-07T15:26:49Z".into(),
+            last_ok_at: "2030-03-09T15:26:49Z".into(),
             ..Default::default()
         };
         assert_eq!(
-            resolve_state(&f, Some(&ok), at("2026-11-07T16:00:00Z")),
+            resolve_state(&f, Some(&ok), at("2030-03-09T16:00:00Z")),
             Some(ResolveState::Scheduled {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
     }
@@ -3254,24 +3253,24 @@ mod tests {
     fn a_passed_date_with_analysis_failing_says_why_it_has_not_resolved() {
         let f = came_back_and_acknowledged();
         let failing = Analysis {
-            last_ok_at: "2026-11-02T21:48:40.182316+00:00".into(),
+            last_ok_at: "2030-03-04T21:48:40.182316+00:00".into(),
             error: "An error occurred (AccessDenied) when calling the AssumeRole operation: User: \
                     arn:aws:sts::111122223333:assumed-role/x/coderhelm-prod-log-analyzer is not \
                     authorized to perform: sts:AssumeRole on resource: \
                     arn:aws:iam::111122223333:role/CoderHelmLogReader with an explicit deny in a \
                     permissions boundary: arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"
                 .into(),
-            error_at: "2026-11-09T09:26:49.056528+00:00".into(),
+            error_at: "2030-03-11T09:26:49.056528+00:00".into(),
         };
         assert!(failing.failing());
-        match resolve_state(&f, Some(&failing), at("2026-11-09T10:00:00Z")) {
+        match resolve_state(&f, Some(&failing), at("2030-03-11T10:00:00Z")) {
             Some(ResolveState::Blocked {
                 at,
                 analysis_ok_at,
                 reason,
             }) => {
-                assert_eq!(at, "2026-11-08T03:38:10Z");
-                assert_eq!(analysis_ok_at, "2026-11-02T21:48:40.182316+00:00");
+                assert_eq!(at, "2030-03-10T03:38:10Z");
+                assert_eq!(analysis_ok_at, "2030-03-04T21:48:40.182316+00:00");
                 assert!(reason.contains("permissions boundary"), "{reason}");
                 assert!(!reason.contains("arn:aws"), "{reason}");
             }
@@ -3284,22 +3283,22 @@ mod tests {
         let f = came_back_and_acknowledged();
         // An error from before the last run that worked is history, not a failure.
         let recovered = Analysis {
-            last_ok_at: "2026-11-09T09:26:49Z".into(),
+            last_ok_at: "2030-03-11T09:26:49Z".into(),
             error: "AccessDenied".into(),
-            error_at: "2026-11-09T03:26:49Z".into(),
+            error_at: "2030-03-11T03:26:49Z".into(),
         };
         assert!(!recovered.failing());
         assert_eq!(
-            resolve_state(&f, Some(&recovered), at("2026-11-09T10:00:00Z")),
+            resolve_state(&f, Some(&recovered), at("2030-03-11T10:00:00Z")),
             Some(ResolveState::Due {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
         // No connection item at all: the next run decides.
         assert_eq!(
-            resolve_state(&f, None, at("2026-11-09T10:00:00Z")),
+            resolve_state(&f, None, at("2030-03-11T10:00:00Z")),
             Some(ResolveState::Due {
-                at: "2026-11-08T03:38:10Z".into()
+                at: "2030-03-10T03:38:10Z".into()
             })
         );
     }
@@ -3308,7 +3307,7 @@ mod tests {
     fn a_finding_that_is_not_open_has_no_resolve_state() {
         let mut f = came_back_and_acknowledged();
         f.status = "resolved".into();
-        assert_eq!(resolve_state(&f, None, at("2026-11-09T10:00:00Z")), None);
+        assert_eq!(resolve_state(&f, None, at("2030-03-11T10:00:00Z")), None);
     }
 
     #[test]
@@ -3326,9 +3325,9 @@ mod tests {
 
     #[test]
     fn the_analyzer_and_gateway_time_formats_both_parse() {
-        assert!(parse_time("2026-10-25 14:03:11.123").is_some());
-        assert!(parse_time("2026-11-03T06:44:39.346874173+00:00").is_some());
-        assert!(parse_time("2026-10-31T03:38:10Z").is_some());
+        assert!(parse_time("2030-02-24 14:03:11.123").is_some());
+        assert!(parse_time("2030-03-05T06:44:39.346874173+00:00").is_some());
+        assert!(parse_time("2030-03-02T03:38:10Z").is_some());
         assert!(parse_time("").is_none());
         assert!(parse_time("soon").is_none());
     }
@@ -4122,7 +4121,7 @@ mod tests {
         assert_eq!(pick_channels("team", own.clone(), team.clone(), true), team);
         assert!(pick_channels("team", own.clone(), team.clone(), false).is_empty());
         assert!(pick_channels("off", own.clone(), team.clone(), true).is_empty());
-        // Never saved: the team's alert channel, when it is on.
+        // Never saved: the team's channel for the kind, when one takes it.
         assert_eq!(pick_channels("", own.clone(), team.clone(), true), team);
         assert!(pick_channels("", own.clone(), team.clone(), false).is_empty());
         assert_eq!(effective_mode(""), "team");
@@ -4306,40 +4305,62 @@ mod fix_card_tests {
         channel_item(kinds, &[("enabled", AttributeValue::Bool(true))])
     }
 
+    fn updates(item: Item) -> Vec<(&'static str, Item)> {
+        vec![(crate::notify::route::UPDATES_SK, item)]
+    }
+
     #[test]
-    fn never_saved_posts_to_the_team_alert_channel() {
-        let team = team_on(&["teams", "slack"]);
-        let p = posts_to(None, Some(&team));
+    fn never_saved_posts_to_the_team_updates_channel() {
+        let team = updates(team_on(&["teams", "slack"]));
+        let p = posts_to(None, &team);
         assert_eq!(p.mode, "team");
         assert!(!p.saved);
         assert_eq!(p.channels, vec!["Microsoft Teams", "Slack"]);
         assert!(p.team_alerts);
         // A record without a mode is the same as none.
         let blank = channel_item(&[], &[("updated_at", sv("x"))]);
-        assert_eq!(posts_to(Some(&blank), Some(&team)).channels.len(), 2);
+        assert_eq!(posts_to(Some(&blank), &team).channels.len(), 2);
+    }
+
+    #[test]
+    fn findings_never_reach_an_alert_channel_that_takes_alerts_only() {
+        let alerts = vec![(crate::notify::route::ALERTS_SK, team_on(&["teams"]))];
+        let p = posts_to(None, &alerts);
+        assert!(p.channels.is_empty() && !p.team_alerts);
+        // Set to take updates too, it does.
+        let mut more = team_on(&["teams"]);
+        more.insert(
+            crate::notify::route::KINDS_ATTR.into(),
+            crate::notify::route::kinds_attr(&[
+                crate::notify::route::Kind::Alert,
+                crate::notify::route::Kind::Update,
+            ]),
+        );
+        let p = posts_to(None, &[(crate::notify::route::ALERTS_SK, more)]);
+        assert_eq!(p.channels, vec!["Microsoft Teams"]);
     }
 
     #[test]
     fn a_saved_choice_stands() {
-        let team = team_on(&["teams"]);
+        let team = updates(team_on(&["teams"]));
         let off = channel_item(&[], &[("notify_mode", sv("off"))]);
-        let p = posts_to(Some(&off), Some(&team));
+        let p = posts_to(Some(&off), &team);
         assert_eq!((p.mode.as_str(), p.saved), ("off", true));
         assert!(p.channels.is_empty());
         let own = channel_item(&["slack"], &[("notify_mode", sv("custom"))]);
-        let p = posts_to(Some(&own), Some(&team));
+        let p = posts_to(Some(&own), &team);
         assert_eq!(p.mode, "custom");
         assert_eq!(p.channels, vec!["Slack"]);
     }
 
     #[test]
-    fn no_alert_channel_posts_nowhere() {
-        assert!(posts_to(None, None).channels.is_empty());
+    fn no_team_channel_posts_nowhere() {
+        assert!(posts_to(None, &[]).channels.is_empty());
         let disabled = channel_item(&["teams"], &[("enabled", AttributeValue::Bool(false))]);
-        let p = posts_to(None, Some(&disabled));
+        let p = posts_to(None, &updates(disabled));
         assert!(p.channels.is_empty() && !p.team_alerts);
         // On, but no channel saved.
-        assert!(!posts_to(None, Some(&team_on(&[]))).team_alerts);
+        assert!(!posts_to(None, &updates(team_on(&[]))).team_alerts);
     }
 
     #[derive(Default)]

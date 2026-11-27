@@ -8,7 +8,7 @@
 //! the CMS ignores a field its schema no longer has, and the code stopped
 //! reading it.
 //!
-//! The same run also spent three fresh steps on one planned file the coder
+//! The same run also spent several fresh steps on one planned file the coder
 //! showed needs no change (every query already fetched the new field), and
 //! rebuilt its stacked branch at the start of each step though the branch
 //! it was stacked on never moved.
@@ -43,8 +43,8 @@ fn the_line_as_written() -> String {
         "add one in Settings, Repositories, o/web, Staging CMS".to_string(),
     );
     let lines: Vec<String> = [
-        dropped("heroCenteredText", "isHeadingOne"),
-        dropped("activitiesCarousel", "isHeadingTwo"),
+        dropped("harborHeroText", "isTitlePrimary"),
+        dropped("toursCarousel", "isTitleSecondary"),
     ]
     .iter()
     .map(|n| {
@@ -67,8 +67,8 @@ fn the_line_as_written() -> String {
 fn facts(body: &str) -> Facts {
     Facts {
         draft: true,
-        title: "Add a Title Size setting to the venue page blocks".into(),
-        body: format!("## Summary\nOne Title Size setting for every venue block.\n\n{body}"),
+        title: "Add a Title Size setting to the library page blocks".into(),
+        body: format!("## Summary\nOne Title Size setting for every library block.\n\n{body}"),
         ci: Ci {
             green: true,
             why: String::new(),
@@ -81,22 +81,22 @@ fn facts(body: &str) -> Facts {
 #[test]
 fn the_changes_own_migration_and_dropped_fields_are_never_staging_work() {
     let needs = vec![
-        dropped("heroCenteredText", "isHeadingOne"),
-        dropped("activitiesCarousel", "isHeadingTwo"),
+        dropped("harborHeroText", "isTitlePrimary"),
+        dropped("toursCarousel", "isTitleSecondary"),
         Need::Require {
-            doc_type: "heroCenteredText".into(),
-            field: "headingLevel".into(),
+            doc_type: "harborHeroText".into(),
+            field: "titleLevel".into(),
             default: None,
         },
     ];
-    let removes: BTreeSet<String> = ["isHeadingOne".to_string()].into();
-    let sets: BTreeSet<String> = ["headingLevel".to_string()].into();
+    let removes: BTreeSet<String> = ["isTitlePrimary".to_string()].into();
+    let sets: BTreeSet<String> = ["titleLevel".to_string()].into();
     // No connection: nothing is left for a person.
     assert!(content::still_needed(needs.clone(), &removes, &sets, false).is_empty());
     // With one, CoderHelm still removes a dropped field the migration doesn't.
     assert_eq!(
         content::still_needed(needs.clone(), &removes, &sets, true),
-        vec![dropped("activitiesCarousel", "isHeadingTwo")]
+        vec![dropped("toursCarousel", "isTitleSecondary")]
     );
     // A required field nothing sets is still real work.
     assert_eq!(
@@ -112,13 +112,13 @@ fn a_line_listing_only_dropped_fields_never_holds_the_pull_request() {
     let d = ready::decide(&facts(&body));
     assert_eq!(d, Decision::Ready { open: vec![] }, "held on: {body}");
     let after = ready::body_for(&facts(&body).body, &d).expect("the line goes");
-    assert!(!after.contains("isHeadingOne"), "{after}");
+    assert!(!after.contains("isTitlePrimary"), "{after}");
     assert!(after.contains("One Title Size setting"), "{after}");
 
     // A line that also names content a person must make still holds.
     let real = body.replace(
-        "remove `isHeadingTwo` from every `activitiesCarousel` document that still has it",
-        "give every `heroCenteredText` document a value for the now required `headingLevel`",
+        "remove `isTitleSecondary` from every `toursCarousel` document that still has it",
+        "give every `harborHeroText` document a value for the now required `titleLevel`",
     );
     assert!(matches!(ready::found(&facts(&real)), Decision::Held { .. }));
 }
@@ -127,14 +127,14 @@ fn a_line_listing_only_dropped_fields_never_holds_the_pull_request() {
 fn a_file_the_coder_shows_needs_no_change_ends_the_rounds() {
     // The coder's own words in the run.
     let notes = "What I checked on the branch:\n\
-        - **`query.ts` needs no change:** every projection for the 10 blocks starts with `...`, \
-        so `headingLevel` is already fetched.";
+        - **`query.ts` needs no change:** every projection for the blocks starts with `...`, \
+        so `titleLevel` is already fetched.";
     let why =
         crate::passes::plan_coverage::declined_by_coder(notes, "apps/web/src/lib/sanity/query.ts")
             .expect("the coder said so");
     assert!(why.contains("already fetched"), "{why}");
     assert!(crate::passes::plan_coverage::declined_by_coder(
-        "Updated `query.ts` to fetch headingLevel.",
+        "Updated `query.ts` to fetch titleLevel.",
         "apps/web/src/lib/sanity/query.ts"
     )
     .is_none());

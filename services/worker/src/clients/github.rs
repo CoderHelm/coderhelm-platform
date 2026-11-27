@@ -411,6 +411,38 @@ pub fn outside_wait(
     outage_in_text(&m).then_some((Cause::Outage, OUTAGE_WAIT_SECS))
 }
 
+/// What a compare's 404 means, from which of its two refs exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare404 {
+    /// The head isn't pushed yet: nothing to compare, so no diff.
+    NoDiffYet,
+    /// The base is gone (deleted or renamed).
+    BaseGone,
+    /// Both are there: the 404 is about something else (the repository,
+    /// access), returned as it is.
+    AsIs,
+}
+
+pub fn compare_404(base_there: bool, head_there: bool) -> Compare404 {
+    match (base_there, head_there) {
+        (false, _) => Compare404::BaseGone,
+        (true, false) => Compare404::NoDiffYet,
+        (true, true) => Compare404::AsIs,
+    }
+}
+
+/// A comparison with nothing in it, shaped like GitHub's.
+pub fn empty_compare() -> serde_json::Value {
+    serde_json::json!({
+        "status": "identical",
+        "ahead_by": 0,
+        "behind_by": 0,
+        "total_commits": 0,
+        "commits": [],
+        "files": [],
+    })
+}
+
 /// A 5xx from GitHub's API, as `status_error_message` writes it.
 fn outage_in_text(m: &str) -> bool {
     m.contains("HTTP status server error (5") && m.contains("api.github.com")
@@ -495,6 +527,52 @@ fn not_sent_message(url: &str, why: common::github_budget::Hold) -> String {
          the work waits for the reset",
         why.as_str()
     )
+}
+
+/// Keeps a successful read GitHub gave a validator (or one that can't
+/// change), so the next ask costs nothing (`github_cache`), and hands the
+/// caller the same response. Anything else passes through as it came.
+async fn keep_read(
+    key: &str,
+    url: &str,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    use super::github_cache as cache;
+    let h = resp.headers();
+    let etag = h
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let small = resp
+        .content_length()
+        .is_none_or(|n| n as usize <= cache::MAX_ENTRY_BYTES);
+    let json = h
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.contains("json") || t.contains("diff") || t.contains("patch"));
+    if resp.status() != reqwest::StatusCode::OK
+        || !small
+        || !json
+        || (etag.is_empty() && !cache::immutable(url))
+    {
+        return Ok(resp);
+    }
+    let headers: Vec<(String, String)> = cache::KEPT_HEADERS
+        .iter()
+        .filter_map(|n| Some((n.to_string(), h.get(*n)?.to_str().ok()?.to_string())))
+        .collect();
+    let body = resp.bytes().await?.to_vec();
+    let kept = cache::Kept {
+        etag,
+        headers,
+        body,
+    };
+    let again = kept
+        .response(url)
+        .ok_or("a kept read could not be answered")?;
+    cache::put(key, kept);
+    Ok(again)
 }
 
 /// Records that the installation is rate limited until `until` (epoch
@@ -1409,17 +1487,11 @@ impl GitHubClient {
         self.app_bot_login().await.ok()
     }
 
-    /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
-    /// stamped as committer on every commit the platform creates via the API.
-    /// Used to distinguish our own commits from foreign (user) commits.
-    pub async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        if common::hybrid::client::github_via_broker(&self.private_key) {
-            self.get_installation_token().await?;
-            return common::hybrid::client::bot_login()
-                .ok_or_else(|| "the broker named no bot".into());
-        }
+    /// This GitHub App as GitHub describes it (`GET /app`, with the app's
+    /// own token): its slug and its owner.
+    async fn get_app(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = self.generate_jwt()?;
-        let resp: serde_json::Value = self
+        Ok(self
             .http
             .get(format!("{API_BASE}/app"))
             .header("Authorization", format!("Bearer {jwt}"))
@@ -1429,7 +1501,19 @@ impl GitHubClient {
             .await?
             .error_for_status()?
             .json()
-            .await?;
+            .await?)
+    }
+
+    /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
+    /// stamped as committer on every commit the platform creates via the API.
+    /// Used to distinguish our own commits from foreign (user) commits.
+    pub async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            self.get_installation_token().await?;
+            return common::hybrid::client::bot_login()
+                .ok_or_else(|| "the broker named no bot".into());
+        }
+        let resp = self.get_app().await?;
         let slug = resp
             .get("slug")
             .and_then(|v| v.as_str())
@@ -1461,7 +1545,8 @@ impl GitHubClient {
     /// its response reports is recorded, and it isn't sent at all when the
     /// hour's budget is spent or (for background work) is the runs'
     /// (`common::github_budget`): the caller gets the rate limit it would
-    /// have met, with the wait.
+    /// have met, with the wait. A read made before is asked conditionally
+    /// and a read that can't change isn't asked again (`github_cache`).
     async fn send_tracked(
         &self,
         req: reqwest::RequestBuilder,
@@ -1476,6 +1561,23 @@ impl GitHubClient {
             branch_moved_by(r.method().as_str(), r.url().path(), body)
         });
         let now = Self::now_epoch();
+        let kept = built.as_ref().and_then(|r| self.kept_read(r));
+        if let Some((key, url)) = &kept {
+            if super::github_cache::immutable(url) {
+                if let Some(resp) = super::github_cache::get(key).and_then(|k| k.response(url)) {
+                    super::github_budget::served_kept(self.installation_id, now);
+                    return Ok(resp);
+                }
+            }
+        }
+        let asked = kept
+            .as_ref()
+            .and_then(|(key, _)| super::github_cache::get(key))
+            .filter(|k| !k.etag.is_empty());
+        let req = match &asked {
+            Some(k) => req.header(reqwest::header::IF_NONE_MATCH, k.etag.as_str()),
+            None => req,
+        };
         if let common::github_budget::Spend::Hold { why, wait_secs } =
             super::github_budget::admit(self.installation_id, now)
         {
@@ -1502,10 +1604,54 @@ impl GitHubClient {
         observe_budget(self.installation_id, resp.headers());
         let limited = note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
         super::github_budget::responded(self.installation_id, resp.status().as_u16(), limited, now);
+        if resp.status() != reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(r) = &built {
+                super::github_budget::route_sent(
+                    self.installation_id,
+                    super::github_budget::route_of(r.method().as_str(), r.url().as_str()),
+                    now,
+                );
+            }
+        }
         if let (Some((owner, repo, branch)), true) = (moving, resp.status().is_success()) {
             note_branch_moved(self.installation_id, &owner, &repo, &branch);
         }
-        Ok(resp)
+        let Some((key, url)) = kept else {
+            return Ok(resp);
+        };
+        // Unchanged since it was kept: GitHub didn't count it, and the
+        // caller reads what it answered then.
+        if let (Some(k), reqwest::StatusCode::NOT_MODIFIED) = (&asked, resp.status()) {
+            if let Some(again) = k.response(&url) {
+                return Ok(again);
+            }
+        }
+        keep_read(&key, &url, resp).await
+    }
+
+    /// The key and URL a request's answer is kept under, when it is a read
+    /// of GitHub's API that may be kept: a GET whose caller didn't ask
+    /// conditionally itself (`unchanged` reads the 304 it asked for).
+    fn kept_read(&self, r: &reqwest::Request) -> Option<(String, String)> {
+        let url = r.url().as_str();
+        if r.method() != reqwest::Method::GET
+            || r.headers().contains_key(reqwest::header::IF_NONE_MATCH)
+            || !(is_github_url(url) || cfg!(test))
+            || url.contains("/tarball/")
+            || url.contains("/zipball/")
+            || url.contains("/logs")
+        {
+            return None;
+        }
+        let accept = r
+            .headers()
+            .get(reqwest::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        Some((
+            super::github_cache::key(self.installation_id, url, accept),
+            url.to_string(),
+        ))
     }
 
     /// GitHub refusing this installation's requests right now: why, and until
@@ -1674,7 +1820,9 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = self.send_tracked(req).await?.error_for_status()?;
+        // A refusal keeps its status line, and a rate limit its wait until
+        // GitHub's reset, so a caller can try again at the right time.
+        let resp = ok_or_body(self.send_tracked(req).await?).await?;
         let bytes = resp.bytes().await?;
         if bytes.len() > MAX_TARBALL_BYTES {
             return Err(format!(
@@ -3911,6 +4059,11 @@ impl GitHubClient {
     // ─── Diff ───────────────────────────────────────────────────
 
     /// Compare two refs.
+    ///
+    /// A 404 is read before it is returned: a `head` that isn't pushed yet
+    /// (a run's branch before its first write) is "no diff yet", an empty
+    /// comparison, never an error; a `base` that is gone says so in words
+    /// the run's recovery reads (`run_recovery::deleted_base_error`).
     pub async fn get_diff(
         &self,
         owner: &str,
@@ -3919,7 +4072,65 @@ impl GitHubClient {
         head: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
-        self.get(&url).await
+        match self.get(&url).await {
+            Ok(v) => Ok(v),
+            Err(e) if is_not_found(&*e) => {
+                let base_there = self.ref_exists(owner, repo, base).await?;
+                let head_there = self.ref_exists(owner, repo, head).await?;
+                match compare_404(base_there, head_there) {
+                    Compare404::NoDiffYet => Ok(empty_compare()),
+                    Compare404::BaseGone => {
+                        Err(common::run_recovery::deleted_base_error(owner, repo, base).into())
+                    }
+                    Compare404::AsIs => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `branch` (or a commit) is in the repository. `Ok(false)` only
+    /// for GitHub's 404; any other error is returned.
+    pub async fn ref_exists(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        match self.get_ref(owner, repo, branch).await {
+            Ok(sha) => Ok(!sha.is_empty()),
+            Err(e) if is_not_found(&*e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Creates a label in the repository (an existing one is kept).
+    pub async fn create_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/labels");
+        match self
+            .post(
+                &url,
+                &serde_json::json!({ "name": name, "color": "ededed" }),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // 422: it exists already.
+            Err(e) if e.to_string().contains("(422 ") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drops the cached installation token: the next request fetches a new one.
+    pub fn forget_token(&self) {
+        if let Ok(mut cache) = self.token_cache.lock() {
+            *cache = None;
+        }
     }
 
     // ─── Issues ─────────────────────────────────────────────────
@@ -4377,6 +4588,48 @@ impl GitHubClient {
         sha: &str,
         merge_method: &str,
     ) -> Result<MergeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // The customer details guard holds every merge CoderHelm makes, the
+        // armed auto-merge and any other: a failing or running guard on the
+        // head, or none yet on a public repository, and nothing is merged.
+        // A failed read is an error, never a merge.
+        let pr = self.get_pull_request(owner, repo, pr_number).await?;
+        let public = pr["base"]["repo"]["private"].as_bool() == Some(false);
+        let guarded = public && self.customer_guard_checks(owner).await?;
+        let runs = self.customer_guard_runs(owner, repo, sha).await?;
+        let guard = common::customer_guard::guard_state(&runs);
+        let head_age = if guarded && guard == common::customer_guard::GuardState::Missing {
+            self.commit_age_secs(owner, repo, sha).await?
+        } else {
+            None
+        };
+        if let Some(why) = common::customer_guard::merge_refusal(guard, guarded, head_age) {
+            return Ok(MergeOutcome::NotMergeable(why.to_string()));
+        }
+        // The head's checks ran on the base as it was then. When the base
+        // has commits the head lacks, those checks never saw the merged
+        // result (two pull requests can each pass and break the base
+        // together), so nothing is merged until the base is brought in and
+        // CI passes on that commit. GitHub's "branch must be up to date"
+        // rule does this only where a repository turned it on, and an admin
+        // merge skips it: this holds on every repository CoderHelm merges
+        // in. An unreadable comparison is an error, never a merge.
+        let base = pr["base"]["ref"]
+            .as_str()
+            .filter(|b| !b.is_empty())
+            .ok_or("the pull request has no base branch")?;
+        let compared = self.compare_status(owner, repo, base, sha).await?;
+        match common::merge_gate::base_standing(&compared) {
+            Some(common::merge_gate::BaseStanding::Current) => {}
+            Some(common::merge_gate::BaseStanding::Moved) => {
+                return Ok(MergeOutcome::BaseMoved(base.to_string()));
+            }
+            None => {
+                return Err(format!(
+                    "could not tell whether {sha} contains `{base}` (compare: {compared:?})"
+                )
+                .into());
+            }
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
         let headers = self.auth_headers().await?;
         let mut req = self.http.put(&url).json(&serde_json::json!({
@@ -4401,6 +4654,115 @@ impl GitHubClient {
             409 => Ok(MergeOutcome::HeadMoved(reason)),
             _ => Err(format!("merge failed ({status}): {text}").into()),
         }
+    }
+
+    /// Seconds since `sha` was committed (its committer date); None when
+    /// GitHub gives no date.
+    pub async fn commit_age_secs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        let c = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
+            .await?;
+        Ok(c["commit"]["committer"]["date"]
+            .as_str()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| chrono::Utc::now().timestamp() - d.timestamp()))
+    }
+
+    /// Whether the customer details guard checks `owner`'s public
+    /// repositories on this deployment (`common::customer_guard::checks_repo`).
+    pub async fn customer_guard_checks(
+        &self,
+        owner: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if common::public_urls::self_hosted() {
+            return Ok(true);
+        }
+        let app_owner = self.app_owner_login().await?;
+        Ok(common::customer_guard::checks_repo(
+            false,
+            owner,
+            Some(&app_owner),
+        ))
+    }
+
+    /// The account that owns this GitHub App (GitHub's `GET /app`), read
+    /// once per process.
+    pub async fn app_owner_login(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        static OWNER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        if let Some(o) = OWNER.lock().ok().and_then(|g| g.clone()) {
+            return Ok(o);
+        }
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            // CoderHelm's app through the broker is a self-hosted install,
+            // which never asks (`customer_guard_checks`).
+            return Err("the app's owner is not known through the broker".into());
+        }
+        let resp = self.get_app().await?;
+        let owner = resp["owner"]["login"]
+            .as_str()
+            .filter(|o| !o.is_empty())
+            .ok_or("Missing owner in GET /app response")?
+            .to_string();
+        if let Ok(mut g) = OWNER.lock() {
+            *g = Some(owner.clone());
+        }
+        Ok(owner)
+    }
+
+    /// The customer details guard's check runs on `sha`, every one of them
+    /// (`common::customer_guard::guard_state` takes the newest).
+    pub async fn customer_guard_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let name = common::customer_guard::CHECK_NAME.replace(' ', "%20");
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/commits/{sha}/check-runs?check_name={name}&filter=all&per_page=100"
+        );
+        let v = self.get(&url).await?;
+        Ok(v["check_runs"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every commit of a pull request, oldest first (GitHub lists up to 250).
+    pub async fn list_pr_commits_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get_pages(
+                &format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/commits"),
+                3,
+            )
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every file a pull request changes, as GitHub lists them (its path,
+    /// status and patch; up to 3000).
+    pub async fn list_pull_files_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get_pages(
+                &format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/files"),
+                30,
+            )
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
     }
 
     /// List open PRs for a repo (newest first), used by the review-reminder sweep.
@@ -5500,6 +5862,54 @@ impl GitHubClient {
         Ok((number, html_url))
     }
 
+    /// Create a GitHub issue with labels (GitHub makes a label that doesn't
+    /// exist yet) and return (issue_number, issue_url).
+    pub async fn create_labelled_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues");
+        let payload = serde_json::json!({ "title": title, "body": body, "labels": labels });
+        let data = self.post(&url, &payload).await?;
+        let number = data["number"].as_u64().unwrap_or(0);
+        let html_url = data["html_url"].as_str().unwrap_or("").to_string();
+        Ok((number, html_url))
+    }
+
+    /// The issues (open or closed, not pull requests) carrying `label`, as
+    /// (number, title, url), newest first, up to 100.
+    pub async fn issues_with_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<(u64, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/issues?state=all&per_page=100&labels={}",
+            urlencoding::encode(label)
+        );
+        let data = self.get(&url).await?;
+        Ok(data
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|i| i.get("pull_request").is_none())
+                    .filter_map(|i| {
+                        Some((
+                            i["number"].as_u64()?,
+                            i["title"].as_str()?.to_string(),
+                            i["html_url"].as_str().unwrap_or("").to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     // ─── Actions: E2E results ───────────────────────────────────
 
     /// POST that expects no response body (GitHub answers 201/204 empty).
@@ -6158,6 +6568,9 @@ pub enum MergeOutcome {
     NotMergeable(String),
     /// The head moved past the reviewed SHA (409); carries GitHub's message.
     HeadMoved(String),
+    /// The base branch (named) has commits the head lacks, so the head's
+    /// checks never ran on the merged result. Nothing was merged.
+    BaseMoved(String),
 }
 
 /// Did a person (not a bot) convert this PR back to draft after it was last
@@ -6892,6 +7305,7 @@ mod body_limit_tests {
             "pub async fn create_pull_request(",
             "pub async fn update_pr_body(",
             "pub async fn create_issue(",
+            "pub async fn create_labelled_issue(",
             "pub async fn create_issue_comment(",
             "pub async fn edit_issue_comment(",
             "pub async fn create_pr_review(",
@@ -7010,8 +7424,9 @@ mod budget_tests {
             assert_eq!(pr["state"], "open");
             let validators = c.take_validators();
             assert_eq!(validators, vec![(url.clone(), "\"v1\"".to_string())]);
-            // Not recording any more.
-            c.get(&url).await.unwrap();
+            // Not recording any more. The same read again is asked with its
+            // validator, comes back 304 and reads as it did.
+            assert_eq!(c.get(&url).await.unwrap()["state"], "open");
             assert!(c.take_validators().is_empty());
 
             assert!(c.unchanged(&validators).await);
@@ -7027,8 +7442,8 @@ mod budget_tests {
         assert_eq!(
             spent[who::SWEEP_PR_WATCH],
             ledger::Counts {
-                sent: 3,
-                not_modified: 1,
+                sent: 2,
+                not_modified: 2,
                 ..Default::default()
             }
         );
@@ -7072,7 +7487,54 @@ mod budget_tests {
         let spent = counts(id);
         assert_eq!(spent[who::SWEEP_SECURITY].held, 1);
         assert_eq!(spent[who::SWEEP_SECURITY].sent, 0);
-        assert_eq!(spent[who::RUN].sent, 2);
+        // The run's second read of the same pull request came back 304.
+        assert_eq!(spent[who::RUN].sent, 1);
+        assert_eq!(spent[who::RUN].not_modified, 1);
+    }
+
+    /// The same read made again by any code in the process is asked
+    /// conditionally and costs nothing while it is unchanged; a read named
+    /// by a full commit SHA is never asked twice; a write is never kept.
+    #[tokio::test]
+    async fn a_read_made_before_costs_nothing_and_one_that_cant_change_is_not_asked_again() {
+        use std::sync::atomic::Ordering;
+        let id = 920_004;
+        let (base, hits) = github(4_000).await;
+        let pr = format!("{base}/repos/o/r/pulls/9");
+        let blob = format!("{base}/repos/o/r/git/blobs/0123456789abcdef0123456789abcdef01234567");
+        ledger::scoped(who::RUN, async {
+            // Two clients, as two passes of one step make: one process.
+            for c in [client(id), client(id)] {
+                for _ in 0..3 {
+                    assert_eq!(c.get(&pr).await.unwrap()["state"], "open");
+                    assert_eq!(c.get(&blob).await.unwrap()["state"], "open");
+                }
+            }
+            // Another installation's reads are its own.
+            let other = client(id + 1);
+            other.get(&pr).await.unwrap();
+        })
+        .await;
+        // The pull request: once whole, five times 304. The blob: once.
+        // The other installation: once.
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + 5 + 1 + 1);
+        let spent = counts(id);
+        assert_eq!(
+            spent[who::RUN],
+            ledger::Counts {
+                sent: 2,
+                not_modified: 5,
+                cached: 5,
+                ..Default::default()
+            }
+        );
+        counts(id + 1);
+        let routes = ledger::drain_routes(id);
+        assert_eq!(
+            ledger::routes_field(&routes),
+            "run GET /repos/:o/:r/git/blobs/:sha=1; run GET /repos/:o/:r/pulls/:n=1"
+        );
+        ledger::drain_routes(id + 1);
     }
 
     /// Once GitHub says the hour's budget is gone, no caller sends another

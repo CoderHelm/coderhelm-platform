@@ -101,6 +101,10 @@ async fn main() -> Result<(), Error> {
         secrets,
     });
 
+    // The first start of a new release runs the self-heal sweep once:
+    // failed runs this release now gets past resume right after the deploy.
+    passes::recover::on_new_release(&state).await;
+
     lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
         // Boxed: the event's future lives on the heap, never on the main
         // thread's stack (see `future_sizes` below).
@@ -390,8 +394,11 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
     use models::WorkerMessage as M;
     match message {
         M::Ticket(_) | M::PlanExecute(_) | M::PlanTaskContinue(_) | M::JiraComment(_) => who::RUN,
-        M::Feedback(_) | M::Resume(_) => who::FIX_ROUND,
-        M::Review(_) => who::REVIEW,
+        M::Feedback(_) => who::FIX_ROUND,
+        // The CI wait and the CI fix rounds it leads to: a run's own steps,
+        // which leave the last of the hour to reviews and people's answers.
+        M::Resume(_) => who::CI,
+        M::Review(_) | M::CustomerGuard(_) => who::REVIEW,
         M::MarkReady(_) => who::READY,
         M::AwaitMerge(_)
         | M::ReleaseSteps(_)
@@ -409,6 +416,7 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
         | M::PluginSync(_)
         | M::PluginTrigger(_)
         | M::PluginResults(_)
+        | M::SkillRun(_)
         | M::SkillSync(_)
         | M::SkillAsk(_)
         | M::ToolProposals(_)
@@ -694,6 +702,34 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             // waiting for someone to open Analytics.
             let resumed = as_sweep(who::SWEEP_DEPLOYS, passes::deploy_stats::sweep(&state)).await;
             info!(resumed, "Deploys backfill sweep done");
+            // Merged changes no release tag holds (merged while nothing was
+            // listening, or before this CoderHelm release): a release window
+            // opens, hourly at most and once after each release.
+            let opened = as_sweep(
+                who::SWEEP_PR_WATCH,
+                passes::review_actions::release_catch_up(&state),
+            )
+            .await;
+            info!(opened = ?opened, "Release catch-up done");
+            // Release steps whose tick chain stopped with work left (a lost
+            // message, a failed send, a crash) are resumed with one normal
+            // tick each, claimed so two sweeps never both resume one.
+            let stalled = as_sweep(
+                who::SWEEP_PR_WATCH,
+                passes::release_run::resume_stalled(&state),
+            )
+            .await;
+            info!(
+                resumed = ?stalled.resumed,
+                gave_up = stalled.gave_up,
+                left = stalled.left,
+                "Stalled releases done"
+            );
+        }
+        models::WorkerMessage::CustomerGuard(msg) => {
+            // A check the guard could not set is tried again later; until it
+            // is set the pull request is not merged.
+            passes::customer_guard::run_or_retry(&state, &msg).await;
         }
         models::WorkerMessage::ReviewTidy(msg) => {
             if let Err(e) = passes::review_tidy::run(&state, &msg).await {
@@ -730,6 +766,20 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 closed = stale.closed,
                 unstaled = stale.unstaled,
                 "Stale PR sweep done"
+            );
+            // Duplicate follow-ups: each team at most once an hour, the
+            // first tick after a deploy included.
+            let dupes = as_sweep(
+                who::SWEEP_FOLLOWUP_DEDUPE,
+                passes::followup_dedupe::sweep(&state),
+            )
+            .await;
+            info!(
+                teams = dupes.teams,
+                families = dupes.families,
+                closed = dupes.closed,
+                flagged = dupes.flagged,
+                "Follow-up duplicate sweep done"
             );
             // Agent files gone stale (pushes that changed what they are
             // written from, or older than 30 days with new commits): each
@@ -849,6 +899,12 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             info!(team_id = %msg.team_id, artifact = %msg.artifact_id, "Plugin results");
             if let Err(e) = passes::plugins::results(&state, msg).await {
                 error!("Plugin results failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::SkillRun(msg) => {
+            info!(team_id = %msg.team_id, schedule = %msg.schedule_id, trigger = %msg.trigger, "Skill run");
+            if let Err(e) = passes::skill_schedule::run(&state, msg).await {
+                error!("Skill run failed: {e:?}");
             }
         }
         models::WorkerMessage::SkillSync(msg) => {
@@ -1020,6 +1076,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 error!("Usage reconciliation failed: {e}");
             }
         }
+        models::WorkerMessage::SelfHealSweep => {
+            passes::recover::self_heal_sweep(&state).await;
+        }
         models::WorkerMessage::AgentResumeSweep => {
             let store = agent::policy::store(&state);
             let sent = common::agent_policy::pause::sweep(&*store, &SqsResender(&state)).await;
@@ -1027,6 +1086,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         models::WorkerMessage::RunWaiting(msg) => {
             passes::webhooks::run_waiting(&state, &msg).await;
+        }
+        models::WorkerMessage::ChangeWaitCheck(msg) => {
+            passes::change_wait::check_all(&state, Some(&msg.team_id)).await;
         }
         models::WorkerMessage::RoleReadsWait(msg) => {
             passes::role_wait::check(&state, &msg).await;

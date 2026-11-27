@@ -8,7 +8,8 @@
 //! - `list_bases`, and the typed lookups: `find_tickets`,
 //!   `find_pull_requests`, `find_runs`, `find_findings`, `code_search`,
 //!   `read_file`, `code_symbol`, `history`, and the app map's lookups
-//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`), the
+//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`, `map_flow`,
+//!   `map_impact`), the
 //!   same ones Chat uses (`common::app_map::Lookups`), over the signed-in
 //!   team's own map.
 //!
@@ -63,6 +64,8 @@ pub const MAP_FIND: &str = "map_find";
 pub const MAP_PART: &str = "map_part";
 pub const MAP_SCREEN: &str = "map_screen";
 pub const MAP_FILE: &str = "map_file";
+pub const MAP_FLOW: &str = "map_flow";
+pub const MAP_IMPACT: &str = "map_impact";
 /// The dashboard route whose check decides a map read: the App map page.
 pub const MAP_ROUTE: &str = "app_map::get_map";
 
@@ -313,7 +316,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_OVERVIEW,
         title: "Read the app map",
-        description: "The team's app map in short, as CoderHelm drew it from every repository: each part of the app (its id, name, kind and what it does in plain words), the screens, the repositories and the open problems on it. Start here for how the app fits together.",
+        description: "The team's app map in short, as CoderHelm drew it from every repository: each part of the app (its id, name, kind and what it does in plain words), the screens, the journeys (user flows such as sign in or checkout), the repositories and the open problems on it. Start here for how the app fits together.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({}), &[]),
         output: None,
@@ -321,9 +324,9 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_FIND,
         title: "Search the app map",
-        description: "Searches the team's app map for parts, files, endpoints and screens whose names, descriptions or paths hold every word, with their ids for map_part, map_screen and map_file.",
+        description: "Searches the team's app map for parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word, with their ids for map_part, map_screen, map_file and map_flow.",
         scopes: &[CODE_SCOPE],
-        schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slip." } }), &["query"]),
+        schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slot." } }), &["query"]),
         output: None,
     },
     Tool {
@@ -337,9 +340,9 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: MAP_SCREEN,
         title: "Follow a screen on the app map",
-        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. Give the screen's id or its address, like /slips/:id.",
+        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. A page one route picks by type (a catch-all that renders a different component for each kind of page) is a screen of its own, with the type, its renderer's file:line and the route that picks it. Give the screen's id, its address (like /slots/:id) or its name.",
         scopes: &[CODE_SCOPE],
-        schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id or address, from map_overview." } }), &["screen"]),
+        schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id, address or name, from map_overview or map_find." } }), &["screen"]),
         output: None,
     },
     Tool {
@@ -348,6 +351,22 @@ pub const TOOLS: &[Tool] = &[
         description: "One file on the team's app map by its path (the repository's folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to. Read the file's lines with read_file.",
         scopes: &[CODE_SCOPE],
         schema: || obj(json!({ "path": { "type": "string", "description": "The file's path on the map." } }), &["path"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_FLOW,
+        title: "Walk through a journey on the app map",
+        description: "One journey through the team's app (a user flow such as sign in, password reset or checkout), step by step in order: the screens, the requests they make, the server code and outside services behind them, and the next screen, each with what happens there and the file:line it cites. Give the journey's id or the words of its title, like mobile sign in.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "journey": { "type": "string", "description": "A journey's id or title words, from map_overview or map_find." } }), &["journey"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_IMPACT,
+        title: "What a change reaches on the app map",
+        description: common::app_map::IMPACT_DESCRIPTION,
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "target": { "type": "string", "description": "A file's path on the map (like harbor-api/src/bookings.js), an endpoint (METHOD /path, like POST /slots/:id/bookings) or a part's id, from map_overview or map_find." } }), &["target"]),
         output: None,
     },
 ];
@@ -595,11 +614,13 @@ pub fn read_of(tool: &str, args: &Value) -> Result<Read, String> {
             Read::new(GITHUB_HISTORY, take(args, &keys))
         }
         MAP_OVERVIEW => Read::new(MAP_OVERVIEW, json!({})),
-        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE => {
+        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE | MAP_FLOW | MAP_IMPACT => {
             let key = match tool {
                 MAP_FIND => "query",
                 MAP_PART => "id",
                 MAP_SCREEN => "screen",
+                MAP_FLOW => "journey",
+                MAP_IMPACT => "target",
                 _ => "path",
             };
             let r = take(args, &[key]);
@@ -1787,8 +1808,10 @@ mod tests {
             (MAP_OVERVIEW, json!({})),
             (MAP_FIND, json!({ "query": "booking" })),
             (MAP_PART, json!({ "id": "api" })),
-            (MAP_SCREEN, json!({ "screen": "/slips/:id" })),
+            (MAP_SCREEN, json!({ "screen": "/slots/:id" })),
             (MAP_FILE, json!({ "path": "harbor-api/src/bookings.js" })),
+            (MAP_FLOW, json!({ "journey": "book a slot" })),
+            (MAP_IMPACT, json!({ "target": "POST /slots/:id/bookings" })),
         ];
         for k in FINDING_KINDS {
             v.push((FIND_FINDINGS, json!({ "kind": k })));
@@ -1820,7 +1843,9 @@ mod tests {
                 MAP_FIND,
                 MAP_PART,
                 MAP_SCREEN,
-                MAP_FILE
+                MAP_FILE,
+                MAP_FLOW,
+                MAP_IMPACT
             ]
         );
         for t in &tools {
@@ -2035,7 +2060,9 @@ mod tests {
                 MAP_FIND,
                 MAP_PART,
                 MAP_SCREEN,
-                MAP_FILE
+                MAP_FILE,
+                MAP_FLOW,
+                MAP_IMPACT
             ]
         );
         assert!(!names(BTreeSet::from([READ_SCOPE, WORK_SCOPE])).contains(&MAP_PART.to_string()));
@@ -2070,10 +2097,10 @@ mod tests {
     #[test]
     fn the_map_lookups_answer_from_the_signed_in_teams_map_only() {
         let member = Holder::builtin("member");
-        let read = read_of(MAP_SCREEN, &json!({ "screen": "/slips/:id" })).unwrap();
+        let read = read_of(MAP_SCREEN, &json!({ "screen": "/slots/:id" })).unwrap();
         assert_eq!(scope_needed(MAP_SCREEN, &json!({})), None);
         assert_eq!(
-            scope_needed(MAP_SCREEN, &json!({ "screen": "/slips/:id" })),
+            scope_needed(MAP_SCREEN, &json!({ "screen": "/slots/:id" })),
             Some(CODE_SCOPE)
         );
         assert!(decide(&BTreeSet::from([READ_SCOPE, CODE_SCOPE]), &member, &read).is_ok());
@@ -2104,14 +2131,14 @@ mod tests {
         );
         assert_eq!(
             found[0].title,
-            "Followed the screen /slips/:id on the app map"
+            "Followed the screen /slots/:id on the app map"
         );
         // Its id reads the same lookup again.
         let t = decode_id(&found[0].id).unwrap();
         assert_eq!(t.read, read);
         // Another team's part or screen isn't in this team's map, and a team
         // with no map gets a plain answer.
-        let theirs = read_of(MAP_PART, &json!({ "id": "marina-docks" })).unwrap();
+        let theirs = read_of(MAP_PART, &json!({ "id": "library-wings" })).unwrap();
         assert!(map_read(Some(harbor("harbor")), &mut Registry::default(), &theirs).is_err());
         let err = map_read(None, &mut Registry::default(), &read).unwrap_err();
         assert!(err.contains("no app map yet"), "{err}");
@@ -2127,6 +2154,158 @@ mod tests {
             audit_detail(MAP_FILE, &json!({ "path": "harbor-api/src/x.js" }))
                 .contains("Code / app_map")
         );
+    }
+
+    /// The map tools on /mcp name each System part by its repository, the
+    /// way the App map page does, and keep the plain role beside it.
+    #[test]
+    fn the_map_tools_name_parts_by_their_repositories() {
+        let answer = |tool: &str, input: Value| -> Value {
+            let read = read_of(tool, &input).unwrap();
+            let (text, _) =
+                map_read(Some(harbor("harbor")), &mut Registry::default(), &read).unwrap();
+            let body = text.split_once("] ").unwrap().1;
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+        };
+        let o = answer(MAP_OVERVIEW, json!({}));
+        let part = |id: &str| {
+            o["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            (
+                part("api")["label"].clone(),
+                part("api")["role"].clone(),
+                part("api")["repos"].clone()
+            ),
+            (
+                json!("harbor-api"),
+                json!("Booking service"),
+                json!(["harbor-api"])
+            )
+        );
+        assert_eq!(part("web")["label"], "harbor-web");
+        assert_eq!(part("web")["role"], "Harbor website");
+        // An outside service keeps its own name and has no role.
+        assert_eq!(part("stripe")["label"], "Stripe");
+        assert!(part("stripe").get("role").is_none());
+        let p = answer(MAP_PART, json!({ "id": "api" }));
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
+        assert_eq!(p["part"]["repos"], json!(["harbor-api"]));
+        let f = answer(MAP_FIND, json!({ "query": "harbor-api" }));
+        assert!(
+            f["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == "api" && p["label"] == "harbor-api"),
+            "{f}"
+        );
+    }
+
+    /// The overview on /mcp counts and lists each screen under the System
+    /// card its file is in, never under a bare repository.
+    #[test]
+    fn the_map_overview_counts_screens_by_card() {
+        let mut g = json!({
+            "schema": common::app_map::GRAPH_SCHEMA, "project": {"name": "Site"},
+            "nodes": [
+                {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui", "paths": ["site/apps/web/**", "site/packages/**"]},
+                {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/apps/studio/**"]},
+            ],
+            "files": [
+                {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
+                {"p": "site/apps/web/blocks/Hero.tsx", "n": "web", "r": "site"},
+                {"p": "site/apps/studio/schemas/slot.ts", "n": "studio", "r": "site"},
+            ],
+            "screens": [
+                {"id": "screen:home", "url": "/", "name": "Home", "file": "site/apps/web/app/page.tsx", "nav": {"app": "site"}},
+                {"id": "screen:hero", "url": "/:slug", "name": "Hero", "file": "site/apps/web/blocks/Hero.tsx", "nav": {"app": "site", "dispatcher": "site/apps/web/app/page.tsx"}},
+                {"id": "screen:doc", "url": "/studio/slot", "name": "Slot", "file": "site/apps/studio/schemas/slot.ts", "kind": "page-kind", "nav": {"app": "site"}},
+            ],
+            "links": [],
+        });
+        common::app_map::stamp_repos(&mut g, &common::app_map::folders(&["harbor/site".into()]));
+        let read = read_of(MAP_OVERVIEW, &json!({})).unwrap();
+        let (text, _) = map_read(Some(g), &mut Registry::default(), &read).unwrap();
+        let o: Value = serde_json::from_str(text.split_once("] ").unwrap().1).unwrap();
+        assert_eq!(
+            o["screen_count"],
+            json!({"site / web": 2, "site / studio": 1})
+        );
+        let apps: Vec<(&str, &str)> = o["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["id"].as_str().unwrap(), s["app_name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            apps,
+            vec![
+                ("screen:home", "site / web"),
+                ("screen:hero", "site / web"),
+                ("screen:doc", "site / studio")
+            ]
+        );
+    }
+
+    /// A journey on /mcp: the same lookup as Chat's, every step citing its
+    /// file and line, cited back to the App map page.
+    #[test]
+    fn a_journey_is_walked_step_by_step_with_its_files() {
+        let mut g = harbor("harbor");
+        g["flows"] = json!([{
+            "id": "book-a-slot", "title": "Book a slot", "custom": true, "coderhelm": {"linked": [true, true, true]},
+            "steps": [
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks the booking service to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        let read = read_of(MAP_FLOW, &json!({ "journey": "book a slot" })).unwrap();
+        assert_eq!(read.lookup, MAP_FLOW);
+        assert_eq!(
+            scope_needed(MAP_FLOW, &json!({ "journey": "x" })),
+            Some(CODE_SCOPE)
+        );
+        assert!(read_of(MAP_FLOW, &json!({})).is_err());
+        let mut reg = Registry::default();
+        let (text, _) = map_read(Some(g.clone()), &mut reg, &read).unwrap();
+        assert!(text.contains("harbor-web/lib/slots.ts:2"), "{text}");
+        assert!(text.contains("Stripe charges the card."), "{text}");
+        let found = items(&reg, &read, "https://app.example");
+        assert_eq!(
+            found[0].title,
+            "Walked through the journey book a slot on the app map"
+        );
+        assert_eq!(
+            found[0].url,
+            "https://app.example/app-map?focus=api,stripe,web"
+        );
+        // Listed in the overview and found by search.
+        let (overview, _) = map_read(
+            Some(g.clone()),
+            &mut Registry::default(),
+            &read_of(MAP_OVERVIEW, &json!({})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            overview.contains("\"journeys\":[{\"id\":\"book-a-slot\""),
+            "{overview}"
+        );
+        let (found, _) = map_read(
+            Some(g),
+            &mut Registry::default(),
+            &read_of(MAP_FIND, &json!({ "query": "slot book" })).unwrap(),
+        )
+        .unwrap();
+        assert!(found.contains("\"title\":\"Book a slot\""), "{found}");
     }
 
     #[test]
@@ -2424,5 +2603,167 @@ mod tests {
         };
         let rendered = reg.render_with("S1", "1 | fn a() {}\n2 | }");
         assert_eq!(body_of(&rendered), "1 | fn a() {}\n2 | }\n");
+    }
+
+    /// The library map: one website whose catch-all route dispatches its
+    /// pages by type (services/worker/floorplan/fixtures/library), with a
+    /// journey through two of the dispatched pages as the worker stores it.
+    fn library() -> Value {
+        let mut g: Value = serde_json::from_str(include_str!(
+            "../../worker/floorplan/fixtures/library-graph.json"
+        ))
+        .unwrap();
+        common::app_map::stamp_repos(
+            &mut g,
+            &common::app_map::folders(&["library/library-web".to_string()]),
+        );
+        g["flows"] = json!([{
+            "id": "join-the-library", "title": "Join the library", "custom": true,
+            "coderhelm": {"entry": "screen:site:/members/join", "linked": [true, true, true]},
+            "steps": [
+                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/join", "note": "The patron fills in the sign-up form.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 19}]},
+                {"ref": "r:1", "note": "The form saves the new member.", "evidence": [{"file": "library-web/components/SignupForm.tsx", "line": 7}, {"file": "library-web/app/api/members/route.ts", "line": 1}]},
+                {"ref": "f:library-web/lib/renderers.tsx", "screen": "screen:site:/members/checkout", "note": "The patron pays for the season.", "evidence": [{"file": "library-web/lib/renderers.tsx", "line": 24}]},
+            ],
+        }]);
+        g
+    }
+
+    /// One map tool on /mcp over the library map, as the model reads it.
+    fn library_tool(name: &str, input: Value) -> Value {
+        let read = read_of(name, &input).unwrap();
+        let (text, _) = map_read(Some(library()), &mut Registry::default(), &read).unwrap();
+        let body = text.split_once("] ").map(|(_, b)| b).unwrap_or(&text);
+        serde_json::from_str(body).unwrap()
+    }
+
+    /// The pages a catch-all route dispatches to by type come through every
+    /// map tool on /mcp: listed, found, followed with their URL pattern and
+    /// renderer, named for their renderer file, and walked in a journey.
+    #[test]
+    fn dispatched_screens_come_through_the_map_tools() {
+        let o = library_tool(MAP_OVERVIEW, json!({}));
+        let listed: Vec<&str> = o["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        for n in [
+            "Member signup",
+            "Member checkout",
+            "Booth page",
+            "Booth list",
+            "Notice page",
+        ] {
+            assert!(listed.contains(&n), "{n} in {listed:?}");
+        }
+        // every screen is counted, all under the app's card (named by its
+        // repository): the route files and the pages they dispatch to alike
+        let counted: u64 = o["screen_count"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert_eq!(counted, 7);
+        assert_eq!(o["screen_count"], json!({ "library-web": 7 }));
+
+        let f = library_tool(MAP_FIND, json!({ "query": "member checkout" }));
+        assert_eq!(f["screens"][0]["url"], "/members/checkout");
+        assert_eq!(
+            f["screens"][0]["dispatch"]["renderer"],
+            "MemberCheckoutRenderer"
+        );
+        // by the type the route dispatches on, too
+        let f = library_tool(MAP_FIND, json!({ "query": "booth-index" }));
+        assert_eq!(f["screens"][0]["name"], "Booth list");
+
+        for q in [
+            "/members/join",
+            "screen:site:/members/join",
+            "Member signup",
+        ] {
+            let v = library_tool(MAP_SCREEN, json!({ "screen": q }));
+            let s = &v["screen"];
+            assert_eq!(s["url"], "/members/join", "{q}");
+            assert_eq!(s["file"], "library-web/lib/renderers.tsx");
+            assert_eq!(s["dispatch"]["type"], "member-signup");
+            assert_eq!(
+                s["dispatch"]["renderer_at"],
+                "library-web/lib/renderers.tsx:19"
+            );
+            assert_eq!(
+                s["dispatch"]["route_file"],
+                "library-web/app/[...slug]/page.tsx"
+            );
+            assert_eq!(s["dispatch"]["url_from"], "resolver");
+            assert_eq!(s["evidence"][0]["at"], "library-web/lib/renderers.tsx:19");
+            assert_eq!(s["evidence"][2]["at"], "library-web/lib/resolve.ts:13");
+            let behind: Vec<&str> = v["behind"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|b| b["id"].as_str())
+                .collect();
+            assert!(behind.contains(&"f:library-web/components/SignupForm.tsx"));
+            assert!(!behind.contains(&"f:library-web/components/CheckoutForm.tsx"));
+        }
+        // a pattern only the route gives says so
+        let v = library_tool(MAP_SCREEN, json!({ "screen": "/(notice)/*" }));
+        assert_eq!(v["screen"]["dispatch"]["url_from"], "route");
+
+        let names = |v: &Value| -> Vec<String> {
+            v["screens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let file = library_tool(MAP_FILE, json!({ "path": "library-web/lib/renderers.tsx" }));
+        let on_file = names(&file);
+        for n in ["Member signup", "Member checkout", "Booth page"] {
+            assert!(on_file.iter().any(|x| x == n), "{n} in {on_file:?}");
+        }
+        let imp = library_tool(
+            MAP_IMPACT,
+            json!({ "target": "library-web/lib/renderers.tsx" }),
+        );
+        let hit = names(&imp);
+        for n in ["Member signup", "Member checkout", "Notice page"] {
+            assert!(hit.iter().any(|x| x == n), "{n} in {hit:?}");
+        }
+        let at: Vec<&str> = imp["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["at"].as_str())
+            .collect();
+        assert!(at.contains(&"library-web/lib/renderers.tsx:24"), "{at:?}");
+        assert_eq!(imp["journeys"][0]["id"], "join-the-library");
+        // the form one screen uses reaches that screen only
+        let imp = library_tool(
+            MAP_IMPACT,
+            json!({ "target": "library-web/components/CheckoutForm.tsx" }),
+        );
+        let mut reached = names(&imp);
+        reached.sort();
+        assert_eq!(reached, ["Member checkout", "Page"]);
+
+        let j = library_tool(MAP_FLOW, json!({ "journey": "join the library" }));
+        assert_eq!(j["journey"]["id"], "join-the-library");
+        let on: Vec<&str> = j["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["screen"]["name"].as_str().unwrap_or("-"))
+            .collect();
+        assert_eq!(on, vec!["Member signup", "-", "Member checkout"]);
+        assert_eq!(j["steps"][2]["screen"]["url"], "/members/checkout");
+        assert_eq!(
+            j["steps"][2]["cites"][0],
+            "library-web/lib/renderers.tsx:24"
+        );
     }
 }

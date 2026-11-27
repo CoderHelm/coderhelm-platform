@@ -1,19 +1,19 @@
 //! bz. Two pull requests did far more than their tickets, and guessed
 //! where they should have measured.
 //!
-//! A data-pipeline ticket asked to link four full-day camps to Swimming as
-//! well as their own sport. The plan added a second overrides map and two
-//! helpers beside the existing `CAMP_MULTI_SPORT_OVERRIDES`, and switched
-//! the insert-only link sync to a replacing upsert that deleted links
-//! nobody asked about. The build added warnings, three summary counters
-//! and an INFO-to-DEBUG change in shared code (the data rules' "report
-//! unexpected data once per run" item asked for them on a four-entry fix),
-//! and a 432-line test with fake hooks and an invented payload. The right
+//! A data-pipeline ticket asked to link four full-day tours to Food Tasting as
+//! well as their own activity. The plan added a second overrides map and two
+//! helpers beside the existing `TOUR_MULTI_STOP_OVERRIDES`, and
+//! switched the insert-only link sync to a replacing upsert that deleted links
+//! nobody asked about. The build added warnings, summary counters and an
+//! INFO-to-DEBUG change in shared code (the data rules' "report unexpected
+//! data once per run" item asked for them on a four-entry fix), and a test
+//! hundreds of lines long with fake hooks and an invented payload. The right
 //! change: four map entries; an insert with `ON CONFLICT DO NOTHING` in the
 //! three write branches; one small test.
 //!
 //! A web ticket embedded a vendor's booking portal in a frame. Its vendor
-//! end-to-end tests were rewritten three times on guesses (no inner
+//! end-to-end tests were rewritten again and again on guesses (no inner
 //! scroll, a click that adds to an order, invented test ids), and when the
 //! criterion "no double scrollbars on desktop" met the vendor's behaviour,
 //! the test was changed to expect the vendor's behaviour instead of the
@@ -41,16 +41,16 @@ use crate::passes::plan_shape;
 use crate::passes::review_rules;
 use serde_json::json;
 
-const MAP_FILE: &str = "dags/camps/sports.py";
-const SYNC_FILE: &str = "dags/camps/sync_links.py";
+const MAP_FILE: &str = "dags/tours/stops.py";
+const SYNC_FILE: &str = "dags/tours/sync_links.py";
 
-const CAMP_TICKET: &str = "Link four full-day camps to Swimming\n\nThese full-day camps should show under Swimming as well as their own sport: \"Aqua Day Camp\", \"Swim and Sail\", \"Pool Explorers\", \"Splash Week\".";
+const TOUR_TICKET: &str = "Link four full-day tours to Food Tasting\n\nThese full-day tours should show under Food Tasting as well as their own activity: \"Dawn Reef Tour\", \"Taste and Stroll\", \"Bay Explorers\", \"Tide Week\".";
 
-const PORTAL_TICKET: &str = "Embed the booking portal on the camps page\n\nShow the vendor's booking portal in an iframe on the camps page.\n\nAcceptance criteria:\n- The portal loads inside the page\n- No double scrollbars on desktop\n";
+const PORTAL_TICKET: &str = "Embed the booking portal on the slots page\n\nShow the vendor's booking portal in an iframe on the slots page.\n\nAcceptance criteria:\n- The portal loads inside the page\n- No double scrollbars on desktop\n";
 
-const BASE_MAP: &str = "CAMP_MULTI_SPORT_OVERRIDES = {\n    \"sports academy break camp\": [\"multi-sport\"],\n}\n\n\ndef get_camp_multi_sport_names(name):\n    return CAMP_MULTI_SPORT_OVERRIDES.get(name.lower(), [])\n";
+const BASE_MAP: &str = "TOUR_MULTI_STOP_OVERRIDES = {\n    \"harbor sampler tour\": [\"multi-stop\"],\n}\n\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name.lower(), [])\n";
 
-const BASE_SYNC: &str = "def write_links(cur, camp_id, sports):\n    for sport_id in sports:\n        cur.execute(\n            \"INSERT INTO camp_sports (camp_id, sport_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n            (camp_id, sport_id),\n        )\n";
+const BASE_SYNC: &str = "def write_links(cur, tour_id, activities):\n    for activity_id in activities:\n        cur.execute(\n            \"INSERT INTO tour_stops (tour_id, activity_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n            (tour_id, activity_id),\n        )\n";
 
 fn plan(design: &str, tasks: &str) -> PlanResult {
     PlanResult {
@@ -60,68 +60,68 @@ fn plan(design: &str, tasks: &str) -> PlanResult {
     }
 }
 
-/// The plan the run wrote for the camps ticket, in its shape.
-fn camps_plan_before() -> PlanResult {
+/// The plan the run wrote for the tours ticket, in its shape.
+fn tours_plan_before() -> PlanResult {
     plan(
-        "## Approach\nAdd `CAMP_SWIMMING_OVERRIDES` and `get_camp_swimming_names` to hold the swimming links. \
-         The link sync upserts each camp's links and deletes stale ones so the table matches. \
-         Report skipped camps once per run with summary counters, and move the per-record INFO log to debug.\n",
-        &format!("- [ ] {MAP_FILE}: add the swimming map and helper\n- [ ] {SYNC_FILE}: replace links per camp\n- [ ] tests/test_sync_links.py: cover the sync"),
+        "## Approach\nAdd `TOUR_TASTING_OVERRIDES` and `get_tour_tasting_names` to hold the tasting links. \
+         The link sync upserts each tour's links and deletes stale ones so the table matches. \
+         Report skipped tours once per run with summary counters, and move the per-record INFO log to debug.\n",
+        &format!("- [ ] {MAP_FILE}: add the tasting map and helper\n- [ ] {SYNC_FILE}: replace links per tour\n- [ ] tests/test_sync_links.py: cover the sync"),
     )
 }
 
 /// The small, correct plan.
-fn camps_plan_after() -> PlanResult {
+fn tours_plan_after() -> PlanResult {
     plan(
-        "## Reuse\n- `CAMP_MULTI_SPORT_OVERRIDES` and `get_camp_multi_sport_names` in dags/camps/sports.py\n\n\
+        "## Reuse\n- `TOUR_MULTI_STOP_OVERRIDES` and `get_tour_multi_stop_names` in dags/tours/stops.py\n\n\
          ## Must not change\nNo deletes: existing links stay. Logging and the other pipelines stay as they are.\n\n\
          ## Measure first\nNone: the change stays inside this repository.\n\n\
-         ## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; in the 3 write branches insert links for \
-         `get_camp_multi_sport_names` with ON CONFLICT DO NOTHING.\n\n\
-         ## Proof\nOne test: the 4 names get Swimming and their own sport, others only their own, nothing deleted.\n\n\
-         ## Out of scope\nNone: the ticket names the four camps and nothing else.\n",
-        &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: insert the extra links\n- [ ] tests/test_sports.py: one test"),
+         ## Smallest change\n4 entries in `TOUR_MULTI_STOP_OVERRIDES`; in the 3 write branches insert links for \
+         `get_tour_multi_stop_names` with ON CONFLICT DO NOTHING.\n\n\
+         ## Proof\nOne test: the 4 names get Food Tasting and their own activity, others only their own, nothing deleted.\n\n\
+         ## Out of scope\nNone: the ticket names the four tours and nothing else.\n",
+        &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: insert the extra links\n- [ ] tests/test_stops.py: one test"),
     )
 }
 
 fn portal_plan_before() -> PlanResult {
     plan(
-        "## Reuse\n- `CampsPage` in web/src/pages/camps.tsx\n\n## Must not change\nThe header.\n\n\
-         ## Measure first\nThe vendor portal renders in an iframe with no inner scroll; clicking a camp adds it to the order summary.\n\n\
-         ## Smallest change\nAn iframe block on the camps page.\n\n\
+        "## Reuse\n- `SlotsPage` in web/src/pages/slots.tsx\n\n## Must not change\nThe header.\n\n\
+         ## Measure first\nThe vendor portal renders in an iframe with no inner scroll; clicking a slot adds it to the booking total.\n\n\
+         ## Smallest change\nAn iframe block on the slots page.\n\n\
          ## Proof\ne2e spec for the portal. If the frame scrolls, update the test to match the vendor.\n",
-        "- [ ] web/src/pages/camps.tsx: embed\n- [ ] e2e/portal.spec.ts: spec",
+        "- [ ] web/src/pages/slots.tsx: embed\n- [ ] e2e/portal.spec.ts: spec",
     )
 }
 
 fn portal_plan_after() -> PlanResult {
     plan(
-        "## Reuse\n- `CampsPage` in web/src/pages/camps.tsx and its layout\n\n## Must not change\nThe header and other pages.\n\n\
-         ## Measure first\nprobe_page on the portal at 1280x900: the embed script caps the frame at the window height below its top (663px) and the portal scrolls inside it; every camp button is disabled until registration opens; weeks are `program-portals-segment-tag-guest-N`.\n\n\
-         ## Smallest change\nAn iframe block on the camps page; drop the footer and bottom padding there so the frame fills the window, as the vendor's embed docs recommend.\n\n\
-         ## Proof\nOne e2e spec from the probe record: the page itself has no scrollbar at 1280x900, the frame is 663px, week tags are listed.\n\n\
-         ## Out of scope\n- Registration after it opens: decided with the default: the spec checks only what the probe saw.\n",
-        "- [ ] web/src/pages/camps.tsx: embed, no footer\n- [ ] e2e/portal.spec.ts: spec from the probe",
+        "## Reuse\n- `SlotsPage` in web/src/pages/slots.tsx and its layout\n\n## Must not change\nThe header and other pages.\n\n\
+         ## Measure first\nprobe_page on the portal at 1280x900: the embed script caps the frame at the window height below its top (640px) and the portal scrolls inside it; every slot button is disabled until booking opens; nights are `booking-night-tag-N`.\n\n\
+         ## Smallest change\nAn iframe block on the slots page; drop the footer and bottom padding there so the frame fills the window, as the vendor's embed docs recommend.\n\n\
+         ## Proof\nOne e2e spec from the probe record: the page itself has no scrollbar at 1280x900, the frame is 640px, night tags are listed.\n\n\
+         ## Out of scope\n- Booking after it opens: decided with the default: the spec checks only what the probe saw.\n",
+        "- [ ] web/src/pages/slots.tsx: embed, no footer\n- [ ] e2e/portal.spec.ts: spec from the probe",
     )
 }
 
 #[test]
 fn the_plans_are_sent_back_until_they_are_the_small_change() {
-    let existing = vec!["CAMP_MULTI_SPORT_OVERRIDES".to_string()];
-    // Before: the camps plan has no sections, a parallel map, a replacing
+    let existing = vec!["TOUR_MULTI_STOP_OVERRIDES".to_string()];
+    // Before: the tours plan has no sections, a parallel map, a replacing
     // sync, a log change and reporting.
-    let g = plan_shape::plan_gaps(&camps_plan_before(), CAMP_TICKET, false, &existing);
+    let g = plan_shape::plan_gaps(&tours_plan_before(), TOUR_TICKET, false, &existing);
     let all = g.join("\n");
     assert!(all.contains("lacks `## Reuse`"), "{all}");
     assert!(
-        all.contains("`CAMP_SWIMMING_OVERRIDES` next to the existing `CAMP_MULTI_SPORT_OVERRIDES`"),
+        all.contains("`TOUR_TASTING_OVERRIDES` next to the existing `TOUR_MULTI_STOP_OVERRIDES`"),
         "{all}"
     );
     assert!(all.contains("delete or overwrite"), "{all}");
     assert!(all.contains("changes logging"), "{all}");
     assert!(all.contains("adds reporting"), "{all}");
     // After: nothing to send back.
-    assert!(plan_shape::plan_gaps(&camps_plan_after(), CAMP_TICKET, false, &existing).is_empty());
+    assert!(plan_shape::plan_gaps(&tours_plan_after(), TOUR_TICKET, false, &existing).is_empty());
     // The portal plan guessed the outside page and planned to bend the
     // test to the vendor against a criterion.
     let g = plan_shape::plan_gaps(&portal_plan_before(), PORTAL_TICKET, false, &[]);
@@ -135,39 +135,39 @@ fn the_plans_are_sent_back_until_they_are_the_small_change() {
     // The planner is told the sections, and the ticket's own words are
     // searched before it plans.
     assert!(plan_shape::PLANNER.contains("## Must not change"));
-    let terms = plan_shape::ticket_terms("Link four full-day camps to Swimming", CAMP_TICKET);
-    assert!(terms.contains(&"Swimming".to_string()), "{terms:?}");
-    assert!(terms.contains(&"Aqua Day Camp".to_string()), "{terms:?}");
+    let terms = plan_shape::ticket_terms("Link four full-day tours to Food Tasting", TOUR_TICKET);
+    assert!(terms.contains(&"Tasting".to_string()), "{terms:?}");
+    assert!(terms.contains(&"Dawn Reef Tour".to_string()), "{terms:?}");
 }
 
 #[test]
 fn the_coder_searches_first_and_never_adds_a_twin() {
     let g = ExploreGuard::for_build();
     let twin = format!(
-        "{BASE_MAP}\nCAMP_SWIMMING_OVERRIDES = {{\n    \"aqua day camp\": [\"swimming\"],\n}}\n"
+        "{BASE_MAP}\nTOUR_TASTING_OVERRIDES = {{\n    \"dawn reef tour\": [\"tasting\"],\n}}\n"
     );
     // The run's first write came before any search.
     let first = json!({"path": MAP_FILE, "edits": []});
     assert!(g.check_first_write(&first).is_err());
-    g.saw("search_code", &json!({"query": "Swimming"}));
+    g.saw("search_code", &json!({"query": "Food Tasting"}));
     let named =
-        json!({"path": MAP_FILE, "reuses": "`CAMP_MULTI_SPORT_OVERRIDES` in dags/camps/sports.py"});
+        json!({"path": MAP_FILE, "reuses": "`TOUR_MULTI_STOP_OVERRIDES` in dags/tours/stops.py"});
     assert!(g.check_first_write(&named).is_ok());
     // A second map beside the first is refused; entries in it are not.
     assert!(g.check_edit(MAP_FILE, BASE_MAP, &twin, &named).is_err());
     let entries = BASE_MAP.replace(
-        "    \"sports academy break camp\": [\"multi-sport\"],\n",
-        "    \"sports academy break camp\": [\"multi-sport\"],\n    \"aqua day camp\": [\"swimming\", \"sailing\"],\n",
+        "    \"harbor sampler tour\": [\"multi-stop\"],\n",
+        "    \"harbor sampler tour\": [\"multi-stop\"],\n    \"dawn reef tour\": [\"tasting\", \"reading\"],\n",
     );
     assert!(g.check_edit(MAP_FILE, BASE_MAP, &entries, &named).is_ok());
 }
 
 fn diff_before() -> Vec<(String, String, String)> {
-    let map = "@@ -1,3 +1,14 @@\n CAMP_MULTI_SPORT_OVERRIDES = {\n+CAMP_SWIMMING_OVERRIDES = {\n+    \"aqua day camp\": [\"swimming\"],\n+}\n+def get_camp_swimming_names(name):\n+    return CAMP_SWIMMING_OVERRIDES.get(name.lower(), [])\n";
-    let sync = "@@ -1,6 +1,20 @@\n def write_links(cur, camp_id, sports):\n-    for sport_id in sports:\n+    cur.execute(\"DELETE FROM camp_sports WHERE camp_id = %s AND NOT (sport_id = ANY(%s))\", (camp_id, sports))\n+    for sport_id in sports:\n         cur.execute(\n-            \"INSERT INTO camp_sports (camp_id, sport_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n+            \"INSERT INTO camp_sports (camp_id, sport_id) VALUES (%s, %s) ON CONFLICT (camp_id, sport_id) DO UPDATE SET sport_id = EXCLUDED.sport_id\",\n+        linked += 1\n+        skipped += 1\n+        log.warning(\"skipped camps: %s\", skipped_ids)\n";
+    let map = "@@ -1,3 +1,14 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n+TOUR_TASTING_OVERRIDES = {\n+    \"dawn reef tour\": [\"tasting\"],\n+}\n+def get_tour_tasting_names(name):\n+    return TOUR_TASTING_OVERRIDES.get(name.lower(), [])\n";
+    let sync = "@@ -1,6 +1,20 @@\n def write_links(cur, tour_id, activities):\n-    for activity_id in activities:\n+    cur.execute(\"DELETE FROM tour_stops WHERE tour_id = %s AND NOT (activity_id = ANY(%s))\", (tour_id, activities))\n+    for activity_id in activities:\n         cur.execute(\n-            \"INSERT INTO tour_stops (tour_id, activity_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n+            \"INSERT INTO tour_stops (tour_id, activity_id) VALUES (%s, %s) ON CONFLICT (tour_id, activity_id) DO UPDATE SET activity_id = EXCLUDED.activity_id\",\n+        linked += 1\n+        skipped += 1\n+        log.warning(\"skipped tours: %s\", skipped_ids)\n";
     let log = "@@ -1,3 +1,3 @@\n-logger.setLevel(logging.INFO)\n+logger.setLevel(logging.DEBUG)\n";
-    let test: String = std::iter::once("+class FakePostgresHook:\n".to_string())
-        .chain((0..16).map(|i| format!("+    \"camp_field_{i}\": \"value\",\n")))
+    let test: String = std::iter::once("+class FakeDbHook:\n".to_string())
+        .chain((0..16).map(|i| format!("+    \"tour_field_{i}\": \"value\",\n")))
         .chain((0..420).map(|i| format!("+    assert rows[{i}]\n")))
         .collect();
     vec![
@@ -179,15 +179,15 @@ fn diff_before() -> Vec<(String, String, String)> {
 }
 
 fn diff_after() -> Vec<(String, String, String)> {
-    let map = "@@ -1,3 +1,7 @@\n CAMP_MULTI_SPORT_OVERRIDES = {\n     \"sports academy break camp\": [\"multi-sport\"],\n+    \"aqua day camp\": [\"swimming\", \"sailing\"],\n+    \"swim and sail\": [\"swimming\", \"sailing\"],\n+    \"pool explorers\": [\"swimming\", \"multi-sport\"],\n+    \"splash week\": [\"swimming\", \"multi-sport\"],\n }\n";
-    let sync = "@@ -1,6 +1,11 @@\n def write_links(cur, camp_id, sports):\n-    for sport_id in sports:\n+    for sport_id in sports + extra_sports(camp_name):\n         cur.execute(\n             \"INSERT INTO camp_sports (camp_id, sport_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n";
+    let map = "@@ -1,3 +1,7 @@\n TOUR_MULTI_STOP_OVERRIDES = {\n     \"harbor sampler tour\": [\"multi-stop\"],\n+    \"dawn reef tour\": [\"tasting\", \"reading\"],\n+    \"taste and stroll\": [\"tasting\", \"reading\"],\n+    \"bay explorers\": [\"tasting\", \"multi-stop\"],\n+    \"tide week\": [\"tasting\", \"multi-stop\"],\n }\n";
+    let sync = "@@ -1,6 +1,11 @@\n def write_links(cur, tour_id, activities):\n-    for activity_id in activities:\n+    for activity_id in activities + extra_activities(tour_name):\n         cur.execute(\n             \"INSERT INTO tour_stops (tour_id, activity_id) VALUES (%s, %s) ON CONFLICT DO NOTHING\",\n";
     let test: String = (0..24)
         .map(|i| format!("+    assert links[{i}]\n"))
         .collect();
     vec![
         (MAP_FILE.into(), "modified".into(), map.into()),
         (SYNC_FILE.into(), "modified".into(), sync.into()),
-        ("tests/test_sports.py".into(), "added".into(), test),
+        ("tests/test_stops.py".into(), "added".into(), test),
     ]
 }
 
@@ -197,7 +197,7 @@ fn the_wider_diff_goes_back_and_the_small_one_passes() {
         (MAP_FILE.to_string(), BASE_MAP.to_string()),
         (SYNC_FILE.to_string(), BASE_SYNC.to_string()),
     ];
-    let found = minimal_change::check(&diff_before(), &base, CAMP_TICKET, false);
+    let found = minimal_change::check(&diff_before(), &base, TOUR_TICKET, false);
     let kinds: Vec<Kind> = found.iter().map(|w| w.kind).collect();
     for k in [
         Kind::Parallel,
@@ -249,9 +249,9 @@ fn the_wider_diff_goes_back_and_the_small_one_passes() {
     );
     // The right change passes every check.
     assert!(
-        minimal_change::check(&diff_after(), &base, CAMP_TICKET, false).is_empty(),
+        minimal_change::check(&diff_after(), &base, TOUR_TICKET, false).is_empty(),
         "{:?}",
-        minimal_change::check(&diff_after(), &base, CAMP_TICKET, false)
+        minimal_change::check(&diff_after(), &base, TOUR_TICKET, false)
     );
 }
 
@@ -271,20 +271,20 @@ fn a_test_bent_to_the_vendor_against_a_criterion_is_a_required_finding() {
 }
 
 /// The shape the data-pipeline run really had: its plan named the right
-/// map, then reused the existing multi-sport link helper, which deletes
+/// map, then reused the existing multi-stop link helper, which deletes
 /// every link it isn't given, on a sync path that only inserted. The run
 /// deleted links nobody asked about. The helper's body says what it does,
 /// so the plan is sent back; the plan that inserts with `ON CONFLICT DO
 /// NOTHING` and reuses only the read-only lookup passes.
 #[test]
 fn a_replacing_helper_reused_on_an_insert_only_path_is_sent_back() {
-    const HELPERS: &str = "CAMP_MULTI_SPORT_OVERRIDES = {\n    \"sports academy break camp\": [\"multi-sport\"],\n}\n\n\ndef get_camp_multi_sport_names(name):\n    return CAMP_MULTI_SPORT_OVERRIDES.get(name.lower(), [])\n\n\ndef upsert_multi_sport_links(cur, group_id, sport_ids):\n    cur.execute(\"DELETE FROM camp_sports WHERE camp_id = %s AND NOT (sport_id = ANY(%s))\", (group_id, sport_ids))\n    for sport_id in sport_ids:\n        cur.execute(\"INSERT INTO camp_sports VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, sport_id))\n";
+    const HELPERS: &str = "TOUR_MULTI_STOP_OVERRIDES = {\n    \"harbor sampler tour\": [\"multi-stop\"],\n}\n\n\ndef get_tour_multi_stop_names(name):\n    return TOUR_MULTI_STOP_OVERRIDES.get(name.lower(), [])\n\n\ndef upsert_multi_stop_links(cur, group_id, activity_ids):\n    cur.execute(\"DELETE FROM tour_stops WHERE tour_id = %s AND NOT (activity_id = ANY(%s))\", (group_id, activity_ids))\n    for activity_id in activity_ids:\n        cur.execute(\"INSERT INTO tour_stops VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, activity_id))\n";
     let reuse_replacing = plan(
-        "## Reuse\n- `CAMP_MULTI_SPORT_OVERRIDES` and `upsert_multi_sport_links` in dags/camps/sports.py (the other two sources already use them)\n\n\
-         ## Must not change\nSingle-sport camps.\n\n## Measure first\nNone: the change stays inside this repository.\n\n\
-         ## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; call `upsert_multi_sport_links` in the 3 write branches.\n\n\
-         ## Proof\nOne test of the links per camp.\n",
-        &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: link the extra sports\n- [ ] tests/test_sports.py: one test"),
+        "## Reuse\n- `TOUR_MULTI_STOP_OVERRIDES` and `upsert_multi_stop_links` in dags/tours/stops.py (the other two sources already use them)\n\n\
+         ## Must not change\nSingle-activity tours.\n\n## Measure first\nNone: the change stays inside this repository.\n\n\
+         ## Smallest change\n4 entries in `TOUR_MULTI_STOP_OVERRIDES`; call `upsert_multi_stop_links` in the 3 write branches.\n\n\
+         ## Proof\nOne test of the links per tour.\n",
+        &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: link the extra activities\n- [ ] tests/test_stops.py: one test"),
     );
     let sources = |p: &PlanResult| -> Vec<(String, String, String)> {
         plan_shape::reused_functions(p)
@@ -298,10 +298,10 @@ fn a_replacing_helper_reused_on_an_insert_only_path_is_sent_back() {
     ];
     let facts = plan_shape::write_facts(&sources(&reuse_replacing), &planned);
     assert!(facts.path_inserts_only, "{facts:?}");
-    let g = plan_shape::write_gaps(&reuse_replacing, CAMP_TICKET, &facts);
+    let g = plan_shape::write_gaps(&reuse_replacing, TOUR_TICKET, &facts);
     assert!(
         g.iter()
-            .any(|l| l.contains("`upsert_multi_sport_links` without what it does to stored rows")),
+            .any(|l| l.contains("`upsert_multi_stop_links` without what it does to stored rows")),
         "{g:?}"
     );
     assert!(
@@ -314,15 +314,15 @@ fn a_replacing_helper_reused_on_an_insert_only_path_is_sent_back() {
     let said = plan(
         &reuse_replacing.design.replace(
             "(the other two sources already use them)",
-            "(it replaces a camp's links: DELETE then insert)",
+            "(it replaces a tour's links: DELETE then insert)",
         ),
         &reuse_replacing.tasks,
     );
-    let g = plan_shape::write_gaps(&said, CAMP_TICKET, &facts);
+    let g = plan_shape::write_gaps(&said, TOUR_TICKET, &facts);
     assert_eq!(g.len(), 1, "{g:?}");
-    assert!(plan_shape::write_gaps(&said, "Replace each camp's sport links", &facts).is_empty());
+    assert!(plan_shape::write_gaps(&said, "Replace each tour's activity links", &facts).is_empty());
     // The small plan reuses only the map and the read-only lookup.
-    let small = camps_plan_after();
+    let small = tours_plan_after();
     let facts = plan_shape::write_facts(&sources(&small), &planned);
-    assert!(plan_shape::write_gaps(&small, CAMP_TICKET, &facts).is_empty());
+    assert!(plan_shape::write_gaps(&small, TOUR_TICKET, &facts).is_empty());
 }

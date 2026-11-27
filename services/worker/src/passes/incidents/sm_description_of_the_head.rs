@@ -1,13 +1,13 @@
-//! sm. A ticket asked a vendor portal page to drop its "open in a new
-//! tab" link and to let the header scroll. The pull request changed 8 files
-//! (119 lines added, 73 removed, most of them tests). Over 16 commits its
+//! sm. A ticket asked a booking vendor's portal page to drop its "open in a
+//! new tab" link and to let the header scroll. The pull request changed a
+//! handful of files, most of the lines tests. Over many commits its
 //! description piled up: an "Earlier attempts" section, "Deferred: reverted
-//! 7 file(s)" and "Waiting on CI" after the work had come back, a note that
+//! N file(s)" and "Waiting on CI" after the work had come back, a note that
 //! the page scroll assertions were "dropped from this pull request" while
 //! the diff still changed that page object, and implementation notes longer
 //! than the change they described. A description is written about the
-//! head, not about the run's history; #1531's grew to about four times its
-//! diff and contradicted the diff in three places.
+//! head, not about the run's history; another pull request's grew to
+//! several times its diff and contradicted the diff in places.
 //!
 //! Guarantee: every build of a description, on every push, holds the
 //! written text to the head (`description_facts::hold_scope`,
@@ -30,11 +30,11 @@ fn facts() -> Facts {
         ("apps/web/src/lib/routing/content-renderers.tsx", 4),
         ("apps/web/src/utils/globalConstants.ts", 2),
         ("apps/web/src/test/components/portal-embed.test.tsx", 60),
-        ("e2e/pages/summer-camp-registration.ts", 40),
-        ("e2e/tests/browse/summer-camp-registration.spec.ts", 72),
+        ("e2e/pages/slot-booking.ts", 40),
+        ("e2e/tests/browse/slot-booking.spec.ts", 72),
     ];
     Facts {
-        head: "15680649400000000000000000000000000000aa".into(),
+        head: "fedcba9876543210fedcba9876543210fedcba98".into(),
         files: files
             .iter()
             .map(|(p, n)| FileChange {
@@ -54,8 +54,8 @@ fn written() -> String {
     format!(
         "## Changes\nRemoves the new-tab link from the portal page and lets the header scroll.\n\n\
          ## Earlier attempts\n- The first push froze the header; the review took the sizing out; a planned-work round put it back.\n\n\
-         ## Deferred\n- Waiting on CI for the reverted files.\n- Reverted 7 file(s) to the last green head <!-- coderhelm:revert to=b66dfd3d0 paths=e2e/pages/summer-camp-registration.ts -->\n\n\
-         ## Notes\nThe page scroll assertions were dropped from this pull request (`summer-camp-registration.ts`).\n\n{notes}\n\n{notes}\n\n{notes}"
+         ## Deferred\n- Waiting on CI for the reverted files.\n- Reverted 5 file(s) to the last green head <!-- coderhelm:revert to=a1b2c3d4e paths=e2e/pages/slot-booking.ts -->\n\n\
+         ## Notes\nThe page scroll assertions were dropped from this pull request (`slot-booking.ts`).\n\n{notes}\n\n{notes}\n\n{notes}"
     )
 }
 
@@ -96,7 +96,7 @@ fn the_shaped_body_stays_four_short_sections() {
     let shaped = description_facts::shape(&written(), "ABC-2: Drop the new-tab link", f, None);
     assert!(!shaped.body.contains("Earlier attempts"));
     assert!(!shaped.body.contains("Waiting on CI"));
-    let defects = common::pr_body::defects(&shaped.body, "1568064");
+    let defects = common::pr_body::defects(&shaped.body, "fedcba9");
     assert!(
         !defects
             .iter()

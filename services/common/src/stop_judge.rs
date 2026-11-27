@@ -294,6 +294,11 @@ pub struct Picture {
     /// relevance to it. Context for the judge, never evidence on their own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<String>,
+    /// The systems the run already reaches through the team's connections
+    /// (`connected_access`): an ask or hold that asks a person to connect
+    /// one of them breaks a rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected: Vec<crate::connected_access::Reach>,
 }
 
 /// Longest text of one field in the prompt and the stored record.
@@ -761,6 +766,7 @@ pub fn prompt(p: &Picture) -> String {
         }
         s.push('\n');
     }
+    s.push_str(&crate::connected_access::prompt_section(&p.connected));
     s.push_str(&format!("## Budget\n{}\n", p.budget.line()));
     s
 }
@@ -820,6 +826,14 @@ pub fn validate(p: &Picture, v: &Value) -> Result<Verdict, String> {
             {
                 return Err(install_level_rule());
             }
+            if person_only == PersonOnly::Access {
+                if let Some(r) = crate::connected_access::asks_to_connect(
+                    &format!("{question} {} {}", tried.join(" "), options.join(" ")),
+                    &p.connected,
+                ) {
+                    return Err(crate::connected_access::rule(r));
+                }
+            }
             if !(2..=4).contains(&options.len()) {
                 return Err(format!(
                     "an ask needs 2 to 4 `options`, not {}",
@@ -856,6 +870,9 @@ pub fn validate(p: &Picture, v: &Value) -> Result<Verdict, String> {
             }
             if crate::aws_role_reads::is_install_grant(&blocker) {
                 return Err(install_level_rule());
+            }
+            if let Some(r) = crate::connected_access::asks_to_connect(&blocker, &p.connected) {
+                return Err(crate::connected_access::rule(r));
             }
             let evidence = list("evidence");
             if evidence.is_empty() {
@@ -996,6 +1013,26 @@ fn install_level(v: &Verdict) -> Option<Verdict> {
     })
 }
 
+/// An ask for access, or a hold, that asks a person to connect a system the
+/// run already reaches: a proceed instead (`connected_access`).
+fn already_connected(v: &Verdict, reaches: &[crate::connected_access::Reach]) -> Option<Verdict> {
+    let words = match v {
+        Verdict::Ask(q) if q.person_only == PersonOnly::Access => {
+            format!(
+                "{} {} {}",
+                q.question,
+                q.tried.join(" "),
+                q.options.join(" ")
+            )
+        }
+        Verdict::Hold(h) => h.blocker.clone(),
+        _ => return None,
+    };
+    crate::connected_access::asks_to_connect(&words, reaches).map(|r| Verdict::Proceed {
+        assumption: crate::connected_access::proceed(r),
+    })
+}
+
 /// The decision. One model call; a rule-breaking answer is asked again once
 /// with what was wrong; then the deterministic fallback.
 pub async fn judge<M: JudgeModel>(model: &M, picture: Picture) -> Judged {
@@ -1004,10 +1041,14 @@ pub async fn judge<M: JudgeModel>(model: &M, picture: Picture) -> Judged {
     let step = picture.step.clone();
     // Every answer, the model's, a rule's or the fallback's, passes the
     // install-level rule last.
+    let connected = picture.connected.clone();
     let make = |verdict: Verdict, source: Source, replies| {
         let (verdict, source) = match install_level(&verdict) {
             Some(v) => (v, Source::Rule("install-level item".into())),
-            None => (verdict, source),
+            None => match already_connected(&verdict, &connected) {
+                Some(v) => (v, Source::Rule("already connected".into())),
+                None => (verdict, source),
+            },
         };
         Judged {
             kind,

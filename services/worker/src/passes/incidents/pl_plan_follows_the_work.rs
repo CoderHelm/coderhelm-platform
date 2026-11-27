@@ -1,4 +1,4 @@
-//! pl. Two plans read wrong for weeks.
+//! pl. Two plans read wrong for a long time.
 //!
 //! The stranded plan: three draft tasks. A person approved the first one
 //! from its row, the way the page suggested. The worker filed its ticket,
@@ -9,9 +9,8 @@
 //!
 //! The false-Done plan: four tasks, all filed, all `done`, the plan `done`.
 //! Its runs said otherwise: one pull request merged, one closed unmerged,
-//! one run failed with no pull request, and one task took eleven runs and
-//! seven pull requests, none merged, about $130, while it read done the
-//! whole time. No run or pull request was ever written back to a task.
+//! one run failed with no pull request, and one task took many runs and
+//! pull requests, none merged, while it read done the whole time. No run or pull request was ever written back to a task.
 //!
 //! Guarantee: a task's state is derived from the runs of its ticket and
 //! their pull requests (`common::plan_state`), never from filing the
@@ -49,7 +48,7 @@ fn plan(m: &Memory, id: &str, status: &str) {
             ("title", "Report handled errors in the mobile app"),
             ("repo", "example-org/mobile"),
             ("status", status),
-            ("executed_at", "2026-04-22T17:16:00Z"),
+            ("executed_at", "2030-03-12T17:16:00Z"),
         ]),
     );
 }
@@ -62,7 +61,7 @@ fn task(m: &Memory, plan_id: &str, id: &str, order: &str, status: &str, key: &st
         ("title".to_string(), format!("Task {order}")),
         ("status".to_string(), status.to_string()),
         ("task_order".to_string(), order.to_string()),
-        ("created_at".to_string(), "2026-04-21T19:04:00Z".to_string()),
+        ("created_at".to_string(), "2030-03-11T19:04:00Z".to_string()),
     ];
     if !key.is_empty() {
         pairs.push(("jira_ticket_key".into(), key.into()));
@@ -115,11 +114,11 @@ async fn approving_one_task_leaves_the_plan_open_with_the_rest_to_approve() {
     // The rows as the old worker left them: the one approved task `done`
     // the moment its ticket was filed, and the plan `done` with it.
     plan(&m, "P1", "done");
-    task(&m, "P1", "T1", "0", "done", "MOB-1");
+    task(&m, "P1", "T1", "0", "done", "HARBOR-1");
     task(&m, "P1", "T2", "1", "draft", "");
     task(&m, "P1", "T3", "2", "draft", "");
 
-    let out = refresh(&m, TEAM, "P1", "2026-04-22T18:00:00Z")
+    let out = refresh(&m, TEAM, "P1", "2030-03-12T18:00:00Z")
         .await
         .unwrap()
         .unwrap();
@@ -150,14 +149,14 @@ async fn approving_one_task_leaves_the_plan_open_with_the_rest_to_approve() {
     run(
         &m,
         "R1",
-        "MOB-1",
+        "HARBOR-1",
         "merged",
-        "2026-04-22T17:20:00Z",
-        Some((854, "merged")),
+        "2030-03-12T17:20:00Z",
+        Some((42, "merged")),
         "4.1",
         "",
     );
-    let out = refresh(&m, TEAM, "P1", "2026-04-23T09:00:00Z")
+    let out = refresh(&m, TEAM, "P1", "2030-03-13T09:00:00Z")
         .await
         .unwrap()
         .unwrap();
@@ -169,15 +168,15 @@ async fn approving_one_task_leaves_the_plan_open_with_the_rest_to_approve() {
 async fn a_plan_is_done_only_when_its_work_merged() {
     let m = Memory::default();
     plan(&m, "P2", "done");
-    for (i, key) in ["OPS-1", "OPS-2", "OPS-3", "OPS-4"].iter().enumerate() {
+    for (i, key) in ["ABC-1", "ABC-2", "ABC-3", "ABC-4"].iter().enumerate() {
         task(&m, "P2", &format!("T{i}"), &i.to_string(), "done", key);
     }
     run(
         &m,
         "A1",
-        "OPS-1",
+        "ABC-1",
         "merged",
-        "2026-04-22T17:30:00Z",
+        "2030-03-12T17:30:00Z",
         Some((101, "merged")),
         "6.0",
         "",
@@ -185,9 +184,9 @@ async fn a_plan_is_done_only_when_its_work_merged() {
     run(
         &m,
         "B1",
-        "OPS-2",
+        "ABC-2",
         "completed",
-        "2026-04-22T17:30:00Z",
+        "2030-03-12T17:30:00Z",
         Some((102, "closed")),
         "9.5",
         "",
@@ -195,31 +194,31 @@ async fn a_plan_is_done_only_when_its_work_merged() {
     run(
         &m,
         "C1",
-        "OPS-3",
+        "ABC-3",
         "failed",
-        "2026-04-22T17:30:00Z",
+        "2030-03-12T17:30:00Z",
         None,
         "3.2",
         "Run timed out (exceeded execution time limit).",
     );
-    // Eleven runs and seven pull requests on one task, none merged.
-    for i in 0..11u64 {
-        let status = if i < 10 { "retried" } else { "completed" };
-        let pr = (i < 6).then_some((200 + i, "closed"));
-        let pr = if i == 10 { Some((300, "")) } else { pr };
+    // Nine runs and six pull requests on one task, none merged.
+    for i in 0..9u64 {
+        let status = if i < 8 { "retried" } else { "completed" };
+        let pr = (i < 5).then_some((200 + i, "closed"));
+        let pr = if i == 8 { Some((300, "")) } else { pr };
         run(
             &m,
             &format!("D{i:02}"),
-            "OPS-4",
+            "ABC-4",
             status,
-            &format!("2026-04-23T{:02}:00:00Z", 10 + i),
+            &format!("2030-03-13T{:02}:00:00Z", 10 + i),
             pr,
-            "11.8",
+            "10.0",
             "",
         );
     }
 
-    let out = refresh(&m, TEAM, "P2", "2026-05-04T12:00:00Z")
+    let out = refresh(&m, TEAM, "P2", "2030-03-24T12:00:00Z")
         .await
         .unwrap()
         .unwrap();
@@ -239,14 +238,14 @@ async fn a_plan_is_done_only_when_its_work_merged() {
         "Run timed out (exceeded execution time limit)."
     );
     let heavy = &out.tasks[3].view;
-    assert_eq!(heavy.attempts, 11);
-    assert_eq!(heavy.prs.len(), 7);
-    assert!((heavy.cost_usd - 129.8).abs() < 0.01, "{}", heavy.cost_usd);
+    assert_eq!(heavy.attempts, 9);
+    assert_eq!(heavy.prs.len(), 6);
+    assert!((heavy.cost_usd - 90.0).abs() < 0.01, "{}", heavy.cost_usd);
     assert_ne!(out.plan.state, PlanState::Done);
     assert_eq!(out.plan.state, PlanState::NeedsYou);
     assert_eq!(out.plan.summary, "1 of 4 merged, 2 failed, 1 in review");
     // Every run is now linked to its task.
-    assert_eq!(out.runs_linked, 14);
+    assert_eq!(out.runs_linked, 12);
     assert_eq!(
         m.run(TEAM, "D03")
             .unwrap()

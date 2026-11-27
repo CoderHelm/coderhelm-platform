@@ -1,12 +1,25 @@
 name: CI
 
+# Pull requests, and the merged result: every push to main, and each group
+# GitHub's merge queue tests before it lands (merge_group). A pull request's
+# run tests its head against the base as it was then, so two pull requests
+# can each pass and still break main together; the push run says whether
+# main itself builds and passes, and the hosted deploy and the self-host
+# releases ship a commit only when it did (.github/scripts/main_ci.py).
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
 
+# A new push to a pull request cancels the run on its old head. On main and
+# in the merge queue every commit keeps its own run to the end: the deploy
+# reads that commit's verdict, and a cancelled run never counts as green.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Pull requests (including from forks) get a read-only token and no secrets.
 permissions:
@@ -25,6 +38,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Every commit of the PR, for the Public text guard step.
+          fetch-depth: 0
+      # The PR's title, branch name, body, commits and docs/ additions carry no details
+      # from a customer install (.github/scripts/text_guard.py); the Public
+      # text guard workflow reruns it when the PR's text is edited. Title and
+      # body come from the event file, never from a script.
+      - name: Public text guard
+        run: |
+          python3 -m unittest discover -s .github/scripts -p test_text_guard.py
+          python3 .github/scripts/text_guard.py
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -62,7 +85,8 @@ jobs:
           fetch-depth: 2
       # Skip the steps below when nothing the Rust build reads changed (a pin
       # bump in selfhost/versions.json): the job still reports, in seconds.
-      # The list and why: .github/scripts/rust_affected.py.
+      # The list and why: .github/scripts/rust_affected.py. On main and in
+      # the merge queue the commit is no merge commit, so everything runs.
       - name: Rust-affecting changes
         id: changes
         working-directory: .
@@ -117,7 +141,8 @@ jobs:
           fetch-depth: 2
       # Skip the steps below when nothing the Rust build reads changed (a pin
       # bump in selfhost/versions.json): the job still reports, in seconds.
-      # The list and why: .github/scripts/rust_affected.py.
+      # The list and why: .github/scripts/rust_affected.py. On main and in
+      # the merge queue the commit is no merge commit, so everything runs.
       - name: Rust-affecting changes
         id: changes
         working-directory: .
@@ -209,8 +234,9 @@ jobs:
       - run: node --test lambda/pre-signup/handler.test.js
       - run: node --test lambda/custom-message/handler.test.js
       # The app map's Floorplan driver on the vendored release: a bump that
-      # changes what CoderHelm's adapter relies on fails here.
-      - run: node --test services/worker/floorplan/driver.test.mjs
+      # changes what CoderHelm's adapter relies on fails here. CoderHelm's
+      # own detectors (screens, services, calls, infra) are tested beside it.
+      - run: node --test services/worker/floorplan/driver.test.mjs services/worker/floorplan/coderhelm.test.mjs services/worker/floorplan/coderhelm/flows.test.mjs
 
   mcp-proxy:
     name: MCP Proxy (Node)
@@ -321,3 +347,32 @@ jobs:
           pip install --quiet cfn-lint==1.58.0
           cfn-lint ../infra/cfn/*.yaml
           cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native/access.json" "$RUNNER_TEMP/native"/stacks/*.json
+
+  # Last: CoderHelm's "Customer details guard" check run on the PR's head
+  # (customer names, hosts and keys from its own records, never listed
+  # here) passed or was skipped; failing fails. Missing after five minutes:
+  # CI's own rules (ids, keys, emails) decide instead, and it says so. An edit to the PR's text after this ran sets the guard again,
+  # and the Customer details guard rerun workflow runs this job again.
+  # Prints only pass or fail (.github/scripts/customer_guard_gate.py).
+  customer-guard:
+    name: Customer details guard (CI)
+    needs: [workflows, rust-lint, rust-test, rust, lambda-tests, mcp-proxy, jira-app, infra, installer, native]
+    if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Every commit of the PR, for the fallback to CI's own rules.
+          fetch-depth: 0
+      - name: Gate tests
+        run: python3 -m unittest discover -s .github/scripts -p "test_*guard*.py"
+      - name: The guard passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/customer_guard_gate.py

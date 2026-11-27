@@ -77,9 +77,9 @@ fn repo_labels() -> Vec<String> {
         "CI:E2E",
         "CI:DEPLOY_STAGING",
         "CI:DEPLOY_PREVIEW",
-        "E2E:join",
+        "E2E:booking",
         "E2E:nav",
-        "E2E:camps",
+        "E2E:slots",
         // Made by the add.
         "E2E:",
     ]
@@ -192,7 +192,7 @@ fn a_label_is_added_only_from_the_repo_labels_and_only_when_certain() {
 #[test]
 fn the_labels_added_by_mistake_come_off_and_the_made_label_goes() {
     // The gate record as the old reading wrote it.
-    let sha = "4f1c0de2b7a9e3c5d8f60172a4b9c3e1d2f50a6b";
+    let sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     let records = vec![format!("{sha}:CI:E2E"), format!("{sha}:E2E:")];
     let ours = skipped_checks::added_before(&records);
     assert_eq!(ours, vec!["CI:E2E", "E2E:"]);

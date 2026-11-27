@@ -250,8 +250,8 @@ pub fn variants(id: &str) -> Vec<String> {
 }
 
 /// Whether `text` names `word` on its own (not inside a longer name: a
-/// kebab-case name such as `boat-index` is one name, so it doesn't name
-/// `boat`).
+/// kebab-case name such as `locker-index` is one name, so it doesn't name
+/// `locker`).
 fn names_word(text: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;

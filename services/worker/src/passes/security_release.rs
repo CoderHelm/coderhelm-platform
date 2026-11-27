@@ -482,7 +482,7 @@ pub(super) struct Live<'a, 'c> {
     pub cx: &'a Ctx<'c>,
     pub started: Instant,
     pub budget_secs: u64,
-    channels: tokio::sync::OnceCell<common::notify::Channels>,
+    channels: tokio::sync::OnceCell<common::notify::route::TeamChannels>,
 }
 
 impl<'a, 'c> Live<'a, 'c> {
@@ -812,7 +812,7 @@ pub(crate) mod fake {
                     state: "open".into(),
                     ..Default::default()
                 }),
-                updated_at: "2026-11-12T09:00:00Z".into(),
+                updated_at: "2030-03-14T09:00:00Z".into(),
                 ..Default::default()
             },
             FindingState {
@@ -829,7 +829,7 @@ pub(crate) mod fake {
         let (mut f, mut st) = in_pr(id, repo, 1, ticket);
         f.status = Status::Fixing;
         f.pr = None;
-        st.claimed_at = Some("2026-11-13T09:00:00Z".into());
+        st.claimed_at = Some("2030-03-15T09:00:00Z".into());
         (f, st)
     }
 
@@ -837,7 +837,7 @@ pub(crate) mod fake {
         PrNow::Closed(Closer {
             by: login.into(),
             person: true,
-            at: Some("2026-11-13T09:30:00Z".into()),
+            at: Some("2030-03-15T09:30:00Z".into()),
         })
     }
 }
@@ -852,7 +852,7 @@ mod tests {
     const TICKET: &str = "SEC-AAAAAAAAAAAA";
 
     fn now() -> DateTime<Utc> {
-        at("2026-11-13T10:00:00Z")
+        at("2030-03-15T10:00:00Z")
     }
 
     fn statuses(findings: &[(Finding, FindingState)]) -> Vec<Status> {
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(closed_fact(&merged, nobody).await, PrNow::Merged);
         let open = serde_json::json!({"state": "open", "merged": false});
         assert_eq!(closed_fact(&open, nobody).await, PrNow::Open);
-        let closed = serde_json::json!({"state": "closed", "merged": false, "merged_at": null, "closed_at": "2026-11-13T09:30:00Z"});
+        let closed = serde_json::json!({"state": "closed", "merged": false, "merged_at": null, "closed_at": "2030-03-15T09:30:00Z"});
         assert_eq!(
             closed_fact(&closed, || async { ("octo".to_string(), true) }).await,
             closed_by("octo")
@@ -1203,13 +1203,13 @@ mod tests {
     #[test]
     fn a_run_that_began_before_the_claim_is_not_the_claims_run() {
         let n = now();
-        let since = Some(at("2026-11-13T09:00:00Z"));
+        let since = Some(at("2030-03-15T09:00:00Z"));
         // The retried run of yesterday: this claim's run has not started yet.
         assert_eq!(
             run_fact(
-                "2026-11-12T08:00:00Z",
+                "2030-03-14T08:00:00Z",
                 "retried",
-                "2026-11-12T09:00:00Z",
+                "2030-03-14T09:00:00Z",
                 None,
                 since,
                 n
@@ -1218,9 +1218,9 @@ mod tests {
         );
         assert_eq!(
             run_fact(
-                "2026-11-13T09:00:05Z",
+                "2030-03-15T09:00:05Z",
                 "running",
-                "2026-11-13T09:55:00Z",
+                "2030-03-15T09:55:00Z",
                 None,
                 since,
                 n
@@ -1229,9 +1229,9 @@ mod tests {
         );
         assert_eq!(
             run_fact(
-                "2026-11-13T09:00:05Z",
+                "2030-03-15T09:00:05Z",
                 "cancelled",
-                "2026-11-13T09:20:00Z",
+                "2030-03-15T09:20:00Z",
                 Some("dev@example.com".into()),
                 since,
                 n

@@ -302,7 +302,7 @@ mod tests {
         }
         .with_text(
             "Retry payments",
-            "Source ticket: OPS-1\n\n**Summary** Retry once.",
+            "Source ticket: HARBOR-1\n\n**Summary** Retry once.",
         );
         let neutral = Exemplar {
             id: "neutral".into(),

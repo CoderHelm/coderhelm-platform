@@ -811,7 +811,7 @@ mod tests {
     fn a_failing_check_finding_settles_when_the_checks_pass() {
         let t = vec![own_thread(
             "T1",
-            "e2e/camps.spec.ts",
+            "e2e/slots.spec.ts",
             "🔴 Blocking (failing check): Lint & Type Check and Deploy Preview are red on this head.",
         )];
         let mut now = pr(HEAD, PrState::Open);

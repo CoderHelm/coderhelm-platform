@@ -1,4 +1,4 @@
-//! ah. A dependency security run of 64 packages finished with its checks
+//! ah. A dependency security run of dozens of packages finished with its checks
 //! passed and its pull request open, and four things were wrong with it:
 //!
 //! - two packages were forced onto a new major version through an override
@@ -12,7 +12,7 @@
 //!   their parents work on it: the sandbox ran the install, the type check,
 //!   the linter and the unit tests. The application's build never ran and
 //!   the application was never started;
-//! - one pull request carried all 64 bumps, so one risky bump held every
+//! - one pull request carried every bump, so one risky bump held every
 //!   safe one;
 //! - the pull request did not say how many advisories stayed open, or why.
 //!
@@ -61,7 +61,7 @@ fn finding(pkg: &str, version: &str, fixed: &[&str], parent: &str) -> (Finding, 
         scope: Scope::Runtime,
         status: Status::Open,
         path: vec![parent.to_string(), pkg.to_string()],
-        due_at: "2026-12-10T00:00:00Z".into(),
+        due_at: "2030-04-11T00:00:00Z".into(),
         advisory: sec::Advisory {
             primary: format!("GHSA-{pkg}"),
             ids: vec![format!("GHSA-{pkg}")],
@@ -72,11 +72,11 @@ fn finding(pkg: &str, version: &str, fixed: &[&str], parent: &str) -> (Finding, 
     (f, st)
 }
 
-/// The run's 64 packages: 58 with a patch on their line, two with a patched
+/// The run's 46 packages: 40 with a patch on their line, two with a patched
 /// release on their line and a newer major beside it (the two the run
 /// forced onto the major), and four with no patched release on their line.
-fn sixty_four() -> Vec<(Finding, FindingState)> {
-    let mut fs: Vec<(Finding, FindingState)> = (0..58)
+fn forty_six() -> Vec<(Finding, FindingState)> {
+    let mut fs: Vec<(Finding, FindingState)> = (0..40)
         .map(|i| finding(&format!("lib-{i:02}"), "2.1.0", &["2.1.5"], "app-shell"))
         .collect();
     fs.push(finding(
@@ -111,7 +111,7 @@ const MAJORS: [&str; 4] = ["css-min", "render-core", "route-kit", "tmpl-engine"]
 
 #[test]
 fn a_bump_stays_inside_its_major_and_a_major_jump_is_its_own_pull_request() {
-    let mut fs = sixty_four();
+    let mut fs = forty_six();
     // The copy that misled the run: the same package, one line up, with its
     // own patched release.
     fs.push(finding(
@@ -121,7 +121,7 @@ fn a_bump_stays_inside_its_major_and_a_major_jump_is_its_own_pull_request() {
         "page-kit",
     ));
     let cfg = SecurityConfig::default();
-    let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T10:00:00Z")
+    let now = chrono::DateTime::parse_from_rfc3339("2030-03-13T10:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
     let units = sec::plan_units(&fs, &cfg, now);
@@ -130,7 +130,7 @@ fn a_bump_stays_inside_its_major_and_a_major_jump_is_its_own_pull_request() {
     let bundles: Vec<&sec::FixUnit> = units.iter().filter(|u| u.bundle).collect();
     assert_eq!(bundles.len(), 1);
     let bundle = bundles[0];
-    assert_eq!(bundle.finding_ids.len(), 61);
+    assert_eq!(bundle.finding_ids.len(), 43);
     assert!(bundle.bumps.iter().all(|b| !b.major), "{:?}", bundle.bumps);
     let lines: Vec<(&str, &str)> = bundle
         .bumps
@@ -164,7 +164,7 @@ fn a_bump_stays_inside_its_major_and_a_major_jump_is_its_own_pull_request() {
         .filter(|(f, _)| bundle.finding_ids.contains(&f.id))
         .collect();
     let plan = df::plan_in(&in_bundle, &cfg, &[LOCK.to_string()]);
-    assert_eq!(plan.bumps.len(), 61);
+    assert_eq!(plan.bumps.len(), 43);
     assert!(plan.deferred.is_empty());
     let all: Vec<&df::PlanBump> = plan.bumps.iter().collect();
     for spec in df::specs(&all) {
@@ -331,10 +331,10 @@ fn the_build_and_the_start_prove_the_bumps_and_what_breaks_them_is_taken_out() {
     assert!(script.contains("export PORT=38411 && pnpm run start"));
 
     // The run as the incident had it: one pull request, majors included.
-    let fs = sixty_four();
+    let fs = forty_six();
     let cfg = SecurityConfig::default();
     let mut run = DepRun::new(df::plan(&pairs(&fs), &cfg), "base", 3.0);
-    assert_eq!(run.plan.bumps.len(), 64);
+    assert_eq!(run.plan.bumps.len(), 46);
     assert_eq!(run.plan.bumps.iter().filter(|b| b.major).count(), 4);
     // The checks pass with every bump; only the build shows `route-kit`.
     let builds = drive(&mut run, &plan, &["route-kit"]);
@@ -343,7 +343,7 @@ fn the_build_and_the_start_prove_the_bumps_and_what_breaks_them_is_taken_out() {
     // red: that set was not the cause) and without the one before (green).
     assert_eq!(builds, 4);
     assert!(builds <= df::MAX_PROOF_RUNS);
-    assert_eq!(run.applied.len(), 62);
+    assert_eq!(run.applied.len(), 44);
     let left: Vec<&str> = run.deferred.iter().map(|d| d.package.as_str()).collect();
     assert_eq!(left, vec!["tmpl-engine", "route-kit"]);
     // The set whose removal made the build pass is the cause, and is held
@@ -453,7 +453,7 @@ fn the_build_and_the_start_prove_the_bumps_and_what_breaks_them_is_taken_out() {
 fn a_major_jump_names_its_parent_and_the_pull_request_counts_what_stays_open() {
     // The parent of a transitive major is read from its dependency path,
     // and a major is read before any patch bump.
-    let fs = sixty_four();
+    let fs = forty_six();
     let cfg = SecurityConfig::default();
     let all = pairs(&fs);
     let bump = sec::Bump {
@@ -482,7 +482,7 @@ fn a_major_jump_names_its_parent_and_the_pull_request_counts_what_stays_open() {
         from: "5.1.0".into(),
         to: "6.0.3".into(),
         major: true,
-        major_reason: df::major_reason(&fs[63].0, &fs[63].1),
+        major_reason: df::major_reason(&fs[45].0, &fs[45].1),
         parents: vec![un::ParentSupport {
             parent: "build-kit".into(),
             version: "3.2.1".into(),

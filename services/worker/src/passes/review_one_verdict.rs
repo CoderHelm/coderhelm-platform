@@ -571,37 +571,37 @@ mod tests {
 
     #[test]
     fn keys_read_every_way_a_finding_is_written() {
-        let a = Key::of_line("`src/a.ts:12` Sport dropdown lists Multi-Sport twice");
-        let b = Key::of_line("Sport dropdown lists Multi-Sport twice (`src/a.ts:14`)");
+        let a = Key::of_line("`src/a.ts:12` Booth dropdown lists Guest-Booth twice");
+        let b = Key::of_line("Booth dropdown lists Guest-Booth twice (`src/a.ts:14`)");
         let c = Key::of_line(
-            "- `src/a.ts:12` Sport dropdown lists Multi-Sport twice (required: tests with behavior changes)",
+            "- `src/a.ts:12` Booth dropdown lists Guest-Booth twice (required: tests with behavior changes)",
         );
         assert_eq!(a.path, "src/a.ts");
         assert_eq!(a.line, 12);
         assert!(a.same(&b) && a.same(&c) && b.same(&c));
-        let other = Key::of_line("`src/b.ts:12` Sport dropdown lists Multi-Sport twice");
+        let other = Key::of_line("`src/b.ts:12` Booth dropdown lists Guest-Booth twice");
         assert!(!a.same(&other));
-        let prose = Key::of_line("The sport dropdown listing Multi-Sport twice no longer applies.");
+        let prose = Key::of_line("The booth dropdown listing Guest-Booth twice no longer applies.");
         assert!(prose.same(&a));
-        let unrelated = Key::of_line("The camp list no longer applies.");
+        let unrelated = Key::of_line("The slot list no longer applies.");
         assert!(!unrelated.same(&a));
     }
 
     #[test]
     fn a_resolved_or_settled_thread_never_holds() {
         let closed = [(
-            Key::of_line("Sport dropdown lists Multi-Sport twice (`src/a.ts:12`)"),
+            Key::of_line("Booth dropdown lists Guest-Booth twice (`src/a.ts:12`)"),
             State::Settled,
         )];
         let s = settle(Inputs {
             holding: vec![
                 Holding::new(
                     K::EarlierThread,
-                    "Sport dropdown lists Multi-Sport twice (`src/a.ts:12`)",
+                    "Booth dropdown lists Guest-Booth twice (`src/a.ts:12`)",
                 ),
                 Holding::new(
                     K::OwnFinding,
-                    "Sport dropdown can list Multi-Sport twice (`src/a.ts:15`)",
+                    "Booth dropdown can list Guest-Booth twice (`src/a.ts:15`)",
                 ),
                 Holding::new(K::Defect, "`src/b.ts:3` Null deref"),
             ],
@@ -640,13 +640,13 @@ mod tests {
 
     #[test]
     fn the_summary_settles_an_earlier_thread_and_never_contradicts_a_head_hold() {
-        let prose = "The earlier comment on `src/a.ts` about the duplicate sport option no \
+        let prose = "The earlier comment on `src/a.ts` about the duplicate booth option no \
                      longer applies. The `src/b.ts` null deref was fixed. Tests pass.";
         let s = settle(Inputs {
             holding: vec![
                 Holding::new(
                     K::EarlierThread,
-                    "Duplicate sport option in the dropdown (`src/a.ts:12`)",
+                    "Duplicate booth option in the dropdown (`src/a.ts:12`)",
                 ),
                 Holding::new(K::Defect, "`src/b.ts:3` Null deref"),
             ],

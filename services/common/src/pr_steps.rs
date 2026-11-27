@@ -36,6 +36,7 @@ pub const INTERNAL_NAMES: &[(&str, &str)] = &[
     ("query_content", "a content query"),
     ("start_workflow", "starting a workflow"),
     ("write_content", "a content write"),
+    ("file_followup_tickets", "filing the follow-up tickets"),
     ("check_url", "a page check"),
     ("run_checks", "the checks"),
     ("search_code", "a code search"),

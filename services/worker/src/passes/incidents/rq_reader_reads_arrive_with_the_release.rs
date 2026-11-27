@@ -26,7 +26,7 @@ const OTHER_ACCOUNT: &str = "999988887777";
 const INSTALL_ROLE: &str = "arn:aws:iam::111122223333:role/coderhelm-prod-ServiceRole-EXAMPLE";
 const TEMPLATE: &str =
     "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml";
-const NOW: &str = "2026-11-19T09:00:00Z";
+const NOW: &str = "2030-03-19T09:00:00Z";
 
 fn reader(account: &str) -> AwsTarget {
     AwsTarget {

@@ -259,6 +259,75 @@ pub fn runner_never_started(output: &str) -> Option<String> {
     None
 }
 
+/// Whether a person's step asks for a read CoderHelm does itself: an
+/// end-to-end or CI result (its workflow run, job log, report or
+/// artifacts, through `github_history`), or what a page or the preview
+/// shows or requests (DevTools, the network tab, the console, through
+/// `check_url` and `probe_page`). Reading needs no write permission: a run
+/// once asked a person to "read the Deploy Preview e2e result" because its
+/// app lacked Actions write, and another to "check DevTools on the preview
+/// for the request".
+pub fn names_own_read(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let reads = [
+        "read ",
+        "check ",
+        "confirm ",
+        "look at",
+        "inspect",
+        "verify ",
+        "see whether",
+        "see if",
+        "open the",
+        "watch ",
+    ];
+    let objects = [
+        "e2e result",
+        "end-to-end result",
+        "test result",
+        "e2e run",
+        "workflow run",
+        "workflow result",
+        "ci result",
+        "check run",
+        "job log",
+        "the log",
+        "artifact",
+        "playwright report",
+        "test report",
+        "devtools",
+        "dev tools",
+        "network tab",
+        "network request",
+        "console",
+        "the preview",
+        "preview page",
+        "page source",
+        "ran (not skipped)",
+        "the spec passed",
+    ];
+    let writes = [
+        "grant",
+        "add the hosts",
+        "credential",
+        "api key",
+        "token",
+        "approve",
+        "merge the",
+        "deploy to",
+        "deploy the",
+        "write access",
+        "upload",
+        "real-device",
+        "real device",
+        "paid checkout",
+        "payment",
+    ];
+    reads.iter().any(|r| t.contains(r))
+        && objects.iter().any(|o| t.contains(o))
+        && !writes.iter().any(|w| t.contains(w))
+}
+
 /// Whether words a run wrote about something it couldn't do name
 /// CoderHelm's own environment: its sandbox, the sandbox's network
 /// allowlist, the browsers or tools it installs. That is CoderHelm's own
@@ -1072,5 +1141,24 @@ mod tests {
         assert!(repair_steps(&bun, "tsc")[0]
             .cmd
             .contains("npm install -g bun"));
+    }
+
+    #[test]
+    fn reading_a_result_or_a_page_is_coderhelms_own() {
+        for t in [
+            "Read the Deploy Preview e2e result: the GitHub App lacks Actions: write",
+            "Confirm 'Deploy Preview' and 'E2E on preview' ran (not skipped) and the spec passed",
+            "Check DevTools on the pr-41 preview for a request to the analytics host when the tab is hidden",
+            "Look at the job log of the failing workflow run",
+        ] {
+            assert!(names_own_read(t), "{t}");
+        }
+        for t in [
+            "Grant the role read access to the WAF logs",
+            "Do a real-device paid checkout on the preview",
+            "Approve the production deploy",
+        ] {
+            assert!(!names_own_read(t), "{t}");
+        }
     }
 }

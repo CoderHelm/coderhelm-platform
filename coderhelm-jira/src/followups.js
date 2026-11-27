@@ -1,0 +1,265 @@
+/**
+ * Follow-up tickets a CoderHelm run files from a ticket it worked on.
+ *
+ * A run that audits something often ends with tickets to file for the fixes.
+ * CoderHelm files them through the create-ticket trigger with a `followup`
+ * object, and the app then:
+ *
+ * 1. checks the app's own project permissions first, so a missing one is
+ *    named exactly (`missingPermissions`), never "connect Jira";
+ * 2. finds a ticket it already filed for the same draft (same project, same
+ *    follow-up label, same summary), so a retried run never files twice
+ *    (`dedupeJql`, `sameSummary`);
+ * 3. picks the issue type (`pickIssueType`) and creates the ticket;
+ * 4. links it to the source ticket with the site's "relates to" link type
+ *    (`pickLinkType`).
+ *
+ * With `followup.list`, the app files nothing: it answers the follow-ups
+ * already filed from the source (`listedIssues`), so CoderHelm matches a
+ * new draft to one by topic before filing. The list asks for no summary,
+ * so an app older than it refuses it (summary required) and files nothing.
+ *
+ * These are the pure parts, tested without Forge; index.js makes the calls.
+ */
+
+/** The Jira project permissions filing and linking need. */
+const NEEDED_PERMISSIONS = ["BROWSE_PROJECTS", "CREATE_ISSUES", "LINK_ISSUES"];
+
+/** Words for each permission, as Jira's project settings name them. */
+const PERMISSION_NAMES = {
+  BROWSE_PROJECTS: "Browse Projects",
+  CREATE_ISSUES: "Create Issues",
+  LINK_ISSUES: "Link Issues",
+};
+
+/** The most existing follow-ups one dedupe search reads. */
+const MAX_DEDUPE = 50;
+
+/** A Jira issue key such as ABC-12 (uppercase project, a number). */
+function isIssueKey(key) {
+  return typeof key === "string" && /^[A-Z][A-Z0-9_]{0,19}-[1-9][0-9]{0,9}$/.test(key);
+}
+
+/**
+ * The label every follow-up of one source ticket carries. Jira labels hold
+ * no spaces, so the key is used as it is.
+ */
+function followupLabel(sourceKey) {
+  return `coderhelm:followup:${sourceKey}`;
+}
+
+/** The label marking any follow-up CoderHelm filed. Never a trigger. */
+const MARKER_LABEL = "coderhelm-followup";
+
+/** Whether `label` is one of the follow-up labels (the marker or a source's). */
+function isFollowupLabel(label) {
+  const l = String(label || "").trim().toLowerCase();
+  return l === MARKER_LABEL || l.startsWith("coderhelm:followup:");
+}
+
+/**
+ * The labels a follow-up is filed with: only the follow-up labels CoderHelm
+ * sent, plus the source's label. Anything else (`coderhelm`, the team's
+ * trigger label, `coderhelm:<repo>`) is dropped here too, so even a
+ * CoderHelm that still sends them can't file a ticket that starts its own
+ * run: follow-ups never cascade.
+ */
+function followupLabels(labels, sourceKey) {
+  const asked = (Array.isArray(labels) ? labels : []).filter(
+    (l) => typeof l === "string" && isFollowupLabel(l)
+  );
+  return [...new Set([...asked, followupLabel(sourceKey)])];
+}
+
+/**
+ * The repository a ticket's labels pin (`coderhelm:owner/repo`), never a
+ * follow-up label (`coderhelm:followup:ABC-1` names a ticket, not a repo).
+ * `{}` when none does.
+ */
+function repoOfLabels(labels) {
+  const l = (Array.isArray(labels) ? labels : []).find(
+    (x) => typeof x === "string" && x.startsWith("coderhelm:") && !isFollowupLabel(x)
+  );
+  if (!l) return {};
+  const [owner, name] = l.replace("coderhelm:", "").split("/");
+  return { owner, name };
+}
+
+/** A summary as compared for "the same draft": case, spacing and trailing dots aside. */
+function normalSummary(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.\s]+$/, "")
+    .trim();
+}
+
+function sameSummary(a, b) {
+  const x = normalSummary(a);
+  return x.length > 0 && x === normalSummary(b);
+}
+
+/**
+ * The JQL that finds the follow-ups already filed from `sourceKey` in
+ * `projectKey`. Both are checked to be keys first, so neither can end the
+ * string and add clauses. `null` when either isn't a key.
+ */
+function dedupeJql(projectKey, sourceKey) {
+  if (!/^[A-Z][A-Z0-9_]{0,19}$/.test(String(projectKey || ""))) return null;
+  if (!isIssueKey(sourceKey)) return null;
+  return `project = "${projectKey}" AND labels = "${followupLabel(sourceKey)}" ORDER BY created DESC`;
+}
+
+/**
+ * The permissions the app lacks, from Jira's `mypermissions` answer
+ * (`{ permissions: { CREATE_ISSUES: { havePermission: true }, ... } }`).
+ * A permission Jira didn't answer about counts as missing.
+ */
+function missingPermissions(answer, needed = NEEDED_PERMISSIONS) {
+  const perms = (answer && answer.permissions) || {};
+  return needed.filter((p) => !(perms[p] && perms[p].havePermission === true));
+}
+
+/** "Create Issues and Link Issues", for a message. */
+function permissionWords(codes) {
+  const names = codes.map((c) => PERMISSION_NAMES[c] || c);
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/**
+ * The issue type to file with, from the project's creatable types (the
+ * `createmeta/{project}/issuetypes` answer's `issueTypes` or `values`).
+ *
+ * Jira keeps a project's default issue type in its issue type scheme, which
+ * only an app with Jira admin access can read; this app has none. So the
+ * type is: the one CoderHelm asked for, when the project has it; else Task,
+ * the type CoderHelm has always filed; else the project's first standard
+ * type (not a sub-task, not an epic level), in the order Jira lists them.
+ *
+ * Returns `{ id, name, from }` or `null` when the project has no type a
+ * ticket can be filed with.
+ */
+function pickIssueType(types, requested) {
+  const all = (Array.isArray(types) ? types : []).filter((t) => t && t.id && t.name);
+  const standard = all.filter(
+    (t) => t.subtask !== true && (t.hierarchyLevel === undefined || t.hierarchyLevel === 0)
+  );
+  const named = (name) =>
+    standard.find((t) => String(t.name).toLowerCase() === String(name || "").toLowerCase());
+  const asked = requested ? named(requested) : null;
+  if (asked) return { id: asked.id, name: asked.name, from: "requested" };
+  const task = named("Task");
+  if (task) return { id: task.id, name: task.name, from: "task" };
+  if (standard.length > 0) return { id: standard[0].id, name: standard[0].name, from: "first_standard" };
+  return null;
+}
+
+/**
+ * The link type for "relates to" on this site, from `/issueLinkType`'s
+ * `issueLinkTypes`: the one CoderHelm asked for by name, else the one named
+ * Relates (or whose outward words are "relates to"), else none (`null`):
+ * a site without it gets no link rather than a wrong one.
+ */
+function pickLinkType(types, requested) {
+  const all = (Array.isArray(types) ? types : []).filter((t) => t && t.name);
+  const low = (s) => String(s || "").toLowerCase().trim();
+  if (requested) {
+    const asked = all.find((t) => low(t.name) === low(requested));
+    if (asked) return asked.name;
+  }
+  const relates =
+    all.find((t) => low(t.name) === "relates") || all.find((t) => low(t.outward) === "relates to");
+  return relates ? relates.name : null;
+}
+
+/** Whether `issue` (search result with `fields.issuelinks`) is linked to `sourceKey`. */
+function linkedTo(issue, sourceKey) {
+  const links = (issue && issue.fields && issue.fields.issuelinks) || [];
+  return links.some(
+    (l) =>
+      (l.inwardIssue && l.inwardIssue.key === sourceKey) ||
+      (l.outwardIssue && l.outwardIssue.key === sourceKey)
+  );
+}
+
+/**
+ * A plain-text description as an Atlassian document: one paragraph per
+ * paragraph of the text (blank lines), line breaks kept inside each.
+ */
+function descriptionAdf(text) {
+  const paras = String(text || "")
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return {
+    type: "doc",
+    version: 1,
+    content: paras.map((p) => {
+      const lines = p.split("\n");
+      const content = [];
+      lines.forEach((line, i) => {
+        if (i > 0) content.push({ type: "hardBreak" });
+        if (line) content.push({ type: "text", text: line });
+      });
+      return { type: "paragraph", content };
+    }),
+  };
+}
+
+/** The plain text of an Atlassian document (a description), at most `max` characters. */
+function adfText(doc, max = 2000) {
+  const out = [];
+  const walk = (n) => {
+    if (!n || out.join("").length > max) return;
+    if (typeof n.text === "string") out.push(n.text);
+    if (n.type === "hardBreak") out.push("\n");
+    (Array.isArray(n.content) ? n.content : []).forEach(walk);
+    if (n.type === "paragraph") out.push("\n");
+  };
+  if (typeof doc === "string") return doc.slice(0, max);
+  walk(doc);
+  return out.join("").trim().slice(0, max);
+}
+
+/**
+ * The follow-ups already filed from a source, as the list path answers
+ * them (from a search with `summary`, `description` and `status`), so
+ * CoderHelm compares a new draft with them by topic before filing it.
+ */
+function listedIssues(issues) {
+  return (Array.isArray(issues) ? issues : [])
+    .filter((i) => i && isIssueKey(i.key))
+    .map((i) => {
+      const f = i.fields || {};
+      return {
+        key: i.key,
+        summary: String(f.summary || ""),
+        description: adfText(f.description),
+        status: (f.status && f.status.name) || "",
+      };
+    });
+}
+
+module.exports = {
+  adfText,
+  listedIssues,
+  NEEDED_PERMISSIONS,
+  PERMISSION_NAMES,
+  MAX_DEDUPE,
+  isIssueKey,
+  followupLabel,
+  followupLabels,
+  isFollowupLabel,
+  repoOfLabels,
+  MARKER_LABEL,
+  normalSummary,
+  sameSummary,
+  dedupeJql,
+  missingPermissions,
+  permissionWords,
+  pickIssueType,
+  pickLinkType,
+  linkedTo,
+  descriptionAdf,
+};

@@ -4,10 +4,10 @@
 //! request had not touched yet: two edits came back "rejected: outside the
 //! ticket's files" and a third failed. The gaps stayed open, a planned task
 //! was "still not done after the fix round", and planned-work rounds went
-//! on for about an hour on a pull request whose checks passed. One of them
+//! on and on for a pull request whose checks passed. One of them
 //! then hit GitHub's hourly limit: it was read as "it met an error", its
 //! work branch was deleted during the limit (a 403 on the branch ref), an
-//! attempt was spent, and the next try started five seconds later.
+//! attempt was spent, and the next try started seconds later.
 //!
 //! Guarantee: a round may edit what it was started for. Its files are the
 //! pull request's, the plan's task files (done or not) and listed
@@ -342,7 +342,7 @@ fn a_round_that_hits_githubs_limit_waits_and_goes_on_as_itself() {
         ..Default::default()
     };
     /// The reset the limit named, and when the round hit it.
-    const RESET: u64 = 1_793_999_100;
+    const RESET: u64 = 1_899_728_400;
     const HIT: u64 = RESET - 2_400;
     // The error the round's pass ended with, as the run words the pause.
     let paused = gw::waiting_text(Cause::RateLimit, RESET);
@@ -403,7 +403,7 @@ fn a_round_that_hits_githubs_limit_waits_and_goes_on_as_itself() {
     let round_fn = fn_src(resume, "async fn run_fix_round(");
     assert!(round_fn.contains("crate::clients::github::outside_wait(err)"));
 
-    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"));
+    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 14:20 UTC"));
     end.never_says(OLD_FAULT);
     assert_eq!(end.status, "awaiting_ci");
 }

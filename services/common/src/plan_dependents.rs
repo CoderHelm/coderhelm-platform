@@ -499,11 +499,16 @@ mod tests {
         for plan in ["p1", "p2"] {
             s.add(
                 T,
-                ticket_task(plan, "t1", "https://github.com/acme/web/issues/4", "OPS-9"),
+                ticket_task(
+                    plan,
+                    "t1",
+                    "https://github.com/acme/web/issues/4",
+                    "HARBOR-6",
+                ),
             );
             s.task(T, plan, "t2", WAITING, "t1");
         }
-        for run in [github_run("acme/web", 4), jira_run("OPS-9")] {
+        for run in [github_run("acme/web", 4), jira_run("HARBOR-6")] {
             assert_eq!(dependents_to_release(&s, T, &run).await.unwrap(), None);
         }
     }
@@ -646,7 +651,7 @@ mod tests {
         s.link(T, &github_link_sk("acme/web", 5), "p1", "t1");
 
         // Issue #5 in another repository, and a Jira ticket, neither from a plan.
-        for run in [github_run("acme/api", 5), jira_run("OPS-1")] {
+        for run in [github_run("acme/api", 5), jira_run("HARBOR-1")] {
             assert_eq!(dependents_to_release(&s, T, &run).await.unwrap(), None);
         }
     }

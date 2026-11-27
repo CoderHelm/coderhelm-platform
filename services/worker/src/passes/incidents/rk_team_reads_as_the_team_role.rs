@@ -143,7 +143,7 @@ fn a_restarted_run_refused_what_the_recheck_read_never_waits_again() {
         role_arn: READER.into(),
         actions: vec!["wafv2:ListWebACLs".into()],
         needed_for: "an AWS WAF rule's requests".into(),
-        seen_at: "2026-11-18T10:00:00Z".into(),
+        seen_at: "2030-03-18T10:00:00Z".into(),
         ..Default::default()
     };
     // The first run waits for the role.
@@ -153,7 +153,7 @@ fn a_restarted_run_refused_what_the_recheck_read_never_waits_again() {
     ));
     // The re-check read it and started the run again; refused again, it is
     // CoderHelm's own failure, never a second wait.
-    let read = Waiting::of("run-1", std::slice::from_ref(&gap), "2026-11-18T10:05:00Z");
+    let read = Waiting::of("run-1", std::slice::from_ref(&gap), "2030-03-18T10:05:00Z");
     match role_wait::ending_after(&[], vec![gap.clone()], Some(&read)) {
         Ending::OwnFailure(a) => {
             assert_eq!(a, vec!["wafv2:ListWebACLs".to_string()]);

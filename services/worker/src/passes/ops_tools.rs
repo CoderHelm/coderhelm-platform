@@ -628,6 +628,35 @@ impl OpsTools {
         self.loaded.iter().find(|l| l.conn.kind() == kind)
     }
 
+    /// Whether the team connected New Relic.
+    pub fn has_newrelic(&self) -> bool {
+        self.get(ConnKind::NewRelic).is_some()
+    }
+
+    /// One read-only NRQL query in `account` through the team's New Relic
+    /// connection, its results as New Relic returns them (redacted).
+    pub async fn newrelic_results(&self, account: &str, nrql: &str) -> Result<Value, StepError> {
+        let l = self.get(ConnKind::NewRelic).ok_or_else(|| {
+            StepError::new(
+                "read_only",
+                "New Relic isn't connected.",
+                "Connect it in Settings under Integrations.",
+            )
+        })?;
+        let nr = NewRelic {
+            key: &l.key,
+            region: &l.conn.region,
+            accounts: &l.conn.account_ids,
+            http: &Https,
+        };
+        let a = if account.trim().is_empty() {
+            None
+        } else {
+            Some(account.trim())
+        };
+        Ok(nr.nrql(a, nrql).await?.data)
+    }
+
     /// The team's connections of `kind` this work may use (REST APIs and
     /// OpenSearch clusters can be several, by name).
     fn of(&self, kind: ConnKind) -> Vec<&Loaded> {
@@ -1720,7 +1749,7 @@ mod tests {
             LookupOutcome::Answered,
             "api_get",
             &input,
-            "{\n  \"id\": 7,\n  \"title\": \"Swim\"\n}",
+            "{\n  \"id\": 7,\n  \"title\": \"Atlas\"\n}",
         );
         assert_eq!(id, "T1");
         let ev = o.lookups();
@@ -1728,7 +1757,7 @@ mod tests {
         assert!(ev[0].line.starts_with("- [T1] Ran api_get: "));
         assert!(ev[0]
             .line
-            .contains("Came back: { \"id\": 7, \"title\": \"Swim\" }"));
+            .contains("Came back: { \"id\": 7, \"title\": \"Atlas\" }"));
         // An empty list and a failure are kept too, marked as what they are.
         o.remember(&source, LookupOutcome::Empty, "api_get", &input, "[]");
         o.remember(

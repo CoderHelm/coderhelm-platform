@@ -508,17 +508,98 @@ pub struct TokenError {
     /// The OAuth error code (`invalid_grant`, ...), or empty.
     pub code: String,
     pub message: String,
+    /// The token endpoint's HTTP status (`0`: it sent no usable reply).
+    pub status: u16,
+    /// Seconds the server asked to wait (`Retry-After`), when it said.
+    pub retry_after: Option<u64>,
 }
+
+/// The codes a token endpoint uses to say the grant itself is refused for
+/// good: the refresh token expired, was revoked or was already used, or the
+/// client is no longer allowed. `invalid_refresh_token` and `token_revoked`
+/// are Slack's words for the same.
+const REFUSED_FOR_GOOD: &[&str] = &[
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "invalid_refresh_token",
+    "token_revoked",
+];
 
 impl TokenError {
     /// The grant is gone (expired, revoked, already used): only a person
-    /// signing in again fixes it.
+    /// signing in again fixes it. Only a definitive refusal counts: a `400`
+    /// or `401` (or a `2xx` carrying an error, as Slack answers) with one of
+    /// [`REFUSED_FOR_GOOD`]. A `5xx`, a `429`, a timeout, or a reply that
+    /// can't be read is passing whatever words it carries.
     pub fn needs_reconnect(&self) -> bool {
-        matches!(
-            self.code.as_str(),
-            "invalid_grant" | "invalid_client" | "unauthorized_client"
-        )
+        let definitive_status = matches!(self.status, 400 | 401 | 200..=299);
+        definitive_status && REFUSED_FOR_GOOD.contains(&self.code.as_str())
     }
+
+    /// Asking again later works: no answer or a timeout (`0`, `408`), a
+    /// rate limit (`425`, `429`) or a server error (`5xx`), whatever words
+    /// the body carries. Neither this nor [`Self::needs_reconnect`] (a bad
+    /// request, an odd reply) is reported as it is and marks nothing.
+    pub fn is_passing(&self) -> bool {
+        matches!(self.status, 0 | 408 | 425 | 429 | 500..=599)
+    }
+
+    /// A rate limit (`429`), as opposed to a server that is down.
+    pub fn rate_limited(&self) -> bool {
+        self.status == 429
+    }
+}
+
+/// The words for a sign-in server that was briefly unavailable, naming who
+/// runs it ("Atlassian's sign-in server was briefly unavailable (HTTP 503);
+/// retrying."). Never asks anyone to reconnect: nothing on their side is
+/// wrong.
+pub fn sign_in_unavailable(provider: &str, status: u16, rate_limited: bool) -> String {
+    let who = if provider.trim().is_empty() {
+        "The".to_string()
+    } else {
+        format!("{}'s", provider.trim())
+    };
+    let what = if rate_limited {
+        "asked Coderhelm to slow down"
+    } else {
+        "was briefly unavailable"
+    };
+    if status == 0 {
+        format!("{who} sign-in server {what}; retrying.")
+    } else {
+        format!("{who} sign-in server {what} (HTTP {status}); retrying.")
+    }
+}
+
+/// Who runs a sign-in server, from its address: the company a person knows
+/// (Atlassian for Confluence and Jira, Google for Drive), or `fallback`.
+pub fn sign_in_provider(endpoint: &str, catalog_id: &str, fallback: &str) -> String {
+    let host = url::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let id = catalog_id.to_ascii_lowercase();
+    let known: &[(&str, &str)] = &[
+        ("atlassian", "Atlassian"),
+        ("confluence", "Atlassian"),
+        ("jira", "Atlassian"),
+        ("google", "Google"),
+        ("gdrive", "Google"),
+        ("notion", "Notion"),
+        ("slack", "Slack"),
+        ("microsoft", "Microsoft"),
+        ("sentry", "Sentry"),
+        ("sanity", "Sanity"),
+        ("linear", "Linear"),
+        ("github", "GitHub"),
+    ];
+    known
+        .iter()
+        .find(|(k, _)| host.contains(k) || id.contains(k))
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Reads a token reply. `previous` keeps the refresh token when a refresh
@@ -529,10 +610,18 @@ pub fn parse_token_response(
     previous: Option<&TokenSet>,
 ) -> Result<TokenSet, TokenError> {
     let doc = r.json().unwrap_or_default();
+    let refused = |code: String, message: String| TokenError {
+        code,
+        message,
+        status: r.status,
+        retry_after: crate::knowledge::sources::pace::retry_after_of(r),
+    };
     if !(200..300).contains(&r.status) || doc.get("error").is_some() {
         let code = doc["error"].as_str().unwrap_or("").to_string();
         let desc = doc["error_description"].as_str().unwrap_or("");
         return Err(TokenError {
+            status: r.status,
+            retry_after: crate::knowledge::sources::pace::retry_after_of(r),
             message: format!(
                 "The sign-in server refused ({}{}{}).",
                 if code.is_empty() {
@@ -548,17 +637,17 @@ pub fn parse_token_response(
     }
     let access_token = doc["access_token"].as_str().unwrap_or("").to_string();
     if access_token.is_empty() {
-        return Err(TokenError {
-            code: String::new(),
-            message: "The sign-in server sent no access token.".into(),
-        });
+        return Err(refused(
+            String::new(),
+            "The sign-in server sent no access token.".into(),
+        ));
     }
     if let Some(t) = doc["token_type"].as_str() {
         if !t.eq_ignore_ascii_case("bearer") {
-            return Err(TokenError {
-                code: String::new(),
-                message: format!("The sign-in server sent a {t} token; only Bearer is supported."),
-            });
+            return Err(refused(
+                String::new(),
+                format!("The sign-in server sent a {t} token; only Bearer is supported."),
+            ));
         }
     }
     let expires_at = doc["expires_in"]
@@ -602,6 +691,103 @@ mod tests {
     use super::super::http::fake::{json, resp};
     use super::*;
     use serde_json::json as j;
+
+    /// Every kind of token endpoint answer, sorted three ways: a definitive
+    /// refusal (reconnect), passing (retry), or neither (reported, nothing
+    /// marked).
+    #[test]
+    fn token_refusals_are_classified_by_status_and_code() {
+        let e = |r: HttpResponse| parse_token_response(&r, 0, None).unwrap_err();
+        let reconnect = [
+            json(
+                400,
+                j!({"error": "invalid_grant", "error_description": "expired"}),
+            ),
+            json(401, j!({"error": "invalid_client"})),
+            json(400, j!({"error": "unauthorized_client"})),
+            // Slack answers 200 with the error in the body.
+            json(200, j!({"ok": false, "error": "invalid_refresh_token"})),
+            json(200, j!({"ok": false, "error": "token_revoked"})),
+        ];
+        for r in reconnect {
+            let t = e(r);
+            assert!(t.needs_reconnect() && !t.is_passing(), "{t:?}");
+        }
+        let passing = [
+            resp(503, &[], "Service Unavailable"),
+            resp(500, &[], ""),
+            resp(502, &[], "<html>Bad gateway</html>"),
+            resp(504, &[], ""),
+            resp(429, &[("retry-after", "30")], ""),
+            resp(408, &[], ""),
+            // A server error carrying grant words is still a server error.
+            json(503, j!({"error": "invalid_grant"})),
+            json(500, j!({"error": "server_error"})),
+            json(503, j!({"error": "temporarily_unavailable"})),
+        ];
+        for r in passing {
+            let t = e(r);
+            assert!(t.is_passing() && !t.needs_reconnect(), "{t:?}");
+        }
+        let neither = [
+            json(400, j!({"error": "invalid_request"})),
+            json(400, j!({"error": "invalid_scope"})),
+            resp(403, &[], "forbidden"),
+            json(200, j!({"token_type": "Bearer"})),
+        ];
+        for r in neither {
+            let t = e(r);
+            assert!(!t.is_passing() && !t.needs_reconnect(), "{t:?}");
+        }
+        let limited = e(resp(429, &[("retry-after", "30")], ""));
+        assert!(limited.rate_limited());
+        assert_eq!(limited.retry_after, Some(30));
+    }
+
+    #[test]
+    fn a_passing_refusal_is_worded_as_retrying_with_who_runs_the_server() {
+        let who = sign_in_provider("https://auth.atlassian.com/oauth/token", "", "Confluence");
+        assert_eq!(who, "Atlassian");
+        assert_eq!(
+            sign_in_unavailable(&who, 503, false),
+            "Atlassian's sign-in server was briefly unavailable (HTTP 503); retrying."
+        );
+        // A hybrid install renews through Coderhelm's broker: the provider
+        // comes from the source it is for.
+        assert_eq!(
+            sign_in_provider(
+                "https://broker.example.com/hybrid/oauth/token",
+                "source:confluence",
+                "Confluence"
+            ),
+            "Atlassian"
+        );
+        assert_eq!(
+            sign_in_provider(
+                "https://oauth2.googleapis.com/token",
+                "source:gdrive",
+                "Google Drive"
+            ),
+            "Google"
+        );
+        assert_eq!(
+            sign_in_provider("https://auth.example.com/t", "", "Docs"),
+            "Docs"
+        );
+        assert_eq!(
+            sign_in_unavailable("Slack", 429, true),
+            "Slack's sign-in server asked Coderhelm to slow down (HTTP 429); retrying."
+        );
+        for s in [
+            sign_in_unavailable("Atlassian", 503, false),
+            sign_in_unavailable("", 0, false),
+        ] {
+            assert!(
+                !s.contains("Reconnect") && !s.contains("invalid_grant"),
+                "{s}"
+            );
+        }
+    }
 
     #[test]
     fn a_service_that_only_takes_approved_apps_says_so_and_points_to_a_key() {

@@ -1,11 +1,11 @@
-//! df. A ticket said a camp card showed a broken image: the page used an
+//! df. A ticket said a tour card showed a broken image: the page used an
 //! older image address that returned an error, while the address the
 //! reporter expected was stored in our database. The trace found it all:
-//! the camp's class record in the source system holds the broken address,
-//! a second source record of the same kind (its league) holds a working
-//! one, and our pipeline gives the class's own image priority, so the
-//! broken one is stored on the class and rendered. A thousand other
-//! classes carried addresses of the same kind. The run decided the fix is
+//! the tour's own record in the source system holds the broken address,
+//! a second source record of the same kind (its fleet) holds a working
+//! one, and our pipeline gives the tour's own image priority, so the
+//! broken one is stored on the tour and rendered. Many other tours
+//! carried addresses of the same kind. The run decided the fix is
 //! outside the code (edit the one source record), and a later run of the
 //! unchanged ticket stopped on that earlier verdict: "No new pull request:
 //! the ticket is unchanged since CoderHelm learned the fix is outside the
@@ -41,43 +41,43 @@ fn layer(layer: &str, where_: &str, shows: &str, state: &str) -> Layer {
 fn outside_decision() -> FixDecision {
     FixDecision {
         fix_location: FixLocation::OutsideCode,
-        cause: "The class record's own image address returns an error, and the pipeline gives \
-                the class's image priority over its league's."
+        cause: "The tour record's own image address returns an error, and the pipeline gives \
+                the tour's image priority over its fleet's."
             .into(),
         intent: TicketIntent::Bug,
         evidence: FixEvidence {
-            looked_up: vec!["[prod database] the class and its group".into()],
-            data_shows: "The class holds the broken address; the league holds a working one."
-                .into(),
+            looked_up: vec!["[prod database] the tour and its fleet".into()],
+            data_shows: "The tour holds the broken address; the fleet holds a working one.".into(),
             basis: "data".into(),
             producer: Producer {
                 kind: "source".into(),
-                where_: "booking system, class record 1001: image address returns 502".into(),
+                where_: "booking system, tour record 1001: image address returns 502".into(),
             },
-            scope: "One class confirmed; 1013 active classes carry addresses of that kind.".into(),
+            scope: "One tour confirmed; hundreds of active tours carry addresses of that kind."
+                .into(),
             layers: vec![
                 layer(
-                    "source (class record)",
+                    "source (tour record)",
                     "booking system, raw copy in the warehouse",
                     "image = old-bucket/a.jpg (the image proxy returns 502)",
                     "wrong",
                 ),
                 layer(
-                    "source (league record)",
+                    "source (fleet record)",
                     "booking system, raw copy in the warehouse",
                     "image = files-bucket/b.jpg (200)",
                     "ok",
                 ),
                 layer(
                     "pipeline",
-                    "acme/pipelines:dags/schedule_pipeline.py:1919",
-                    "copies the class's own image when set, per its rule",
+                    "acme/pipelines:dags/tour_pipeline.py:212",
+                    "copies the tour's own image when set, per its rule",
                     "ok",
                 ),
                 layer(
                     "app database",
-                    "class table",
-                    "group files-bucket/b.jpg; class old-bucket/a.jpg",
+                    "tour table",
+                    "fleet files-bucket/b.jpg; tour old-bucket/a.jpg",
                     "wrong",
                 ),
                 layer(
@@ -91,7 +91,7 @@ fn outside_decision() -> FixDecision {
         },
         outside_change: Some(OutsideChange {
             system: "the booking system".into(),
-            change: "Replace the class record's image with a working one".into(),
+            change: "Replace the tour record's image with a working one".into(),
             ..Default::default()
         }),
         ..Default::default()
@@ -105,7 +105,7 @@ fn a_broken_source_value_with_a_working_one_in_reach_goes_back_as_a_code_fix() {
     let all = gaps.join("\n");
     assert!(all.contains("working value in reach"), "{all}");
     assert!(
-        all.contains("acme/pipelines:dags/schedule_pipeline.py:1919"),
+        all.contains("acme/pipelines:dags/tour_pipeline.py:212"),
         "{all}"
     );
     assert!(all.contains("fall back to"), "{all}");

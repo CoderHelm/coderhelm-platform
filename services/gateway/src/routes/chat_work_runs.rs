@@ -55,6 +55,7 @@ impl Group {
             rs::NEEDS_INPUT,
             rs::NEEDS_OUTSIDE_CHANGE,
             rs::AWAITING_SETUP,
+            rs::AWAITING_CHANGE,
         ];
         match self {
             // Archived runs show only when asked for by run id.
@@ -117,7 +118,7 @@ impl RunAsk {
             words: Vec::new(),
             since,
         };
-        // A query that is only a pull request number ("#609") or a ticket
+        // A query that is only a pull request number ("#42") or a ticket
         // key ("SEC-1A2B") asks by that, not by title words: neither is in
         // a run's title.
         if let Some(q) = s("query") {
@@ -729,7 +730,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_ticket_key_a_pr_and_a_repo_narrow_the_runs() {
-        let mut with_pr = run("02", "completed", "ABC-12", "Add slips", "acme/api");
+        let mut with_pr = run("02", "completed", "ABC-12", "Add slots", "acme/api");
         with_pr.insert("pr_number".into(), AttributeValue::N("41".into()));
         let items = vec![with_pr, run("01", "failed", "ABC-120", "Other", "acme/web")];
         assert_eq!(
@@ -753,17 +754,17 @@ pub(crate) mod tests {
     #[test]
     fn a_number_or_a_key_in_the_query_asks_by_it() {
         let now = chrono::Utc::now();
-        let a = RunAsk::from_input(&serde_json::json!({"query": "#609"}), now);
-        assert_eq!((a.pr, a.words.len()), (Some(609), 0));
+        let a = RunAsk::from_input(&serde_json::json!({"query": "#42"}), now);
+        assert_eq!((a.pr, a.words.len()), (Some(42), 0));
         let a = RunAsk::from_input(&serde_json::json!({"query": "SEC-25142555683B"}), now);
         assert_eq!(a.ticket.as_deref(), Some("sec-25142555683b"));
         assert!(a.words.is_empty());
         // Words stay words; a number given twice keeps the field's.
         let a = RunAsk::from_input(
-            &serde_json::json!({"query": "security updates gangway-api"}),
+            &serde_json::json!({"query": "security updates harbor-api"}),
             now,
         );
-        assert_eq!(a.words, ["security", "updates", "gangway-api"]);
+        assert_eq!(a.words, ["security", "updates", "harbor-api"]);
         let a = RunAsk::from_input(&serde_json::json!({"query": "#5", "pr": 7}), now);
         assert_eq!(a.pr, Some(7));
         let items = vec![
@@ -794,13 +795,13 @@ pub(crate) mod tests {
             assert!(ticket_key(k), "{k}");
         }
         for k in [
-            "gangway-api",
+            "harbor-api",
             "fix-deps",
             "SEC-",
             "-1",
             "SEC-ABC",
             "a b-1",
-            "#609",
+            "#42",
         ] {
             assert!(!ticket_key(k), "{k}");
         }
@@ -809,12 +810,12 @@ pub(crate) mod tests {
     #[test]
     fn the_pull_requests_runs_opened_are_listed_once_newest_first() {
         let mut a = run("01B", "running", "SEC-1A", "t", "acme/api");
-        a.insert("pr_number".into(), AttributeValue::N("609".into()));
+        a.insert("pr_number".into(), AttributeValue::N("42".into()));
         a.insert(
             "pr_numbers".into(),
             AttributeValue::L(vec![
-                AttributeValue::N("602".into()),
-                AttributeValue::N("609".into()),
+                AttributeValue::N("41".into()),
+                AttributeValue::N("42".into()),
             ]),
         );
         let b = run("01A", "retried", "SEC-1A", "t", "acme/api");
@@ -822,7 +823,7 @@ pub(crate) mod tests {
         let got = prs_of(&[a, b, none]);
         assert_eq!(
             got,
-            [("acme/api".to_string(), 609), ("acme/api".to_string(), 602)]
+            [("acme/api".to_string(), 42), ("acme/api".to_string(), 41)]
         );
     }
 

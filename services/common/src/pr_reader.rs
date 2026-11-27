@@ -302,7 +302,7 @@ mod tests {
         Facts {
             head: "abc1234def".into(),
             why: Some(Why {
-                reference: "OPS-41".into(),
+                reference: "HARBOR-57".into(),
                 title: "Export poller gives up on the first timeout".into(),
                 url: String::new(),
             }),
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn a_rebuild_without_a_model_keeps_the_slots_it_can_still_verify() {
         let body = format!(
-            "{LEAD_START}\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\nRetries a timed-out export poll 3 times before giving up (OPS-41).<!-- ch:summary-end -->\n\n### Review focus\n\n- Approach: does this do what OPS-41 asks?\n{LEAD_END}\n\n{WRITTEN}\n\nHow to check: `cargo test -p export`."
+            "{LEAD_START}\n<!-- coderhelm:body v1 ticket=HARBOR-57 head=abc1234 -->\nRetries a timed-out export poll 3 times before giving up (HARBOR-57).<!-- ch:summary-end -->\n\n### Review focus\n\n- Approach: does this do what HARBOR-57 asks?\n{LEAD_END}\n\n{WRITTEN}\n\nHow to check: `cargo test -p export`."
         );
         let s = Slots::from_body(&body, &facts());
         assert_eq!(

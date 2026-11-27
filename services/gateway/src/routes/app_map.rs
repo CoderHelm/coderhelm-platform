@@ -52,6 +52,36 @@ pub async fn queue_build(
             return Err(None);
         }
     };
+    send_build(state, team_id, st).await.ok_or(None)
+}
+
+/// Builds the map again when the one there now was made by another
+/// extractor than this release's (`common::app_map::queue_for_extractor`):
+/// once per release, through the same one-build-at-a-time conditional write,
+/// so two pages read at once queue one build. The map there now is served
+/// meanwhile. `None` when nothing was queued.
+pub async fn queue_release_build(state: &AppState, team_id: &str) -> Option<am::Status> {
+    let table = &state.config.settings_table_name;
+    let st = match am::queue_release_build(&state.dynamo, table, team_id).await {
+        Ok(Some(st)) => st,
+        Ok(None) => return None,
+        Err(e) => {
+            error!("app map: could not mark a release's build queued: {e}");
+            return None;
+        }
+    };
+    info!(
+        team_id,
+        extractor = am::EXTRACTOR_VERSION,
+        "App map: made by another extractor, built again"
+    );
+    send_build(state, team_id, st).await
+}
+
+/// Sends a queued build's first message; when it can't be sent, the build is
+/// marked failed (`None`).
+async fn send_build(state: &AppState, team_id: &str, st: am::Status) -> Option<am::Status> {
+    let table = &state.config.settings_table_name;
     let msg = crate::models::WorkerMessage::AppMap(crate::models::AppMapMessage {
         team_id: team_id.to_string(),
         build: st.build.clone(),
@@ -69,7 +99,7 @@ pub async fn queue_build(
     {
         Ok(_) => {
             info!(team_id, "App map: build queued");
-            Ok(st)
+            Some(st)
         }
         Err(e) => {
             error!("app map: could not queue a build: {e}");
@@ -79,7 +109,7 @@ pub async fn queue_build(
                 am::failed(cur, &st.build, why, now)
             })
             .await;
-            Err(None)
+            None
         }
     }
 }
@@ -95,6 +125,14 @@ pub fn shown_state(st: Option<&am::Status>, has_map: bool, now: i64) -> (&'stati
         (false, Some(s)) if s.state == "ready" => ("empty", false),
         _ => ("not_built", false),
     }
+}
+
+/// Whether reading the page asks for the map to be built again because the
+/// map there now was made by another extractor than this release's (a
+/// build already queued or running builds with this one anyway).
+pub fn needs_release_build(st: Option<&am::Status>, has_map: bool, now: i64) -> bool {
+    !st.is_some_and(|s| s.is_running(now))
+        && am::made_by_another_extractor(st, has_map, am::EXTRACTOR_VERSION)
 }
 
 /// The map there now, as far as the status page needs it: when it was
@@ -138,7 +176,97 @@ pub fn status_view(st: Option<&am::Status>, map: MapFacts, team_repos: u32, now:
         "built_repos": if map.has_map { built_repos } else { 0 },
         "now": now,
         "floorplan": am::FLOORPLAN_VERSION.trim(),
+        // `release` while the map is built again because this release
+        // extracts more than the one that made it; the page says so.
+        "reason": if st.is_some_and(|s| am::rebuilding_for_release(s, now)) { "release" } else { "" },
+        // A repository the journeys couldn't read, in one plain line (empty
+        // once it can be read again).
+        "unread": s.unread,
+        "journeys_note": am::unread_line(&s.unread),
     })
+}
+
+/// What the Knowledge page says about the map: it is not embedded as
+/// passages, runs and Chat look things up in it directly.
+pub const KNOWLEDGE_NOTE: &str = "Not split into passages like a knowledge base: runs and Chat look things up in the map directly.";
+
+/// The App map's card on the Knowledge page: its state (`built`,
+/// `building`, `rebuilding`, `failed` or `not_built`), when it was built,
+/// what it covers, where it is, and whether this person may build it again
+/// (admins, one build at a time through `POST /api/app-map/rebuild`).
+pub fn knowledge_view(
+    st: Option<&am::Status>,
+    map: MapFacts,
+    coverage: Option<&am::Coverage>,
+    can_rebuild: bool,
+    now: i64,
+) -> Value {
+    let (shown, updating) = shown_state(st, map.has_map, now);
+    let state = match (shown, updating) {
+        ("ready", true) => "rebuilding",
+        ("ready", false) => "built",
+        ("building", _) => "building",
+        ("failed", _) => "failed",
+        _ => "not_built",
+    };
+    let s = st.cloned().unwrap_or_default();
+    let built_at = if s.built > 0 { s.built } else { map.written_at };
+    let coverage = coverage.filter(|c| c.counted).map(|c| {
+        json!({
+            "screens": c.screens,
+            "outside_services": c.outside_services,
+            "cloud_links": c.cloud_links,
+            "repos": c.repos,
+            "journeys": c.journeys,
+        })
+    });
+    json!({
+        "state": state,
+        "built_at": if map.has_map { built_at } else { 0 },
+        // With a map there, the last update that didn't finish.
+        "last_failed": map.has_map && s.state == "failed",
+        "note": if state == "failed" || (map.has_map && s.state == "failed") { s.error } else { String::new() },
+        "repos": if map.has_map { map.repos } else { 0 },
+        "coverage": coverage,
+        "href": "/app-map",
+        "can_rebuild": can_rebuild,
+        "embedded": false,
+        "explain": KNOWLEDGE_NOTE,
+    })
+}
+
+/// [`knowledge_view`] for the signed-in team, from the status, when the map
+/// was written and its small index (never the map itself). Reading it never
+/// starts a build.
+pub async fn knowledge_card(state: &AppState, claims: &Claims) -> Value {
+    let bucket = &state.config.bucket_name;
+    let team = claims.team_id.as_str();
+    let (written, index, st) = tokio::join!(
+        am::graph_written_at(&state.s3, bucket, team),
+        am::load_index(&state.s3, bucket, team),
+        am::status(&state.dynamo, &state.config.settings_table_name, team),
+    );
+    let index = index.map(|(i, _)| i);
+    let facts = match written {
+        Some(at) => MapFacts {
+            has_map: true,
+            written_at: at,
+            repos: index
+                .as_ref()
+                .map(|i| i.repos.len() as u32)
+                .or(st.as_ref().map(|s| s.built_repos))
+                .unwrap_or(0),
+        },
+        None => MapFacts::default(),
+    };
+    let can_rebuild = claims.support_view.is_none() && claims.require_role(3).is_ok();
+    knowledge_view(
+        st.as_ref(),
+        facts,
+        index.as_ref().map(|i| &i.coverage),
+        can_rebuild,
+        chrono::Utc::now().timestamp(),
+    )
 }
 
 /// The team's turned-on repositories, counted for the estimate (0 when
@@ -206,9 +334,12 @@ pub async fn get_map(
     );
     let now = chrono::Utc::now().timestamp();
     // The index is written after the map (and the page's copy before the
-    // index): one older than the map belongs to an earlier map.
+    // index): one older than the map belongs to an earlier map. A copy made
+    // the way an earlier release made it is written again from the map.
     let index = match (index, written) {
-        (Some((idx, at)), Some(map_at)) if at + 1 >= map_at => Some(idx),
+        (Some((idx, at)), Some(map_at)) if at + 1 >= map_at && idx.copy >= am::COPY_VERSION => {
+            Some(idx)
+        }
         (_, Some(_)) if !status_only => backfill(&state, team).await,
         _ => None,
     };
@@ -224,6 +355,13 @@ pub async fn get_map(
         },
         None => MapFacts::default(),
     };
+    // A map made by another extractor than this release's is built again
+    // (once), and served as it is until the new one is there.
+    if needs_release_build(st.as_ref(), facts.has_map, now) {
+        if let Some(new) = queue_release_build(&state, team).await {
+            st = Some(new);
+        }
+    }
     // The first visit starts the first build.
     if shown_state(st.as_ref(), facts.has_map, now).0 == "not_built" {
         match queue_build(&state, team).await {
@@ -394,9 +532,10 @@ async fn one(
     kind: &str,
     q: &MapQuery,
 ) -> Result<Json<Value>, StatusCode> {
-    let graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
+    let mut graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
+    am::name_by_repo(&mut graph);
     view(&graph, kind, q).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -779,6 +918,85 @@ mod tests {
         g
     }
 
+    /// The Knowledge page's card: each state, when it was built, what it
+    /// covers, the link, who may build it again, and the line saying it is
+    /// looked up directly rather than split into passages.
+    #[test]
+    fn the_knowledge_card_says_where_the_map_stands() {
+        let now = 1_000_000;
+        let cov = am::MapIndex::of(&harbor()).coverage;
+        let map = MapFacts {
+            has_map: true,
+            written_at: now - 3600,
+            repos: 2,
+        };
+        let ready = am::Status {
+            state: "ready".into(),
+            at: now - 3600,
+            built: now - 3600,
+            ..Default::default()
+        };
+        let v = knowledge_view(Some(&ready), map, Some(&cov), true, now);
+        assert_eq!(v["state"], "built");
+        assert_eq!(v["built_at"], now - 3600);
+        assert_eq!(
+            v["coverage"]["screens"],
+            json!({"harbor-mobile": 3, "web": 1})
+        );
+        assert_eq!(v["coverage"]["outside_services"], 4);
+        assert_eq!(v["coverage"]["cloud_links"], 2);
+        assert_eq!(v["href"], "/app-map");
+        assert_eq!(v["can_rebuild"], true);
+        assert_eq!(v["embedded"], false);
+        assert_eq!(v["explain"], KNOWLEDGE_NOTE);
+        // Building again with a map there; building the first; failed.
+        let running = am::Status {
+            state: "building".into(),
+            at: now - 10,
+            ..ready.clone()
+        };
+        assert_eq!(
+            knowledge_view(Some(&running), map, None, false, now)["state"],
+            "rebuilding"
+        );
+        assert_eq!(
+            knowledge_view(Some(&running), MapFacts::default(), None, false, now)["state"],
+            "building"
+        );
+        let failed = am::Status {
+            state: "failed".into(),
+            at: now - 10,
+            error: "The build couldn't be started.".into(),
+            ..Default::default()
+        };
+        let f = knowledge_view(Some(&failed), MapFacts::default(), None, false, now);
+        assert_eq!(f["state"], "failed");
+        assert_eq!(f["note"], "The build couldn't be started.");
+        assert_eq!(f["built_at"], 0);
+        assert_eq!(f["coverage"], Value::Null);
+        // An update that failed keeps the map built, and says so.
+        let kept = knowledge_view(Some(&failed), map, Some(&cov), false, now);
+        assert_eq!(
+            (kept["state"].as_str(), kept["last_failed"].as_bool()),
+            (Some("built"), Some(true))
+        );
+        assert_eq!(
+            knowledge_view(None, MapFacts::default(), None, false, now)["state"],
+            "not_built"
+        );
+        // An index from before the counts: no counts rather than zeros.
+        assert_eq!(
+            knowledge_view(
+                Some(&ready),
+                map,
+                Some(&am::Coverage::default()),
+                false,
+                now
+            )["coverage"],
+            Value::Null
+        );
+    }
+
     #[test]
     fn a_team_reads_only_its_own_map() {
         let mine = harbor();
@@ -788,21 +1006,71 @@ mod tests {
         };
         assert!(view(&mine, "part", &q("api")).is_some());
         // Another team's part, file or screen is not in this team's map.
-        assert!(view(&mine, "part", &q("marina-docks")).is_none());
+        assert!(view(&mine, "part", &q("library-wings")).is_none());
         assert!(view(
             &mine,
             "file",
             &MapQuery {
-                path: "marina/src/x.js".into(),
+                path: "library/src/x.js".into(),
                 ..Default::default()
             }
         )
         .is_none());
-        assert!(view(&mine, "screen", &q("screen:marina:/berths")).is_none());
-        assert!(view(&mine, "screen", &q("/slips/:id")).is_some());
+        assert!(view(&mine, "screen", &q("screen:library:/booths")).is_none());
+        assert!(view(&mine, "screen", &q("/slots/:id")).is_some());
         // Each team's map has its own keys.
         assert_ne!(am::graph_key("team-a"), am::graph_key("team-b"));
         assert_eq!(am::map_pk("team-a"), "AM#team-a");
+    }
+
+    #[test]
+    fn a_map_from_another_extractor_is_built_again_once_and_served_meanwhile() {
+        let now = 10_000;
+        let older = am::Status {
+            state: "ready".into(),
+            at: now - 60,
+            built: now - 86_400,
+            built_repos: 2,
+            extractor: "0000000000000000".into(),
+            ..Default::default()
+        };
+        // Made by another extractor: the page asks for one build.
+        assert!(needs_release_build(Some(&older), true, now));
+        let q = am::queue_for_extractor(Some(&older), now, "b1", am::EXTRACTOR_VERSION).unwrap();
+        // The next read (or a second read at once, after the conditional
+        // write) asks for none, and the old map is served, updating, with
+        // the reason the page words.
+        assert!(!needs_release_build(Some(&q), true, now + 1));
+        assert!(am::queue_for_extractor(Some(&q), now + 1, "b2", am::EXTRACTOR_VERSION).is_none());
+        let facts = MapFacts {
+            has_map: true,
+            written_at: now - 86_400,
+            repos: 2,
+        };
+        let v = status_view(Some(&q), facts, 0, now + 1);
+        assert_eq!(
+            (v["state"].as_str(), v["updating"].as_bool()),
+            (Some("ready"), Some(true))
+        );
+        assert_eq!(v["reason"], "release");
+        // A build that failed is not asked for again on every visit.
+        let running = am::take_turn(Some(&q), "b1", 0, now + 2).unwrap();
+        let f = am::failed(Some(&running), "b1", "x", now + 3).unwrap();
+        assert!(!needs_release_build(Some(&f), true, now + 4));
+        assert_eq!(status_view(Some(&f), facts, 0, now + 4)["reason"], "");
+        // Made by this extractor: nothing asked, no reason given.
+        let current = am::Status {
+            extractor: am::EXTRACTOR_VERSION.into(),
+            ..older.clone()
+        };
+        assert!(!needs_release_build(Some(&current), true, now));
+        assert_eq!(status_view(Some(&current), facts, 0, now)["reason"], "");
+        // No map yet: the first visit's build, not this one.
+        assert!(!needs_release_build(None, false, now));
+        // A push's build running: it builds with this extractor anyway.
+        let pushed = am::queue_next(Some(&older), now, "p1").unwrap();
+        assert!(!needs_release_build(Some(&pushed), true, now + 1));
+        assert_eq!(status_view(Some(&pushed), facts, 0, now + 1)["reason"], "");
     }
 
     #[test]
@@ -928,7 +1196,7 @@ mod tests {
         assert_eq!(press(&state, team).await.0, StatusCode::ACCEPTED);
         assert_eq!(f.store.sent().len(), 2);
         // Another team's build is its own.
-        assert_eq!(press(&state, "TEAM#marina").await.0, StatusCode::ACCEPTED);
+        assert_eq!(press(&state, "TEAM#library").await.0, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -947,6 +1215,72 @@ mod tests {
             1,
             "{codes:?}"
         );
+        assert_eq!(f.store.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_release_queues_one_build_for_a_map_another_extractor_made() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#harbor";
+        let now = chrono::Utc::now().timestamp();
+        let made_by = |extractor: &'static str| {
+            let dynamo = state.dynamo.clone();
+            async move {
+                am::update_status(&dynamo, "settings", team, |_| {
+                    Some(am::Status {
+                        state: "ready".into(),
+                        at: now - 60,
+                        built: now - 86_400,
+                        built_repos: 2,
+                        extractor: extractor.into(),
+                        ..Default::default()
+                    })
+                })
+                .await
+                .unwrap();
+            }
+        };
+        // Made by this release's extractor: nothing is queued.
+        made_by(am::EXTRACTOR_VERSION).await;
+        assert!(queue_release_build(&state, team).await.is_none());
+        assert!(f.store.sent().is_empty());
+        // Made by another: six page reads at the same moment queue one build.
+        made_by("0000000000000000").await;
+        let reads = (0..6).map(|_| queue_release_build(&state, team));
+        let queued = futures::future::join_all(reads)
+            .await
+            .into_iter()
+            .flatten()
+            .count();
+        assert_eq!(queued, 1);
+        assert_eq!(f.store.sent().len(), 1);
+        let st = am::status(&state.dynamo, "settings", team).await.unwrap();
+        assert_eq!(st.state, "queued");
+        assert_eq!(st.asked_extractor, am::EXTRACTOR_VERSION);
+        // The map there now is still the one shown, marked as updating.
+        let v = status_view(
+            Some(&st),
+            MapFacts {
+                has_map: true,
+                written_at: now - 86_400,
+                repos: 2,
+            },
+            0,
+            now,
+        );
+        assert_eq!(
+            (v["state"].as_str(), v["reason"].as_str()),
+            (Some("ready"), Some("release"))
+        );
+        // A later read while it runs, and after it failed: none more.
+        assert!(queue_release_build(&state, team).await.is_none());
+        am::update_status(&state.dynamo, "settings", team, |cur| {
+            am::failed(cur, &st.build, "x", now)
+        })
+        .await
+        .unwrap();
+        assert!(queue_release_build(&state, team).await.is_none());
         assert_eq!(f.store.sent().len(), 1);
     }
 
@@ -971,6 +1305,7 @@ mod tests {
                 "last_build": "building", "note": "", "started_at": now - 120, "repos": 12,
                 "estimate": {"low_secs": 15 * 60, "high_secs": 30 * 60},
                 "built_at": 0, "built_repos": 0, "now": now, "floorplan": am::FLOORPLAN_VERSION.trim(),
+                "reason": "", "unread": [], "journeys_note": "",
             })
         );
         // Built: when, and from how many repositories; nothing running.
@@ -992,6 +1327,23 @@ mod tests {
         assert_eq!(
             (v["started_at"].as_i64(), v["estimate"].is_null()),
             (Some(0), true)
+        );
+        // A repository the journeys couldn't read: one plain line, gone
+        // once it can be read again.
+        let mut waiting = done.clone();
+        waiting.unread = vec!["harbor/harbor-etl".into()];
+        let v = status_view(Some(&waiting), facts, 0, now);
+        assert_eq!(v["state"], "ready");
+        let line = v["journeys_note"].as_str().unwrap();
+        assert!(
+            line.starts_with("harbor-etl couldn't be read from GitHub just now"),
+            "{line}"
+        );
+        assert!(line.contains("every other journey goes on"));
+        waiting.unread.clear();
+        assert_eq!(
+            status_view(Some(&waiting), facts, 0, now)["journeys_note"],
+            ""
         );
         // A map from before the status kept these: the map's own date and repositories.
         let v = status_view(
@@ -1042,7 +1394,7 @@ mod tests {
             vec![("infra/main.tf".to_string(), 0)]
         );
         assert!(infra_item(&json!({"id": "i2"})).is_none());
-        assert_eq!(why_of("# Proposal\n\n## Why\nBoaters can't book a slip twice.\nIt double charges.\n\n## What\nx"), "Boaters can't book a slip twice. It double charges.");
+        assert_eq!(why_of("# Proposal\n\n## Why\nPatrons can't book a slot twice.\nIt double charges.\n\n## What\nx"), "Patrons can't book a slot twice. It double charges.");
         // Placed on the map, in Floorplan's own Health field.
         let g = am::with_overlays(harbor(), None, Some(&[it]));
         assert!(g["health"]["issues"]
@@ -1056,23 +1408,23 @@ mod tests {
     /// A made-up map the size of a large team's: `files` files in 12 parts
     /// across 9 repositories, three lines per file.
     fn big_map(files: usize) -> Value {
-        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let repos: Vec<String> = (0..9).map(|i| format!("bookshop/yard{i}")).collect();
         let folders = am::folders(&repos);
         let fs: Vec<Value> = (0..files)
             .map(|i| {
                 let r = &repos[i % 9];
-                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes."})
+                json!({"p": format!("{}/src/area{}/booth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Booth keeper {i}"), "d": "Keeps one booth's bookings, its gate code and the lockers that may use it, and tells the office when it changes."})
             })
             .collect();
         let links: Vec<Value> = (0..files * 3)
             .map(|i| json!({"a": format!("f:{}", fs[i % files]["p"].as_str().unwrap()), "b": format!("f:{}", fs[(i * 7 + 13) % files]["p"].as_str().unwrap()), "k": "import", "w": 1}))
             .collect();
         let mut g = json!({
-            "schema": am::GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "schema": am::GRAPH_SCHEMA, "project": {"name": "Bookshop", "summary": "Booths and bookings."},
             "meta": {"root": "/tmp/x", "agent": "claude"},
-            "nodes": (0..12).map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service"})).collect::<Vec<_>>(),
+            "nodes": (0..12).map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Wing area {i}"), "kind": "service"})).collect::<Vec<_>>(),
             "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
-            "health": {"issues": [{"id": "open-endpoints:x", "severity": "high", "title": "Open", "items": [], "locations": [{"file": "yard0/src/area0/berth_0_keeper.ts", "line": 3}]}]},
+            "health": {"issues": [{"id": "open-endpoints:x", "severity": "high", "title": "Open", "items": [], "locations": [{"file": "yard0/src/area0/booth_0_keeper.ts", "line": 3}]}]},
         });
         am::stamp_repos(&mut g, &folders);
         g
@@ -1100,7 +1452,7 @@ mod tests {
         let state = crate::fake_aws::state(&f.url);
         let team = "TEAM#harbor";
         // No map yet: no address.
-        let first = read_map(&state, "TEAM#marina").await;
+        let first = read_map(&state, "TEAM#library").await;
         assert!(first["graph_url"].is_null() && first["graph"].is_null());
 
         // A map built before the page's copy and its index existed.
@@ -1153,9 +1505,74 @@ mod tests {
             .unwrap();
         assert_eq!(bytes.to_vec(), view.body);
         // Another team's copy is not this team's.
-        assert!(graph(State(state.clone()), Extension(admin("TEAM#marina")))
+        assert!(
+            graph(State(state.clone()), Extension(admin("TEAM#library")))
+                .await
+                .is_err()
+        );
+    }
+
+    /// A page's copy made by an earlier release (its System cards still under
+    /// their old names) is written again from the stored map on the next
+    /// read, once: the cards are titled by their repositories without a new
+    /// build.
+    #[tokio::test]
+    async fn an_earlier_releases_copy_is_named_by_repository_without_a_build() {
+        let f = crate::fake_aws::start().await;
+        let state = crate::fake_aws::state(&f.url);
+        let team = "TEAM#harbor";
+        let g = harbor();
+        f.store.put_object(
+            "bucket",
+            &am::graph_key(team),
+            am::gzip(g.to_string().as_bytes()),
+        );
+        let old_view = am::for_viewer(g.clone(), "then");
+        f.store.put_object(
+            "bucket",
+            &am::view_key(team),
+            am::gzip(old_view.to_string().as_bytes()),
+        );
+        let old_index = am::MapIndex {
+            copy: 0,
+            ..am::MapIndex::of(&g)
+        };
+        f.store.put_object(
+            "bucket",
+            &am::index_key(team),
+            am::gzip(&serde_json::to_vec(&old_index).unwrap()),
+        );
+        let body = read_map(&state, team).await;
+        assert!(body["graph_url"].is_string());
+        let view = f.store.object("bucket", &am::view_key(team)).unwrap();
+        let copy: Value =
+            serde_json::from_slice(&am::gunzip(&view.body, am::MAX_GRAPH_BYTES).unwrap()).unwrap();
+        let api = copy["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "api")
+            .unwrap();
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        let (idx, _) = am::load_index(&state.s3, "bucket", team).await.unwrap();
+        assert_eq!(idx.copy, am::COPY_VERSION);
+        // Read again: not written again.
+        read_map(&state, team).await;
+        assert_eq!(
+            f.store.object("bucket", &am::view_key(team)).unwrap().at,
+            view.at
+        );
+        // The page's lookups name the part the same way.
+        let q = MapQuery {
+            id: "api".into(),
+            ..Default::default()
+        };
+        let Json(p) = part(State(state.clone()), Extension(admin(team)), Query(q))
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
     }
 
     /// A page view at a large team's map size, through the real handler: the
@@ -1164,7 +1581,7 @@ mod tests {
     async fn a_page_view_of_a_large_map_is_small_and_quick() {
         let f = crate::fake_aws::start().await;
         let state = crate::fake_aws::state(&f.url);
-        let team = "TEAM#dockyard";
+        let team = "TEAM#bookshop";
         let map = am::gzip(big_map(4_000).to_string().as_bytes());
         let map_len = map.len();
         f.store.put_object("bucket", &am::graph_key(team), map);

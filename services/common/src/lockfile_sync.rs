@@ -315,12 +315,12 @@ mod tests {
 
     /// The CI lines of the run this module answers, as GitHub Actions printed
     /// them (package names invented).
-    const NPM_CI: &str = "2026-11-12T19:43:02.1234567Z npm error code EUSAGE\n\
-        2026-11-12T19:43:02.1234567Z npm error\n\
-        2026-11-12T19:43:02.1234567Z npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\n\
-        2026-11-12T19:43:02.1234567Z npm error\n\
-        2026-11-12T19:43:02.1234567Z npm error Invalid: lock file's undici@6.28.1 does not satisfy undici@8.12.4\n\
-        2026-11-12T19:43:02.1234567Z npm error Missing: @acme/streams@2.0.1 from lock file\n";
+    const NPM_CI: &str = "2030-03-12T19:43:02.1234567Z npm error code EUSAGE\n\
+        2030-03-12T19:43:02.1234567Z npm error\n\
+        2030-03-12T19:43:02.1234567Z npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\n\
+        2030-03-12T19:43:02.1234567Z npm error\n\
+        2030-03-12T19:43:02.1234567Z npm error Invalid: lock file's undici@6.28.1 does not satisfy undici@8.12.4\n\
+        2030-03-12T19:43:02.1234567Z npm error Missing: @acme/streams@2.0.1 from lock file\n";
     const PNPM_CI: &str = "Scope: all 6 workspace projects\n\
          \u{1b}[41m ERR_PNPM_LOCKFILE_CONFIG_MISMATCH \u{1b}[0m Cannot proceed with the frozen installation. The current \"overrides\" configuration doesn't match the value found in the lockfile\n\n\
         Update your lockfile using \"pnpm install --no-frozen-lockfile\"\n";

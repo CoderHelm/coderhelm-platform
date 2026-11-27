@@ -745,7 +745,10 @@ pub async fn run(
             &msg.ticket_id,
             msg.issue_number,
         ),
-    );
+    )
+    // The app map's lookups (`run_map`): who else calls what it changes.
+    .load_map(state)
+    .await;
     super::code_graph::offer(
         &graphs,
         super::code_graph::Role::Coder,

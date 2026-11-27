@@ -1,4 +1,4 @@
-//! ah. A dependency update finished "completed" with its checks passed, and
+//! ai. A dependency update finished "completed" with its checks passed, and
 //! its pull request still listed five Open items for a person:
 //!
 //! 1. the remaining critical and high advisory counts were unknown, because

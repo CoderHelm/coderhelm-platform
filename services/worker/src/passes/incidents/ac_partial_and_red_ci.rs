@@ -1,9 +1,9 @@
-//! ac. Two runs on one repository, one afternoon.
+//! ac. Two runs on one repository.
 //!
 //! The first, from a Jira ticket, did seven of its eight planned tasks. The
 //! eighth asked to adapt a scroll hook to a taller bar; the coder read the
 //! hook, found it measures the bar at runtime, and said so: "The last task
-//! needed no code change ... `useStickyScroll.ts` stays as it is". The plan
+//! needed no code change ... `useScrollOffset.ts` stays as it is". The plan
 //! check only knew a task as done when its file changed, and its list of
 //! no-change phrases didn't include those words, so two more steps asked the
 //! same task, the coder gave the same answer, and the progress guard stopped
@@ -160,10 +160,10 @@ fn a_run_stopped_mid_implement_opens_the_standard_held_draft() {
     // The stop sentence names the task the steps were stuck on.
     let why = crate::passes::steps::stall_reason(
         3,
-        "a8c88140",
+        "aaa11122",
         "implement_started",
         "coderhelm-wip/coderhelm/web-12",
-        Some("task 8 of 8 (`web/src/hooks/useStickyScroll.ts`: adapt the scroll offset)"),
+        Some("task 8 of 8 (`web/src/hooks/useScrollOffset.ts`: adapt the scroll offset)"),
     );
     let stop = outcome::Stop::from_recorded(&why);
     let words = stop.words();
@@ -194,14 +194,14 @@ fn issue_zero_never_renders_in_any_body() {
 /// The coder's own words from the stopped run (file renamed). The old
 /// phrase list matched neither line, so the task stayed open for two steps.
 const CODER_NOTES: &str = "The last task needed no code change, so the branch now covers all \
-eight tasks. `useStickyScroll.ts` stays as it is because it measures the sticky bar's height when \
+eight tasks. `useScrollOffset.ts` stays as it is because it measures the sticky bar's height when \
 the page runs, so a 12px taller bar is picked up on its own.";
 
 fn the_plan() -> String {
     (1..=7)
         .map(|i| format!("- [ ] web/src/blocks/part{i}.tsx: adjust the padding"))
         .chain(std::iter::once(
-            "- [ ] web/src/hooks/useStickyScroll.ts: adapt the scroll offset to the taller bar"
+            "- [ ] web/src/hooks/useScrollOffset.ts: adapt the scroll offset to the taller bar"
                 .to_string(),
         ))
         .collect::<Vec<_>>()
@@ -223,12 +223,12 @@ fn a_planned_file_the_coder_says_needs_no_change_settles_and_stays_settled() {
     assert_eq!(cov.required_missing().len(), 1);
     // The coder's words settle the task.
     assert!(
-        plan_coverage::declined_by_coder(CODER_NOTES, "web/src/hooks/useStickyScroll.ts").is_some()
+        plan_coverage::declined_by_coder(CODER_NOTES, "web/src/hooks/useScrollOffset.ts").is_some()
     );
     let settled = plan_coverage::settle_declined(&mut tasks, &cov, CODER_NOTES);
     assert_eq!(
         settled,
-        vec!["web/src/hooks/useStickyScroll.ts".to_string()]
+        vec!["web/src/hooks/useScrollOffset.ts".to_string()]
     );
     let cov = coverage_of(&tasks);
     assert_eq!(
@@ -263,17 +263,17 @@ fn the_step_after_one_that_changed_nothing_takes_a_different_approach() {
     let fb = plan_coverage::narrowed_feedback(&cov, &files).unwrap();
     assert!(fb.contains("takes a different approach: one task only"));
     assert!(fb.contains("task 8 of 8"));
-    assert!(fb.contains("web/src/hooks/useStickyScroll.ts"));
+    assert!(fb.contains("web/src/hooks/useScrollOffset.ts"));
     assert!(fb.contains(plan_coverage::NO_CHANGE_LINE));
     assert!(fb.contains("- `web/src/blocks/part1.tsx`"));
     // The usual ask is not what a stalled step gets.
     assert_ne!(fb, plan_coverage::round_feedback(&cov));
     // A coder that answers with the line settles the task.
     let line = format!(
-        "{} web/src/hooks/useStickyScroll.ts: it measures the bar at runtime",
+        "{} web/src/hooks/useScrollOffset.ts: it measures the bar at runtime",
         plan_coverage::NO_CHANGE_LINE
     );
-    assert!(plan_coverage::declined_by_coder(&line, "web/src/hooks/useStickyScroll.ts").is_some());
+    assert!(plan_coverage::declined_by_coder(&line, "web/src/hooks/useScrollOffset.ts").is_some());
     // The pipeline passes the supervisor's rung and uses the narrowed ask,
     // with the rung's change of approach beside it.
     let src = include_str!("../mod.rs");

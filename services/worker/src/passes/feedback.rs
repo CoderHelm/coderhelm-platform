@@ -3497,6 +3497,7 @@ async fn handle_wrong_repo(
         base_branch: "main".to_string(),
         image_attachments,
         continuation: 0,
+        retry_after_secs: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
         resume_from: None,
@@ -3512,6 +3513,7 @@ async fn handle_wrong_repo(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     });
@@ -4106,6 +4108,7 @@ fn run_ticket_message(
         base_branch,
         image_attachments: vec![],
         continuation: 0,
+        retry_after_secs: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
         resume_from: None,
@@ -4121,6 +4124,7 @@ fn run_ticket_message(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     }

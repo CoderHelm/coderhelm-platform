@@ -258,11 +258,11 @@ pub fn tarball(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
 /// `echo "..."`), then the commands' own output follows.
 pub fn codebuild_log(printed: &[&str]) -> String {
     let mut log = String::from(
-        "[Container] 2026/10/28 03:21:02 Running command cd \"$SRC\" && sh -c \"$CODEGEN_CMD\"; CODE=$?; \
+        "[Container] 2030/03/10 03:21:02 Running command cd \"$SRC\" && sh -c \"$CODEGEN_CMD\"; CODE=$?; \
          echo \"CODERHELM_CODEGEN_END exit=$CODE\"; if [ $CODE -eq 0 ]; then \
          if aws s3 cp out.tgz \"$OUT\"; then echo \"===CODERHELM_CODEGEN_UPLOADED===\"; \
          else echo \"===CODERHELM_CODEGEN_UPLOAD_FAILED===\"; fi; fi\n\
-         [Container] 2026/10/28 03:21:03 Running command if [ -f /tmp/egress.log ]; then grep \
+         [Container] 2030/03/10 03:21:03 Running command if [ -f /tmp/egress.log ]; then grep \
          CODERHELM_EGRESS_BLOCKED /tmp/egress.log; fi\n\
          > studio@ typegen /codebuild/src/apps/studio\n\
          > sanity schema extract && sanity typegen generate\n",

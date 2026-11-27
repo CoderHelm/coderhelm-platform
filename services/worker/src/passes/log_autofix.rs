@@ -122,6 +122,7 @@ impl StartEnv for WorkerEnv<'_> {
             base_branch: "main".into(),
             image_attachments: vec![],
             continuation: 0,
+            retry_after_secs: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
             resume_from: None,
@@ -137,6 +138,7 @@ impl StartEnv for WorkerEnv<'_> {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            followup_of: None,
             after_merge: false,
             merged_note: None,
         });
@@ -404,6 +406,7 @@ async fn post_card(
         &cipher,
         &state.config.settings_table_name,
         team_id,
+        common::notify::route::Kind::Alert,
     )
     .await;
     if channels.is_empty() {
@@ -996,6 +999,7 @@ pub async fn notify_pr(
         &cipher,
         &state.config.settings_table_name,
         team_id,
+        common::notify::route::Kind::Update,
     )
     .await;
     if channels.is_empty() {

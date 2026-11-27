@@ -1,10 +1,10 @@
 //! A test branch that has never run is unverified code.
 //!
-//! A portal spec had two branches on the page's state: registration closed
-//! (the camp's button disabled, it must say so) and registration open (the
+//! A portal spec had two branches on the page's state: booking closed
+//! (the slot's button disabled, it must say so) and booking open (the
 //! button enabled, choosing it must fill the cart). Only the closed one
 //! ever ran; the open one was written from a guess, and the day the vendor
-//! opened registration it failed on every branch, because a signed-out
+//! opened booking it failed on every branch, because a signed-out
 //! visitor gets a sign-in drawer and the cart stays empty.
 //!
 //! - [`state_branches`] finds the branches of end-to-end code on a page's
@@ -478,13 +478,13 @@ export class Portal {
     if (open) {
       await session.click();
       await expect(
-        this.cartSubtotal(),
-        `Choosing "${camp}" did not add it to the order summary`,
+        this.cartTotal(),
+        `Choosing "${slot}" did not add it to the booking total`,
       ).not.toHaveText(/\$0$/);
     } else {
       await expect(
         session,
-        `"${camp}" is disabled but doesn't say registration is closed`,
+        `"${slot}" is disabled but doesn't say booking is closed`,
       ).toContainText(/not open/i);
     }
     if ((await more.count()) > 0) await more.first().click();
@@ -504,11 +504,11 @@ export class Portal {
         );
         assert_eq!(
             open.arms[0].markers,
-            vec!["did not add it to the order summary"]
+            vec!["did not add it to the booking total"]
         );
         assert_eq!(
             open.arms[1].markers,
-            vec!["is disabled but doesn't say registration is closed"]
+            vec!["is disabled but doesn't say booking is closed"]
         );
         assert!(open
             .arm_words(&open.arms[0])
@@ -522,7 +522,7 @@ export class Portal {
     fn a_report_says_which_arm_ran_and_a_probe_which_can_run_now() {
         let b = &state_branches("e2e/pages/portal.ts", PAGE)[0];
         let report = serde_json::json!({"suites": [{"specs": [{"tests": [{"results": [{"steps": [
-            {"title": "\"Mini camp\" is disabled but doesn't say registration is closed", "steps": []}
+            {"title": "\"Day slot\" is disabled but doesn't say booking is closed", "steps": []}
         ]}]}]}]}]});
         let steps = step_titles(&report);
         assert!(!executed(&b.arms[0], &steps));

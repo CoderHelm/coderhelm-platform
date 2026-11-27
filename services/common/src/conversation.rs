@@ -2163,7 +2163,7 @@ mod tests {
     fn the_same_question_worded_twice_is_asked_once() {
         let qs = vec![
             "What H1 and intro copy should each of the four pages use? (Default: the page title and one line.)".to_string(),
-            "Final H1 and intro copy per venue? Proposed default: the page title. I am building the default now.".to_string(),
+            "Final H1 and intro copy per library? Proposed default: the page title. I am building the default now.".to_string(),
             "Which analytics event should the button send?".to_string(),
         ];
         let merged = merge_questions(&qs);
@@ -2299,7 +2299,7 @@ mod tests {
         };
         let (id, body, meta) = answered_edit(
             &view,
-            "Final H1 and intro copy per venue?",
+            "Final H1 and intro copy per library?",
             "Kim",
             "Skip the H1 and intro copy. Just use the title Spring Menu",
         )

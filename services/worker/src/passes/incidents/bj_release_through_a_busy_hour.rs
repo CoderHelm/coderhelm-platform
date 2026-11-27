@@ -1,11 +1,11 @@
 //! bj. Two repositories' Security pages read hundreds of findings "in a
-//! pull request" for two days, through two releases meant to give them
+//! pull request" for days, through releases meant to give them
 //! back, and they were taken for stuck. The logs could not say otherwise:
 //! the sweep that compares each finding with GitHub wrote its line only
 //! when it changed something, so a sweep that read every pull request and
 //! found each one still open left no trace, and neither did one that never
 //! ran. And in the hours GitHub's budget ran low, the sweep did stop: the
-//! budget held it before its first read, three sweeps in a row read
+//! budget held it before its first read, several sweeps in a row read
 //! nothing, and a pull request closed in those hours would have kept its
 //! findings until the budget came back. What GitHub said in the end: both
 //! pull requests were open (one repository's findings had moved from a
@@ -31,7 +31,7 @@ const WEB: &str = "acme/web";
 const API: &str = "acme/api";
 
 fn now() -> DateTime<Utc> {
-    at("2026-11-14T18:18:52Z")
+    at("2030-03-16T20:00:00Z")
 }
 
 /// The two repositories as they stood: one bundle pull request each, with
@@ -86,7 +86,7 @@ async fn a_held_budget_still_gives_back_a_closed_pull_requests_findings() {
 
 #[test]
 fn the_floor_spends_inside_the_runs_share_on_a_small_cap_of_its_own() {
-    let t = 1_794_680_332;
+    let t = 1_899_734_400;
     let low = Some(budget::Budget {
         remaining: 2_350,
         limit: 5_000,

@@ -32,12 +32,12 @@ use crate::passes::security_fixes::release::{fake::*, reconcile, Scope};
 
 const REPO: &str = "acme/infra";
 const TICKET: &str = "SEC-0A1B2C3D4E5F";
-const PR: u64 = 58;
+const PR: u64 = 42;
 const REFUSED: &str =
     "db/main.tf, line 2: `aws_db_instance.orders` changes `identifier`, which replaces the resource";
 
 fn now() -> DateTime<Utc> {
-    at("2026-11-13T10:00:00Z")
+    at("2030-03-15T10:00:00Z")
 }
 
 /// The orders database's engine update, with a pull request to open.
@@ -59,7 +59,7 @@ fn finding() -> Record {
             },
             ..Default::default()
         },
-        "2026-11-11T08:00:00Z",
+        "2030-03-13T08:00:00Z",
     )
 }
 
@@ -74,7 +74,7 @@ fn in_its_pull_request() -> Record {
         state: "open".into(),
         ..Default::default()
     });
-    r.updated_at = "2026-11-12T09:00:00Z".into();
+    r.updated_at = "2030-03-14T09:00:00Z".into();
     r
 }
 
@@ -101,8 +101,8 @@ async fn a_closed_pull_request_gives_the_record_back_with_who_closed_it() {
     let v = rec.view();
     assert_eq!(v["pr"]["state"], "closed");
     assert_eq!(v["pr"]["closed_by"], "octo-admin");
-    assert_eq!(v["pr"]["closed_at"], "2026-11-13T09:30:00Z");
-    assert!(github.event_texts()[0].contains("PR #58 was closed without merging by octo-admin"));
+    assert_eq!(v["pr"]["closed_at"], "2030-03-15T09:30:00Z");
+    assert!(github.event_texts()[0].contains("PR #42 was closed without merging by octo-admin"));
     // No run starts by itself for a week; a person asking never waits
     // (`start_fixes` skips the hold only for the finding asked for).
     assert!(rec.on_hold(now() + Duration::days(6)));
@@ -135,7 +135,7 @@ async fn a_cancelled_or_failed_run_no_longer_keeps_the_record_fixing() {
         ("failed", None, 1),
     ] {
         let mut r = finding();
-        r.claim(TICKET, at("2026-11-13T09:00:00Z"));
+        r.claim(TICKET, at("2030-03-15T09:00:00Z"));
         let mut recs = vec![r];
         let runs = Fake::default();
         runs.run(
@@ -154,7 +154,7 @@ async fn a_cancelled_or_failed_run_no_longer_keeps_the_record_fixing() {
     }
     // GitHub or the run records not answering releases nothing.
     let mut r = finding();
-    r.claim(TICKET, at("2026-11-13T09:00:00Z"));
+    r.claim(TICKET, at("2030-03-15T09:00:00Z"));
     let mut recs = vec![r];
     let down = Fake {
         branches_down: true,
@@ -231,7 +231,7 @@ async fn a_fix_round_that_dies_becomes_the_guards_second_step_never_a_ready_pull
     assert_eq!(newly_drafted(r), Some((REPO.to_string(), PR)));
     let line = github.event_texts().pop().unwrap();
     assert!(
-        line.contains("PR #58 is now a draft") && !line.contains("closed"),
+        line.contains("PR #42 is now a draft") && !line.contains("closed"),
         "{line}"
     );
 }

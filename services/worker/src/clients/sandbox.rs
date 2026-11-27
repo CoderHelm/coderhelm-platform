@@ -395,6 +395,9 @@ pub struct ScriptRun<'r> {
     /// Hosts the script needs beyond the team's allowlist (GitHub's API for
     /// a script given a token).
     pub hosts: Vec<String>,
+    /// Files of `$CODERHELM_OUT` brought back at most: a skill run's whole
+    /// output folder holds more than one run's outputs.
+    pub max_files: usize,
 }
 
 /// The S3 keys of one script run: its source, its secret and its output.
@@ -893,7 +896,7 @@ impl<'a> SandboxClient<'a> {
                     .logs()
                     .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
                     .unzip_or_default();
-                let captured = self.download_script_out(out_key).await;
+                let captured = self.download_script_out(out_key, run.max_files).await;
                 let mut log = String::new();
                 for attempt in 0..4 {
                     if !group.is_empty() {
@@ -918,9 +921,203 @@ impl<'a> SandboxClient<'a> {
         }
     }
 
+    /// The S3 keys of a stdio MCP session's request and answer slot `i`.
+    pub fn session_slot_keys(key: &str, i: usize) -> (String, String) {
+        let (src, _, _) = script_keys(key);
+        let dir = src
+            .trim_end_matches("/src.tgz")
+            .replacen("skill-run/", "mcp-session/", 1);
+        (
+            format!("{dir}/req-{i}.json"),
+            format!("{dir}/resp-{i}.json"),
+        )
+    }
+
+    /// Presigned URLs for a session's slots: the relay reads each request
+    /// and writes each answer through them, nothing else.
+    pub async fn session_slots(
+        &self,
+        key: &str,
+        n: usize,
+        ttl: Duration,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let (req, resp) = Self::session_slot_keys(key, i);
+            let get = self
+                .s3
+                .get_object()
+                .bucket(self.bucket)
+                .key(&req)
+                .presigned(PresigningConfig::expires_in(ttl)?)
+                .await?;
+            let put = self
+                .s3
+                .put_object()
+                .bucket(self.bucket)
+                .key(&resp)
+                .presigned(PresigningConfig::expires_in(ttl)?)
+                .await?;
+            out.push((get.uri().to_string(), put.uri().to_string()));
+        }
+        Ok(out)
+    }
+
+    /// Starts a stdio MCP session build: the relay and the server from
+    /// `source` (a tar.gz whose top folder holds `relay.py`, `manifest.json`
+    /// and `server/`), with `secret` (the AWS keys) behind a one-time URL.
+    /// Returns the build's id.
+    pub async fn start_session(
+        &self,
+        key: &str,
+        source: Vec<u8>,
+        secret: Option<&str>,
+        hosts: &[String],
+        minutes: i32,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let (src_key, secret_key, _) = script_keys(&format!("mcp-{key}"));
+        self.s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(&src_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(source))
+            .content_type("application/gzip")
+            .send()
+            .await
+            .map_err(|e| format!("sandbox: session upload failed: {e}"))?;
+        let mut env = vec![
+            env_var("SANDBOX_GET_URL", &self.presigned_get(&src_key).await?)?,
+            env_var("MCP_SESSION", "1")?,
+        ];
+        if let Some(secret) = secret {
+            self.s3
+                .put_object()
+                .bucket(self.bucket)
+                .key(&secret_key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    secret.as_bytes().to_vec(),
+                ))
+                .content_type("application/json")
+                .send()
+                .await
+                .map_err(|e| format!("sandbox: session secret upload failed: {e}"))?;
+            env.push(env_var(
+                "SANDBOX_SECRET_URL",
+                &self.presigned_get(&secret_key).await?,
+            )?);
+        }
+        if let Some(allow) = build_allowlist(self.egress.as_deref(), hosts, true) {
+            use base64::Engine;
+            env.push(env_var("EGRESS_ALLOW", &allow)?);
+            env.push(env_var(
+                "EGRESS_PROXY_B64",
+                &base64::engine::general_purpose::STANDARD.encode(EGRESS_PROXY),
+            )?);
+        }
+        let started = self
+            .codebuild
+            .start_build()
+            .project_name(self.project)
+            .timeout_in_minutes_override(minutes.clamp(5, 480))
+            .set_environment_variables_override(Some(env))
+            .send()
+            .await
+            .map_err(|e| format!("codebuild start_build (session) failed: {e}"))?;
+        let id = started
+            .build_value()
+            .and_then(|b| b.id())
+            .ok_or("codebuild returned no build id")?
+            .to_string();
+        info!(build_id = %id, "sandbox: stdio session started");
+        Ok(id)
+    }
+
+    /// One request through a session's slot `i`, and its answer, waited for
+    /// until `deadline`. The slot's objects are deleted after.
+    pub async fn session_request(
+        &self,
+        key: &str,
+        build: &str,
+        i: usize,
+        body: &str,
+        deadline: Instant,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let (req, resp) = Self::session_slot_keys(key, i);
+        self.s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(&req)
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                body.as_bytes().to_vec(),
+            ))
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|e| format!("sandbox: session request failed: {e}"))?;
+        let mut checks = 0u32;
+        loop {
+            if let Ok(o) = self
+                .s3
+                .get_object()
+                .bucket(self.bucket)
+                .key(&resp)
+                .send()
+                .await
+            {
+                let bytes = o
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_bytes();
+                for k in [&req, &resp] {
+                    let _ = self
+                        .s3
+                        .delete_object()
+                        .bucket(self.bucket)
+                        .key(k)
+                        .send()
+                        .await;
+                }
+                return Ok(String::from_utf8_lossy(&bytes).to_string());
+            }
+            if Instant::now() >= deadline {
+                return Err("the sandbox server gave no answer in time".into());
+            }
+            checks += 1;
+            // Every half minute: is the session still there?
+            if checks.is_multiple_of(30) {
+                let builds = self.codebuild.batch_get_builds().ids(build).send().await?;
+                let done = builds
+                    .builds()
+                    .first()
+                    .is_some_and(|b| !matches!(b.build_status(), Some(StatusType::InProgress)));
+                if done {
+                    return Err("the sandbox session ended".into());
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Ends a session's build (after its relay was asked to stop).
+    pub async fn stop_session(&self, key: &str, build: &str) {
+        let _ = self.codebuild.stop_build().id(build).send().await;
+        let (src_key, secret_key, _) = script_keys(&format!("mcp-{key}"));
+        for k in [src_key, secret_key] {
+            let _ = self
+                .s3
+                .delete_object()
+                .bucket(self.bucket)
+                .key(k)
+                .send()
+                .await;
+        }
+    }
+
     /// The files a script wrote, read with the outputs' caps (none when it
     /// wrote nothing).
-    async fn download_script_out(&self, out_key: &str) -> Captured {
+    async fn download_script_out(&self, out_key: &str, max_files: usize) -> Captured {
         let Ok(obj) = self
             .s3
             .get_object()
@@ -934,7 +1131,7 @@ impl<'a> SandboxClient<'a> {
         let Ok(bytes) = obj.body.collect().await.map(|b| b.into_bytes()) else {
             return Captured::default();
         };
-        read_changed_tar(&bytes, MAX_SCRIPT_FILES, MAX_SCRIPT_FILE_BYTES).unwrap_or_default()
+        read_changed_tar(&bytes, max_files.max(1), MAX_SCRIPT_FILE_BYTES).unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]

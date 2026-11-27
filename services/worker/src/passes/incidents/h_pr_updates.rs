@@ -20,13 +20,13 @@ use common::ticket_state::{self, Notice, NoticeAction};
 #[test]
 fn the_description_drops_an_older_rounds_failure_when_a_newer_round_lands() {
     let failed = evidence::Round {
-        date: "2026-10-26".into(),
+        date: "2030-03-11".into(),
         commit: "aaa1111".into(),
         headline: "Register the card block".into(),
         lines: vec!["Full test suite FAILED (exit 1): `pnpm test` (12 passed, 1 failed)".into()],
     };
     let passed = evidence::Round {
-        date: "2026-10-27".into(),
+        date: "2030-03-12".into(),
         commit: "bbb2222".into(),
         headline: "Map the card block to its component".into(),
         lines: vec!["Full test suite passed: `pnpm test` (13 passed)".into()],
@@ -48,8 +48,8 @@ fn the_description_drops_an_older_rounds_failure_when_a_newer_round_lands() {
 #[test]
 fn the_same_ticket_comment_from_two_runs_is_posted_once() {
     let key = "outside_note";
-    let first = "**Content:** add the card block on `/events` (run https://app.example.com/runs/01JA, 2026-10-27T10:00:00Z)";
-    let second = "**Content:** add the card block on `/events` (run https://app.example.com/runs/01JB, 2026-10-27T10:04:00Z)";
+    let first = "**Content:** add the card block on `/events` (run https://app.example.com/runs/01JA, 2030-03-12T10:00:00Z)";
+    let second = "**Content:** add the card block on `/events` (run https://app.example.com/runs/01JB, 2030-03-12T10:04:00Z)";
     let posted = vec![Notice {
         key: key.into(),
         text_hash: ticket_state::notice_hash(key, first),

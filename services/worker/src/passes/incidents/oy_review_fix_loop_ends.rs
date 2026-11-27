@@ -1,12 +1,12 @@
-//! oy. A data-pipeline ticket's run fixed the sport a few camps land on.
+//! oy. A data-pipeline ticket's run fixed the wing a few slots land on.
 //! After a merge of the base branch, each round of CoderHelm's own review
 //! raised something new: round 2 a model finding, round 3 "A test out of
 //! proportion to the change", round 4 "A parallel structure next to an
 //! existing one" in the shared helpers, which named as new a function the
-//! main branch had had for months (`get_sport_name_to_id_map`: the branch
+//! main branch had had for months (`get_wing_name_to_id_map`: the branch
 //! only added a parameter to it; the real new builder was
-//! `build_sport_name_map`). Every one held the merge, so the run went
-//! review, fix, review every ten minutes, nine fix rounds and past its
+//! `build_wing_name_map`). Every one held the merge, so the run went
+//! review, fix, review every few minutes, many fix rounds and past its
 //! spend ceiling. Meanwhile the review on the pull request stayed on an
 //! old head: rounds driven by the run's own review pass never asked the PR
 //! reviewer, and a review of CoderHelm's own push with the same verdict and
@@ -30,20 +30,20 @@ use crate::passes::review_policy::{hold_late_blockers, Round, UpFront, ADVISORY_
 use crate::passes::review_rules::wider_findings;
 use std::collections::{HashMap, HashSet};
 
-const COMMON: &str = "dags/utils/schedule_common.py";
+const COMMON: &str = "dags/utils/booking_common.py";
 
 /// The helpers file on the base branch.
-const BASE: &str = "def get_sport_id_map(conn):\n    return {}\n\n\
-def get_sport_name_to_id_map(conn):\n    return {}\n\n\
-def extract_sport_from_class_name(name):\n    return None\n";
+const BASE: &str = "def get_wing_id_map(conn):\n    return {}\n\n\
+def get_wing_name_to_id_map(conn):\n    return {}\n\n\
+def extract_wing_from_tour_name(name):\n    return None\n";
 
 /// The branch: a parameter added to the existing lookup, and a new builder.
 const PATCH: &str = "@@ -4,5 +4,12 @@\n\
--def get_sport_name_to_id_map(conn):\n\
-+def get_sport_name_to_id_map(conn, include_inactive=False):\n\
+-def get_wing_name_to_id_map(conn):\n\
++def get_wing_name_to_id_map(conn, include_inactive=False):\n\
      return {}\n\
 +\n\
-+def build_sport_name_map(rows):\n\
++def build_wing_name_map(rows):\n\
 +    return {r[0]: r[1] for r in rows}\n";
 
 #[test]
@@ -55,14 +55,14 @@ fn a_function_on_the_base_is_never_called_new() {
     assert!(
         !found
             .iter()
-            .any(|w| w.what.starts_with("`get_sport_name_to_id_map` next to")),
+            .any(|w| w.what.starts_with("`get_wing_name_to_id_map` next to")),
         "{found:?}"
     );
     // What the branch really added is still read.
     assert!(
         found
             .iter()
-            .all(|w| w.what.starts_with("`build_sport_name_map`")),
+            .all(|w| w.what.starts_with("`build_wing_name_map`")),
         "{found:?}"
     );
 }
@@ -72,7 +72,7 @@ fn changed() -> HashMap<String, HashSet<u64>> {
     [
         (COMMON.to_string(), HashSet::from([4u64, 9])),
         (
-            "tests/test_exerp_camp_sport.py".to_string(),
+            "tests/test_vendor_slot_wing.py".to_string(),
             HashSet::from([12u64]),
         ),
     ]
@@ -82,7 +82,7 @@ fn changed() -> HashMap<String, HashSet<u64>> {
 #[test]
 fn smallest_change_advice_after_the_first_review_never_holds_and_starts_no_round() {
     for (n, kind, path) in [
-        (3usize, Kind::TestSize, "tests/test_exerp_camp_sport.py"),
+        (3usize, Kind::TestSize, "tests/test_vendor_slot_wing.py"),
         (4, Kind::Parallel, COMMON),
     ] {
         let mut findings = wider_findings(&[Widening {
@@ -117,7 +117,7 @@ fn smallest_change_advice_after_the_first_review_never_holds_and_starts_no_round
     // The first review: they block, so the coder takes them in round one.
     let mut findings = wider_findings(&[Widening {
         kind: Kind::TestSize,
-        path: "tests/test_exerp_camp_sport.py".into(),
+        path: "tests/test_vendor_slot_wing.py".into(),
         what: "x".into(),
     }]);
     let r1 = Round {

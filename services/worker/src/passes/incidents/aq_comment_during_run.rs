@@ -1,6 +1,6 @@
 //! aq. A run started from a ticket asked three questions on it ("Questions
 //! only a person can answer"), proposed its defaults and kept building.
-//! Twenty minutes later a person answered on the ticket. The gateway logged
+//! Soon after, a person answered on the ticket. The gateway logged
 //! "Ignoring Jira comment — run already in progress" and dropped it: nothing
 //! acknowledged the comment, the run never saw it, and its notes kept saying
 //! "3 question(s) already asked on the ticket — not asked again; the run goes
@@ -110,7 +110,7 @@ async fn an_answer_written_while_the_run_builds_is_acknowledged_read_and_applied
     let store = Memory::default();
     let mut end = Ending::default();
 
-    // Twenty minutes in, the run is building from its final plan.
+    // Soon after, the run is building from its final plan.
     let (c, ack) = deliver(&store, &answer_delivery(), "running")
         .await
         .expect("the comment is kept, never dropped");

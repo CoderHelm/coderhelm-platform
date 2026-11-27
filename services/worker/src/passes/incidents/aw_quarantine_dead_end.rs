@@ -1,5 +1,5 @@
-//! aw. Sixteen end-to-end tests of one team sat in quarantine, thirteen for
-//! more than two days and some for over three weeks. Each row had one
+//! aw. Many end-to-end tests of one team sat in quarantine, most for days
+//! and some for weeks. Each row had one
 //! button, "Release from quarantine", and one row a link to a fix pull
 //! request. Nothing was happening to the rest and nothing could be done
 //! from the page:
@@ -11,10 +11,10 @@
 //! - a person's "Fix this test" was marked by the gateway and then dropped
 //!   by the worker as a duplicate of that mark, and was refused outright for
 //!   a quarantined test whose health had gone back to healthy;
-//! - one test had failed three times and then passed about thirty-five runs
-//!   in a row on several pull requests and branches. It stayed quarantined,
+//! - one test had failed a few times and then passed dozens of runs in a
+//!   row on several pull requests and branches. It stayed quarantined,
 //!   under "Likely cause: Environment ... passed on retry in 0 of the last
-//!   30 runs", a sentence its history had disproved hours before.
+//!   30 runs", a sentence its history had long disproved.
 //!
 //! Guarantee: a quarantined test always shows where it stands and what
 //! happens next (`common::e2e::quarantine::standing`): the fix pull request
@@ -46,7 +46,7 @@ const OLD_DROP: &str = "Not starting another";
 
 /// Thursday morning, the day the page was looked at.
 fn now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-11-12T09:00:00Z")
+    DateTime::parse_from_rfc3339("2030-03-14T09:00:00Z")
         .unwrap()
         .with_timezone(&Utc)
 }
@@ -140,11 +140,11 @@ fn the_test_that_went_back_to_passing_leaves_by_itself_and_its_cause_is_withdraw
             Some(60),
         ));
     }
-    // Thirty-five passes over the next hours, recorded one run at a time,
+    // Thirty passes over the next hours, recorded one run at a time,
     // on four pull requests and the default branch.
     let mut released_on = None;
     let mut stale_on = None;
-    for i in 0..35u32 {
+    for i in 0..30u32 {
         let at = start + Duration::minutes(10 * i as i64);
         let pr = match i % 5 {
             0 => None,
@@ -172,13 +172,13 @@ fn the_test_that_went_back_to_passing_leaves_by_itself_and_its_cause_is_withdraw
     assert_eq!(r.health, State::Healthy);
     let rel = r.care.release.clone().unwrap();
     assert!(rel.reason.starts_with(
-        "Left quarantine by itself: 20 passes in a row with no failure and no retry, on 5 pull requests and branches, over 3 hours, since it last failed on 12 November 2026."
+        "Left quarantine by itself: 20 passes in a row with no failure and no retry, on 5 pull requests and branches, over 3 hours, since it last failed on 14 March 2030."
     ));
     let cause = r.cause.as_ref().unwrap();
     assert!(cause.out_of_date.as_deref().unwrap().starts_with(
-        "Out of date: this was worked out while the test was failing. Since its last failure on 12 November 2026 it has passed 10 runs in a row on 5 pull requests and branches"
+        "Out of date: this was worked out while the test was failing. Since its last failure on 14 March 2030 it has passed 10 runs in a row on 5 pull requests and branches"
     ));
-    // The history says why, and the fifteen passes after it change nothing.
+    // The history says why, and the ten passes after it change nothing.
     let left: Vec<_> = r
         .events
         .iter()
@@ -301,10 +301,10 @@ fn automatic_fixes_go_to_the_longest_quarantined_and_the_cap_is_said() {
     for row in &list {
         assert_eq!(
             row["quarantine"]["why"],
-            "Automatic fixes are at this week's limit of 2 for this repository. They resume on Monday 16 November."
+            "Automatic fixes are at this week's limit of 2 for this repository. They resume on Monday 18 March."
         );
     }
-    assert_eq!(quarantine::week_key(now()), "2026-W46");
+    assert_eq!(quarantine::week_key(now()), "2030-W11");
 }
 
 #[test]
@@ -399,7 +399,7 @@ fn a_removal_is_proposed_only_under_the_rule_and_never_merged() {
     let ticket = quarantine::removal_ticket(&r, &evidence, "coderhelm");
     assert!(ticket.contains("Delete this one test case only."));
     assert!(ticket.contains("Do not merge this pull request."));
-    assert!(ticket.contains("- Quarantined since 9 October 2026 (34 days), automatically."));
+    assert!(ticket.contains("- Quarantined since 8 February 2030 (34 days), automatically."));
     assert!(ticket.contains(
         "- 2 fix attempts did not hold; the last: Fix didn't hold: failed 2 of 20 repeat runs."
     ));

@@ -5,8 +5,10 @@
 //! check is green. If the repo configures an (operator-set, never hardcoded)
 //! deploy label, it is added once per commit after both keys are in and the
 //! gate waits for that deploy's CI. It NEVER merges on failing, still-running
-//! or unreadable CI. Bound to the reviewed head: a later commit stops the gate
-//! (the review of the new commit re-arms it).
+//! or unreadable CI, nor on a head its base has moved past (the head's green
+//! CI never ran on the merged result): it brings the base in and waits for CI
+//! on that commit (`MergeOutcome::BaseMoved`). Bound to the reviewed head: a
+//! later commit stops the gate (the review of the new commit re-arms it).
 //!
 //! Event-driven, with bounded polling only as a fallback:
 //! - Waiting on people never polls. An approval, a dismissal or a new review
@@ -1605,16 +1607,14 @@ async fn evaluate(
             );
             set_state(state, msg, decision.state, &detail).await;
             // A person's approval that no longer counts is never waited on
-            // silently: the PR's one status comment, and the team's channel
-            // once per commit.
+            // silently: the PR's one status comment says so. Waiting on
+            // people's reviews is a PR's normal state, so it never goes to a
+            // team channel (`incidents::nt_alerts_channel_alerts_only`).
             let person_gap = view.require_human
                 && !person_key(&view)
                 && (!view.approvals.approved_by.is_empty() || !view.approvals.dismissed.is_empty());
             if watched || person_gap {
                 publish_status(state, github, msg, record, &status).await;
-            }
-            if person_gap {
-                tell_team(state, msg, &pr, &detail).await;
             }
             Ok(Next::Recheck)
         }
@@ -1807,7 +1807,33 @@ async fn merge(
             set_state(state, msg, STATE_HEAD_MOVED, &reason).await;
             Ok(Next::Stop)
         }
+        MergeOutcome::BaseMoved(base) => {
+            // The base moved since this head's checks ran, whether or not
+            // the branch's rules ask for it to be current: CoderHelm brings
+            // the base in, and the gate goes on on that commit, where CI
+            // runs on the merged result and is read again before merging.
+            info!(
+                pr = msg.pr_number,
+                base = %base,
+                "await-merge: the base moved since the head's checks ran — bringing it in"
+            );
+            lines.push(base_moved_line(&base));
+            let pr = github.get_pull_request(owner, repo, msg.pr_number).await?;
+            keep_current(state, github, msg, record, &pr, BaseNeed::Behind, lines).await
+        }
     }
+}
+
+/// Pure: the status line when the base moved past the head that passed.
+pub(crate) fn base_moved_line(base: &str) -> (Mark, String) {
+    (
+        Mark::Waiting,
+        format!(
+            "`{base}` has commits this branch doesn't, so its checks never ran on the merged \
+             result: CoderHelm merges `{base}` into this branch and merges once the checks pass \
+             on that commit"
+        ),
+    )
 }
 
 /// Why the base has to come in before the PR can merge.
@@ -2026,7 +2052,7 @@ async fn keep_current(
         BaseMerge::Unresolved { .. } | BaseMerge::CannotPush => {
             set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
             publish_status(state, github, msg, record, &body).await;
-            tell_team(state, msg, pr, &line.1).await;
+            tell_team(state, msg, pr, TeamNotice::Conflict, &line.1).await;
         }
     }
     Ok(Next::Stop)
@@ -2228,26 +2254,53 @@ async fn read_review_rules(
     review_rules(protection.as_ref(), rulesets.as_ref())
 }
 
-/// One message to the team's channel, once per PR commit and wait: what
-/// the merge waits on. Silent where no channel is set up.
+/// Why the gate tells the team, beyond the PR's own status comment. Only
+/// a wait a person has to end is here: a review the branch's rules ask for
+/// is the PR's normal state, and CI, labels and CoderHelm's own review end
+/// by themselves, so none of those is ever posted to a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamNotice {
+    /// A merge conflict CoderHelm could not resolve, or could not push.
+    Conflict,
+}
+
+impl TeamNotice {
+    fn key(self) -> &'static str {
+        match self {
+            TeamNotice::Conflict => "conflict",
+        }
+    }
+}
+
+/// Pure: the claim that makes a notice go out once per PR and reason, ever
+/// (for the record's life): not once per commit or per wording.
+pub(crate) fn told_sk(owner: &str, repo: &str, pr: u64, notice: TeamNotice) -> String {
+    format!(
+        "MERGEGATETOLD#{}/{}#{pr}#{}",
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase(),
+        notice.key()
+    )
+}
+
+/// One "needs you" message, once per PR and reason: what a person has to
+/// do before the merge can go on. It goes only where the team takes action
+/// messages (`common::notify::route`), never to an alert channel that takes
+/// alerts only, and nowhere when none is set up.
 async fn tell_team(
     state: &WorkerState,
     msg: &AwaitMergeMessage,
     pr: &serde_json::Value,
+    notice: TeamNotice,
     line: &str,
 ) {
-    let channels = super::security_fixes::team_channels(state, &msg.team_id).await;
+    let channels = super::security_fixes::team_channels(state, &msg.team_id)
+        .await
+        .get(common::notify::route::Kind::Action);
     if channels.is_empty() {
         return;
     }
-    let sk = format!(
-        "MERGEGATETOLD#{}/{}#{}#{}#{}",
-        msg.repo_owner,
-        msg.repo_name,
-        msg.pr_number,
-        msg.head_sha,
-        common::content_hash(line)
-    );
+    let sk = told_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number, notice);
     let claim = common::claim::claim(
         &state.dynamo,
         &state.config.settings_table_name,

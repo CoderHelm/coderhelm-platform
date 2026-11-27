@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn the_first_write_follows_a_search_and_names_what_it_reuses() {
         let g = ExploreGuard::for_build();
-        let w = json!({"path": "dags/camps.py"});
+        let w = json!({"path": "dags/tours.py"});
         assert!(g
             .check_first_write(&w)
             .unwrap_err()
@@ -280,11 +280,11 @@ mod tests {
         assert!(g.check_first_write(&w).is_err());
         g.saw("bash", &json!({"command": "grep -rn OVERRIDES dags"}));
         assert!(g.check_first_write(&w).unwrap_err().contains("`reuses`"));
-        let named = json!({"path": "dags/camps.py", "reuses": "`CAMP_OVERRIDES` in dags/camps.py"});
+        let named = json!({"path": "dags/tours.py", "reuses": "`TOUR_OVERRIDES` in dags/tours.py"});
         assert!(g.check_first_write(&named).is_ok());
         // Later writes go ahead.
         assert!(g.check_first_write(&w).is_ok());
-        assert!(g.evidence_lines().starts_with("Reuses: `CAMP_OVERRIDES`"));
+        assert!(g.evidence_lines().starts_with("Reuses: `TOUR_OVERRIDES`"));
         // A fix round asks for none of it.
         assert!(ExploreGuard::for_fix().check_first_write(&w).is_ok());
     }
@@ -292,23 +292,23 @@ mod tests {
     #[test]
     fn a_twin_beside_the_existing_map_needs_a_reason() {
         let g = ExploreGuard::for_fix();
-        let old = "CAMP_SPORT_OVERRIDES = {\n    \"a\": [\"x\"],\n}\n";
-        let twin = format!("{old}CAMP_SWIM_SPORT_OVERRIDES = {{\n}}\n");
+        let old = "TOUR_STOP_OVERRIDES = {\n    \"a\": [\"x\"],\n}\n";
+        let twin = format!("{old}TOUR_TASTING_STOP_OVERRIDES = {{\n}}\n");
         let e = g
-            .check_edit("dags/camps.py", old, &twin, &json!({}))
+            .check_edit("dags/tours.py", old, &twin, &json!({}))
             .unwrap_err();
         assert!(
-            e.contains("`CAMP_SWIM_SPORT_OVERRIDES` next to the existing `CAMP_SPORT_OVERRIDES`")
+            e.contains("`TOUR_TASTING_STOP_OVERRIDES` next to the existing `TOUR_STOP_OVERRIDES`")
         );
         // Entries in the existing map are the change it should make.
-        let entries = old.replace("}\n", "    \"b\": [\"x\", \"swimming\"],\n}\n");
+        let entries = old.replace("}\n", "    \"b\": [\"x\", \"tasting\"],\n}\n");
         assert!(g
-            .check_edit("dags/camps.py", old, &entries, &json!({}))
+            .check_edit("dags/tours.py", old, &entries, &json!({}))
             .is_ok());
         // A stated reason is let through and kept.
         assert!(g
             .check_edit(
-                "dags/camps.py",
+                "dags/tours.py",
                 old,
                 &twin,
                 &json!({"why_new": "a different key type"})
@@ -316,7 +316,7 @@ mod tests {
             .is_ok());
         assert!(g
             .evidence_lines()
-            .contains("Wider than the ticket: dags/camps.py: a different key type"));
+            .contains("Wider than the ticket: dags/tours.py: a different key type"));
         let mut schema = json!({"type": "object", "properties": {}});
         offer_fields(&mut schema);
         assert!(schema["properties"]["reuses"].is_object());

@@ -485,6 +485,7 @@ async fn start_fix(
         base_branch: msg.default_branch.clone(),
         image_attachments: vec![],
         continuation: 0,
+        retry_after_secs: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
         resume_from: None,
@@ -500,6 +501,7 @@ async fn start_fix(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: None,
     };
@@ -746,9 +748,9 @@ mod tests {
     /// not blocked; and a failed fix never blocks.
     #[test]
     fn a_stale_or_dead_unrelated_verdict_never_blocks_the_pull_request() {
-        let spec = "e2e/tests/site/venue-subnav-more-menu.spec.ts";
+        let spec = "e2e/tests/site/library-subnav-more-menu.spec.ts";
         let saved = Record {
-            pr: 1501,
+            pr: 101,
             runs: vec![100],
             tests: vec![Attribution {
                 test: "More menu on a phone".into(),

@@ -1,4 +1,4 @@
-//! dj. A made-up marina's booking ticket waited on a person's answer about
+//! dj. A made-up library's booking ticket waited on a person's answer about
 //! which booking page to embed. Ten minutes later an edit to the ticket
 //! started a fresh run, which built the page and opened its pull request;
 //! the first run went on waiting, reminded once a day, its question long
@@ -29,7 +29,7 @@ fn runs() -> Vec<(String, String, String)> {
         r(ASKED, NEEDS_INPUT, "harbor/booking"),
         r(ASKED_AGAIN, NEEDS_INPUT, "Harbor/Booking"),
         r(FAILED_RUN, FAILED, "harbor/booking"),
-        r(OTHER_REPO, NEEDS_INPUT, "harbor/docks"),
+        r(OTHER_REPO, NEEDS_INPUT, "harbor/wings"),
         r(LATER, NEEDS_INPUT, "harbor/booking"),
     ]
 }

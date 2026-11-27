@@ -2609,9 +2609,9 @@ mod refresh_tests {
     fn the_writer_reports_the_runs_evidence() {
         assert_eq!(evidence_instructions(""), "");
         let block = evidence_instructions(
-            "- Ran api_get: /v1/products/7\n  Came back: {\"title\": \"Swim\"}",
+            "- Ran api_get: /v1/products/7\n  Came back: {\"title\": \"Atlas\"}",
         );
-        assert!(block.contains("Came back: {\"title\": \"Swim\"}"));
+        assert!(block.contains("Came back: {\"title\": \"Atlas\"}"));
         assert!(block.contains("Add an **Evidence** list at the end of the Verification section"));
         assert!(block.contains("Never write that something was not verified, not measured"));
         // The reviewer reads these markers back: an `Unconfirmed:` line holds
@@ -2692,7 +2692,7 @@ mod refresh_tests {
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(
-            "Source ticket: OPS-7\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** **Low**\n\n**Verification**\n1. z",
+            "Source ticket: HARBOR-4\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** **Low**\n\n**Verification**\n1. z",
             &owned,
         );
         let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s}:\n{body}"));

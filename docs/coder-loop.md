@@ -8,11 +8,11 @@ in code, so the loop holds whatever the model writes.
 
 Two pull requests show what went wrong.
 
-- **A data-pipeline ticket** asked to link four camps to a second sport. The plan
+- **A data-pipeline ticket** asked to link four slots to a second wing. The plan
   added a second map and helpers beside the existing overrides map, and made an
   insert-only link sync replace and delete links. The build added warnings, three
-  counters and a log level change in shared code, plus a 432-line test with fake
-  hooks and an invented payload. The right change was four map entries, an insert
+  counters and a log level change in shared code, plus a test of several hundred
+  lines with fake hooks and an invented payload. The right change was four map entries, an insert
   that does nothing on conflict, and one small test.
 - **A web ticket's** end-to-end tests for a vendor's embedded portal were rewritten
   three times, each time on a guess about the vendor's page. When a criterion met
@@ -65,7 +65,7 @@ The causes were in the loop, not only in prompt wording:
    body (`minimal_change::write_semantics`: a `DELETE`, an `ON CONFLICT DO
    UPDATE`, a delete-then-insert, a relation `.set(`). A plan that reuses a
    replacing helper on a path that only inserts today is sent back unless the
-   ticket asks to replace. The camps run's plan named the right map, then
+   ticket asks to replace. The slots run's plan named the right map, then
    reused the link helper that deletes every link it isn't given.
 
    The plan also writes `## Criteria map`: one line for each acceptance
@@ -75,7 +75,7 @@ The causes were in the loop, not only in prompt wording:
    (`common::e2e_proof`). A plan without that line, or with a unit test in
    place of the end-to-end test, is sent back (`plan_shape::criteria_gaps`).
    Unit tests may go with it; they never replace it. A ticket once asked
-   for one chip on one page and got about 530 lines of unit tests and no
+   for one chip on one page and got hundreds of lines of unit tests and no
    test of the page (`incidents::cp_criteria_proven_both_ways`).
 
    Whatever is still open after the one send-back stays on the decision.
@@ -121,7 +121,7 @@ The causes were in the loop, not only in prompt wording:
    step's runs, restore that install from a cache named by the install steps
    and the manifests' blob ids. Only the first build installs and saves it.
    The coder is told the environment is ready and how the tests run. One run
-   reinstalled its dependencies eighteen times, about 25 minutes of builds.
+   reinstalled its dependencies on every build, many minutes of builds.
    The CI job chosen is the one whose tests run for the plan's files
    (`test_env::from_workflows_for`). A workflow filtered to other paths, or a
    job in a folder none of the files is in, is used only when nothing fits
@@ -216,19 +216,19 @@ The causes were in the loop, not only in prompt wording:
      test and its error, and nothing more is pushed. The branch is never
      rolled back to an older green head, and a planned task is never taken
      out to turn CI green. Only a dependency run's newest set of bumps comes
-     out (`resume::take_out_failing_bumps`). Five of 53 runs had rolled back,
-     two of them with tests left behind that expected the reverted code.
+     out (`resume::take_out_failing_bumps`). Several runs had rolled back,
+     some of them with tests left behind that expected the reverted code.
    - **No log is no reason to stop** (`push_gate::logs_unread_brief`,
      `hold_no_logs`). When CI's job log can't be read, the fix brief gives
      the owning package's commands so the fixer reproduces the failure in the
      sandbox. Any sentence that blames the missing log is replaced.
    - **Fixtures use looked-up ids, and tests are sized to the behaviour**
      (`minimal_change::made_up_ids`, `repeated_cases`, in the habits check).
-     Ids like `sport-a` or `id-1` are sent back when the run's lookups
+     Ids like `wing-a` or `id-1` are sent back when the run's lookups
      returned real ids. Three or more added cases that differ only in their
      values are sent back as one case per behaviour. The size check (test
-     lines against code lines) runs too; it fires on the roughly 415 test
-     lines one run added for 50 lines of code.
+     lines against code lines) runs too; it fires on a run that added hundreds
+     of test lines for a few dozen lines of code.
 
 8. **Rounds agree.**
    Planned work that a review commit on the pull request took out is not
@@ -267,7 +267,7 @@ The causes were in the loop, not only in prompt wording:
    or comment asks for moves into scope and records who asked. No
    `Scope change:` line is needed. From then on, a diff that takes that work
    out is a breach that goes back to be put back. A comment that keeps the
-   item out moves nothing. One run replied "Understood" to a reviewer's answer
+   item out moves nothing. One run agreed with a reviewer's answer
    and then reverted the work the answer asked for
    (`incidents::sn_person_answer_moves_scope`).
 

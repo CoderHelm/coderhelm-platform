@@ -31,6 +31,9 @@ pub mod trace;
 /// Expiring once-only claims (dedup markers, leases) on the settings table.
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
+// The customer details guard: public pull request text carries no install's
+// identifiers, read from CoderHelm's own records and kept in memory only.
+pub mod customer_guard;
 /// A re-review started by an edit of a pull request's description: what
 /// counts as a change, and the keys that queue one review per edit burst.
 pub mod prose;
@@ -102,6 +105,7 @@ pub mod alert_budget;
 /// Dockerfile base images: their package lists matched against OSV's
 /// distribution data, fixed by pinning the same tag to a newer digest.
 pub mod base_images;
+pub mod connected_access;
 /// The repository's deploy label as a verification gate: its workflow's
 /// runs on a head, the wait before ready, and putting the label back once
 /// per head.
@@ -111,6 +115,8 @@ pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
+pub mod followup_dedupe;
+pub mod followup_tickets;
 /// A team's branch, commit and PR title templates, and how they render.
 pub mod git_conventions;
 /// What an installation's token may read: permissions a feature uses when
@@ -195,6 +201,11 @@ pub mod ci_lines;
 /// A red check reproduced against the base branch before anything is
 /// decided about it.
 pub mod ci_repro;
+/// A red check the CI fix round showed isn't the change's: re-run once,
+/// then classified on its own outcome, never the run's failure.
+pub mod ci_unrelated;
+pub mod ci_watch;
+pub mod content_gap;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
@@ -256,6 +267,9 @@ pub mod run_prs;
 pub mod scope_ledger;
 pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
+/// A run waiting for another ticket's change to merge, and what it does
+/// when that change moves.
+pub mod change_wait;
 /// How a comment reads: the renderer and lint every comment passes before
 /// it is posted (short, plain, no pasted plans, no history).
 pub mod comment_style;
@@ -333,6 +347,9 @@ pub mod run_fail;
 /// The questions a run asks when it needs a person's answer, and the
 /// answers people give in CoderHelm.
 pub mod run_questions;
+/// What a run does with a pass's error before anything is marked failed:
+/// classified, retried, repaired, or handed to a person in plain words.
+pub mod run_recovery;
 /// Fix rounds on an open pull request: each with its own time budget,
 /// resumable, and never a failed run when one doesn't finish.
 pub mod run_round;
@@ -348,6 +365,8 @@ pub mod scorecard;
 mod selfhost_links;
 pub mod skill_apply;
 pub mod skill_compat;
+/// Scheduled skill runs: a team's synced skill run on a schedule or on "Run now".
+pub mod skill_runs;
 pub mod skills;
 /// Stale pull request cleanup: settings, activity and the decision.
 pub mod stale_prs;

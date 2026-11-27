@@ -1018,7 +1018,7 @@ mod tests {
         let s = objections_section(&["alice".into(), "bob".into()]);
         assert!(s.contains("`alice`, `bob` requested changes"), "{s}");
         assert!(!s.contains('@'), "nobody is notified: {s}");
-        let rest = "Source ticket: OPS-1\n\n**Summary** x";
+        let rest = "Source ticket: HARBOR-1\n\n**Summary** x";
         let owned = Owned {
             open_findings: format!(
                 "{}\nfinding\n{}",
@@ -1188,7 +1188,7 @@ mod tests {
 
         // Set into a description that has one already: replaced, in place.
         let body = assemble(
-            "Source ticket: OPS-1\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** Low\n\n**Verification**\n1. z",
+            "Source ticket: HARBOR-1\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** Low\n\n**Verification**\n1. z",
             &Owned { merge_order: merge_order_section(&prs, 0), ..Default::default() },
         );
         let (mut owned, rest) = take_owned(&body);

@@ -11,6 +11,7 @@
     "plan_task_continue": {"type":"plan_task_continue","team_id":"TEAM#team-a","plan_id":"p1","tasks":["t2"]},
     "infra_analyze": {"type":"infra_analyze","team_id":"TEAM#team-a","triggered_by":"someone","repo":"acme/widgets"},
     "resume": {"type":"resume","team_id":"TEAM#team-a","run_id":"r1","installation_id":1},
+    "change_wait_check": {"type":"change_wait_check","team_id":"TEAM#team-a"},
     "review": {"type":"review","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","label":"coderhelm-review","question":"why?","trigger":"labeled","dedup_key":"d","reply_to_comment_id":6,"requested_by":"someone"},
     "webhook_emit": {"type":"webhook_emit","team_id":"TEAM#team-a","event":{"id":"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W","type":"run.failed","created_at":"2026-10-26T14:31:47.512Z","team_id":"TEAM#team-a","api_version":"2026-10-26","data":{"run_id":"r1"}}},
     "webhook_send": {"type":"webhook_send","team_id":"TEAM#team-a","endpoint_id":"ep_01jbendpt4a7b0c3d6e9f2g5h8","event_id":"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W","delivery_id":"01hzzdelivery","due_at":1792416387},
@@ -29,6 +30,7 @@
     "reward_outcome": {"type":"reward_outcome","team_id":"TEAM#team-a","installation_id":1,"run_id":"r1","repo_owner":"acme","repo_name":"widgets","pr_number":2},
     "stale_prs_preview": {"type":"stale_prs_preview","team_id":"TEAM#team-a","repo":"acme/widgets"},
     "review_tidy": {"type":"review_tidy","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"reason":"push"},
+    "customer_guard": {"type":"customer_guard","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2},
     "security_event": {"type":"security_event","team_id":"TEAM#team-a","installation_id":1,"kind":"dependabot_alert","repo":"acme/widgets","action":"created","alert_number":88,"ghsa_id":"GHSA-q9fx-2w5c-8m4r"},
     "review_lesson": {"type":"review_lesson","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"trigger":"reply","event_at":1},
     "jira_comment": {"type":"jira_comment","team_id":"TEAM#team-a","installation_id":1,"ticket_id":"T-1","title":"t","run_id":"r1","run_status":"completed","pr_number":2,"repo_owner":"acme","repo_name":"widgets","author":"someone","comment":"c","context_hash":"h","action":{"type":"resume","team_id":"TEAM#team-a","run_id":"r1","installation_id":1}},
@@ -47,6 +49,7 @@
     "log_autofix": {"type":"log_autofix"},
     "aws_permissions_sweep": {"type":"aws_permissions_sweep"},
     "agent_resume_sweep": {"type":"agent_resume_sweep"},
+    "self_heal_sweep": {"type":"self_heal_sweep"},
     "run_waiting": {"type":"run_waiting","team_id":"TEAM#team-a","run_id":"r1","why":"reminder"},
     "knowledge_sync_sweep": {"type":"knowledge_sync_sweep"},
     "knowledge_sync": {"type":"knowledge_sync","team_id":"TEAM#team-a","kb_id":"kb1","source_id":"src1"},
@@ -54,6 +57,7 @@
     "hybrid_name_check": {"type":"hybrid_name_check"},
     "support_sync": {"type":"support_sync"},
     "plugin_trigger": {"type":"plugin_trigger","team_id":"TEAM#team-a","plugin_id":"marketing","trigger":1},
-    "plugin_results": {"type":"plugin_results","team_id":"TEAM#team-a","artifact_id":"01hzzart"}
+    "plugin_results": {"type":"plugin_results","team_id":"TEAM#team-a","artifact_id":"01hzzart"},
+    "skill_run": {"type":"skill_run","team_id":"TEAM#team-a","schedule_id":"01hzzsched","trigger":"schedule","requested_by":"schedule"}
   }
 }

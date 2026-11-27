@@ -3,12 +3,12 @@
 //! saw the PR's own change was the one it approved and posted a new approval
 //! on the new head whose whole body was one line: "Approved: the new commits
 //! only bring in the base branch; the PR's own change is the same as the
-//! approved `dab6dae`." plus the rating footer. Posting it rewrote every
+//! approved `abc1234`." plus the rating footer. Posting it rewrote every
 //! earlier review of CoderHelm's to "Outdated: see CoderHelm's latest
 //! review", and the tidy between reviews cuts any review of an older commit
 //! to one line, so the full review the approval rested on was gone from
-//! sight. The pull request's only visible approval had no review in it: "if
-//! this happens we have no review to check".
+//! sight. The pull request's only visible approval had no review in it, and
+//! a person pointed out there was no review left to check.
 //!
 //! Guarantee: a carried approval stands on its own. Its body is the verdict,
 //! why the earlier review still holds for the new head ("the PR's own change
@@ -28,7 +28,7 @@ use serde_json::json;
 
 /// The approved commit (the full review) and the head after the person
 /// merged the base branch in.
-const A: &str = "dab6dae0c1f2e3d4a5b6c7d8e9f0a1b2c3d4e5f6";
+const A: &str = "abc12340c1f2e3d4a5b6c7d8e9f0a1b2c3d4e5f6";
 const B: &str = "7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f";
 
 /// The full review of `A` as it was posted, without the rating footer.
@@ -58,7 +58,7 @@ fn records() -> Vec<ReviewRecord> {
         verdict: "APPROVE".into(),
         posted_as: "APPROVE".into(),
         head_sha: A.into(),
-        created_at: "2026-11-11T15:00:00Z".into(),
+        created_at: "2030-03-05T15:00:00Z".into(),
         body: "Validates the date of birth.".into(),
         posted_body: full_review(),
         ..Default::default()
@@ -124,7 +124,7 @@ fn the_carried_approval_carries_the_review_it_rests_on() {
     assert!(
         body.contains(
             "✅ **Approved with notes** on `7e8f9a0`: the PR's own change is unchanged since \
-             `dab6dae`; the new commits only bring in `main`."
+             `abc1234`; the new commits only bring in `main`."
         ),
         "{body}"
     );
@@ -174,7 +174,7 @@ fn the_tidy_never_cuts_the_review_a_carry_rests_on() {
 #[test]
 fn an_old_one_line_carry_still_keeps_its_review() {
     let one_line = "✅ **Approved**: the new commits only bring in the base branch; the PR's \
-                    own change is the same as the approved `dab6dae`.";
+                    own change is the same as the approved `abc1234`.";
     let r = reviews(one_line);
     assert!(rs::tidy(&r, &[], &open_pr()).collapse.is_empty());
     assert!(rs::plan(&r, &[], 13, &[]).edit.is_empty());
@@ -230,7 +230,7 @@ fn a_second_merge_carries_the_same_review_once() {
         "c3d4e5f60718293a4b5c6d7e8f90123456789abc",
     );
     assert!(again.contains("unchanged since `7e8f9a0`"), "{again}");
-    assert!(again.contains("The review of `dab6dae` below"), "{again}");
+    assert!(again.contains("The review of `abc1234` below"), "{again}");
     assert_eq!(again.matches("#### Criteria").count(), 1, "{again}");
 }
 

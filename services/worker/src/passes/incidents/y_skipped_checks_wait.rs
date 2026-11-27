@@ -6,11 +6,11 @@
 //! so on the draft every one of them was skipped: draft, so skipped, so
 //! still a draft. CoderHelm tried to start them again, which a rerun can't
 //! do (it replays the same draft event, and the app had no Actions write),
-//! and then waited, deciding every ten minutes for six hours and then
-//! giving up. Each recheck was decided twice, about fifteen seconds apart:
-//! the run's own decision and the one its review verdict asked for each
-//! scheduled its own next recheck, so two chains ran side by side and spent
-//! the twelve-hour budget in six.
+//! and then waited, deciding again and again for hours and then giving
+//! up. Each recheck was decided twice, seconds apart: the run's own
+//! decision and the one its review verdict asked for each scheduled its own
+//! next recheck, so two chains ran side by side and spent the wait's budget
+//! twice as fast.
 //!
 //! Guarantees:
 //! - Why a check was skipped is read from its workflow file (draft
@@ -37,7 +37,7 @@ use super::fixture::fn_src;
 use crate::passes::ready::{self, Ci, Decision, Facts};
 use crate::passes::test_fix::{self, Hold};
 
-/// What the ready decision said every ten minutes, twice.
+/// What the ready decision said on every recheck, twice.
 const OLD_WAIT: &str = "skipped on this commit: `Deploy to Staging`, `E2E after staging deploy`";
 
 /// The repository's staging workflow, as its conditions read.
@@ -49,7 +49,7 @@ on:
 jobs:
   deploy:
     name: Deploy to Staging
-    if: github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'CI:DEPLOY_STAGING')
+    if: github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'deploy-staging')
     runs-on: ubuntu-latest
     steps: []
   e2e:
@@ -101,14 +101,14 @@ fn facts(test_fix: Hold, draft: bool, body: &str) -> Facts {
     Facts {
         draft,
         body: body.into(),
-        title: "fix(e2e): settle the venue menu before the click".into(),
+        title: "fix(e2e): settle the library menu before the click".into(),
         test_fix: Some(test_fix),
         ci: Ci {
             green: true,
             why: String::new(),
         },
         approved: true,
-        head: "bcf845d".into(),
+        head: "abc1234".into(),
         ..Default::default()
     }
 }
@@ -131,7 +131,7 @@ fn the_draft_is_marked_ready_so_the_checks_that_skip_drafts_run() {
         .contains(&OLD_WAIT[..OLD_WAIT.find(": ").unwrap()]));
     // The staging label is on the pull request: only the draft keeps all
     // three off, and the preview tests and staging both start on ready.
-    let on_pr = vec!["ch-review".to_string(), "CI:DEPLOY_STAGING".into()];
+    let on_pr = vec!["needs-review".to_string(), "deploy-staging".into()];
     let skipped = workflow_gate::sort(&gates(), &on_pr);
     assert!(skipped.all_draft_gated());
     let hold = test_fix::decide(&[], &standing, &skipped, true, Some(true));
@@ -191,13 +191,13 @@ fn a_check_skipped_for_a_label_coderhelm_may_not_add_is_one_action_never_a_wait(
     // No staging label: marking it ready alone wouldn't run the staging
     // checks. The preview tests still start on ready, so it is marked ready
     // first.
-    let skipped = workflow_gate::sort(&gates(), &["E2E:nav".into()]);
+    let skipped = workflow_gate::sort(&gates(), &["needs-e2e".into()]);
     assert_eq!(skipped.draft_gated, vec!["E2E on preview"]);
     let hold = test_fix::decide(&[], &standing, &skipped, true, Some(true));
     assert_eq!(hold, Hold::RunsWhenReady(vec!["E2E on preview".into()]));
     // Once ready the staging checks are still skipped: a hold with one
     // plain action, on the ready pull request.
-    let after = workflow_gate::sort(&gates()[1..], &["E2E:nav".into()]);
+    let after = workflow_gate::sort(&gates()[1..], &["needs-e2e".into()]);
     let staging_only = Standing {
         skipped: vec![
             "Deploy to Staging".into(),
@@ -211,13 +211,13 @@ fn a_check_skipped_for_a_label_coderhelm_may_not_add_is_one_action_never_a_wait(
     };
     assert_eq!(
         todo,
-        "Add the `CI:DEPLOY_STAGING` label to run `Deploy to Staging`, `E2E after staging \
+        "Add the `deploy-staging` label to run `Deploy to Staging`, `E2E after staging \
          deploy`, or mark it ready yourself if they aren't needed."
     );
     let proving_body = format!("{}\nx", ready::PROVING_MARK);
     let d = ready::decide(&facts(hold.clone(), false, &proving_body));
     assert!(
-        matches!(&d, Decision::Proving { reasons, .. } if reasons.len() == 1 && reasons[0].todo.contains("CI:DEPLOY_STAGING"))
+        matches!(&d, Decision::Proving { reasons, .. } if reasons.len() == 1 && reasons[0].todo.contains("deploy-staging"))
     );
     // On a draft with nothing that starts on ready: held, never a wait.
     let d = ready::decide(&facts(hold, true, ""));
@@ -229,7 +229,7 @@ fn a_check_skipped_for_a_label_coderhelm_may_not_add_is_one_action_never_a_wait(
     let may = fn_src(src, "pub(crate) async fn may_add_label(");
     assert!(may.contains("is_deploy_label(label)"));
     assert!(common::e2e::workflow_gate::is_deploy_label(
-        "CI:DEPLOY_STAGING"
+        "deploy-staging"
     ));
 }
 
@@ -238,7 +238,7 @@ fn an_end_to_end_proof_that_skips_drafts_is_run_on_a_ready_pull_request() {
     let f = Facts {
         draft: true,
         title: format!(
-            "{} settle the venue menu",
+            "{} settle the library menu",
             crate::passes::e2e::FIX_TICKET_PREFIX
         ),
         runs_when_ready: vec!["E2E after staging deploy".into()],
@@ -261,18 +261,18 @@ fn a_wait_that_does_not_change_for_two_hours_is_a_hold() {
             .unwrap()
             .with_timezone(&chrono::Utc)
     };
-    let mut prior = DraftHold::new(Kind::Waiting, vec![Reason::new(why, "")], 1508, "").unwrap();
-    prior.since = "2026-11-10T06:35:47Z".into();
-    prior.head = "bcf845d".into();
+    let mut prior = DraftHold::new(Kind::Waiting, vec![Reason::new(why, "")], 42, "").unwrap();
+    prior.since = "2030-03-10T06:35:47Z".into();
+    prior.head = "abc1234".into();
     let mut f = facts(
         Hold::Wait("the repeat run of the affected test hasn't passed yet".into()),
         true,
         "",
     );
     f.prior = Some(prior.clone());
-    f.now = Some(t("2026-11-10T07:35:00Z"));
+    f.now = Some(t("2030-03-10T07:35:00Z"));
     assert!(matches!(ready::decide(&f), Decision::Wait { .. }));
-    f.now = Some(t("2026-11-10T08:36:00Z"));
+    f.now = Some(t("2030-03-10T08:36:00Z"));
     // Stalled: CoderHelm acts again on that head (incident bv), and once its
     // attempts are spent the wait is its note on a ready pull request.
     assert!(matches!(

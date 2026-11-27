@@ -1,7 +1,9 @@
 //! Chat notifications for alerts.
 //!
 //! A team sets one alert channel (Teams, Slack or both) that every alert route
-//! notifies; a route can instead use its own channels or notify nowhere. Each
+//! notifies; a route can instead use its own channels or notify nowhere. The
+//! alert channel takes alerts only unless the team chose more kinds
+//! (`crate::notify::route`). Each
 //! alert posts a message, and when CoderHelm opens a pull request for an alert
 //! a follow-up message links it (or, when the run finds that no code change
 //! is needed, says why: [`no_change_message`]). Webhooks can't edit a posted message, so the
@@ -59,10 +61,7 @@ pub async fn notify_target(
             .key("sk", AttributeValue::S(sk.to_string()))
             .send()
     };
-    let (route, team) = tokio::join!(
-        get(format!("ALERTTOPIC#{topic_arn}"), "ROUTE"),
-        get(team_id.to_string(), TEAM_SETTINGS_SK),
-    );
+    let route = get(format!("ALERTTOPIC#{topic_arn}"), "ROUTE").await;
     let Some(route) = route.ok().and_then(|r| r.item().cloned()) else {
         return Channels::default();
     };
@@ -74,32 +73,31 @@ pub async fn notify_target(
     {
         return Channels::default();
     }
-    let team = team
-        .ok()
-        .and_then(|t| t.item().cloned())
-        .unwrap_or_default();
     let mode = route
         .get("notify_mode")
         .and_then(|v| v.as_s().ok())
         .cloned()
         .unwrap_or_default();
-    let enabled = team
-        .get("enabled")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false);
     let (route_channels, team_channels) = match mode.as_str() {
         MODE_OFF => return Channels::default(),
         MODE_CUSTOM => (
             store::open_all(cipher, team_id, &route).await,
             Channels::default(),
         ),
-        _ if enabled => (
+        // The team's channel for alerts (`notify::route`).
+        _ => (
             Channels::default(),
-            store::open_all(cipher, team_id, &team).await,
+            crate::notify::route::team_channels(
+                dynamo,
+                cipher,
+                table,
+                team_id,
+                crate::notify::route::Kind::Alert,
+            )
+            .await,
         ),
-        _ => return Channels::default(),
     };
+    let enabled = !team_channels.is_empty();
     pick(&mode, route_channels, team_channels, enabled)
 }
 

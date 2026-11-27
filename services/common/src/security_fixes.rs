@@ -1444,6 +1444,24 @@ impl Stage {
     }
 }
 
+/// Pure: what a card is, for where it may go. A critical (P0) finding's
+/// new card, its rise to P0 and its deadlines are alerts: something is wrong
+/// now. Every other card (a lower tier, a pull request opened, CI passing,
+/// merged, withdrawn) is an update, and never reaches an alert channel that
+/// takes alerts only.
+pub fn card_kind(f: &Finding, stage: Stage) -> crate::notify::route::Kind {
+    use crate::notify::route::Kind;
+    let urgent = matches!(
+        stage,
+        Stage::New | Stage::RaisedP0 | Stage::Half | Stage::Deadline
+    );
+    if urgent && f.tier == Some(Tier::P0) {
+        Kind::Alert
+    } else {
+        Kind::Update
+    }
+}
+
 /// Whether a finding's tier posts cards at all.
 pub fn posts(f: &Finding, cfg: &SecurityConfig) -> bool {
     !f.private_report && f.tier.is_some_and(|t| cfg.post_alerts.get(t))
@@ -7296,7 +7314,7 @@ mod tests {
             json!({"package": {"name": "lodash", "ecosystem": "npm"}, "version": "4.17.20"})
         );
         assert!(
-            exact_version("npm", "1.4.4-lts.1")
+            exact_version("npm", "1.6.2-lts.1")
                 && !exact_version("npm", "3")
                 && !exact_version("npm", "main")
         );

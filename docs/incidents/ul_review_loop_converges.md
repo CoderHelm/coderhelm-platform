@@ -1,0 +1,5 @@
+# ul. `ul_review_loop_converges`
+
+**What happened:** Review and fix rounds didn't converge. On one run the review raised "A parallel structure next to an existing one" round after round. Each fix round moved the duplicate (a flag, then a merged helper, then a moved function), the next review found it in the new place, and the ledger counted it as a new finding each time. The rounds ran out only when the pull request merged, after a costly string of rounds. On another run, two rounds undid each other: a review fix changed how an event listener was attached, a later pass put the old listener back, and the review raised the same finding again.
+
+**The guarantee:** A style-level finding (a parallel structure, near-identical helpers) is the same ledger item wherever the code moved. After two rounds on it, it becomes CoderHelm's note for the reviewer, demoted so it never blocks. A round whose change takes back what an earlier review fix did lands only when its account says why (`Undoes <sha>: <why>`). Otherwise it is refused and the next step is told to keep that fix.

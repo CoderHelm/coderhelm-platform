@@ -1,20 +1,20 @@
-//! cr. A pull request that removed a link from a camp registration page
-//! had its end-to-end check fail on a test it had edited: "selecting a camp
-//! adds it to the cart while registration is open". The vendor portal the
-//! page embeds had just opened registration, and a visitor who isn't signed
+//! cr. A pull request that removed a link from a slot booking page had its
+//! end-to-end check fail on a test it had edited: "selecting a slot adds it
+//! to the cart while booking is open". The booking vendor's portal the
+//! page embeds had just opened booking, and a visitor who isn't signed
 //! in gets the vendor's sign-in drawer instead of a cart line, so the test
 //! was red on every branch, the base branch's staging deployment included.
 //! The failure comment on the pull request named the test, its error
-//! (`Subtotal$0`) and had a screenshot of the drawer.
+//! (`Total$0`) and had a screenshot of the drawer.
 //!
 //! The run never compared the test with the base branch. A fix attempt
 //! wrote that a different spec was "broken on main"; with the check still
-//! red, the supervisor reverted seven of the pull request's own files to an
+//! red, the supervisor reverted four of the pull request's own files to an
 //! older head whose checks had passed, and the check failed the same way on
 //! the result. The pull request said "CI is failing" with a lint warning
-//! and a line of the workflow script as the error, "Deferred: reverted 7
+//! and a line of the workflow script as the error, "Deferred: reverted 4
 //! file(s)" after the work had come back, and the run wrote that it
-//! couldn't confirm what the test saw. Four other runs that week reverted
+//! couldn't confirm what the test saw. Several other runs reverted
 //! their own work the same way with no comparison, one of them for a cloud
 //! account's load balancer limit in the preview deploy.
 //!
@@ -39,23 +39,23 @@ use crate::passes::{ci_repro, resume};
 use common::ci_lines::{self, HeadCi};
 use common::ci_repro::{self as repro, Leg, Record, RevertGate, Verdict};
 
-const HEAD: &str = "eb32df14230678e5";
-const TEST: &str = "tests/browse/camp-registration.spec.ts › selecting a camp adds it to the cart while registration is open";
+const HEAD: &str = "e1e2e3f4a5b6c7d8";
+const TEST: &str = "tests/browse/slot-booking.spec.ts › selecting a slot adds it to the cart while booking is open";
 
 /// The e2e reporter's comment on the pull request, as it was posted.
 fn failure_comment() -> String {
     [
-        "## Playwright E2E results for eb32df1",
+        "## Playwright E2E results for e1e2e3f",
         "",
         "1 failed, 52 passed",
         "",
-        "  1) [chromium] › tests/browse/camp-registration.spec.ts:141:7 › Camp registration › selecting a camp adds it to the cart while registration is open",
+        "  1) [chromium] › tests/browse/slot-booking.spec.ts:141:7 › Slot booking › selecting a slot adds it to the cart while booking is open",
         "",
-        "    Error: Choosing \"Acme Mini-Camp (AM session)\" did not add it to the portal's Order Summary",
+        "    Error: Choosing \"Acme Guest Slot (morning)\" did not add it to the portal's Booking total",
         "    expect(locator).not.toHaveText(expected) failed",
-        "    Received: Subtotal$0",
+        "    Received: Total$0",
         "",
-        "![failure](https://github.com/user-attachments/assets/0b7a-camp-drawer.png)",
+        "![failure](https://github.com/user-attachments/assets/0b7a-slot-drawer.png)",
         "",
         "[Full report](https://e2e-reports.example.com/pr-12/index.html)",
     ]
@@ -65,12 +65,12 @@ fn failure_comment() -> String {
 /// What the sandbox printed for each side: red on staging and on the
 /// preview alike.
 fn compared() -> Record {
-    let red = "Running 1 test using 1 worker\n  1) [chromium] › tests/browse/camp-registration.spec.ts:141:7 › selecting a camp\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Subtotal$0\n  1 failed\n";
+    let red = "Running 1 test using 1 worker\n  1) [chromium] › tests/browse/slot-booking.spec.ts:141:7 › selecting a slot\n    Error: expect(locator).not.toHaveText(expected) failed\n    Received: Total$0\n  1 failed\n";
     Record {
         head: HEAD.into(),
         check: "Deploy Preview".into(),
         tests: vec![TEST.into()],
-        base: repro::leg_of("https://staging-shop.example.com", red),
+        base: repro::leg_of("https://staging.harbor.example.com", red),
         change: repro::leg_of("https://pr-12.preview.example.com", red),
         source: "sandbox".into(),
         at: String::new(),
@@ -83,23 +83,23 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
     assert_eq!(ev.tests, vec![TEST.to_string()]);
     assert!(
         ev.error
-            .contains("did not add it to the portal's Order Summary"),
+            .contains("did not add it to the portal's Booking total"),
         "{ev:?}"
     );
     assert_eq!(
         ev.shots,
-        vec!["https://github.com/user-attachments/assets/0b7a-camp-drawer.png".to_string()]
+        vec!["https://github.com/user-attachments/assets/0b7a-slot-drawer.png".to_string()]
     );
     assert!(ci_repro::image_host_allowed(
         "github.com",
-        "/user-attachments/assets/0b7a-camp-drawer.png",
+        "/user-attachments/assets/0b7a-slot-drawer.png",
         &[]
     ));
     // The test runs against both addresses with the head's test code.
     let (spec, title) = repro::spec_and_title(TEST);
-    let cmd = repro::leg_cmd("e2e", &spec, &title, "https://staging-shop.example.com").unwrap();
+    let cmd = repro::leg_cmd("e2e", &spec, &title, "https://staging.harbor.example.com").unwrap();
     assert!(
-        cmd.contains("--grep 'selecting a camp adds it to the cart while registration is open'"),
+        cmd.contains("--grep 'selecting a slot adds it to the cart while booking is open'"),
         "{cmd}"
     );
     assert!(cmd.contains("--retries=0"));
@@ -112,10 +112,10 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
     // failure red on the base means for the fix.
     let brief = repro::brief(Some(&ev), std::slice::from_ref(&r), HEAD);
     assert!(
-        brief.contains("Subtotal$0") || brief.contains("Order Summary"),
+        brief.contains("Total$0") || brief.contains("Booking total"),
         "{brief}"
     );
-    assert!(brief.contains("0b7a-camp-drawer.png"), "{brief}");
+    assert!(brief.contains("0b7a-slot-drawer.png"), "{brief}");
     assert!(brief.contains("attached to this message as an image"));
     assert!(
         brief.contains("Fix the test, or the code it checks, on this branch"),
@@ -126,7 +126,7 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
 
 #[test]
 fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
-    // Red on the base too: the seven files stay.
+    // Red on the base too: the four files stay.
     match repro::may_revert(&[compared()], HEAD) {
         RevertGate::Refused(why) => assert!(why.contains("fails on the base branch too"), "{why}"),
         g => panic!("reverted: {g:?}"),
@@ -134,7 +134,7 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
     // No comparison at all (the check that failed doesn't run on the base,
     // as a preview deploy that hit the cloud account's limit): nothing comes
     // out either.
-    let infra = repro::from_checks(HEAD, "121ea38c", "Deploy Preview", None);
+    let infra = repro::from_checks(HEAD, "a0a1a2a3", "Deploy Preview", None);
     assert!(matches!(
         repro::may_revert(&[infra], HEAD),
         RevertGate::Refused(_)
@@ -155,7 +155,7 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
         RevertGate::Allowed(_)
     ));
     assert!(matches!(
-        repro::may_revert(&[ours], "b66dfd3d06d9"),
+        repro::may_revert(&[ours], "b0b1b2b3b4b5"),
         RevertGate::Refused(_)
     ));
 
@@ -171,7 +171,8 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
 #[test]
 fn blame_and_unconfirmed_need_the_record_and_the_report() {
     // The first attempt's account, before anything was compared.
-    let said = "The `summer camp pricing` spec is broken on main since #1545; nothing in this diff touches it.";
+    let said =
+        "The `slot pricing` spec is broken on main since #310; nothing in this diff touches it.";
     let held = resume::held_tried(&[said.to_string()], &[], HEAD, "");
     assert!(!held[0].contains("broken on main"), "{held:?}");
     assert!(held[0].contains(repro::BLAME_HELD));
@@ -186,9 +187,9 @@ fn blame_and_unconfirmed_need_the_record_and_the_report() {
     let ev = ci_repro::evidence_of("Deploy Preview", &failure_comment(), "").unwrap();
     let unsure = "I couldn't confirm what the e2e test saw on the portal.";
     let held = resume::held_tried(&[unsure.to_string()], &[compared()], HEAD, &ev.line());
-    assert!(held[0].starts_with("The failure's report says: `Deploy Preview` failed in `tests/browse/camp-registration.spec.ts"), "{held:?}");
+    assert!(held[0].starts_with("The failure's report says: `Deploy Preview` failed in `tests/browse/slot-booking.spec.ts"), "{held:?}");
     assert!(held[0]
-        .contains("screenshot: https://github.com/user-attachments/assets/0b7a-camp-drawer.png"));
+        .contains("screenshot: https://github.com/user-attachments/assets/0b7a-slot-drawer.png"));
 
     // The pipeline: every account goes through the hold before the pull
     // request, and the fixer's message carries the brief and the shot.
@@ -206,11 +207,11 @@ fn blame_and_unconfirmed_need_the_record_and_the_report() {
 #[test]
 fn the_error_quoted_is_the_tests_never_the_workflow_script() {
     let logs = [
-        "2026-11-17T04:36:58.1Z ✖ 1 problem (0 errors, 1 warning)",
-        "2026-11-17T04:36:58.2Z 0 errors and 1 warning potentially fixable with the `--fix` option.",
-        "2026-11-17T04:37:00.7683325Z \u{1b}[36;1m# With a build ID, also wait until the page is served by that build\u{1b}[0m",
-        "2026-11-17T15:22:44.6320006Z Error: Choosing \"Acme Mini-Camp (AM session)\" did not add it to the portal's Order Summary",
-        "2026-11-17T15:22:44.6320874Z expect(locator).not.toHaveText(expected) failed",
+        "2030-03-17T04:36:58.1Z ✖ 1 problem (0 errors, 1 warning)",
+        "2030-03-17T04:36:58.2Z 0 errors and 1 warning potentially fixable with the `--fix` option.",
+        "2030-03-17T04:37:00.7683325Z \u{1b}[36;1m# With a build ID, also wait until the page is served by that build\u{1b}[0m",
+        "2030-03-17T15:22:44.6320006Z Error: Choosing \"Acme Guest Slot (morning)\" did not add it to the portal's Booking total",
+        "2030-03-17T15:22:44.6320874Z expect(locator).not.toHaveText(expected) failed",
     ]
     .join("\n");
     let e = resume::failure_excerpt(&logs);
@@ -220,17 +221,17 @@ fn the_error_quoted_is_the_tests_never_the_workflow_script() {
 #[test]
 fn the_ci_lines_are_true_for_the_head() {
     let section = resume::ci_failing_section(
-        "43f1bdd46cc6",
+        "c4c5c6c7c8c9",
         &["Deploy Preview".to_string()],
-        "Error: Choosing a camp did not add it",
+        "Error: Choosing a slot did not add it",
         &[],
         "CoderHelm fixes the test on this branch.",
     );
     let body = format!(
-        "Source ticket: SHOP-12\n\n{section}\n\nRemoves the new-tab link.\n\n## Deferred\n{}",
+        "Source ticket: HARBOR-12\n\n{section}\n\nRemoves the new-tab link.\n\n## Deferred\n{}",
         ci_lines::revert_line(
-            "CI stayed red: reverted 7 file(s) to b66dfd3.",
-            "b66dfd3d06d95895",
+            "CI stayed red: reverted 4 file(s) to b0b1b2b.",
+            "b0b1b2b3b4b5b6b7",
             &["apps/web/src/components/blocks/portal-embed.tsx".to_string()],
         )
     );
@@ -245,7 +246,7 @@ fn the_ci_lines_are_true_for_the_head() {
         m.paths.iter().any(|p| p.ends_with("portal-embed.tsx"))
     });
     assert!(!out.contains("CI is failing"), "{out}");
-    assert!(!out.contains("reverted 7 file(s)"), "{out}");
+    assert!(!out.contains("reverted 4 file(s)"), "{out}");
     assert!(!out.contains("## Deferred"), "{out}");
     assert!(out.contains("Removes the new-tab link."));
     // Every build runs it, and a failing section is never "current".
@@ -254,6 +255,6 @@ fn the_ci_lines_are_true_for_the_head() {
     assert!(build.find("ci_lines_for_head(").unwrap() < build.find("gather(").unwrap());
     assert!(!crate::passes::description::is_current(
         &body,
-        "43f1bdd46cc6"
+        "c4c5c6c7c8c9"
     ));
 }

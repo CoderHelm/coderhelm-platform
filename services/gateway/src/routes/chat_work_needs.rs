@@ -79,7 +79,7 @@ pub struct Need {
     pub rank: i64,
     /// `run`, `ticket`, `pull_request` or `record` (an approval).
     pub kind: &'static str,
-    /// What it is: "ABC-12 Fix the login redirect", "acme/web#41 Add slips".
+    /// What it is: "ABC-12 Fix the login redirect", "acme/web#41 Add slots".
     pub what: String,
     /// Exactly what the person does.
     pub action: String,
@@ -1593,7 +1593,7 @@ pub(crate) mod tests {
                 return (
                     200,
                     json!({"items": [
-                        {"number": 41, "title": "Add slips", "updated_at": "2026-11-12T00:00:00Z", "user": {"login": "sam"},
+                        {"number": 41, "title": "Add slots", "updated_at": "2026-11-12T00:00:00Z", "user": {"login": "sam"},
                          "repository_url": "https://api.github.com/repos/acme/web", "html_url": "https://github.com/acme/web/pull/41"},
                         {"number": 7, "title": "Not ours", "updated_at": "2026-11-16T00:00:00Z",
                          "repository_url": "https://api.github.com/repos/other/secret", "html_url": "https://github.com/other/secret/pull/7"}
@@ -1945,7 +1945,7 @@ pub(crate) mod tests {
         assert_eq!(n[0].urgency, Urgency::Now);
         // Coderhelm's open pull request on their own run.
         let mut done = with(
-            run("02B", "completed", "ABC-6", "Add slips", "acme/web"),
+            run("02B", "completed", "ABC-6", "Add slots", "acme/web"),
             &[
                 ("updated_at", "2026-11-15T00:00:00Z"),
                 ("requester_email", ME),

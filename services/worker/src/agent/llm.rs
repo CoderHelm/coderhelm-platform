@@ -1,5 +1,25 @@
 use serde_json::Value;
 
+/// A skill run's worker step is over: the tool loop ends after this turn's
+/// results, and the run goes on from its saved conversation in its next
+/// step.
+#[derive(Debug)]
+pub struct StepEnds;
+
+impl std::fmt::Display for StepEnds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this step of the run is over; it goes on in its next step"
+        )
+    }
+}
+
+impl std::error::Error for StepEnds {}
+
+/// What a call not run because the step ended says.
+pub const STEP_ENDS_NOTE: &str = "Not run yet: this step of the run is over. The run goes on in its next step, from here: call it again there.";
+
 /// Options for controlling the converse loop.
 #[derive(Clone, Copy)]
 pub struct ConverseOptions {

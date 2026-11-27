@@ -1375,7 +1375,7 @@ pub struct Run {
     /// While the run waits for GitHub (its hourly limit, or a moment GitHub
     /// failed to answer): when it goes on, in plain words. The run continues
     /// by itself; nothing is needed from anyone.
-    #[schema(example = "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC")]
+    #[schema(example = "Waiting for GitHub's hourly limit; continues by itself at 14:05 UTC")]
     pub github_wait: Option<String>,
     /// The approval card that timed out, when one did.
     #[schema(example = json!(null))]
@@ -1609,14 +1609,14 @@ pub struct RunTrace {
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct RunTraceRow {
     /// The criterion, as written.
-    #[schema(example = "Only one sport filter chip shows on /camps")]
+    #[schema(example = "Only one wing filter chip shows on /slots")]
     pub criterion: String,
     /// Where it was written: `ticket` or `plan` (the plan's criteria map).
     #[schema(example = "ticket")]
     pub source: String,
     /// The site path it is about, when it names one.
     #[serde(default)]
-    #[schema(example = "/camps")]
+    #[schema(example = "/slots")]
     pub page: String,
     /// The changed files traced to it, each with the definitions it adds
     /// or changes there.
@@ -1624,7 +1624,7 @@ pub struct RunTraceRow {
     pub code: Vec<RunTraceCode>,
     /// The tests that cover it (`file` or `file › title`).
     #[serde(default)]
-    #[schema(example = json!(["e2e/camps.spec.ts › shows one chip"]))]
+    #[schema(example = json!(["e2e/slots.spec.ts › shows one chip"]))]
     pub tests: Vec<String>,
     /// What proves it on the head.
     pub proof: RunTraceProof,

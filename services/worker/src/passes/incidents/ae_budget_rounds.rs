@@ -1,5 +1,6 @@
 //! ae. Two loops of fix rounds still stopped on their own budget and waited
-//! on a person after #635 moved every other ending onto the supervisor:
+//! on a person after an earlier change moved every other ending onto the
+//! supervisor:
 //!
 //! - the CI-only fix rounds on a finished run's pull request: at eight
 //!   automatic pushes CoderHelm marked the pull request ready, completed the
@@ -132,7 +133,14 @@ fn ci_only_rounds_without_progress_change_approach_then_end_with_the_cause() {
     let tried = feedback::auto_fix_rounds_tried(why);
     let cause = format!(
         "{}. {}",
-        resume::ci_failing_reason(&left, "error[E0425]: cannot find value", tried.len()),
+        resume::ci_failing_reason(
+            &left,
+            "error[E0425]: cannot find value",
+            resume::Tally {
+                rounds: tried.len() as u32,
+                pushed: tried.len() as u32,
+            }
+        ),
         tried.join("; ")
     );
     assert!(cause.contains("check-1, check-2"), "{cause}");

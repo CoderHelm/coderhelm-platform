@@ -6,12 +6,15 @@
 //! and link buttons. [`teams`] renders it as an Adaptive Card for a Teams
 //! Workflows or incoming webhook, [`slack`] as Block Kit for a Slack incoming
 //! webhook. A destination ([`Channels`]) posts to Teams, Slack or both, and a
-//! failure on one channel never stops the other ([`deliver`]).
+//! failure on one channel never stops the other ([`deliver`]). Which team
+//! channel a message goes to depends on its kind (alert, action or update):
+//! [`route`].
 //!
 //! Webhook URLs post as the team, so they are secrets: [`store`] seals them
 //! with KMS and API answers only ever show a hint.
 
 pub mod messages;
+pub mod route;
 pub mod slack;
 pub mod store;
 pub mod teams;

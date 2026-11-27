@@ -925,7 +925,7 @@ mod tests {
         )]
     }
 
-    const BODY: &str = "Source ticket: OPS-41\n\n1. **Summary** — The export poller retries a timed-out poll three times before it gives up.\n\n2. **Changes**\n\n* `src/export/poller.rs`: the retry loop.\n* `src/export/writer.rs`: flushes after each batch.\n\n3. **Risk** — **Low**, contract unchanged.\n\n4. **Verification**\n\n1. Run `cargo test -p export`.\n\n<!-- coderhelm:unverified -->\n## Open items\n- The export against the live bucket was not run.\n- Lint has not run yet. <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->\n\n<sub>Consulted: the platform agent</sub>";
+    const BODY: &str = "Source ticket: HARBOR-57\n\n1. **Summary** — The export poller retries a timed-out poll three times before it gives up.\n\n2. **Changes**\n\n* `src/export/poller.rs`: the retry loop.\n* `src/export/writer.rs`: flushes after each batch.\n\n3. **Risk** — **Low**, contract unchanged.\n\n4. **Verification**\n\n1. Run `cargo test -p export`.\n\n<!-- coderhelm:unverified -->\n## Open items\n- The export against the live bucket was not run.\n- Lint has not run yet. <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->\n\n<sub>Consulted: the platform agent</sub>";
 
     fn inputs<'a>(
         files: &'a [(String, String, String)],
@@ -939,7 +939,7 @@ mod tests {
             floor,
             checks: Some(checks),
             why: Some(Why {
-                reference: "OPS-41".into(),
+                reference: "HARBOR-57".into(),
                 title: "Export poller gives up on the first timeout".into(),
                 url: String::new(),
             }),
@@ -964,14 +964,16 @@ mod tests {
         let f = facts(&inputs(&files, &floor, &checks));
         assert_eq!(f.open.len(), 2);
         assert_eq!(f.open[1].closer, Closer::Ci);
-        let s = shape(BODY, "OPS-41: Export poller gives up", f.clone(), None);
+        let s = shape(BODY, "HARBOR-57: Export poller gives up", f.clone(), None);
         // The phantom file and the unsupported word were corrected.
         assert_eq!(s.corrections.len(), 2, "{:?}", s.corrections);
         assert!(!s.body.contains("writer.rs"), "{}", s.body);
         assert!(!s.body.contains("contract unchanged"), "{}", s.body);
         let seen = common::pr_layout::visible(&s.body);
         assert!(
-            seen.starts_with("### Problem\nExport poller gives up on the first timeout (OPS-41)."),
+            seen.starts_with(
+                "### Problem\nExport poller gives up on the first timeout (HARBOR-57)."
+            ),
             "{seen}"
         );
         assert!(
@@ -996,7 +998,7 @@ mod tests {
             seen.contains("How to check: `cargo test -p export`."),
             "{seen}"
         );
-        for below in ["Source ticket: OPS-41", "the retry loop"] {
+        for below in ["Source ticket: HARBOR-57", "the retry loop"] {
             assert!(
                 s.body.contains(below) && !seen.contains(below),
                 "{below}: {}",
@@ -1005,7 +1007,7 @@ mod tests {
         }
         assert_eq!(common::pr_layout::rubric(&s.body, &s.facts), vec![]);
         // Shaping what was shaped changes nothing.
-        let again = shape(&s.body, "OPS-41: Export poller gives up", f, None);
+        let again = shape(&s.body, "HARBOR-57: Export poller gives up", f, None);
         assert_eq!(again.body, s.body);
         assert!(again.corrections.is_empty());
     }

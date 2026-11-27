@@ -54,6 +54,7 @@ mod tests {
         ),
         ("worker/src/passes/skill_compat.rs", &[Reader::TeamItems]),
         ("worker/src/passes/skill_run.rs", &[Reader::TeamItems]),
+        ("common/src/skill_runs/engine.rs", &[Reader::TeamItems]),
     ];
 
     /// Files that name such instructions without following their steps.
@@ -85,6 +86,10 @@ mod tests {
         ("worker/src/passes/review_labels.rs", "picks labels the repository's docs allow"),
         ("worker/src/passes/review_scope.rs", "decides which files a review reads"),
         ("worker/src/passes/host_steps_readers.rs", "this guard"),
+        ("common/src/skill_runs/mod.rs", "a scheduled skill's record; the run's prompt is engine.rs (routed)"),
+        ("common/src/skill_runs/engine/tests.rs", "the engine's tests, with a synthetic skill"),
+        ("worker/src/passes/skill_schedule.rs", "the engine's seams to AWS; the run's prompt is engine.rs (routed)"),
+        ("gateway/src/routes/skill_runs.rs", "stores schedules and queues runs; follows no steps"),
         ("gateway/src/routes/brain.rs", "chat answers questions; it offers read_skill as a source and carries out no steps"),
         ("gateway/src/routes/chat_code.rs", "chat's code reads"),
         ("gateway/src/routes/chat_eval.rs", "chat evaluations"),

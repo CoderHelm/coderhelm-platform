@@ -1,18 +1,96 @@
 {
   "floorplan/descriptions/api.json": {
     "files": {
-      "harbor-api/src/billing.js": { "name": "Card charges", "description": "Charges a boater's card through Stripe for a slip booking." },
-      "harbor-api/src/bookings.js": { "name": "Slip bookings", "description": "Takes a booking for a slip and charges for it." },
-      "harbor-api/src/server.js": { "name": "Booking service start", "description": "Starts the booking service and sends slip requests to the bookings code." }
+      "harbor-api/src/billing.js": {
+        "name": "Card charges",
+        "description": "Charges a patron's card through Stripe for a slot booking."
+      },
+      "harbor-api/src/bookings.js": {
+        "name": "Slot bookings",
+        "description": "Takes a booking for a slot and charges for it."
+      },
+      "harbor-api/src/server.js": {
+        "name": "Booking service start",
+        "description": "Starts the booking service and sends slot requests to the bookings code."
+      },
+      "harbor-api/src/webhooks.js": {
+        "name": "Payment callbacks",
+        "description": "Takes Stripe's payment events after it checks their signature."
+      },
+      "harbor-api/src/tides.js": {
+        "name": "Tide lookup",
+        "description": "Asks the tide service for the water level at a slot."
+      },
+      "harbor-api/src/entities/slot.entity.ts": {
+        "name": "Slot record",
+        "description": "The stored slot: its id and name."
+      },
+      "harbor-api/src/receipts/index.js": {
+        "name": "Receipt handler",
+        "description": "Reads each receipt uploaded to the receipts bucket."
+      }
     },
     "routes": {
-      "POST /slips/:id/bookings": { "name": "Book a slip", "description": "Books the slip and charges the boater's card." }
+      "POST /slots/:id/bookings": {
+        "name": "Book a slot",
+        "description": "Books the slot and charges the patron's card."
+      },
+      "POST /webhooks/stripe": {
+        "name": "Stripe payment events",
+        "description": "Stripe calls this when a payment changes."
+      }
     }
   },
   "floorplan/descriptions/web.json": {
     "files": {
-      "harbor-web/app/slips/[id]/page.tsx": { "name": "Slip page", "description": "Shows one slip with a button to book it." },
-      "harbor-web/lib/slips.ts": { "name": "Booking request", "description": "Sends the booking for a slip to the booking service." }
+      "harbor-web/app/slots/[id]/page.tsx": {
+        "name": "Slot page",
+        "description": "Shows one slot with a button to book it."
+      },
+      "harbor-web/lib/slots.ts": {
+        "name": "Booking request",
+        "description": "Sends the booking for a slot to the booking service."
+      }
+    }
+  },
+  "floorplan/descriptions/mobile.json": {
+    "files": {
+      "harbor-mobile/app/navigation/RootNavigator.tsx": {
+        "name": "App screens",
+        "description": "Lists the app's screens: sign in when signed out, the slots when signed in."
+      },
+      "harbor-mobile/app/lib/session.ts": {
+        "name": "Signed-in patron",
+        "description": "Says who is signed in, if anyone."
+      },
+      "harbor-mobile/app/lib/api.ts": {
+        "name": "Server requests",
+        "description": "Sends the app's requests to the booking service."
+      },
+      "harbor-mobile/app/screens/SignIn.tsx": {
+        "name": "Sign in",
+        "description": "Signs the patron in and opens the slots."
+      },
+      "harbor-mobile/app/screens/Slots.tsx": {
+        "name": "Slots",
+        "description": "Lists slots; tapping one opens it."
+      },
+      "harbor-mobile/app/screens/SlotDetail.tsx": {
+        "name": "Slot",
+        "description": "Shows one slot with a button to book it."
+      }
+    }
+  },
+  "floorplan/descriptions/cloud.json": {
+    "files": {
+      "harbor-infra/main.tf": {
+        "name": "Receipts setup",
+        "description": "The receipts bucket and the function that runs when a receipt is uploaded."
+      },
+      "harbor-infra/dags/nightly_slots.py": {
+        "name": "Nightly slot load",
+        "description": "Copies the day's slots into the booking database each night."
+      }
     }
   }
 }

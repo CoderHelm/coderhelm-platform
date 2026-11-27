@@ -1,10 +1,11 @@
-//! gb. A pull request that removed a link from a camp registration page had
-//! its end-to-end check fail on "selecting a camp adds it to the cart while
-//! registration is open" with `Subtotal$0`. Three fix attempts later the
-//! supervisor rolled seven of the pull request's files back to an older
-//! green head; five runs of the last 53 rolled back that way. The test failed the same way on the result: the vendor portal
-//! had opened registration, so it was red on every branch. Rolling back
-//! fixed nothing and threw the change away.
+//! gb. A pull request that removed a link from a slot booking page had
+//! its end-to-end check fail on "selecting a slot adds it to the cart while
+//! booking is open" with `Total$0`. Three fix attempts later the
+//! supervisor rolled several of the pull request's files back to an older
+//! green head, and other runs rolled back the same way. The test failed the
+//! same way on the result: the booking vendor's portal had opened booking,
+//! so it was red on every branch. Rolling back fixed nothing and threw the
+//! change away.
 //!
 //! Guarantee: red checks never roll a ticket run's branch back to an older
 //! head or take a planned task out (`resume::take_out_failing_bumps` only
@@ -20,13 +21,13 @@ use crate::passes::push_checks;
 use crate::passes::supervisor::{self, Ending, ReplayStop};
 use common::push_gate::{self, FixLedger};
 
-const TEST: &str = "tests/browse/camp-registration.spec.ts:141:7 › Camp registration › selecting a camp adds it to the cart while registration is open";
+const TEST: &str = "tests/browse/slot-booking.spec.ts:141:7 › Slot booking › selecting a slot adds it to the cart while booking is open";
 
 fn log() -> String {
     format!(
-        "2026-11-17T04:37:00.1Z   ✘  1 [chromium] › {TEST} (12.4s)\n\
-         2026-11-17T04:37:00.2Z     Error: Choosing \"Acme Mini-Camp (AM session)\" did not add it to the portal's Order Summary\n\
-         2026-11-17T04:37:00.3Z     Received: Subtotal$0"
+        "2030-03-12T09:15:00.1Z   ✘  1 [chromium] › {TEST} (12.4s)\n\
+         2030-03-12T09:15:00.2Z     Error: Choosing \"Acme Day Slot (morning)\" did not add it to the portal's Booking total\n\
+         2030-03-12T09:15:00.3Z     Received: Total$0"
     )
 }
 
@@ -40,12 +41,12 @@ fn the_failing_test_is_named_and_the_rounds_stop_after_two_fixes() {
         ledger.record_push(&keys);
     }
     let stop = ledger.stop(&keys).expect("stop after two fixes");
-    let text = stop.text("Received: Subtotal$0");
+    let text = stop.text("Received: Total$0");
     assert!(
-        text.contains("selecting a camp adds it to the cart"),
+        text.contains("selecting a slot adds it to the cart"),
         "{text}"
     );
-    assert!(text.contains("Subtotal$0"));
+    assert!(text.contains("Total$0"));
     assert!(text.contains("No more fixes are pushed and nothing was rolled back"));
     // The ledger is kept on the run between invocations.
     assert_eq!(FixLedger::from_json(&ledger.to_json()), ledger);
@@ -84,7 +85,7 @@ fn an_unreadable_log_is_reproduced_never_the_reason() {
     let held = crate::passes::resume::held_tried(
         &["I could not read the CI logs, so the cause is unknown.".to_string()],
         &[],
-        "eb32df1",
+        "abc1234",
         "",
     );
     assert!(!held[0].contains("could not read"), "{}", held[0]);

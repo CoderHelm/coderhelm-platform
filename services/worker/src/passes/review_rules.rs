@@ -122,6 +122,30 @@ pub fn wider_findings(found: &[super::minimal_change::Widening]) -> Vec<Finding>
         .collect()
 }
 
+/// The review's finding for app code that throws, asserts or exits when
+/// CMS content is missing (`common::content_gap::content_throws`): one per
+/// file, a verified defect the fix round makes tolerant.
+pub fn content_throw_findings(files: &[(String, String, String)]) -> Vec<Finding> {
+    files
+        .iter()
+        .filter(|(_, status, _)| status != "removed")
+        .filter_map(|(path, _, patch)| {
+            let found = common::content_gap::content_throws(path, patch);
+            (!found.is_empty()).then(|| Finding {
+                file: path.clone(),
+                line: anchor_line(patch, &found[0]),
+                severity: "blocking".into(),
+                category: "data".into(),
+                title: common::content_gap::THROW_TITLE.to_string(),
+                body: common::content_gap::throw_instruction(&found),
+                evidence: Some("verified-defect".into()),
+                caused_by_diff: Some(true),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
 /// When each check the review runs with no model started running (the
 /// merge of the change that added it), by the title its findings carry.
 /// A finding such a check raises on code an earlier review read is new to
@@ -153,6 +177,10 @@ pub const CHECKS_STARTED: &[(&str, &str)] = &[
     (
         "No end-to-end spec for a change a person sees",
         "2026-11-17T03:33:40Z",
+    ),
+    (
+        "A build or page that fails when CMS content is missing",
+        "2026-11-24T18:00:00Z",
     ),
 ];
 
@@ -823,7 +851,7 @@ mod e2e_rule_tests {
             },
             Widening {
                 kind: Kind::Parallel,
-                path: "dags/camps.py".into(),
+                path: "dags/tours.py".into(),
                 what: "`A_MAP` next to the existing `B_MAP`".into(),
             },
         ]);

@@ -107,9 +107,9 @@ fn with_waf_reads_the_run_gathers_the_evidence_and_moves_to_a_pr() {
         "s3://aws-waf-logs-acme/AWSLogs/",
         &bucket
     ));
-    let end = 1_794_916_800;
+    let end = 1_899_979_200;
     let q = ae::athena_query(&log_table(), &alarm.rule, end - 3 * 3600, end).unwrap();
-    assert!(q.contains("\"log_time\" BETWEEN '2026/11/17/09' AND '2026/11/17/12'"));
+    assert!(q.contains("\"log_time\" BETWEEN '2030/03/17/09' AND '2030/03/17/12'"));
     assert!(q.contains("r.ruleid = 'CrawlerASignatureCount'"));
     assert!(!q.contains("clientip"));
     // What the reads returned.

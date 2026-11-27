@@ -688,8 +688,8 @@ mod tests {
     #[test]
     fn reads_ticket_keys_from_text() {
         assert_eq!(
-            ticket_keys("Parent: WEB-12. Related to OPS-7 and WEB-12; not abc-1 or X-9"),
-            vec!["WEB-12", "OPS-7"]
+            ticket_keys("Parent: WEB-12. Related to HARBOR-4 and WEB-12; not abc-1 or X-9"),
+            vec!["WEB-12", "HARBOR-4"]
         );
         assert!(ticket_keys("no keys here, utf-8 is not one").is_empty());
     }

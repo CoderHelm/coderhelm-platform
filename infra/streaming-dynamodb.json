@@ -1,0 +1,32 @@
+{
+  "about": "Every DynamoDB action the streaming function's routes (/api/brain/stream, /api/plans/chat/stream) were seen to call, by table (the deployment's table name without its prefix; main is the prefix itself) or table/index/name. services/gateway/src/routes/stream_access.rs fails when the code calls one not listed here; infra/test/streaming-access.test.ts fails when the streaming role doesn't allow one listed here.",
+  "dynamodb": {
+    "main": [
+      "dynamodb:GetItem"
+    ],
+    "users": [
+      "dynamodb:GetItem"
+    ],
+    "teams": [
+      "dynamodb:GetItem"
+    ],
+    "settings": [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Query"
+    ],
+    "repos": [
+      "dynamodb:Query"
+    ],
+    "plans": [
+      "dynamodb:Query"
+    ],
+    "mcp-configs": [
+      "dynamodb:GetItem",
+      "dynamodb:Query"
+    ],
+    "jira-config": [
+      "dynamodb:GetItem"
+    ]
+  }
+}

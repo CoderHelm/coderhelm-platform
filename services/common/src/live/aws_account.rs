@@ -421,26 +421,32 @@ impl AwsAccount {
     }
 }
 
-/// Every connected account of a team.
+/// Every connected account of a team, every page.
 pub async fn list(
     dynamo: &aws_sdk_dynamodb::Client,
     table: &str,
     team_id: &str,
 ) -> Result<Vec<AwsAccount>, String> {
-    let out = dynamo
-        .query()
-        .table_name(table)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
-        .expression_attribute_values(":pk", av_s(team_id))
-        .expression_attribute_values(":p", av_s(PREFIX))
-        .send()
-        .await
-        .map_err(|e| format!("list aws accounts: {e}"))?;
-    Ok(out
-        .items()
-        .iter()
-        .filter_map(AwsAccount::from_item)
-        .collect())
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    loop {
+        let page = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", av_s(team_id))
+            .expression_attribute_values(":p", av_s(PREFIX))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| format!("list aws accounts: {e}"))?;
+        out.extend(page.items().iter().filter_map(AwsAccount::from_item));
+        match page.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Ok(out)
 }
 
 /// When a check ran, in milliseconds since the epoch (`None` when its

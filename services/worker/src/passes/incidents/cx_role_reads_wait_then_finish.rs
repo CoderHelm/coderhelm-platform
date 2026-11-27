@@ -2,7 +2,7 @@
 //! requests that got past a Block rule) reached a team's terraform
 //! repository. The account's role stack predated the template's WAF reads,
 //! so the alarm's evidence was refused; CoderHelm refused the alarm's own
-//! metric itself ("AWS/WAFV2 isn't a namespace Coderhelm reads"); five
+//! metric itself ("AWS/WAFV2 isn't a namespace Coderhelm reads"); several
 //! New Relic lookups were labelled "no lookups were made"; and the run
 //! ended `needs_outside_change` with "Needed from you: Nothing", asking a
 //! person to run an Athena query.
@@ -43,18 +43,18 @@ fn decision() -> FixDecision {
     serde_json::from_value(json!({
         "fix_location": "outside_code",
         "intent": "bug",
-        "cause": "Since 10:00 UTC both the block rule's blocks and the count rule's counts rose: part of the crawler's traffic no longer matches the identity. Which attribute changed is only in the WAF request logs.",
+        "cause": "Since the morning both the block rule's blocks and the count rule's counts rose: part of the crawler's traffic no longer matches the identity. Which attribute changed is only in the WAF request logs.",
         "evidence": {
             "basis": "data",
             "looked_up": [
                 "T2 metrics_query AWS/WAFV2 CountedRequests: refused",
-                "T3 NRQL aws.wafv2 hourly: count rule 277, 357, 422; block rule 234, 447, 330",
+                "T3 NRQL aws.wafv2 hourly: count rule 310, 380, 450; block rule 250, 420, 360",
                 "T4 aws_identity: neither role lists Athena"
             ],
             "code_rule": "The block rule blocks listing loads that match the crawler's identity; the count rule counts what it misses.",
-            "data_shows": "T3: counts rose from 104-199 an hour to 277-422.",
+            "data_shows": "T3: counts rose from 90-180 an hour to 310-450.",
             "producer": {"kind": "source", "where": "Requests to web ACL example-web-acl that match the count rule but not the block rule; recorded in the WAF logs (S3 aws-waf-logs-example), unread"},
-            "scope": "About 150-300 requests an hour above the overnight residual"
+            "scope": "About 200-300 requests an hour above the overnight residual"
         },
         "outside_change": {
             "system": "AWS Athena, workgroup waf_logs",
@@ -111,7 +111,7 @@ fn the_waf_metric_is_read_and_every_lookup_counts() {
         Some("1d"),
         None,
         None,
-        1_795_007_000,
+        1_900_007_000,
     )
     .expect("AWS/WAFV2 is read");
     assert_eq!(q.region.as_deref(), Some("us-east-1"));
@@ -122,7 +122,7 @@ fn the_waf_metric_is_read_and_every_lookup_counts() {
     // AWS's own refusal is the role's setup item, never ours.
     let e = common::live::StepError::role_refused(&["cloudwatch:GetMetricData"]);
     assert!(!e.is_refusal() && e.message.contains(aws_role_reads::ITEM_LABEL));
-    // Five monitoring lookups are lookups: the decision is not "unchecked".
+    // Several monitoring lookups are lookups: the decision is not "unchecked".
     let d = decision();
     let made = fix_location::lookups_made(0, 5);
     assert!(!fix_location::needs_lookup(Some(&d), true, made, &[]));
@@ -146,13 +146,13 @@ fn without_the_roles_waf_reads_the_run_waits_and_raises_the_item() {
     assert!(left.human.is_empty(), "{:?}", left.human);
     // It met the role's refusals this run, so it waits; never an outside
     // change with nobody to make it.
-    let started = "2026-11-18T12:57:29Z";
-    let gaps = vec![gap("2026-11-18T12:57:36Z"), gap("2026-10-01T00:00:00Z")];
+    let started = "2030-03-18T12:57:29Z";
+    let gaps = vec![gap("2030-03-18T12:57:36Z"), gap("2030-01-31T00:00:00Z")];
     let refused = role_wait::refused_this_run(&gaps, started);
     let Ending::AwaitRole(waiting_on) = role_wait::ending(&left.human, refused) else {
         panic!("the run waits for the role's reads");
     };
-    let w = Waiting::of("run-1", &waiting_on, "2026-11-18T13:04:33Z");
+    let w = Waiting::of("run-1", &waiting_on, "2030-03-18T13:04:33Z");
     assert_eq!(w.accounts, vec![ACCOUNT]);
     let note = role_wait::waiting_note(&w);
     assert!(note.contains("\"AWS role reads\"") && note.contains("goes on by itself"));
@@ -199,7 +199,7 @@ fn once_the_role_reads_the_run_reads_the_logs_and_plans_its_pr() {
             ("Accept-Language".into(), "en-US,en;q=0.9".into()),
         ],
         "GET",
-        "/listings?sport=a",
+        "/listings?wing=a",
         "US",
         &[],
     )];
@@ -208,12 +208,12 @@ fn once_the_role_reads_the_run_reads_the_logs_and_plans_its_pr() {
         "arn:aws:s3:::aws-waf-logs-example",
     )
     .unwrap();
-    assert!(loc.hour_prefixes(1_795_000_000, 1_795_007_000)[0]
+    assert!(loc.hour_prefixes(1_900_000_000, 1_900_007_000)[0]
         .starts_with("AWSLogs/111122223333/WAFLogs/cloudfront/example-web-acl/"));
     let mut t = Tally::default();
     for i in 0..3 {
         let line = json!({
-            "timestamp": 1_795_000_000_000i64 + i,
+            "timestamp": 1_900_000_000_000i64 + i,
             "terminatingRuleId": "Default_Action",
             "action": "ALLOW",
             "nonTerminatingMatchingRules": [{"ruleId": alarm.rule, "action": "COUNT"}],

@@ -2,13 +2,13 @@
 //!
 //! A run queried the production database, found the two records behind a
 //! duplicated filter and quoted their ids in its evidence, then wrote test
-//! fixtures with `sport-a` and `sport-b`. The test passed on data that
+//! fixtures with `booth-a` and `booth-b`. The test passed on data that
 //! doesn't exist, and nobody could tell from it which records the bug was
 //! about.
 //!
 //! [`looked_up_ids`] reads the ids out of the run's lookups (UUIDs, their
 //! eight-character prefixes, long hex and numeric ids); [`made_up`] finds an
-//! id-like value in a test's added lines that looks invented (`sport-a`,
+//! id-like value in a test's added lines that looks invented (`booth-a`,
 //! `id-1`, `test-id`, `fake_user`) while real ids are on record. The check
 //! of the change against the plan (`habits_check`) sends each one back.
 
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn made_up_ids_are_found_only_when_real_ones_were_looked_up() {
         let lines = vec![
-            "- [L1] Asked Production database: SELECT id FROM sport WHERE ... Came back: 4c2d9e10-1111-4a2b-8c3d-0a2b3c4d5e6f 'Multi-sport'; b7f3a2c8… 'Multi-Sport'".to_string(),
+            "- [L1] Asked Production database: SELECT id FROM booth WHERE ... Came back: 4c2d9e10-1111-4a2b-8c3d-0a2b3c4d5e6f 'Guest-booth'; b7f3a2c8… 'Guest-Booth'".to_string(),
             "- [L2] Asked it: SELECT 9f8e7d6c-0000-0000-0000-000000000000 Came back EMPTY".to_string(),
         ];
         let ids = looked_up_ids(&lines);
@@ -106,21 +106,21 @@ mod tests {
             (
                 "src/test/filters.test.ts".to_string(),
                 "modified".to_string(),
-                "+  { id: 'sport-a', name: 'Multi-sport' },\n+  { id: \"sport-b\", name: 'Multi-Sport' },\n+  { sportId: '4c2d9e10-1111-4a2b-8c3d-0a2b3c4d5e6f' },\n-  { id: 'old-1' }".to_string(),
+                "+  { id: 'booth-a', name: 'Guest-booth' },\n+  { id: \"booth-b\", name: 'Guest-Booth' },\n+  { boothId: '4c2d9e10-1111-4a2b-8c3d-0a2b3c4d5e6f' },\n-  { id: 'old-1' }".to_string(),
             ),
             (
                 "src/utils/filters.ts".to_string(),
                 "modified".to_string(),
-                "+const id = 'sport-a';".to_string(),
+                "+const id = 'booth-a';".to_string(),
             ),
         ];
         let found = made_up(&diff, &ids);
         assert_eq!(
             found.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
-            vec!["sport-a", "sport-b"]
+            vec!["booth-a", "booth-b"]
         );
         assert!(made_up(&diff, &[]).is_empty());
         assert!(looks_made_up("id-1") && looks_made_up("test-id") && looks_made_up("fake_user"));
-        assert!(!looks_made_up("multi-sport") && !looks_made_up("4c2d9e10"));
+        assert!(!looks_made_up("guest-booth") && !looks_made_up("4c2d9e10"));
     }
 }

@@ -1289,7 +1289,7 @@ fn traced_input() -> Input {
             about: "Secrets detected in CloudWatch Logs (2 instances)".into(),
             samples: vec![LogLine {
                 log_group: "/ecs/prod-ledger-api".into(),
-                message: "[Nest] 1  - 11/12/2026, 10:19:20 AM   ERROR [SearchIndexService] Failed to reach the search cluster with password=[REDACTED_PASSWORD]".into(),
+                message: "[Nest] 1  - 3/12/2030, 10:19:20 AM   ERROR [AvailabilityService] Failed to reach the availability cache with password=[REDACTED_PASSWORD]".into(),
             }],
             ..Default::default()
         },
@@ -1403,7 +1403,7 @@ fn a_file_is_read_for_what_it_does() {
         assert_eq!(file_role(infra), FileRole::Infra, "{infra}");
     }
     for other in [
-        "src/search/search-index.service.ts",
+        "src/availability/availability.service.ts",
         "README.md",
         "scripts/seed.ts",
     ] {
@@ -1447,10 +1447,10 @@ fn a_workflow_ships_the_image_and_terraform_only_defines_it() {
 #[test]
 fn the_error_lines_name_the_class_and_the_text_that_logged_them() {
     let inp = traced_input();
-    assert_eq!(code_symbols(&inp.target), ["SearchIndexService"]);
+    assert_eq!(code_symbols(&inp.target), ["AvailabilityService"]);
     assert_eq!(
         message_phrase(&inp.target).as_deref(),
-        Some("Failed to reach the search cluster with")
+        Some("Failed to reach the availability cache with")
     );
     // A framework's own names and dotted logger names.
     let t = Target {
@@ -1471,18 +1471,18 @@ fn the_error_lines_name_the_class_and_the_text_that_logged_them() {
     let rs = repos(&["acme/ledger-api", "acme/ops-cli"]);
     let mut ev = Vec::new();
     symbol_evidence(
-        "the class SearchIndexService the error's lines name",
+        "the class AvailabilityService the error's lines name",
         &[
             hit(
                 "acme/ledger-api",
-                "src/search/search-index.service.ts",
-                "export class SearchIndexService {",
+                "src/availability/availability.service.ts",
+                "export class AvailabilityService {",
             ),
-            hit("acme/ops-cli", "docs/notes.md", "class SearchIndexService"),
+            hit("acme/ops-cli", "docs/notes.md", "class AvailabilityService"),
             hit(
                 "acme/ops-cli",
                 "node_modules/x/index.js",
-                "class SearchIndexService",
+                "class AvailabilityService",
             ),
         ],
         &rs,
@@ -1556,11 +1556,11 @@ async fn without_the_commit_the_build_files_and_the_code_still_decide() {
         ],
     );
     env.hits.insert(
-        "class SearchIndexService".into(),
+        "class AvailabilityService".into(),
         vec![hit(
             "acme/ledger-api",
-            "src/search/search-index.service.ts",
-            "export class SearchIndexService {",
+            "src/availability/availability.service.ts",
+            "export class AvailabilityService {",
         )],
     );
     let r = resolve(&env, &traced_input(), t(NOW)).await;

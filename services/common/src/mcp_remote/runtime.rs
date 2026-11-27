@@ -133,6 +133,45 @@ impl std::fmt::Display for ConnError {
     }
 }
 
+/// Waits before asking a sign-in server again, within one run, after a
+/// passing refusal (a `5xx`, a `429`, no answer). After the last one the
+/// run reports it, marks nothing, and the next sync asks again.
+#[cfg(not(test))]
+pub const REFRESH_BACKOFF_MS: &[u64] = &[500, 2_000];
+#[cfg(test)]
+pub const REFRESH_BACKOFF_MS: &[u64] = &[0, 0];
+
+/// How long one refresher holds a token record ([`Store::claim_refresh`]):
+/// longer than its tries take (three token requests and the waits between).
+pub const REFRESH_LEASE_SECS: i64 = 60;
+
+/// How long a refresher that found another at work waits for its tokens.
+#[cfg(not(test))]
+const OTHER_REFRESH_WAIT_MS: &[u64] = &[250, 500, 1_000, 2_000];
+#[cfg(test)]
+const OTHER_REFRESH_WAIT_MS: &[u64] = &[0, 0];
+
+/// A failure to open the saved tokens that is the key service's, not the
+/// tokens': throttled, unreachable or timed out. The tokens are kept and
+/// nobody is asked to reconnect.
+pub fn key_service_passing(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    [
+        "throttl",
+        "dispatch failure",
+        "timeout",
+        "timed out",
+        "io error",
+        "response error",
+        "kmsinternal",
+        "keyunavailable",
+        "dependencytimeout",
+        "service unavailable",
+    ]
+    .iter()
+    .any(|w| e.contains(w))
+}
+
 /// How a server signs in, found by asking it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Detected {
@@ -519,7 +558,26 @@ impl Runtime {
                     .map_err(|_| ConnError::Failed("The saved key is not text.".into()))?;
                 Ok(Some(AuthHeader(s.header_name.clone(), v)))
             }
-            AuthKind::OAuth => self.bearer(s, owner, force).await.map(Some),
+            AuthKind::OAuth => self.bearer(s, owner, force, None).await.map(Some),
+        }
+    }
+
+    /// A new header after the server refused `refused` (a `401`): the
+    /// tokens someone else minted meanwhile when there are some, else a
+    /// refresh. A refresh token is never spent to replace a token that was
+    /// already replaced.
+    pub async fn auth_header_after(
+        &self,
+        s: &ServerRecord,
+        owner: &Owner,
+        refused: Option<&AuthHeader>,
+    ) -> Result<Option<AuthHeader>, ConnError> {
+        match s.auth {
+            AuthKind::OAuth => self
+                .bearer(s, owner, true, refused.map(|h| h.1.as_str()))
+                .await
+                .map(Some),
+            _ => self.auth_header(s, owner, true).await,
         }
     }
 
@@ -528,6 +586,7 @@ impl Runtime {
         s: &ServerRecord,
         owner: &Owner,
         force: bool,
+        refused: Option<&str>,
     ) -> Result<AuthHeader, ConnError> {
         let rec = self
             .store
@@ -540,6 +599,14 @@ impl Runtime {
         }
         let set = match self.open_tokens(&s.id, owner, &rec.sealed).await {
             Ok(t) => t,
+            // The key service didn't answer: the saved sign-in is fine.
+            Err(e) if key_service_passing(&e) => {
+                return Err(ConnError::Busy {
+                    why: "The saved sign-in couldn't be opened just now (the key service didn't answer); retrying.".into(),
+                    retry_after: None,
+                    rate_limited: false,
+                })
+            }
             Err(_) => {
                 let why = "The saved sign-in can't be opened. Reconnect.";
                 self.mark(s, owner, Status::NeedsReconnect, why, &[]).await;
@@ -547,7 +614,8 @@ impl Runtime {
             }
         };
         let now = self.now();
-        if !force && set.usable_at(now) {
+        let replaced = refused.is_some_and(|r| r != format!("Bearer {}", set.access_token));
+        if (!force || replaced) && set.usable_at(now) {
             return Ok(AuthHeader(
                 "Authorization".into(),
                 format!("Bearer {}", set.access_token),
@@ -568,16 +636,70 @@ impl Runtime {
         } else {
             &o.refresh_endpoint
         };
-        let mut req = oauth::refresh_request(endpoint, &client, &refresh_token, &o.resource);
-        if o.token_body_json {
-            req = oauth::as_json_body(req);
-        }
-        let resp = self
-            .http
-            .send(req)
+        // One refresher at a time: a provider that rotates refresh tokens
+        // (Atlassian) would refuse the second use of the same one, and that
+        // refusal would read as a revoked sign-in.
+        let claimed = self
+            .store
+            .claim_refresh(
+                &self.team,
+                &s.id,
+                owner,
+                rec.version,
+                now,
+                now + REFRESH_LEASE_SECS,
+            )
             .await
-            .map_err(|e| ConnError::Temporary(format!("Couldn't renew the sign-in: {e}")))?;
-        match oauth::parse_token_response(&resp, now, Some(&set)) {
+            .map_err(ConnError::Temporary)?;
+        if !claimed {
+            return self.await_other_refresh(s, owner, rec.version).await;
+        }
+        let provider = oauth::sign_in_provider(endpoint, &s.catalog_id, &display_name(s));
+        let mut attempt = 0;
+        let answer = loop {
+            let mut req = oauth::refresh_request(endpoint, &client, &refresh_token, &o.resource);
+            if o.token_body_json {
+                req = oauth::as_json_body(req);
+            }
+            let got = match self.http.send(req).await {
+                Ok(resp) => oauth::parse_token_response(&resp, self.now(), Some(&set)),
+                Err(super::http::HttpError::Unreachable(m)) => Err(oauth::TokenError {
+                    code: String::new(),
+                    message: format!("Couldn't reach the sign-in server: {m}"),
+                    status: 0,
+                    retry_after: None,
+                }),
+                Err(super::http::HttpError::Refused(m)) => {
+                    self.release_refresh(s, owner, now).await;
+                    return Err(ConnError::Temporary(format!(
+                        "Couldn't renew the sign-in: {m}"
+                    )));
+                }
+            };
+            match got {
+                // A passing refusal is asked again within this run, a little
+                // later each time; a wait the server named that is longer
+                // than that is left to the next sync.
+                Err(e)
+                    if e.is_passing()
+                        && attempt < REFRESH_BACKOFF_MS.len()
+                        && e.retry_after.unwrap_or(0) * 1000 <= REFRESH_BACKOFF_MS[attempt] =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        REFRESH_BACKOFF_MS[attempt],
+                    ))
+                    .await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
+        if answer.is_err() {
+            // The next refresher may try at once (a check by hand right
+            // after a sync that met an outage).
+            self.release_refresh(s, owner, now).await;
+        }
+        match answer {
             Ok(new) => {
                 let sealed = self
                     .seal_tokens(&s.id, owner, &new, &display_name(s))
@@ -626,12 +748,90 @@ impl Runtime {
                 }
             }
             Err(e) if e.needs_reconnect() => {
+                // A person signing in again meanwhile wrote new tokens: the
+                // refusal was for the old ones.
+                if let Some(h) = self.newer_tokens(s, owner, rec.version).await {
+                    return Ok(h);
+                }
                 let why = format!("{} Reconnect to sign in again.", e.message);
                 self.mark(s, owner, Status::NeedsReconnect, &why, &[]).await;
                 Err(ConnError::NeedsReconnect(why))
             }
+            // Down, overloaded, rate limiting or silent: nothing is marked
+            // and the saved tokens stay; the next sync asks again.
+            Err(e) if e.is_passing() => Err(ConnError::Busy {
+                why: oauth::sign_in_unavailable(&provider, e.status, e.rate_limited()),
+                retry_after: e.retry_after,
+                rate_limited: e.rate_limited(),
+            }),
+            // Refused, but not the grant (a bad request, an odd reply):
+            // nothing is marked, and the words are the server's.
             Err(e) => Err(ConnError::Temporary(e.message)),
         }
+    }
+
+    async fn release_refresh(&self, s: &ServerRecord, owner: &Owner, claimed_at: i64) {
+        if let Err(e) = self
+            .store
+            .release_refresh(&self.team, &s.id, owner, claimed_at + REFRESH_LEASE_SECS)
+            .await
+        {
+            tracing::warn!(server = %s.id, error = %e, "Could not release an MCP token refresh");
+        }
+    }
+
+    /// The tokens someone else wrote after `version`, when they can be used.
+    async fn newer_tokens(
+        &self,
+        s: &ServerRecord,
+        owner: &Owner,
+        version: i64,
+    ) -> Option<AuthHeader> {
+        let t = self
+            .store
+            .get_token(&self.team, &s.id, owner)
+            .await
+            .ok()
+            .flatten()?;
+        if t.version == version || t.status == Status::NeedsReconnect {
+            return None;
+        }
+        let set = self.open_tokens(&s.id, owner, &t.sealed).await.ok()?;
+        set.usable_at(self.now()).then(|| {
+            AuthHeader(
+                "Authorization".into(),
+                format!("Bearer {}", set.access_token),
+            )
+        })
+    }
+
+    /// Another refresher holds the record: waits a little for its tokens
+    /// instead of sending the same refresh token a second time.
+    async fn await_other_refresh(
+        &self,
+        s: &ServerRecord,
+        owner: &Owner,
+        version: i64,
+    ) -> Result<AuthHeader, ConnError> {
+        for ms in OTHER_REFRESH_WAIT_MS {
+            if let Some(h) = self.newer_tokens(s, owner, version).await {
+                return Ok(h);
+            }
+            if let Ok(Some(t)) = self.store.get_token(&self.team, &s.id, owner).await {
+                if t.status == Status::NeedsReconnect {
+                    return Err(ConnError::NeedsReconnect(t.status_reason));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+        }
+        if let Some(h) = self.newer_tokens(s, owner, version).await {
+            return Ok(h);
+        }
+        Err(ConnError::Busy {
+            why: "Another sync is renewing the sign-in right now; retrying.".into(),
+            retry_after: None,
+            rate_limited: false,
+        })
     }
 
     /// Turns a refused request into the connection's status.
@@ -708,7 +908,7 @@ impl Runtime {
                     return Ok(out);
                 }
                 Err(CallError::Unauthorized(_)) if attempt == 0 && s.auth == AuthKind::OAuth => {
-                    auth = self.auth_header(s, owner, true).await?;
+                    auth = self.auth_header_after(s, owner, auth.as_ref()).await?;
                 }
                 Err(e @ (CallError::Unauthorized(_) | CallError::Forbidden(_))) => {
                     return Err(self.refused(s, owner, &e).await)
@@ -809,7 +1009,7 @@ impl Runtime {
                 }
                 Err(CallError::Unauthorized(_)) if attempt == 0 && s.auth == AuthKind::OAuth => {
                     auth = self
-                        .auth_header(s, owner, true)
+                        .auth_header_after(s, owner, auth.as_ref())
                         .await
                         .map_err(|e| format!("{}: {e}", s.name))?;
                 }
@@ -849,7 +1049,7 @@ impl Runtime {
                     return Ok(out);
                 }
                 Err(CallError::Unauthorized(_)) if attempt == 0 && s.auth == AuthKind::OAuth => {
-                    auth = self.auth_header(s, owner, true).await?;
+                    auth = self.auth_header_after(s, owner, auth.as_ref()).await?;
                 }
                 Err(e @ (CallError::Unauthorized(_) | CallError::Forbidden(Some(_)))) => {
                     return Err(self.refused(s, owner, &e).await)
@@ -1889,6 +2089,369 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(h.1, "Bearer at-winner");
+    }
+
+    /// The saved sign-in is untouched: still connected, same version, same
+    /// tokens, and nothing on the server record asks for a reconnect.
+    async fn untouched(r: &Rig) {
+        let t = r
+            .store
+            .get_token("TEAM#a", "docs", &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((t.status, t.version), (Status::Connected, 1));
+        assert!(t.status_reason.is_empty());
+        let set =
+            r.rt.open_tokens("docs", &Owner::Team, &t.sealed)
+                .await
+                .unwrap();
+        assert_eq!(set.refresh_token.as_deref(), Some("rt-1"));
+        let s = r.store.get_server("TEAM#a", "docs").await.unwrap().unwrap();
+        assert_ne!(s.status, Status::NeedsReconnect);
+    }
+
+    async fn expired_rig() -> (Rig, ServerRecord) {
+        let r = rig("TEAM#a");
+        let s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        connect(&r, &s, &Owner::Team, tokens("at-1", Some(1_000_000 - 10))).await;
+        (r, s)
+    }
+
+    fn busy(e: ConnError) -> (String, Option<u64>, bool) {
+        match e {
+            ConnError::Busy {
+                why,
+                retry_after,
+                rate_limited,
+            } => (why, retry_after, rate_limited),
+            other => panic!("expected a passing refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_503_from_the_sign_in_server_retries_and_never_asks_to_reconnect() {
+        let (r, s) = expired_rig().await;
+        r.http
+            .on(Method::Post, TOKEN, resp(503, &[], "Service Unavailable"));
+        let (why, _, limited) = busy(r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err());
+        assert_eq!(
+            why,
+            "Docs's sign-in server was briefly unavailable (HTTP 503); retrying."
+        );
+        assert!(!why.contains("Reconnect") && !why.contains("invalid_grant") && !limited);
+        // Asked again within the run, a little later each time.
+        assert_eq!(r.http.sent_to(TOKEN).len(), 1 + REFRESH_BACKOFF_MS.len());
+        untouched(&r).await;
+        // The refresh it claimed is given back: a check by hand right after
+        // asks the sign-in server itself instead of waiting.
+        let before = r.http.sent_to(TOKEN).len();
+        assert!(r.rt.auth_header(&s, &Owner::Team, false).await.is_err());
+        assert_eq!(
+            r.http.sent_to(TOKEN).len(),
+            before + 1 + REFRESH_BACKOFF_MS.len()
+        );
+        // The next sync, with the server back, signs in: nothing was stored
+        // that stops it.
+        let fresh = rig_after(&r);
+        assert!(fresh.rt.auth_header(&s, &Owner::Team, false).await.is_ok());
+    }
+
+    /// The same store and HTTP, with the first answer cleared (a later sync).
+    fn rig_after(r: &Rig) -> Rig {
+        let http = Arc::new(Fake::default());
+        http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                200,
+                json!({"access_token": "at-2", "token_type": "Bearer", "expires_in": 3600}),
+            ),
+        );
+        // Half an hour later.
+        let now = Arc::new(AtomicI64::new(1_000_000 + 1_800));
+        let n2 = now.clone();
+        Rig {
+            rt: Runtime {
+                store: r.store.clone(),
+                cipher: Arc::new(FakeKms),
+                http: http.clone(),
+                team: "TEAM#a".into(),
+                clock: Arc::new(move || n2.load(Ordering::SeqCst)),
+            },
+            store: r.store.clone(),
+            http,
+            now,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_503_that_clears_within_the_run_signs_in() {
+        let (r, s) = expired_rig().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        r.http.with(move |req| {
+            (req.url == TOKEN).then(|| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    resp(503, &[], "")
+                } else {
+                    fjson(200, json!({"access_token": "at-2", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-2"}))
+                }
+            })
+        });
+        let h =
+            r.rt.auth_header(&s, &Owner::Team, false)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(h.1, "Bearer at-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_5xx_that_says_invalid_grant_is_still_passing() {
+        let (r, s) = expired_rig().await;
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                502,
+                json!({"error": "invalid_grant", "error_description": "upstream"}),
+            ),
+        );
+        let (why, _, _) = busy(r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err());
+        assert!(why.contains("(HTTP 502); retrying."), "{why}");
+        untouched(&r).await;
+    }
+
+    #[tokio::test]
+    async fn a_429_is_a_rate_limit_and_its_wait_is_left_to_the_next_sync() {
+        let (r, s) = expired_rig().await;
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            resp(429, &[("retry-after", "120")], ""),
+        );
+        let (why, after, limited) =
+            busy(r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err());
+        assert!(limited && after == Some(120), "{why}");
+        assert!(
+            why.contains("asked Coderhelm to slow down (HTTP 429)"),
+            "{why}"
+        );
+        // A wait longer than the run's own is not slept through.
+        assert_eq!(r.http.sent_to(TOKEN).len(), 1);
+        untouched(&r).await;
+    }
+
+    /// A sign-in server that never answers (a timeout, a dropped
+    /// connection).
+    struct Silent(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl Http for Silent {
+        async fn send(
+            &self,
+            _: super::super::http::HttpRequest,
+        ) -> Result<super::super::http::HttpResponse, super::super::http::HttpError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(super::super::http::HttpError::Unreachable(
+                "operation timed out".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_server_that_doesnt_answer_is_passing() {
+        let (mut r, s) = expired_rig().await;
+        let silent = Arc::new(Silent(Default::default()));
+        r.rt.http = silent.clone();
+        let (why, _, _) = busy(r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err());
+        assert_eq!(
+            why,
+            "Docs's sign-in server was briefly unavailable; retrying."
+        );
+        assert_eq!(
+            silent.0.load(Ordering::SeqCst),
+            1 + REFRESH_BACKOFF_MS.len()
+        );
+        untouched(&r).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_that_isnt_the_grant_marks_nothing() {
+        let (r, s) = expired_rig().await;
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                400,
+                json!({"error": "invalid_request", "error_description": "missing resource"}),
+            ),
+        );
+        let e = r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err();
+        assert!(
+            matches!(&e, ConnError::Temporary(m) if m.contains("invalid_request")),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("Reconnect"));
+        untouched(&r).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_definitive_refusal_asks_for_a_reconnect() {
+        for (status, code) in [(400, "invalid_grant"), (401, "invalid_client")] {
+            let (r, s) = expired_rig().await;
+            r.http
+                .on(Method::Post, TOKEN, fjson(status, json!({"error": code})));
+            let e = r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err();
+            assert!(
+                matches!(e, ConnError::NeedsReconnect(_)),
+                "{status} {code}: {e:?}"
+            );
+            // A definitive refusal is asked once, never again in the run.
+            assert_eq!(r.http.sent_to(TOKEN).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_someone_signed_in_again_uses_the_new_sign_in() {
+        let (r, s) = expired_rig().await;
+        let store = r.store.clone();
+        let theirs =
+            r.rt.seal_tokens(
+                "docs",
+                &Owner::Team,
+                &tokens("at-new", Some(1_000_000 + 3600)),
+                "",
+            )
+            .await
+            .unwrap();
+        r.http.with(move |req| {
+            (req.url == TOKEN).then(|| {
+                let mut items = store.items.lock().unwrap();
+                let item = items
+                    .get_mut(&("TEAM#a".to_string(), "MCPTOKEN#docs#team".to_string()))
+                    .unwrap();
+                item.insert(
+                    "version".into(),
+                    aws_sdk_dynamodb::types::AttributeValue::N("2".into()),
+                );
+                item.insert(
+                    "token_sealed".into(),
+                    aws_sdk_dynamodb::types::AttributeValue::S(theirs.clone()),
+                );
+                fjson(
+                    400,
+                    json!({"error": "invalid_grant", "error_description": "already used"}),
+                )
+            })
+        });
+        let h =
+            r.rt.auth_header(&s, &Owner::Team, false)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(h.1, "Bearer at-new");
+        let t = r
+            .store
+            .get_token("TEAM#a", "docs", &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.status, Status::Connected);
+    }
+
+    #[tokio::test]
+    async fn two_refreshers_at_once_send_the_rotating_refresh_token_once() {
+        let (r, s) = expired_rig().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        r.http.with(move |req| {
+            (req.url == TOKEN).then(|| {
+                // Atlassian rotates: the first use of rt-1 works, any
+                // second one is refused for good.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    fjson(200, json!({"access_token": "at-2", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-2"}))
+                } else {
+                    fjson(400, json!({"error": "invalid_grant", "error_description": "refresh token reused"}))
+                }
+            })
+        });
+        // A scheduled sync, and a check by hand whose old token was just
+        // refused.
+        let old = AuthHeader("Authorization".into(), "Bearer at-1".into());
+        let (a, b) = tokio::join!(
+            r.rt.auth_header(&s, &Owner::Team, false),
+            r.rt.auth_header_after(&s, &Owner::Team, Some(&old))
+        );
+        assert_eq!(a.unwrap().unwrap().1, "Bearer at-2");
+        assert_eq!(b.unwrap().unwrap().1, "Bearer at-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let t = r
+            .store
+            .get_token("TEAM#a", "docs", &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.status, Status::Connected);
+    }
+
+    #[tokio::test]
+    async fn a_refresher_that_finds_another_at_work_waits_instead_of_sending() {
+        let (r, s) = expired_rig().await;
+        // Someone else holds the record.
+        assert!(r
+            .store
+            .claim_refresh("TEAM#a", "docs", &Owner::Team, 1, 1_000_000, 1_000_000 + 60)
+            .await
+            .unwrap());
+        let (why, _, _) = busy(r.rt.auth_header(&s, &Owner::Team, false).await.unwrap_err());
+        assert!(why.contains("renewing"), "{why}");
+        assert!(r.http.sent_to(TOKEN).is_empty());
+        // Their tokens land: the waiter takes them.
+        let sealed =
+            r.rt.seal_tokens(
+                "docs",
+                &Owner::Team,
+                &tokens("at-theirs", Some(1_000_000 + 3600)),
+                "",
+            )
+            .await
+            .unwrap();
+        let mut rec = r
+            .store
+            .get_token("TEAM#a", "docs", &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        rec.sealed = sealed;
+        rec.version = 2;
+        assert!(r
+            .store
+            .put_token("TEAM#a", "docs", &rec, Some(1))
+            .await
+            .unwrap());
+        let h = r.rt.await_other_refresh(&s, &Owner::Team, 1).await.unwrap();
+        assert_eq!(h.1, "Bearer at-theirs");
+    }
+
+    #[tokio::test]
+    async fn a_key_service_hiccup_keeps_the_saved_sign_in() {
+        assert!(key_service_passing(
+            "kms decrypt: dispatch failure: io error"
+        ));
+        assert!(key_service_passing(
+            "kms decrypt: service error: ThrottlingException: Rate exceeded"
+        ));
+        assert!(key_service_passing(
+            "kms decrypt: service error: KMSInternalException"
+        ));
+        assert!(!key_service_passing(
+            "kms decrypt: InvalidCiphertextException"
+        ));
+        assert!(!key_service_passing("stored value is not valid"));
+        assert!(!key_service_passing("stored tokens are not valid"));
     }
 
     #[tokio::test]

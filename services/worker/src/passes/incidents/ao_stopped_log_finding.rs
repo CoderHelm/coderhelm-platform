@@ -1,10 +1,10 @@
-//! am. Two log findings of one production service stayed on the Logs page
+//! ao. Two log findings of one production service stayed on the Logs page
 //! as Critical and New, each with "Create fix PR" and "Not started
 //! automatically: not sure the repo is ...; check it and start the fix",
-//! a day and a half after their error had stopped: 735 matching lines in
-//! one six-hour window, then none while the service wrote its usual volume.
-//! The team had fixed the cause the day before. Nothing but time closed a
-//! finding (three days without a line), so for those three days a problem
+//! more than a day after their error had stopped: hundreds of matching
+//! lines in a few hours, then none while the service wrote its usual
+//! volume. The team had fixed the cause the day before. Nothing but time
+//! closed a finding (three days without a line), so for days a problem
 //! that was over read as a live emergency that needed a person.
 //!
 //! Guarantee: every analysis counts each open finding's own lines on its
@@ -53,14 +53,14 @@ fn during_the_burst() -> Finding {
         source_log_group: GROUP.into(),
         source_account_id: "111122223333".into(),
         error_pattern: "getaddrinfo ENOTFOUND search.ledger.internal".into(),
-        created_at: "2026-11-02T12:00:00Z".into(),
-        first_seen_at: "2026-11-02T00:05:00Z".into(),
-        last_seen_at: "2026-11-02T05:10:00Z".into(),
+        created_at: "2030-03-04T12:00:00Z".into(),
+        first_seen_at: "2030-03-04T00:05:00Z".into(),
+        last_seen_at: "2030-03-04T05:10:00Z".into(),
         daily_lines: vec![Counted {
-            name: "2026-11-02".into(),
-            lines: 735,
+            name: "2030-03-04".into(),
+            lines: 640,
         }],
-        activity: vec![check("2026-11-02T06:00:00Z", 735, 100_800, 1440)],
+        activity: vec![check("2030-03-04T06:00:00Z", 640, 100_800, 1440)],
         auto_status: "skipped".into(),
         auto_reason: Skip::RepoUnsure(REPO.into()).reason(),
         ..Default::default()
@@ -71,11 +71,11 @@ fn during_the_burst() -> Finding {
 fn a_day_and_a_half_later() -> Finding {
     let mut f = during_the_burst();
     for (t, scanned, minutes) in [
-        ("2026-11-02T12:00:00Z", 28_700, 410),
-        ("2026-11-02T18:00:00Z", 53_900, 770),
-        ("2026-11-03T00:00:00Z", 79_100, 1130),
-        ("2026-11-03T06:00:00Z", 100_800, 1440),
-        ("2026-11-03T12:00:00Z", 100_800, 1440),
+        ("2030-03-04T12:00:00Z", 28_700, 410),
+        ("2030-03-04T18:00:00Z", 53_900, 770),
+        ("2030-03-05T00:00:00Z", 79_100, 1130),
+        ("2030-03-05T06:00:00Z", 100_800, 1440),
+        ("2030-03-05T12:00:00Z", 100_800, 1440),
     ] {
         f.activity.push(check(t, 0, scanned, minutes));
     }
@@ -85,7 +85,7 @@ fn a_day_and_a_half_later() -> Finding {
 fn settings() -> AutoFix {
     AutoFix {
         enabled: true,
-        enabled_at: "2026-11-01T00:00:00Z".into(),
+        enabled_at: "2030-03-03T00:00:00Z".into(),
         overrides: vec![GroupOverride {
             log_group: GROUP.into(),
             repo: REPO.into(),
@@ -104,7 +104,7 @@ fn while_the_burst_runs_it_is_a_live_critical() {
     // One analysis without a line is never evidence that it stopped.
     let mut one = f.clone();
     one.activity
-        .push(check("2026-11-02T12:00:00Z", 0, 28_700, 410));
+        .push(check("2030-03-04T12:00:00Z", 0, 28_700, 410));
     assert_eq!(lf::display_status(&one, FixState::None), "new");
 }
 
@@ -121,7 +121,7 @@ fn a_day_and_a_half_after_it_stopped_it_is_not_a_live_emergency() {
     assert!(!lf::is_open_problem(&f, FixState::None));
     // No automatic fix starts for it, and what it says is what was checked,
     // not a request to check something.
-    let now = at("2026-11-03T16:30:00Z");
+    let now = at("2030-03-05T16:30:00Z");
     let skip = lf::screen(&settings(), &f_undecided(&f), now).unwrap_err();
     assert!(matches!(skip, Skip::Stopped(_)), "{skip:?}");
     let said = skip.reason();
@@ -151,7 +151,7 @@ fn the_change_that_fixed_it_closes_it_after_a_day_not_three() {
     let mut f = a_day_and_a_half_later();
     // Nothing on record: three days after the last line, as before.
     assert_eq!(lf::quiet_period(&f), (3, QuietBasis::Default));
-    assert_eq!(f.resolves_at().as_deref(), Some("2026-11-05T05:10:00Z"));
+    assert_eq!(f.resolves_at().as_deref(), Some("2030-03-07T05:10:00Z"));
     // The sweep looks in the repo saved for the log group and finds the
     // commit that landed as the errors stopped.
     assert_eq!(lf::change_wanted(&f, &settings()).as_deref(), Some(REPO));
@@ -159,12 +159,12 @@ fn the_change_that_fixed_it_closes_it_after_a_day_not_three() {
         (
             "0a1b2c3".to_string(),
             "Point search at the new endpoint".to_string(),
-            "2026-11-02T04:50:00Z".to_string(),
+            "2030-03-04T04:50:00Z".to_string(),
         ),
         (
             "9f8e7d6".to_string(),
             "Last week's work".to_string(),
-            "2026-10-27T10:00:00Z".to_string(),
+            "2030-02-26T10:00:00Z".to_string(),
         ),
     ];
     let merges = lf::merge_changes(REPO, &commits);
@@ -174,16 +174,16 @@ fn the_change_that_fixed_it_closes_it_after_a_day_not_three() {
     assert_eq!(lf::quiet_period(&f), (1, QuietBasis::Change));
     // Thirty-five hours after the last line it is past its day: the next
     // analysis resolves it.
-    assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T05:10:00Z"));
+    assert_eq!(f.resolves_at().as_deref(), Some("2030-03-05T05:10:00Z"));
     assert!(matches!(
-        lf::resolve_state(&f, None, at("2026-11-03T16:30:00Z")),
+        lf::resolve_state(&f, None, at("2030-03-05T16:30:00Z")),
         Some(lf::ResolveState::Due { .. })
     ));
     assert_eq!(lf::change_wanted(&f, &settings()), None);
     // The same change on an error that keeps coming back shortens nothing.
     let mut back = f.clone();
-    back.last_resolved_at = "2026-10-28T00:00:00Z".into();
-    back.reopened_at = "2026-11-02T00:05:00Z".into();
+    back.last_resolved_at = "2030-02-27T00:00:00Z".into();
+    back.reopened_at = "2030-03-04T00:05:00Z".into();
     assert_eq!(lf::quiet_period(&back), (10, QuietBasis::Returns));
 }
 
@@ -199,7 +199,7 @@ fn when_the_service_itself_went_quiet_nobody_claims_it_stopped() {
     f.change = Some(lf::Change {
         kind: "merge".into(),
         repo: REPO.into(),
-        at: "2026-11-02T04:50:00Z".into(),
+        at: "2030-03-04T04:50:00Z".into(),
         ..Default::default()
     });
     assert_eq!(lf::quiet_period(&f), (3, QuietBasis::Default));
@@ -210,11 +210,11 @@ fn seen_again_it_is_live_again_and_its_fix_may_start() {
     let mut f = f_undecided(&a_day_and_a_half_later());
     f.auto_status = "waiting".into();
     f.activity
-        .push(check("2026-11-03T18:00:00Z", 12, 25_200, 360));
-    f.last_seen_at = "2026-11-03T17:40:00Z".into();
+        .push(check("2030-03-05T18:00:00Z", 12, 25_200, 360));
+    f.last_seen_at = "2030-03-05T17:40:00Z".into();
     assert_eq!(lf::display_status(&f, FixState::None), "new");
     assert_eq!(
-        lf::screen(&settings(), &f, at("2026-11-03T18:10:00Z")),
+        lf::screen(&settings(), &f, at("2030-03-05T18:10:00Z")),
         Ok(Some(REPO.into()))
     );
 }

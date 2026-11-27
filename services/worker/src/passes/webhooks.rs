@@ -500,34 +500,20 @@ async fn notify_disabled(state: &WorkerState, team_id: &str, ep: &endpoint::Endp
     if let Err(e) = crate::clients::email::send_notification(state, team_id, event).await {
         warn!(team_id, error = %e, "Could not email admins about a turned-off webhook endpoint");
     }
-    // The team's chat channel, when alert notifications are on for it.
+    // The team's channel for things a person has to act on, when one takes
+    // them; never an alert channel that takes alerts only.
     let cipher = common::mcp_credentials::Kms {
         client: &state.kms,
         key_id: "",
     };
-    let item = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(team_id.into()))
-        .key(
-            "sk",
-            AttributeValue::S(common::alert_notify::TEAM_SETTINGS_SK.into()),
-        )
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-    let Some(item) = item else { return };
-    let on = item
-        .get("enabled")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false);
-    if !on {
-        return;
-    }
-    let channels = common::notify::store::open_all(&cipher, team_id, &item).await;
+    let channels = common::notify::route::team_channels(
+        &state.dynamo,
+        &cipher,
+        &state.config.settings_table_name,
+        team_id,
+        common::notify::route::Kind::Action,
+    )
+    .await;
     if channels.is_empty() {
         return;
     }

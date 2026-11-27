@@ -37,7 +37,7 @@ pub struct Understood {
 }
 
 /// The note for a map question when the team's map is built.
-pub const MAP_FIRST: &str = "start from the app map (map_find or map_overview, then map_part, map_screen or map_file) and answer from it in plain words, as numbered steps in the order things happen when it asks how something happens, citing the map. Then read the code with your code tools only for the exact lines a step needs.";
+pub const MAP_FIRST: &str = "start from the app map (map_find or map_overview, then map_part, map_screen or map_file) and answer from it in plain words, as numbered steps in the order things happen when it asks how something happens, citing the map. When it asks what a change would reach or break (shared code, an endpoint), call map_impact on the file, the endpoint (METHOD /path) or the part. Then read the code with your code tools only for the exact lines a step needs.";
 
 /// The note for a map question when the team has no map yet.
 pub const NO_MAP: &str = "the team has no app map yet. Say so in one line first (it can be built on the App map page, /app-map), then answer from the code with your code tools.";
@@ -273,7 +273,7 @@ mod tests {
     /// code for exact lines; with no map, a one-line note and the code.
     #[test]
     fn a_question_about_how_the_app_fits_together_reaches_for_the_map_first() {
-        let q = "What happens when someone books a slip?";
+        let q = "What happens when someone books a slot?";
         let u = read(q, &[]);
         assert!(u.about_app());
         let mut tools = vec![

@@ -31,6 +31,40 @@ pub const BACKFILL_QUEUED_SK: &str = "ANALYTICS#deploy-runs-backfill-queued";
 /// (`repos_read`, `repos_total`), and the lease of the one pass reading
 /// (`lease`, `lease_until`), so a page load never starts a second chain.
 pub const BACKFILL_PROGRESS_SK: &str = "ANALYTICS#deploy-runs-backfill-progress";
+/// `INDEX#DEPLOY_STATS` ([`crate::settings_index`]): the teams with a
+/// backfill progress item or a deploy health item, so the 15-minute sweep
+/// reads those items by key instead of scanning the settings table (a
+/// capped scan of it stopped before reaching them). Writers add the team
+/// when they write either item; the daily rebuild finds the rest.
+pub const INDEX: &str = "DEPLOY_STATS";
+
+/// The team an item stands for in [`INDEX`]: its partition key, when the
+/// item is a backfill progress or a deploy health item.
+pub fn index_member(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Option<String> {
+    let sk = item.get("sk")?.as_s().ok()?;
+    if sk != BACKFILL_PROGRESS_SK && sk != health::SK {
+        return None;
+    }
+    let pk = item.get("pk")?.as_s().ok()?;
+    (!pk.is_empty() && !pk.starts_with("INDEX#")).then(|| pk.clone())
+}
+
+/// How the index's rebuild finds the items.
+pub fn index_spec() -> crate::settings_index::Spec<'static> {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    crate::settings_index::Spec {
+        name: INDEX,
+        filter: "sk = :sk OR sk = :h",
+        values: vec![
+            (":sk", AttributeValue::S(BACKFILL_PROGRESS_SK.to_string())),
+            (":h", AttributeValue::S(health::SK.to_string())),
+        ],
+        member_of: index_member,
+    }
+}
+
 /// How far back the backfill reads: the longest period the page shows (90
 /// days) and the one before it.
 pub const BACKFILL_DAYS: i64 = 182;
@@ -159,6 +193,42 @@ pub fn cause_of(run: &Value, default_branch: &str, is_tag: bool) -> Cause {
 pub fn started_by_coderhelm(run: &Value, bot_login: &str) -> bool {
     let (login, kind) = trigger(run);
     !bot_login.is_empty() && kind != "User" && login.eq_ignore_ascii_case(bot_login)
+}
+
+/// Whether an app or bot triggered a run (CoderHelm's own app, a merge
+/// queue, any other bot), never a person.
+pub fn triggered_by_a_bot(run: &Value) -> bool {
+    let (login, kind) = trigger(run);
+    kind != "User" && (kind == "Bot" || login.to_ascii_lowercase().ends_with("[bot]"))
+}
+
+/// Whether a completed workflow run from a webhook goes to the worker to be
+/// read as a deploy CoderHelm may have started. With the app's bot login
+/// known: its app triggered the run, or another bot pushed (a merge queue
+/// merging a PR CoderHelm merged). Without it (the gateway of a hybrid
+/// install has no GitHub App key of its own to ask GitHub with): every run a
+/// bot triggered, since the worker knows its bot and decides. A person's run
+/// never goes, and neither does a run that deployed nothing.
+pub fn worth_reading(run: &Value, bot_login: Option<&str>) -> bool {
+    let concluded = matches!(
+        run["conclusion"].as_str(),
+        Some("success" | "failure" | "timed_out" | "startup_failure" | "action_required")
+    );
+    if !concluded {
+        return false;
+    }
+    match bot_login.filter(|b| !b.is_empty()) {
+        Some(bot) => {
+            started_by_coderhelm(run, bot) || (trigger(run).1 == "Bot" && run["event"] == "push")
+        }
+        None => triggered_by_a_bot(run),
+    }
+}
+
+/// Whether a run the worker was sent may be CoderHelm's, before anything is
+/// asked of GitHub: its app triggered it, or another bot pushed.
+pub fn may_be_ours(run: &Value, bot_login: &str) -> bool {
+    started_by_coderhelm(run, bot_login) || (trigger(run).1 == "Bot" && run["event"] == "push")
 }
 
 /// A run pushed to the default branch by another bot (a merge queue): it is
@@ -546,8 +616,236 @@ pub fn stat_item_from(
     item
 }
 
+/// Whether deploys are still being recorded, and the holes in the record.
+///
+/// A team that records deploys most days and then records none for
+/// [`STALL_HOURS`](health::STALL_HOURS) while runs its bots triggered keep
+/// arriving is `stalled`: the Learning health page turns red, the worker's
+/// log carries `deploy_records_stalled` (an alarm), and the hole is read back
+/// from GitHub's run history. A hole is any stretch of
+/// [`STALL_HOURS`](health::STALL_HOURS) with no record after a busy stretch,
+/// whatever stopped the recording; it is read once, from each repository's
+/// newest record before it, and reading it again writes the same records.
+pub mod health {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use chrono::{DateTime, Duration, Utc};
+
+    use crate::rewards::health::{Loop, State};
+
+    /// One item per team. The gateway counts the completed runs bots
+    /// triggered (`bot_runs`, `bot_run_seen_at`); the worker's check writes
+    /// its reading (`state`, `newest_at`, `checked_at`, ...).
+    pub const SK: &str = "ANALYTICS#deploy-runs-health";
+    /// Hours with no record before a busy team is stalled.
+    pub const STALL_HOURS: i64 = 48;
+    /// The days before a hole that say whether the team was busy.
+    pub const BUSY_DAYS_BEFORE: i64 = 14;
+    /// Days with a deploy, of [`BUSY_DAYS_BEFORE`], for "most days".
+    pub const BUSY_MIN_DAYS: usize = 8;
+    /// Runs bots triggered since the newest record before a quiet stretch
+    /// counts as stalled: work went on, deploys stopped being recorded.
+    pub const STALL_MIN_BOT_RUNS: u64 = 10;
+    /// How far back holes are looked for.
+    pub const LOOKBACK_DAYS: i64 = 45;
+    /// How often the worker checks a team.
+    pub const CHECK_EVERY_SECS: i64 = 3600;
+
+    /// When a deploy record's run started and its repository (lowercase),
+    /// from its key (`DRUN#{created_at}#{repo}#{run_id}#{env}`).
+    pub fn of_sk(sk: &str) -> Option<(DateTime<Utc>, String)> {
+        let rest = sk.strip_prefix(super::PREFIX)?;
+        let mut parts = rest.splitn(3, '#');
+        let at = DateTime::parse_from_rfc3339(parts.next()?).ok()?;
+        let repo = parts.next()?.to_string();
+        (!repo.is_empty()).then(|| (at.with_timezone(&Utc), repo))
+    }
+
+    /// Days with a deploy in the [`BUSY_DAYS_BEFORE`] days up to `at`.
+    pub fn busy_days(times: &[DateTime<Utc>], at: DateTime<Utc>) -> usize {
+        let from = at - Duration::days(BUSY_DAYS_BEFORE);
+        times
+            .iter()
+            .filter(|t| **t > from && **t <= at)
+            .map(|t| t.date_naive())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// What the check reads for a team.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Reading {
+        /// No deploy recorded in the window.
+        Idle,
+        /// Deploys are being recorded (or the team is quiet, its bots too).
+        Recording { newest: DateTime<Utc> },
+        /// A team that records deploys most days recorded none since
+        /// `since`, for [`STALL_HOURS`] or more, while its bots kept working.
+        Stalled {
+            since: DateTime<Utc>,
+            busy_days: usize,
+            bot_runs: u64,
+        },
+    }
+
+    impl Reading {
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                Reading::Idle => "idle",
+                Reading::Recording { .. } => "recording",
+                Reading::Stalled { .. } => "stalled",
+            }
+        }
+    }
+
+    /// `times`: the records' start times, oldest first. `bot_runs`: runs
+    /// bots triggered since the newest record.
+    pub fn read(times: &[DateTime<Utc>], bot_runs: u64, now: DateTime<Utc>) -> Reading {
+        let Some(newest) = times.last().copied() else {
+            return Reading::Idle;
+        };
+        let busy = busy_days(times, newest);
+        if now - newest >= Duration::hours(STALL_HOURS)
+            && busy >= BUSY_MIN_DAYS
+            && bot_runs >= STALL_MIN_BOT_RUNS
+        {
+            Reading::Stalled {
+                since: newest,
+                busy_days: busy,
+                bot_runs,
+            }
+        } else {
+            Reading::Recording { newest }
+        }
+    }
+
+    /// The first hole to read back: a record after which none came for
+    /// [`STALL_HOURS`] (to the next record, or to now), though the team
+    /// recorded deploys most days before it. Holes from `filled_from` or
+    /// earlier were read already and are left. `times` oldest first.
+    pub fn first_gap(
+        times: &[DateTime<Utc>],
+        now: DateTime<Utc>,
+        filled_from: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let stall = Duration::hours(STALL_HOURS);
+        let oldest = now - Duration::days(LOOKBACK_DAYS);
+        times.iter().enumerate().find_map(|(i, t)| {
+            if *t < oldest || filled_from.is_some_and(|f| *t <= f) {
+                return None;
+            }
+            let next = times.get(i + 1).copied().unwrap_or(now);
+            (next - *t >= stall && busy_days(&times[..=i], *t) >= BUSY_MIN_DAYS).then_some(*t)
+        })
+    }
+
+    /// Where each repository's read of a hole from `gap_from` starts: its
+    /// newest record at or before the hole, else the hole itself, and never
+    /// before `floor` (the backfill's window). Keyed by lowercase name.
+    pub fn repo_starts(
+        records: &[(DateTime<Utc>, String)],
+        repos: &[String],
+        gap_from: DateTime<Utc>,
+        floor: DateTime<Utc>,
+    ) -> BTreeMap<String, DateTime<Utc>> {
+        let mut newest: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+        for (at, repo) in records.iter().filter(|(at, _)| *at <= gap_from) {
+            let e = newest.entry(repo.to_ascii_lowercase()).or_insert(*at);
+            if *at > *e {
+                *e = *at;
+            }
+        }
+        repos
+            .iter()
+            .map(|r| {
+                let key = r.to_ascii_lowercase();
+                let start = newest.get(&key).copied().unwrap_or(gap_from).max(floor);
+                (key, start)
+            })
+            .collect()
+    }
+
+    /// The Learning health page's loop for deploy records, from the check's
+    /// item (`state`, `newest_at`, `checked_at`, `bot_runs_since`) and
+    /// whether a hole is being read back now.
+    pub fn loop_of(
+        state: &str,
+        newest_at: &str,
+        checked_at: &str,
+        bot_runs_since: u64,
+        filling_from: Option<&str>,
+    ) -> Loop {
+        let newest = if newest_at.is_empty() {
+            "none recorded yet".to_string()
+        } else {
+            format!("newest deploy recorded {newest_at}")
+        };
+        let checked = if checked_at.is_empty() {
+            String::new()
+        } else {
+            format!(", checked {checked_at}")
+        };
+        let (state, detail, check) = match (state, filling_from) {
+            ("stalled", _) => (
+                State::Quiet,
+                format!(
+                    "No deploy recorded in {STALL_HOURS} hours though {bot_runs_since} runs CoderHelm's \
+                     app or other bots triggered arrived since; {newest}{checked}"
+                ),
+                "Deploys stopped being recorded. CoderHelm is reading the missed ones back from \
+                 GitHub's run history by itself; look in the gateway's log for the workflow run \
+                 events and in the worker's log for \"deploy_records_stalled\"."
+                    .to_string(),
+            ),
+            (_, Some(from)) => (
+                State::Retrying,
+                format!("Reading back deploys missed since {from}; {newest}{checked}"),
+                String::new(),
+            ),
+            ("recording", None) => (State::Ok, format!("Recording; {newest}{checked}"), String::new()),
+            _ => (State::Idle, format!("{newest}{checked}"), String::new()),
+        };
+        Loop {
+            key: "deploy_records",
+            label: "Deploys CoderHelm started, recorded from GitHub",
+            state,
+            last_signal_at: newest_at.to_string(),
+            count: 0,
+            expected: None,
+            detail,
+            check,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sweep_index_names_teams_with_a_progress_or_health_item() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let it = |pk: &str, sk: &str| {
+            std::collections::HashMap::from([
+                ("pk".to_string(), AttributeValue::S(pk.into())),
+                ("sk".to_string(), AttributeValue::S(sk.into())),
+            ])
+        };
+        assert_eq!(
+            index_member(&it("TEAM#a", BACKFILL_PROGRESS_SK)).as_deref(),
+            Some("TEAM#a")
+        );
+        assert_eq!(
+            index_member(&it("TEAM#b", health::SK)).as_deref(),
+            Some("TEAM#b")
+        );
+        assert_eq!(index_member(&it("TEAM#a", BACKFILL_QUEUED_SK)), None);
+        assert_eq!(index_member(&it("INDEX#DEPLOY_STATS", health::SK)), None);
+        assert_eq!(index_member(&it("", health::SK)), None);
+        assert_eq!(
+            crate::settings_index::partition(index_spec().name),
+            "INDEX#DEPLOY_STATS"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -944,5 +1242,210 @@ jobs:
         ));
         assert!(!pushed_a_branch(&serde_json::json!({"pull_requests": []})));
         assert!(!pushed_a_branch(&serde_json::json!({})));
+    }
+
+    fn run_by(login: &str, kind: &str, event: &str, conclusion: &str) -> Value {
+        json!({
+            "id": 1, "event": event, "conclusion": conclusion, "status": "completed",
+            "triggering_actor": {"login": login, "type": kind},
+            "actor": {"login": login, "type": kind},
+        })
+    }
+
+    #[test]
+    fn with_the_bot_known_only_its_runs_and_bot_pushes_go_to_the_worker() {
+        let bot = Some(BOT);
+        assert!(worth_reading(
+            &run_by(BOT, "Bot", "pull_request", "success"),
+            bot
+        ));
+        assert!(worth_reading(&run_by(BOT, "Bot", "push", "failure"), bot));
+        // A merge queue's push: the worker checks who merged.
+        assert!(worth_reading(
+            &run_by("github-merge-queue[bot]", "Bot", "push", "success"),
+            bot
+        ));
+        assert!(!worth_reading(
+            &run_by("someone", "User", "push", "success"),
+            bot
+        ));
+        assert!(!worth_reading(
+            &run_by("dependabot[bot]", "Bot", "pull_request", "success"),
+            bot
+        ));
+        assert!(!worth_reading(
+            &run_by(BOT, "Bot", "push", "cancelled"),
+            bot
+        ));
+    }
+
+    #[test]
+    fn with_the_bot_unknown_every_bots_run_still_goes_to_the_worker() {
+        // A hybrid install's gateway has no app key to ask GitHub for its
+        // bot: dropping the run there recorded nothing at all.
+        for bot in [None, Some("")] {
+            assert!(worth_reading(
+                &run_by(BOT, "Bot", "pull_request", "success"),
+                bot
+            ));
+            assert!(worth_reading(&run_by(BOT, "Bot", "push", "success"), bot));
+            assert!(worth_reading(
+                &run_by("dependabot[bot]", "Bot", "pull_request", "success"),
+                bot
+            ));
+            assert!(!worth_reading(
+                &run_by("someone", "User", "push", "success"),
+                bot
+            ));
+            assert!(!worth_reading(&run_by(BOT, "Bot", "push", "skipped"), bot));
+        }
+        // The worker decides with its own bot, before any request.
+        assert!(may_be_ours(
+            &run_by(BOT, "Bot", "pull_request", "success"),
+            BOT
+        ));
+        assert!(!may_be_ours(
+            &run_by("dependabot[bot]", "Bot", "pull_request", "success"),
+            BOT
+        ));
+        assert!(may_be_ours(
+            &run_by("github-merge-queue[bot]", "Bot", "push", "success"),
+            BOT
+        ));
+    }
+
+    mod deploy_health {
+        use super::super::health::*;
+        use chrono::{DateTime, Duration, TimeZone, Utc};
+
+        fn at(d: u32, h: u32) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap()
+        }
+
+        /// A deploy every five hours for the twenty days up to the `d`th at
+        /// 21:00, the last one then.
+        fn busy_until(d: u32) -> Vec<DateTime<Utc>> {
+            let start = at(d, 21) - Duration::days(20);
+            let mut out = Vec::new();
+            let mut t = start;
+            while t <= at(d, 21) {
+                out.push(t);
+                t += Duration::hours(5);
+            }
+            out
+        }
+
+        #[test]
+        fn a_record_key_gives_its_time_and_repository() {
+            let (t, repo) =
+                of_sk("DRUN#2026-11-06T21:26:48Z#acme/web#42296784769#production").unwrap();
+            assert_eq!(t, Utc.with_ymd_and_hms(2026, 11, 6, 21, 26, 48).unwrap());
+            assert_eq!(repo, "acme/web");
+            assert!(of_sk("ANALYTICS#deploy-runs-health").is_none());
+            assert!(of_sk("DRUN#not-a-time#acme/web#1#prod").is_none());
+        }
+
+        #[test]
+        fn a_busy_team_with_no_record_for_two_days_while_its_bots_work_is_stalled() {
+            let times = busy_until(6);
+            let now = at(23, 12);
+            match read(&times, 40, now) {
+                Reading::Stalled {
+                    since, busy_days, ..
+                } => {
+                    assert_eq!(since, at(6, 21));
+                    assert!(busy_days >= BUSY_MIN_DAYS, "{busy_days}");
+                }
+                r => panic!("{r:?}"),
+            }
+            // The bots went quiet too: a quiet team, not a broken record.
+            assert!(matches!(read(&times, 2, now), Reading::Recording { .. }));
+            // Under two days: not yet.
+            assert!(matches!(
+                read(&times, 40, at(8, 12)),
+                Reading::Recording { .. }
+            ));
+            assert_eq!(read(&[], 40, now), Reading::Idle);
+        }
+
+        #[test]
+        fn a_team_that_rarely_deploys_is_never_stalled() {
+            let times = vec![at(1, 10), at(4, 10), at(9, 10)];
+            assert!(matches!(
+                read(&times, 100, at(23, 0)),
+                Reading::Recording { .. }
+            ));
+            assert_eq!(first_gap(&times, at(23, 0), None), None);
+        }
+
+        #[test]
+        fn the_first_hole_is_read_once_from_where_it_started() {
+            let mut times = busy_until(6);
+            // Recording came back on the 24th.
+            times.push(at(24, 9));
+            times.push(at(24, 11));
+            let now = at(24, 12);
+            assert_eq!(first_gap(&times, now, None), Some(at(6, 21)));
+            // Once read, it is left; a later hole still counts.
+            assert_eq!(first_gap(&times, now, Some(at(6, 21))), None);
+            // Still nothing since: the hole runs to now.
+            let still = busy_until(6);
+            assert_eq!(first_gap(&still, at(23, 0), None), Some(at(6, 21)));
+            // A hole older than the lookback is left.
+            assert_eq!(
+                first_gap(&still, at(6, 21) + Duration::days(LOOKBACK_DAYS + 1), None),
+                None
+            );
+        }
+
+        #[test]
+        fn each_repository_reads_from_its_own_newest_record() {
+            let gap = at(6, 21);
+            let records = vec![
+                (at(6, 21), "acme/web".to_string()),
+                (at(2, 8), "acme/api".to_string()),
+                (at(5, 8), "acme/api".to_string()),
+                (at(24, 9), "acme/api".to_string()),
+            ];
+            let repos = vec![
+                "Acme/Web".to_string(),
+                "acme/api".to_string(),
+                "acme/new".to_string(),
+            ];
+            let s = repo_starts(&records, &repos, gap, at(1, 0));
+            assert_eq!(s["acme/web"], at(6, 21));
+            // Its newest before the hole, not the one after it.
+            assert_eq!(s["acme/api"], at(5, 8));
+            assert_eq!(s["acme/new"], gap);
+            // Never before the backfill's window.
+            let s = repo_starts(&records, &repos, gap, at(6, 0));
+            assert_eq!(s["acme/api"], at(6, 0));
+        }
+
+        #[test]
+        fn the_health_loop_is_red_while_stalled_and_retrying_while_it_reads_back() {
+            use crate::rewards::health::State;
+            let l = loop_of(
+                "stalled",
+                "2026-11-06T21:26:48Z",
+                "2026-11-23T12:00:00Z",
+                40,
+                None,
+            );
+            assert_eq!(l.state, State::Quiet);
+            assert!(l.detail.contains("40 runs"), "{}", l.detail);
+            assert!(!l.check.is_empty());
+            let l = loop_of(
+                "recording",
+                "2026-11-24T09:00:00Z",
+                "",
+                0,
+                Some("2026-11-06T21:26:48Z"),
+            );
+            assert_eq!(l.state, State::Retrying);
+            assert!(l.detail.contains("since 2026-11-06T21:26:48Z"));
+            assert_eq!(loop_of("recording", "x", "", 0, None).state, State::Ok);
+            assert_eq!(loop_of("", "", "", 0, None).state, State::Idle);
+        }
     }
 }

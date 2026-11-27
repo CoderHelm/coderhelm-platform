@@ -32,6 +32,13 @@ pub trait Scheduler: Send + Sync {
     async fn at(&self, name: &str, when: DateTime<Utc>, body: &Value) -> Result<(), String>;
     /// Sends `body` on an EventBridge `cron(...)` expression (UTC).
     async fn cron(&self, name: &str, expr: &str, body: &Value) -> Result<(), String>;
+    /// Sends `body` on a `cron(...)` expression read in the time zone `tz`
+    /// (`America/New_York`), so a 07:23 schedule stays 07:23 across daylight
+    /// saving. Replaces a schedule of the same name.
+    async fn cron_in(&self, name: &str, expr: &str, tz: &str, body: &Value) -> Result<(), String> {
+        let _ = tz;
+        self.cron(name, expr, body).await
+    }
     /// Deletes a schedule. `Ok(false)` when there was none (already fired or
     /// deleted).
     async fn delete(&self, name: &str) -> Result<bool, String>;
@@ -194,6 +201,7 @@ impl EventBridge {
         expr: String,
         body: &Value,
         one_off: bool,
+        tz: &str,
     ) -> Result<(), String> {
         use aws_sdk_scheduler::types::{
             ActionAfterCompletion, FlexibleTimeWindow, FlexibleTimeWindowMode,
@@ -206,7 +214,7 @@ impl EventBridge {
             .name(name)
             .group_name(&self.group)
             .schedule_expression(expr)
-            .schedule_expression_timezone("UTC")
+            .schedule_expression_timezone(tz)
             .flexible_time_window(
                 FlexibleTimeWindow::builder()
                     .mode(FlexibleTimeWindowMode::Off)
@@ -228,10 +236,14 @@ impl EventBridge {
 impl Scheduler for EventBridge {
     async fn at(&self, name: &str, when: DateTime<Utc>, body: &Value) -> Result<(), String> {
         let expr = format!("at({})", when.format("%Y-%m-%dT%H:%M:%S"));
-        self.create(name, expr, body, true).await
+        self.create(name, expr, body, true, "UTC").await
     }
     async fn cron(&self, name: &str, expr: &str, body: &Value) -> Result<(), String> {
-        self.create(name, expr.to_string(), body, false).await
+        self.create(name, expr.to_string(), body, false, "UTC")
+            .await
+    }
+    async fn cron_in(&self, name: &str, expr: &str, tz: &str, body: &Value) -> Result<(), String> {
+        self.create(name, expr.to_string(), body, false, tz).await
     }
     async fn delete(&self, name: &str) -> Result<bool, String> {
         use aws_sdk_scheduler::operation::delete_schedule::DeleteScheduleError;

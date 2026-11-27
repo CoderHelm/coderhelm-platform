@@ -204,7 +204,8 @@ pub fn relay_kind(role: &str, status: &str) -> relay::RecipientKind {
 async fn everyone(state: &AppState) -> BTreeMap<String, relay::RecipientKind> {
     let mut out: BTreeMap<String, relay::RecipientKind> = BTreeMap::new();
     let mut start = None;
-    for _ in 0..50 {
+    // Every page: a cap would leave later people off the relay's list.
+    loop {
         let r = state
             .dynamo
             .scan()

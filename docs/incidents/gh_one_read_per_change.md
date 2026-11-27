@@ -1,0 +1,5 @@
+# gh. `gh_one_read_per_change`
+
+**What happened:** A busy stretch of runs on one installation spent GitHub's whole hourly budget more than once in an afternoon. The runs' own steps made most of the counted requests, mostly the same reads asked again by code that didn't know another part of the step had just asked. A run waiting on CI wrote "Waiting for GitHub's hourly limit; continues by itself at ..." several times in two minutes, and a review or a person's answer that came in during that hour waited for the reset like everything else.
+
+**The guarantee:** A read the worker made before is asked again conditionally, which GitHub answers 304 and doesn't count while nothing changed; a read named by a full commit SHA isn't asked again at all. Every counted request is logged by caller and route on the `github_budget` line. A run's own steps (its passes, its CI wait, merge steps, a rebuilt description) stop at the last tenth of the hour and wait for the reset, leaving that tenth to reviews and people's answers; sweeps still stop at half. The same progress note written again within a quarter of an hour stays one note, with the repeat counted on the record.

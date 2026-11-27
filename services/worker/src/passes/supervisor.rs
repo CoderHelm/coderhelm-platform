@@ -476,7 +476,7 @@ pub fn decide_end(f: &EndFacts) -> Ending {
     Ending::Finished { deferred }
 }
 
-/// [`decide_end`], with its rules checked: a slip is logged loudly (and
+/// [`decide_end`], with its rules checked: a slot is logged loudly (and
 /// the tests drive every combination, so none ships).
 pub fn end(f: &EndFacts) -> Ending {
     let e = decide_end(f);

@@ -60,6 +60,11 @@ pub enum WorkerMessage {
     /// and on a merge or a close; the review sweep covers the rest.
     #[serde(rename = "review_tidy")]
     ReviewTidy(ReviewTidyMessage),
+    /// A public repository's pull request opened, edited or pushed to: the
+    /// customer details guard reads its text again and sets its check run
+    /// (`worker::passes::customer_guard`).
+    #[serde(rename = "customer_guard")]
+    CustomerGuard(CustomerGuardMessage),
     /// Work out one repository's stale pull request plan now, without
     /// changing anything (the dashboard's "Preview"). The scheduled cleanup
     /// rides on the review-reminder tick.
@@ -210,6 +215,12 @@ pub enum WorkerMessage {
     /// passing needs nobody to click anything).
     #[serde(rename = "agent_resume_sweep")]
     AgentResumeSweep,
+    /// On deploy and every 15 minutes (EventBridge, then SQS): runs left
+    /// failed on an error CoderHelm now gets past by itself (transient, or a
+    /// state it repairs) are resumed from their checkpoint, at most once per
+    /// run per deploy (the worker's `passes::recover`).
+    #[serde(rename = "self_heal_sweep")]
+    SelfHealSweep,
     /// A run waiting on a person, from the stuck-run sweep: its one
     /// reminder, or the notice for a wait the sweep just named (a run left
     /// `needs_input` with nothing asked). Sent as the usual
@@ -222,6 +233,11 @@ pub enum WorkerMessage {
     /// sends one too).
     #[serde(rename = "role_reads_wait")]
     RoleReadsWait(RoleReadsWaitMessage),
+    /// A pull request of the team merged or closed: its runs waiting for
+    /// another change (`awaiting_change`, `crate::change_wait`) read their
+    /// dependency again (the self-heal sweep checks every 15 minutes too).
+    #[serde(rename = "change_wait_check")]
+    ChangeWaitCheck(ChangeWaitCheckMessage),
     /// One plugin run: a brief, a schedule or a release (see
     /// `plugins::run`).
     #[serde(rename = "plugin_run")]
@@ -259,6 +275,10 @@ pub enum WorkerMessage {
     /// due (`crate::alert_episodes`).
     #[serde(rename = "alert_episode_check")]
     AlertEpisodeCheck(AlertEpisodeCheckMessage),
+    /// One run of a scheduled skill: its EventBridge schedule fired, or an
+    /// admin pressed Run now (`crate::skill_runs`).
+    #[serde(rename = "skill_run")]
+    SkillRun(crate::skill_runs::SkillRunMessage),
 }
 
 /// One later check of an alert episode. A wait longer than SQS allows chains:
@@ -450,6 +470,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::ReviewTidy(_)
+            | WorkerMessage::CustomerGuard(_)
             | WorkerMessage::StalePrsPreview(_) => f::REVIEW,
             WorkerMessage::SecurityEvent(_) => f::SECURITY,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
@@ -477,8 +498,10 @@ impl WorkerMessage {
             | WorkerMessage::DlqCleanup
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::SelfHealSweep
             | WorkerMessage::RunWaiting(_)
             | WorkerMessage::RoleReadsWait(_)
+            | WorkerMessage::ChangeWaitCheck(_)
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
             | WorkerMessage::HybridNameCheck
@@ -490,6 +513,7 @@ impl WorkerMessage {
             | WorkerMessage::PluginSweep
             | WorkerMessage::PluginTrigger(_)
             | WorkerMessage::PluginResults(_) => f::PLUGIN,
+            WorkerMessage::SkillRun(_) => f::SKILL_RUN,
         }
     }
 
@@ -520,6 +544,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::ReviewTidy(_)
+            | WorkerMessage::CustomerGuard(_)
             | WorkerMessage::StalePrsPreview(_)
             | WorkerMessage::SetupAnalyze(_)
             | WorkerMessage::SecurityEvent(_)
@@ -555,8 +580,10 @@ impl WorkerMessage {
             | WorkerMessage::RewardOutcome(_)
             | WorkerMessage::JiraComment(_)
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::SelfHealSweep
             | WorkerMessage::RunWaiting(_)
             | WorkerMessage::RoleReadsWait(_)
+            | WorkerMessage::ChangeWaitCheck(_)
             | WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
@@ -565,7 +592,8 @@ impl WorkerMessage {
             | WorkerMessage::SupportSync
             | WorkerMessage::AlertEpisodeCheck(_)
             | WorkerMessage::PluginTrigger(_)
-            | WorkerMessage::PluginResults(_) => None,
+            | WorkerMessage::PluginResults(_)
+            | WorkerMessage::SkillRun(_) => None,
         }
     }
 
@@ -612,6 +640,11 @@ impl WorkerMessage {
             WorkerMessage::PluginRun(m) => Some((
                 &m.team_id,
                 format!("Plugin {} run", m.plugin_id),
+                m.run_id.clone(),
+            )),
+            WorkerMessage::SkillRun(m) => Some((
+                &m.team_id,
+                format!("Skill run of schedule {}", m.schedule_id),
                 m.run_id.clone(),
             )),
             _ => None,
@@ -673,6 +706,21 @@ pub struct ReviewTidyMessage {
     pub pr_number: u64,
     /// What sent it: `push`, `checks`, `merged`, `closed`.
     pub reason: String,
+}
+
+/// One pull request the customer details guard reads (`crate::customer_guard`).
+/// It carries no text: the worker reads the pull request fresh from GitHub.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomerGuardMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    /// Tries so far that failed (GitHub or the records unreadable); each is
+    /// sent again after a delay, up to a limit.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).
@@ -784,6 +832,14 @@ pub struct TagSweepMessage {
     /// Failed cuts so far (retries back off, then the failure is recorded).
     #[serde(default)]
     pub attempt: u32,
+    /// A commit that landed on the default branch (a push, whoever merged):
+    /// the message opens the repository's release window, or joins the one
+    /// waiting, instead of releasing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merged_sha: String,
+    /// Looks at the branch head's CI that found it still running.
+    #[serde(default)]
+    pub ci_waits: u32,
 }
 
 /// An armed auto-merge job. Bound to the reviewed head; a later commit aborts it
@@ -852,6 +908,12 @@ pub struct RunWaitingMessage {
     /// worker goes ahead with its recommended default.
     #[serde(default)]
     pub why: String,
+}
+
+/// Read again the dependency of a team's runs waiting for another change.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeWaitCheckMessage {
+    pub team_id: String,
 }
 
 /// Re-check the role of a run waiting for the install's "AWS role reads"
@@ -1154,6 +1216,11 @@ pub struct TicketMessage {
     /// How many times this ticket has already been auto-continued. Hard cap.
     #[serde(default)]
     pub continuation: u32,
+    /// Seconds the next step waits before it starts: a recovery's backoff
+    /// (the worker's `passes::recover`). Read once when the next step is
+    /// sent, never carried past it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retry_after_secs: u32,
     /// Reuse this run_id across continuations so it's ONE run, not duplicates.
     #[serde(default)]
     pub continuation_run_id: Option<String>,
@@ -1234,6 +1301,11 @@ pub struct TicketMessage {
     /// that picks the answers up). A continuation keeps its own id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_run_id: Option<String>,
+    /// The source ticket, when this ticket is a follow-up CoderHelm filed
+    /// (`followup_tickets`): a run on it files no follow-ups of its own.
+    /// Empty when it is known to be one but not from where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_of: Option<String>,
     /// A person asked for this run after the ticket's pull request merged
     /// (Retry on a run that ended on the merge, or a command or dashboard
     /// start on the GitHub issue whose run did), so the run skips the
@@ -1338,6 +1410,7 @@ impl Default for TicketMessage {
             base_branch: default_branch(),
             image_attachments: Vec::new(),
             continuation: 0,
+            retry_after_secs: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
             resume_from: None,
@@ -1354,6 +1427,7 @@ impl Default for TicketMessage {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            followup_of: None,
             after_merge: false,
             merged_note: None,
         }

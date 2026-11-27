@@ -73,7 +73,7 @@ pub fn kind_of(template: &str) -> &'static str {
         | "alert" => "alerts",
         t if t.starts_with("two_factor") => "alerts",
         "run_complete" | "run_failed" | "review" | "review_complete" | "plugin_approval"
-        | "support_update" | "update_notice" => "notices",
+        | "skill_run_result" | "support_update" | "update_notice" => "notices",
         t if t.starts_with("run_") || t.starts_with("review_") => "notices",
         _ => "other",
     }

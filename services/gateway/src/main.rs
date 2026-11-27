@@ -440,6 +440,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         // A person starts a run on a ticket from outside its tracker (a
         // connected app's start_run).
         .route("/runs/start", post(routes::run_start::start_run))
+        // Close a source's duplicate follow-ups (`followup_dedupe`).
+        .route("/followups/dedupe", post(routes::followup_dedupe::dedupe))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
         .route(
@@ -667,6 +669,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             get(routes::alerts::get_notify).put(routes::alerts::put_notify),
         )
         .route("/alert-notify/test", post(routes::alerts::test_notify))
+        .route(
+            "/updates-notify",
+            get(routes::alerts::get_updates_notify).put(routes::alerts::put_updates_notify),
+        )
         .route("/notify/test", post(routes::alerts::test_notify))
         .route("/alerts", get(routes::alerts::list_events))
         .route("/alerts/event", get(routes::alerts::get_event))
@@ -1504,6 +1510,19 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/skills/activity", get(routes::skills::activity))
         .route("/skills/used", get(routes::skills::used))
+        .route(
+            "/skill-runs",
+            get(routes::skill_runs::list).post(routes::skill_runs::create),
+        )
+        .route("/skill-runs/options", get(routes::skill_runs::options))
+        .route("/skill-runs/resolve", post(routes::skill_runs::resolve))
+        .route("/skill-runs/resolve/:id", get(routes::skill_runs::resolved))
+        .route(
+            "/skill-runs/:id",
+            put(routes::skill_runs::update).delete(routes::skill_runs::remove),
+        )
+        .route("/skill-runs/:id/run", post(routes::skill_runs::run_now))
+        .route("/skill-runs/:id/runs", get(routes::skill_runs::runs))
         .route("/activity/summary", get(routes::activity::summary))
         .route("/data-sources", get(routes::data_sources::list))
         .route("/connectors", get(routes::connectors::list))

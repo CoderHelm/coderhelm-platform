@@ -20,7 +20,6 @@
 
 use std::collections::BTreeMap;
 
-use aws_sdk_dynamodb::types::AttributeValue;
 use common::live::aws_account::{self, AwsAccount};
 use common::live::permissions;
 use tracing::{info, warn};
@@ -35,36 +34,18 @@ pub struct Report {
     pub sources_moved: usize,
 }
 
-/// Every connected account, by team.
-async fn accounts_by_team(
+/// Every connected account, by team: each team's accounts read by key
+/// (`pk = team`, every page), never by a scan of the whole AWS insights
+/// table (it also holds every account's inventory reads).
+pub(crate) async fn accounts_by_team(
     state: &WorkerState,
 ) -> Result<BTreeMap<String, Vec<AwsAccount>>, String> {
     let mut out: BTreeMap<String, Vec<AwsAccount>> = BTreeMap::new();
-    let mut start = None;
-    loop {
-        let page = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.aws_insights_table_name)
-            .filter_expression("begins_with(sk, :p)")
-            .expression_attribute_values(":p", AttributeValue::S(aws_account::PREFIX.into()))
-            .set_exclusive_start_key(start)
-            .send()
-            .await
-            .map_err(|e| format!("scan aws connections: {e}"))?;
-        for item in page.items() {
-            let team = item
-                .get("pk")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            if let (false, Some(a)) = (team.is_empty(), AwsAccount::from_item(item)) {
-                out.entry(team).or_default().push(a);
-            }
-        }
-        start = page.last_evaluated_key().cloned();
-        if start.is_none() {
-            break;
+    for team in super::learning_wait::teams(state).await {
+        let accounts =
+            aws_account::list(&state.dynamo, &state.config.aws_insights_table_name, &team).await?;
+        if !accounts.is_empty() {
+            out.insert(team, accounts);
         }
     }
     Ok(out)

@@ -71,8 +71,6 @@ const CAP_DELAY_SECS: u64 = 60;
 const MAX_FAILED_PASSES: i64 = 8;
 /// The most deployments of one commit read for a run's deploys.
 const MAX_DEPLOYMENTS: usize = 10;
-/// The most progress items one sweep reads.
-const SWEEP_MAX_PAGES: usize = 50;
 
 /// GitHub refused because the app has no access to Actions here.
 fn is_no_access(e: &(dyn std::error::Error + Send + Sync)) -> bool {
@@ -865,6 +863,11 @@ pub async fn record_run(state: &WorkerState, msg: &DeployRunMessage) -> Result<(
     let requests = AtomicUsize::new(0);
     let outcome: Result<usize, GhError> = async {
         let bot = github.app_bot_login().await?;
+        // The gateway may send every bot's run (it can't always know the
+        // app's bot): another bot's run costs nothing more here.
+        if !ds::may_be_ours(&msg.run, &bot) {
+            return Ok(0);
+        }
         let mut reads = live_reads(
             state,
             &msg.team_id,
@@ -936,8 +939,9 @@ async fn update(
         }
         expr.push_str(&format!(" REMOVE {}", names.join(", ")));
     }
-    if let Err(e) = req.update_expression(expr).send().await {
-        warn!(sk, error = %e, "Deploys backfill: could not write a marker");
+    match req.update_expression(expr).send().await {
+        Ok(_) => index_team(state, team_id, sk).await,
+        Err(e) => warn!(sk, error = %e, "Deploys backfill: could not write a marker"),
     }
 }
 
@@ -981,6 +985,9 @@ async fn claim_lease(
         .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
         .send()
         .await;
+    if r.is_ok() {
+        index_team(state, team_id, ds::BACKFILL_PROGRESS_SK).await;
+    }
     match r {
         Ok(out) => Ok(Some(
             out.attributes()
@@ -1037,18 +1044,28 @@ async fn queue_next_pass(state: &WorkerState, team_id: &str, lease: &str, delay:
 /// as not readable.
 pub async fn backfill(state: &WorkerState, msg: &DeployStatsBackfillMessage) -> Result<(), String> {
     let team_id = msg.team_id.as_str();
-    let done = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", av(team_id))
-        .key("sk", av(ds::BACKFILL_MARKER_SK))
-        .send()
-        .await
-        .map_err(|e| format!("read backfill marker: {e}"))?;
-    if done.item().is_some() {
-        return Ok(());
-    }
+    let read = |sk: &'static str| async move {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(team_id))
+            .key("sk", av(sk))
+            .send()
+            .await
+            .map(|r| r.item().cloned())
+            .map_err(|e| format!("read {sk}: {e}"))
+    };
+    let done = read(ds::BACKFILL_MARKER_SK).await?;
+    // Once every repository was read, a pass runs only to read a hole back
+    // (`open_gap_fill`).
+    let gap = match &done {
+        Some(_) => match gap_open(read(ds::BACKFILL_PROGRESS_SK).await?.as_ref()) {
+            Some(g) => Some(g),
+            None => return Ok(()),
+        },
+        None => None,
+    };
     let lease = msg
         .lease
         .clone()
@@ -1064,14 +1081,26 @@ pub async fn backfill(state: &WorkerState, msg: &DeployStatsBackfillMessage) -> 
         queue_next_pass(state, team_id, &lease, wait as u64).await;
         return Ok(());
     }
-    match backfill_pass(state, team_id).await {
+    match backfill_pass(state, team_id, gap.is_some()).await {
         Ok(PassEnd::Finished) => {
+            let mut sets = vec![("done", AttributeValue::Bool(true))];
+            if let Some(g) = &gap {
+                info!(team_id, gap_from = %g, "Deploys gap fill done");
+                sets.push(("gap_filled_from", av(g)));
+                sets.push(("gap_filled_at", av(&Utc::now().to_rfc3339())));
+            }
             update(
                 state,
                 team_id,
                 ds::BACKFILL_PROGRESS_SK,
-                &[("done", AttributeValue::Bool(true))],
-                &["lease", "lease_until", "failed_passes", "last_error"],
+                &sets,
+                &[
+                    "lease",
+                    "lease_until",
+                    "failed_passes",
+                    "last_error",
+                    "gap_from",
+                ],
             )
             .await;
             Ok(())
@@ -1130,50 +1159,57 @@ pub fn should_resume(progress: &Item, now: i64) -> bool {
 /// Runs with the 15-minute sweep; the lease keeps it from doubling a pass.
 pub async fn sweep(state: &WorkerState) -> usize {
     let now = Utc::now().timestamp();
-    let mut start: Option<Item> = None;
     let mut teams = Vec::new();
-    for _ in 0..SWEEP_MAX_PAGES {
-        let res = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("sk = :sk AND attribute_not_exists(done)")
-            .expression_attribute_values(":sk", av(ds::BACKFILL_PROGRESS_SK))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let page = match res {
-            Ok(p) => p,
+    let mut health = Vec::new();
+    // The teams with a progress or health item come from the settings
+    // index, and their items are read by key: the settings table is never
+    // scanned (a capped scan of it stopped before reaching them).
+    let table = &state.config.settings_table_name;
+    let members =
+        match common::settings_index::members(&state.dynamo, table, &ds::index_spec()).await {
+            Ok(m) => m,
             Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Deploys backfill sweep: scan failed");
-                break;
+                warn!(error = %e, "Deploys backfill sweep: could not read the index");
+                return 0;
             }
         };
-        for item in page.items() {
-            if should_resume(item, now) {
-                if let Some(pk) = item.get("pk").and_then(|v| v.as_s().ok()) {
-                    teams.push(pk.clone());
-                }
+    for pk in members {
+        let (progress, health_item) = match team_items(state, &pk).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(team_id = %pk, error = %e, "Deploys backfill sweep: could not read the team's items");
+                continue;
             }
+        };
+        if progress.is_none() && health_item.is_none() {
+            common::settings_index::remove(&state.dynamo, table, ds::INDEX, &pk).await;
+            continue;
         }
-        match page.last_evaluated_key {
-            Some(k) if !k.is_empty() => start = Some(k),
-            _ => break,
+        if let Some(item) = health_item.filter(|i| health_due(i, now)) {
+            health.push((pk.clone(), item));
+        }
+        // A finished backfill (`done` written) is never resumed.
+        if let Some(item) = progress.filter(|i| !i.contains_key("done")) {
+            if should_resume(&item, now) {
+                teams.push((pk.clone(), gap_open(Some(&item)).is_some()));
+            }
         }
     }
     let mut started = 0;
-    for team_id in teams {
+    for (team_id, filling_gap) in teams {
         // Finished before `done` was written: mark it so the sweep skips it.
-        let finished = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", av(&team_id))
-            .key("sk", av(ds::BACKFILL_MARKER_SK))
-            .send()
-            .await
-            .ok()
-            .is_some_and(|r| r.item().is_some());
+        // A hole being read back runs after the marker, and carries on.
+        let finished = !filling_gap
+            && state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", av(&team_id))
+                .key("sk", av(ds::BACKFILL_MARKER_SK))
+                .send()
+                .await
+                .ok()
+                .is_some_and(|r| r.item().is_some());
         if finished {
             progress(state, &team_id, &[("done", AttributeValue::Bool(true))]).await;
             continue;
@@ -1190,10 +1226,282 @@ pub async fn sweep(state: &WorkerState) -> usize {
             started += 1;
         }
     }
+    for (team_id, item) in health {
+        if check_health(state, &team_id, &item).await {
+            started += 1;
+        }
+    }
     started
 }
 
-async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, String> {
+/// A team's backfill progress item and deploy health item, read by key.
+async fn team_items(
+    state: &WorkerState,
+    team_id: &str,
+) -> Result<(Option<Item>, Option<Item>), String> {
+    let get = |sk: &'static str| async move {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(team_id))
+            .key("sk", av(sk))
+            .send()
+            .await
+            .map(|r| r.item().cloned())
+            .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())
+    };
+    let (p, h) = tokio::join!(get(ds::BACKFILL_PROGRESS_SK), get(ds::health::SK));
+    Ok((p?, h?))
+}
+
+/// Names the team in the sweep's index ([`ds::INDEX`]) when `sk` is one of
+/// the items the sweep reads. A failed add waits for the daily rebuild.
+async fn index_team(state: &WorkerState, team_id: &str, sk: &str) {
+    if sk != ds::BACKFILL_PROGRESS_SK && sk != ds::health::SK {
+        return;
+    }
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        ds::INDEX,
+        team_id,
+    )
+    .await
+    {
+        warn!(team_id, error = %e, "Deploys: could not add the team to the sweep index");
+    }
+}
+
+fn item_s(i: &Item, k: &str) -> String {
+    i.get(k)
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn item_n(i: &Item, k: &str) -> i64 {
+    i.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The hole a pass is reading back, from the progress item: set by
+/// `open_gap_fill`, cleared when the pass finishes.
+pub fn gap_open(progress: Option<&Item>) -> Option<String> {
+    let p = progress?;
+    if matches!(p.get("done"), Some(AttributeValue::Bool(true))) {
+        return None;
+    }
+    Some(item_s(p, "gap_from")).filter(|g| !g.is_empty())
+}
+
+/// Whether the team's deploy health is checked in this sweep: hourly.
+pub fn health_due(item: &Item, now: i64) -> bool {
+    let checked = parse_time(&item_s(item, "checked_at")).map_or(0, |t| t.timestamp());
+    now - checked >= ds::health::CHECK_EVERY_SECS
+}
+
+/// The team's deploy records from `since` on: when each run started, and
+/// its repository. Keys only.
+async fn records_since(
+    state: &WorkerState,
+    team_id: &str,
+    since: DateTime<Utc>,
+) -> Result<Vec<(DateTime<Utc>, String)>, String> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    // Every page: a cap would leave the newest records out.
+    loop {
+        let page = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND sk BETWEEN :lo AND :hi")
+            .expression_attribute_values(":p", av(team_id))
+            .expression_attribute_values(":lo", av(&format!("{}{}", ds::PREFIX, secs(since))))
+            .expression_attribute_values(":hi", av(&format!("{}~", ds::PREFIX)))
+            .projection_expression("sk")
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| format!("read deploy records: {e}"))?;
+        out.extend(
+            page.items()
+                .iter()
+                .filter_map(|i| ds::health::of_sk(&item_s(i, "sk"))),
+        );
+        match page.last_evaluated_key {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Checks one team's deploy records (`ds::health`): writes the reading the
+/// Learning health page shows, logs `deploy_records_stalled` (an alarm)
+/// while a busy team's deploys stopped being recorded, and opens a gap fill
+/// for the first hole not read yet. True when a gap fill was started.
+async fn check_health(state: &WorkerState, team_id: &str, item: &Item) -> bool {
+    let now = Utc::now();
+    let since = now - Duration::days(ds::health::LOOKBACK_DAYS + ds::health::BUSY_DAYS_BEFORE + 1);
+    let records = match records_since(state, team_id, since).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(team_id, error = %e, "Deploy health: could not read the records");
+            return false;
+        }
+    };
+    let times: Vec<DateTime<Utc>> = records.iter().map(|(t, _)| *t).collect();
+    let newest = times.last().map(|t| secs(*t)).unwrap_or_default();
+    // Runs bots triggered since the newest record: the count when the
+    // newest record changed is the mark.
+    let bot_runs = item_n(item, "bot_runs").max(0);
+    let mark = if item_s(item, "mark_newest") == newest {
+        item_n(item, "bot_runs_mark").clamp(0, bot_runs)
+    } else {
+        bot_runs
+    };
+    let since_newest = (bot_runs - mark) as u64;
+    let reading = ds::health::read(&times, since_newest, now);
+    let mut sets = vec![
+        ("checked_at", av(&now.to_rfc3339())),
+        ("state", av(reading.as_str())),
+        ("newest_at", av(&newest)),
+        ("mark_newest", av(&newest)),
+        ("bot_runs_mark", num(mark)),
+    ];
+    if let ds::health::Reading::Stalled {
+        since,
+        busy_days,
+        bot_runs,
+    } = &reading
+    {
+        // Matched by the worker's log alarm (infra monitoring stack).
+        warn!(
+            team_id,
+            since = %secs(*since),
+            busy_days,
+            bot_runs,
+            "deploy_records_stalled: a team that records deploys most days recorded none for two days while its bots kept working; reading the hole back"
+        );
+        sets.push(("stalled_since", av(&secs(*since))));
+    }
+    let progress = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", av(team_id))
+        .key("sk", av(ds::BACKFILL_PROGRESS_SK))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+    // Only after the first backfill, and one read at a time.
+    let idle = progress
+        .as_ref()
+        .is_some_and(|p| matches!(p.get("done"), Some(AttributeValue::Bool(true))));
+    let filled_from = progress
+        .as_ref()
+        .and_then(|p| parse_time(&item_s(p, "gap_filled_from")));
+    let mut opened = false;
+    if idle {
+        if let Some(gap) = ds::health::first_gap(&times, now, filled_from) {
+            opened = open_gap_fill(state, team_id, gap, &records, now).await;
+        }
+    }
+    update(state, team_id, ds::health::SK, &sets, &[]).await;
+    opened
+}
+
+/// Reads a hole back: each repository from its newest record before the
+/// hole (`ds::health::repo_starts`) to now, by the backfill's own passes.
+/// The team's marker stays; a record read again is the same item.
+async fn open_gap_fill(
+    state: &WorkerState,
+    team_id: &str,
+    gap: DateTime<Utc>,
+    records: &[(DateTime<Utc>, String)],
+    now: DateTime<Utc>,
+) -> bool {
+    let repos: Vec<String> = super::plan::fetch_team_repo_list(state, team_id)
+        .await
+        .into_iter()
+        .map(|r| r.full_name)
+        .collect();
+    let floor = now - Duration::days(ds::BACKFILL_DAYS);
+    let starts = ds::health::repo_starts(records, &repos, gap, floor);
+    for (repo, from) in &starts {
+        let sk = repo_sk(repo);
+        let mark = RepoMark::from_item(
+            state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", av(team_id))
+                .key("sk", av(&sk))
+                .send()
+                .await
+                .ok()
+                .and_then(|r| r.item().cloned())
+                .as_ref(),
+        );
+        // A repository CoderHelm can't read, or that is gone, stays so.
+        if matches!(mark.state, RepoState::NoAccess | RepoState::Gone) {
+            continue;
+        }
+        let Some(c) = Cursor::first(*from, now) else {
+            continue;
+        };
+        update(
+            state,
+            team_id,
+            &sk,
+            &[
+                ("read_state", av("reading")),
+                ("cursor_from", av(&secs(c.from))),
+                ("cursor_to", av(&secs(c.to))),
+                ("cursor_page", num(c.page)),
+                ("attempts", num(0)),
+                ("pauses", num(0)),
+            ],
+            &["reason"],
+        )
+        .await;
+    }
+    update(
+        state,
+        team_id,
+        ds::BACKFILL_PROGRESS_SK,
+        &[
+            ("gap_from", av(&secs(gap))),
+            ("gap_opened_at", av(&now.to_rfc3339())),
+            ("gap_filled_from", av(&secs(gap))),
+            ("lease_until", num(0)),
+        ],
+        &["done", "failed_passes", "last_error", "resume_at"],
+    )
+    .await;
+    info!(team_id, gap_from = %secs(gap), repos = starts.len(), "Deploys gap fill: reading the hole back");
+    let body = serde_json::to_string(&crate::models::WorkerMessage::DeployStatsBackfill(
+        DeployStatsBackfillMessage {
+            team_id: team_id.to_string(),
+            lease: None,
+        },
+    ))
+    .unwrap_or_default();
+    // Not queued: the next sweep starts it (the progress item is unfinished).
+    let _ = send(state, body, 0).await;
+    true
+}
+
+/// One pass over the team's repositories. `gap`: reading a hole back after
+/// the first backfill finished; the team's marker (from when deploys are
+/// known, which repositories can't be read) stays as it is.
+async fn backfill_pass(state: &WorkerState, team_id: &str, gap: bool) -> Result<PassEnd, String> {
     let table = &state.config.settings_table_name;
     let started = Instant::now();
     let out_of_time = move || started.elapsed().as_secs() > PASS_BUDGET_SECS;
@@ -1382,6 +1690,9 @@ async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, St
     progress(state, team_id, &counts(read)).await;
     if retry_later {
         return Ok(PassEnd::Again(RETRY_DELAY_SECS));
+    }
+    if gap {
+        return Ok(PassEnd::Finished);
     }
     let mut req = state
         .dynamo
@@ -2093,5 +2404,42 @@ mod tests {
             ("failed_passes", num(MAX_FAILED_PASSES - 1)),
         ]);
         assert!(should_resume(&one_short, now));
+    }
+
+    /// The backfill was marked done and never read again, so seventeen days
+    /// of deploys the webhooks dropped stayed missing. A hole opened for
+    /// reading back is carried by the same passes until it is read.
+    #[test]
+    fn a_hole_opened_for_reading_back_runs_until_it_is_read() {
+        let now = 1_800_000_000;
+        let open = progress_item(&[
+            ("gap_from", av("2026-11-06T21:26:48Z")),
+            ("lease_until", num(0)),
+        ]);
+        assert_eq!(
+            gap_open(Some(&open)).as_deref(),
+            Some("2026-11-06T21:26:48Z")
+        );
+        assert!(should_resume(&open, now));
+        // Read: done again, and nothing left open.
+        let read = progress_item(&[
+            ("gap_from", av("2026-11-06T21:26:48Z")),
+            ("done", AttributeValue::Bool(true)),
+        ]);
+        assert_eq!(gap_open(Some(&read)), None);
+        assert_eq!(gap_open(Some(&progress_item(&[]))), None);
+        assert_eq!(gap_open(None), None);
+    }
+
+    #[test]
+    fn a_teams_deploy_health_is_checked_hourly() {
+        let now = Utc::now();
+        let item =
+            |checked: &str| -> Item { HashMap::from([("checked_at".to_string(), av(checked))]) };
+        assert!(health_due(&HashMap::new(), now.timestamp()));
+        let recent = item(&(now - Duration::minutes(10)).to_rfc3339());
+        assert!(!health_due(&recent, now.timestamp()));
+        let old = item(&(now - Duration::minutes(61)).to_rfc3339());
+        assert!(health_due(&old, now.timestamp()));
     }
 }

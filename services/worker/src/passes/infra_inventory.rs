@@ -31,7 +31,7 @@ use common::infra_vuln::raw::{
     RawInstance, RawLoadBalancer, RawNodegroup, RawPending, RawService,
 };
 use common::live::aws::Session;
-use common::live::aws_account::{self, AwsAccount};
+use common::live::aws_account::AwsAccount;
 use tracing::{info, warn};
 
 use crate::passes::{attr_n, attr_s};
@@ -1728,40 +1728,26 @@ async fn save(
     n
 }
 
-/// Every connected account an admin switched the option on for, by team.
+/// Every connected account an admin switched the option on for, by team:
+/// read team by team to the last page (a capped scan of the AWS insights
+/// table stopped before reaching some accounts).
 async fn accounts(state: &WorkerState) -> Vec<(String, AwsAccount)> {
-    let mut out = Vec::new();
-    let mut start = None;
-    for _ in 0..50 {
-        let Ok(page) = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.aws_insights_table_name)
-            .filter_expression("begins_with(sk, :p) AND infra_on = :on")
-            .expression_attribute_values(":p", AttributeValue::S(aws_account::PREFIX.into()))
-            .expression_attribute_values(":on", AttributeValue::Bool(true))
-            .set_exclusive_start_key(start)
-            .send()
-            .await
-        else {
-            break;
-        };
-        for item in page.items() {
-            let team = item
-                .get("pk")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            if let (false, Some(a)) = (team.is_empty(), AwsAccount::from_item(item)) {
-                out.push((team, a));
-            }
+    let by_team = match super::aws_permissions::accounts_by_team(state).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "Infrastructure inventory: could not list the connected accounts");
+            return Vec::new();
         }
-        start = page.last_evaluated_key().cloned();
-        if start.is_none() {
-            break;
-        }
-    }
-    out
+    };
+    by_team
+        .into_iter()
+        .flat_map(|(team, accounts)| {
+            accounts
+                .into_iter()
+                .filter(|a| a.infra_on())
+                .map(move |a| (team.clone(), a))
+        })
+        .collect()
 }
 
 /// Asks AWS to apply one pending RDS or Aurora action on one ARN

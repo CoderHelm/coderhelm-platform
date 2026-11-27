@@ -39,6 +39,13 @@ pub const FLOORPLAN_VERSION: &str = include_str!("../../../vendor/floorplan/VERS
 /// Floorplan's job file: the model jobs, their instructions and schemas.
 pub const WORKFLOW_JSON: &str =
     include_str!("../../../vendor/floorplan/skills/floorplan/workflow.json");
+/// The version of what extracts the map: a hash of the sandbox's driver,
+/// CoderHelm's detectors and the vendored Floorplan's release (`build.rs`).
+/// Each map carries the version that made it (the job, the status and
+/// `graph.coderhelm.extractor`); a map made by another version is built
+/// again in full, once ([`queue_for_extractor`]), so a release that finds
+/// more shows it without anyone pressing "Build the map again".
+pub const EXTRACTOR_VERSION: &str = env!("CODERHELM_APP_MAP_EXTRACTOR");
 /// The map format this adapter reads.
 pub const GRAPH_SCHEMA: &str = "floorplan/graph@1";
 /// Largest map served to the page (bytes of JSON).
@@ -94,6 +101,36 @@ pub fn job_key(team_id: &str) -> String {
     format!("{}/job.json", s3_prefix(team_id))
 }
 
+/// The journeys the model is to write after a build (the sandbox's
+/// candidates and the entries to cover), until it has.
+pub fn flows_todo_key(team_id: &str) -> String {
+    format!("{}/flows-todo.json.gz", s3_prefix(team_id))
+}
+
+/// The worksheets a description step had no time left for, continued in
+/// the next step.
+/// What tracing journeys has cost a team today (`{day, usd}`).
+pub fn flows_spend_key(team_id: &str) -> String {
+    format!("{}/flows-spend.json", s3_prefix(team_id))
+}
+
+/// Who is tracing a team's journeys now (`{until}`), so a message
+/// delivered twice runs once.
+pub fn flows_lease_key(team_id: &str) -> String {
+    format!("{}/flows-lease.json", s3_prefix(team_id))
+}
+
+/// When a team's journeys step may next run (`{seq, at}`): exactly one
+/// message carries `seq` as its turn; any other is an older resume and is
+/// dropped, and one that arrives before `at` waits for it.
+pub fn flows_next_key(team_id: &str) -> String {
+    format!("{}/flows-next.json", s3_prefix(team_id))
+}
+
+pub fn describe_key(team_id: &str) -> String {
+    format!("{}/describe.json.gz", s3_prefix(team_id))
+}
+
 pub const STATUS_SK: &str = "STATUS";
 /// A build queued or running this long is treated as stuck.
 pub const STALE_SECS: i64 = 45 * 60;
@@ -144,6 +181,45 @@ pub struct Status {
     /// Repositories that map was made from.
     #[serde(default)]
     pub built_repos: u32,
+    /// Repositories the map left out, whole or in part, because every
+    /// repository together is larger than the snapshot holds (`owner/name`),
+    /// so the page can say which.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cut: Vec<String>,
+    /// The extractor ([`EXTRACTOR_VERSION`]) the map there now was made by
+    /// (empty: a map from before maps carried it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extractor: String,
+    /// The extractor a build was last asked for because the map was made by
+    /// another one, so each release asks once: a build for it that fails is
+    /// not asked for again on every visit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub asked_extractor: String,
+    /// Repositories the journeys step couldn't read from GitHub on its last
+    /// pass (`owner/name`): the journeys through them wait and are traced
+    /// once they can be read, and the list clears itself then
+    /// ([`unread_line`] words it for the page).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<String>,
+}
+
+/// The status's plain line about repositories the journeys couldn't read
+/// (empty when every one could).
+pub fn unread_line(unread: &[String]) -> String {
+    let names: Vec<&str> = unread
+        .iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r))
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => format!(
+            "{one} couldn't be read from GitHub just now, so the journeys through it wait; they are traced once it can be read, and every other journey goes on."
+        ),
+        [rest @ .., last] => format!(
+            "{} and {last} couldn't be read from GitHub just now, so the journeys through them wait; they are traced once they can be read, and every other journey goes on.",
+            rest.join(", ")
+        ),
+    }
 }
 
 impl Status {
@@ -180,7 +256,43 @@ pub fn queue_next(cur: Option<&Status>, now: i64, build: &str) -> Option<Status>
         },
         built: prev.built,
         built_repos: prev.built_repos,
+        // The map that is there now still left these out.
+        cut: prev.cut,
+        extractor: prev.extractor,
+        asked_extractor: prev.asked_extractor,
+        unread: prev.unread,
     })
+}
+
+/// Whether the map there now was made by another extractor than `running`
+/// and no build has been asked for `running` yet.
+pub fn made_by_another_extractor(cur: Option<&Status>, has_map: bool, running: &str) -> bool {
+    has_map && cur.is_none_or(|s| s.extractor != running && s.asked_extractor != running)
+}
+
+/// A new build because the map there now was made by another extractor
+/// than `running`, marked as asked for it: `None` when the map is the
+/// running extractor's, a build was already asked for it, or a build is
+/// queued or running (which builds with the running extractor anyway).
+pub fn queue_for_extractor(
+    cur: Option<&Status>,
+    now: i64,
+    build: &str,
+    running: &str,
+) -> Option<Status> {
+    if !made_by_another_extractor(cur, true, running) {
+        return None;
+    }
+    let mut s = queue_next(cur, now, build)?;
+    s.asked_extractor = running.to_string();
+    Some(s)
+}
+
+/// Whether the running build was asked for because the map was made by
+/// another extractor (the page says it is being rebuilt with the release's
+/// improvements).
+pub fn rebuilding_for_release(s: &Status, now: i64) -> bool {
+    s.is_running(now) && s.asked_extractor == EXTRACTOR_VERSION && s.extractor != EXTRACTOR_VERSION
 }
 
 /// The worker taking turn `turn` of build `build` (one message of it):
@@ -329,51 +441,84 @@ pub async fn update_status(
     team_id: &str,
     change: impl Fn(Option<&Status>) -> Option<Status>,
 ) -> Result<Updated, String> {
+    update_versioned(
+        || read_status(dynamo, table, team_id),
+        |next: Status, version: Option<i64>| put_status(dynamo, table, team_id, next, version),
+        change,
+    )
+    .await
+}
+
+/// [`update_status`]'s loop over any versioned store: `read` gives the
+/// status and its version, `put` writes the next one conditioned on that
+/// version (`Ok(false)` when another write came first).
+async fn update_versioned<R, RF, P, PF>(
+    read: R,
+    put: P,
+    change: impl Fn(Option<&Status>) -> Option<Status>,
+) -> Result<Updated, String>
+where
+    R: Fn() -> RF,
+    RF: std::future::Future<Output = Result<(Option<Status>, Option<i64>), String>>,
+    P: Fn(Status, Option<i64>) -> PF,
+    PF: std::future::Future<Output = Result<bool, String>>,
+{
     for _ in 0..5 {
-        let (cur, version) = read_status(dynamo, table, team_id).await?;
+        let (cur, version) = read().await?;
         let Some(next) = change(cur.as_ref()) else {
             return Ok(Updated::Kept(cur));
         };
-        let v = version.unwrap_or(0);
-        let mut put = dynamo
-            .put_item()
-            .table_name(table)
-            .item("pk", A::S(map_pk(team_id)))
-            .item("sk", A::S(STATUS_SK.into()))
-            .item(
-                "json",
-                A::S(serde_json::to_string(&next).unwrap_or_default()),
-            )
-            .item("state", A::S(next.state.clone()))
-            .item("at", A::N(next.at.to_string()))
-            .item("v", A::N((v + 1).to_string()));
-        put = match version {
-            None => put.condition_expression("attribute_not_exists(pk)"),
-            Some(0) => put
-                .condition_expression("attribute_not_exists(#v)")
-                .expression_attribute_names("#v", "v"),
-            Some(v) => put
-                .condition_expression("#v = :v")
-                .expression_attribute_names("#v", "v")
-                .expression_attribute_values(":v", A::N(v.to_string())),
-        };
-        match put.send().await {
-            Ok(_) => return Ok(Updated::Written(next)),
-            Err(e)
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
-            {
-                continue
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{}",
-                    aws_sdk_dynamodb::error::DisplayErrorContext(e)
-                ))
-            }
+        if put(next.clone(), version).await? {
+            return Ok(Updated::Written(next));
         }
     }
     Err("the map's build status kept changing; try again".into())
+}
+
+/// Writes `next` if the status is still at `version` (`Ok(false)` if not).
+async fn put_status(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+    next: Status,
+    version: Option<i64>,
+) -> Result<bool, String> {
+    let v = version.unwrap_or(0);
+    let mut put = dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", A::S(map_pk(team_id)))
+        .item("sk", A::S(STATUS_SK.into()))
+        .item(
+            "json",
+            A::S(serde_json::to_string(&next).unwrap_or_default()),
+        )
+        .item("state", A::S(next.state.clone()))
+        .item("at", A::N(next.at.to_string()))
+        .item("v", A::N((v + 1).to_string()));
+    put = match version {
+        None => put.condition_expression("attribute_not_exists(pk)"),
+        Some(0) => put
+            .condition_expression("attribute_not_exists(#v)")
+            .expression_attribute_names("#v", "v"),
+        Some(v) => put
+            .condition_expression("#v = :v")
+            .expression_attribute_names("#v", "v")
+            .expression_attribute_values(":v", A::N(v.to_string())),
+    };
+    match put.send().await {
+        Ok(_) => Ok(true),
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(format!(
+            "{}",
+            aws_sdk_dynamodb::error::DisplayErrorContext(e)
+        )),
+    }
 }
 
 /// Asks for a build: `Ok(Ok(new))` when it is queued (send its message),
@@ -389,6 +534,28 @@ pub async fn queue_build(
     match update_status(dynamo, table, team_id, |cur| queue_next(cur, now, &build)).await? {
         Updated::Written(s) => Ok(Ok(s)),
         Updated::Kept(cur) => Ok(Err(cur)),
+    }
+}
+
+/// Asks for a build because the team's map was made by another extractor
+/// than this release's ([`queue_for_extractor`]): `Ok(Some(new))` when it is
+/// queued (send its message), `Ok(None)` when no build is needed or one is
+/// already asked for, queued or running. The same conditional write as
+/// [`queue_build`], so two readers at once queue one build.
+pub async fn queue_release_build(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+) -> Result<Option<Status>, String> {
+    let now = chrono::Utc::now().timestamp();
+    let build = format!("{:032x}", rand::random::<u128>());
+    match update_status(dynamo, table, team_id, |cur| {
+        queue_for_extractor(cur, now, &build, EXTRACTOR_VERSION)
+    })
+    .await?
+    {
+        Updated::Written(s) => Ok(Some(s)),
+        Updated::Kept(_) => Ok(None),
     }
 }
 
@@ -525,7 +692,407 @@ pub fn stamp_repos(graph: &mut Value, folders: &BTreeMap<String, String>) {
         .iter()
         .map(|(repo, folder)| (folder.clone(), json!(repo)))
         .collect();
-    graph["coderhelm"] = json!({ "repos": m, "floorplan": FLOORPLAN_VERSION.trim() });
+    graph["coderhelm"] = json!({
+        "repos": m,
+        "floorplan": FLOORPLAN_VERSION.trim(),
+        "extractor": EXTRACTOR_VERSION,
+    });
+}
+
+/// Records on the map the repositories its snapshot left out, whole or in
+/// part (`owner/name`), so the page can say so.
+pub fn stamp_cut(graph: &mut Value, cut: &[String]) {
+    if !cut.is_empty() {
+        graph["coderhelm"]["cut"] = json!(cut);
+    }
+}
+
+/// Past this many characters, or more than three repositories, a card that
+/// covers several repositories is titled by the first and how many more.
+const TITLE_MAX: usize = 32;
+
+/// Each map folder's repository name as GitHub has it, without the owner
+/// (`coderhelm.repos`; a map without it names its folders in `meta.repos`).
+fn repo_names(graph: &Value) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = arr(&graph["meta"], "repos")
+        .filter_map(|r| {
+            let folder = r["path"].as_str()?;
+            Some((
+                folder.to_string(),
+                r["name"].as_str().unwrap_or(folder).to_string(),
+            ))
+        })
+        .collect();
+    for (folder, repo) in repo_of_folder(graph) {
+        let name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+        out.insert(folder, name);
+    }
+    out
+}
+
+/// Whether a node is a card on the System board (`level: system`) or a
+/// top-level part (the Parts level's cards, and what the System board shows
+/// in place of the cloud resources folded into it).
+fn is_system(n: &Value) -> bool {
+    n["level"] == "system" || n["parent"].is_null()
+}
+
+/// A card's repositories: each folder with the paths inside it.
+type CardRepos = Vec<(String, Vec<Vec<String>>)>;
+
+/// The repositories a card's own paths are in, in the paths' order: each
+/// folder with the paths inside it, globs and slashes stripped (empty for the
+/// whole repository).
+fn card_repos(n: &Value, names: &HashMap<String, String>) -> CardRepos {
+    let mut out: CardRepos = Vec::new();
+    for p in arr(n, "paths").filter_map(Value::as_str) {
+        let mut segs = p
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "." && !s.contains(['*', '?', '[', '{']));
+        let Some(folder) = segs.next() else { continue };
+        if !names.contains_key(folder) {
+            continue;
+        }
+        let rest: Vec<String> = segs.map(str::to_string).collect();
+        match out.iter_mut().find(|x| x.0 == folder) {
+            Some((_, paths)) if !paths.contains(&rest) => paths.push(rest),
+            Some(_) => {}
+            None => out.push((folder.to_string(), vec![rest])),
+        }
+    }
+    out
+}
+
+/// Top-level folders a repository's cards share (its packages, tests, CI,
+/// scripts): a card that holds one of them beside its own app is named by
+/// the app.
+const SHARED_TOP: [&str; 11] = [
+    "packages", "e2e", ".github", "scripts", "docs", "test", "tests", "tools", "config", ".husky",
+    "shared",
+];
+
+/// Folders that only hold other folders: never a card's name on their own.
+const CONTAINERS: [&str; 10] = [
+    "apps",
+    "packages",
+    "services",
+    "src",
+    "lib",
+    "libs",
+    "modules",
+    "projects",
+    "workspaces",
+    "source",
+];
+
+/// The card's main path in one repository: its path outside the shared
+/// top-level folders holding the most of the map's files (the first on a
+/// tie); `None` when the card is the whole repository.
+fn main_path(graph: &Value, folder: &str, paths: &[Vec<String>]) -> Option<Vec<String>> {
+    if paths.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let own: Vec<&Vec<String>> = paths
+        .iter()
+        .filter(|p| !SHARED_TOP.contains(&p[0].as_str()))
+        .collect();
+    let pool = if own.is_empty() {
+        paths.iter().collect()
+    } else {
+        own
+    };
+    let files_under = |p: &Vec<String>| {
+        let prefix = format!("{folder}/{}/", p.join("/"));
+        arr(graph, "files")
+            .filter(|f| f["p"].as_str().is_some_and(|x| x.starts_with(&prefix)))
+            .count()
+    };
+    let mut best: Option<(&Vec<String>, usize)> = None;
+    for p in pool {
+        let c = files_under(p);
+        if best.is_none_or(|(_, b)| c > b) {
+            best = Some((p, c));
+        }
+    }
+    best.map(|(p, _)| p.clone())
+}
+
+/// The words a path is named by, shortest first: its most specific folder
+/// that is not a container (`apps/web` is `web`), then longer endings of the
+/// path (`admin/web`), to tell two cards apart.
+fn path_names(path: &[String]) -> Vec<String> {
+    let last = path
+        .iter()
+        .rposition(|s| !CONTAINERS.contains(&s.as_str()))
+        .unwrap_or(path.len() - 1);
+    let mut out = vec![path[last].clone()];
+    for k in (0..last).rev() {
+        out.push(path[k..=last].join("/"));
+    }
+    out
+}
+
+/// A card's title from its repositories' names (see [`name_by_repo`]).
+pub fn repo_title(names: &[String]) -> String {
+    let joined = names.join(", ");
+    if names.len() <= 3 && joined.chars().count() <= TITLE_MAX {
+        joined
+    } else {
+        format!("{} +{} more", names[0], names.len() - 1)
+    }
+}
+
+/// System cards titled by the repositories they are, the way people know
+/// them, instead of a role a model gave them:
+///
+/// - a card that is one repository: its name on GitHub, without the owner
+///   (`harbor-api`);
+/// - a card that covers several: their names joined, or the first and how
+///   many more when that is long ([`repo_title`]); "more" counts
+///   repositories only, never paths;
+/// - a card that is one of several cards in the same repository (a web app
+///   and a content studio in one repository): `repo / folder`, the folder
+///   being one word from the card's main path (`site/apps/web/**` is
+///   `site / web`; globs, containers like `apps` and the repository's shared
+///   folders like `packages` or `e2e` left out), longer only when two cards
+///   would read the same;
+/// - a card that is no repository (outside services, cloud resources, a
+///   cloud setup made from no repository's folder) keeps its name.
+///
+/// A renamed card keeps its old name as its `role` (unless it was already
+/// the repository's name) and lists every name in `repos`. Read from the
+/// paths the map already keeps, so a map built before this is named the
+/// same way; naming a map twice changes nothing.
+pub fn name_by_repo(graph: &mut Value) {
+    let names = repo_names(graph);
+    if names.is_empty() {
+        return;
+    }
+    let cards: Vec<(usize, CardRepos)> = arr(graph, "nodes")
+        .enumerate()
+        .filter(|(_, n)| is_system(n) && n["kind"] != "external")
+        .map(|(i, n)| (i, card_repos(n, &names)))
+        .filter(|(_, r)| !r.is_empty())
+        .collect();
+    // How many cards each repository is split across.
+    let mut cards_in: HashMap<&str, usize> = HashMap::new();
+    for (_, rs) in &cards {
+        for (folder, _) in rs {
+            *cards_in.entry(folder).or_default() += 1;
+        }
+    }
+    // The folder word of each (card, repository) split across several cards:
+    // the shortest that no other card in that repository shares.
+    let mut word: HashMap<(usize, &str), String> = HashMap::new();
+    let mut by_repo: BTreeMap<&str, Vec<(usize, Vec<String>)>> = BTreeMap::new();
+    for (i, rs) in &cards {
+        for (folder, paths) in rs {
+            if cards_in[folder.as_str()] > 1 {
+                if let Some(m) = main_path(graph, folder, paths) {
+                    by_repo
+                        .entry(folder)
+                        .or_default()
+                        .push((*i, path_names(&m)));
+                }
+            }
+        }
+    }
+    for (folder, list) in &by_repo {
+        for (i, options) in list {
+            let others: Vec<&Vec<String>> = list
+                .iter()
+                .filter(|(j, _)| j != i)
+                .map(|(_, o)| o)
+                .collect();
+            let pick = options
+                .iter()
+                .find(|w| !others.iter().any(|o| o.contains(w)))
+                .unwrap_or_else(|| options.last().unwrap_or(&options[0]));
+            word.insert((*i, folder), pick.clone());
+        }
+    }
+    let mut titled: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, rs) in &cards {
+        let mut list: Vec<String> = Vec::new();
+        for (folder, _) in rs {
+            let name = &names[folder];
+            let entry = match word.get(&(*i, folder.as_str())) {
+                Some(w) => format!("{name} / {w}"),
+                None => name.clone(),
+            };
+            if !list.contains(&entry) {
+                list.push(entry);
+            }
+        }
+        titled.push((*i, list));
+    }
+    let Some(nodes) = graph["nodes"].as_array_mut() else {
+        return;
+    };
+    for (i, list) in titled {
+        let n = &mut nodes[i];
+        // Named before (by this or an earlier release): its own name is its role.
+        let named = n.get("repos").is_some();
+        let own = if named {
+            n["role"].clone()
+        } else {
+            n["label"].clone()
+        };
+        let title = repo_title(&list);
+        match own.as_str() {
+            Some(l) if !l.trim().is_empty() && l != title => n["role"] = own.clone(),
+            _ => {
+                if let Some(o) = n.as_object_mut() {
+                    o.remove("role");
+                }
+            }
+        }
+        n["label"] = json!(title);
+        n["repos"] = json!(list);
+    }
+    place_screens(graph, &names);
+}
+
+/// Every screen under exactly one System card, the one its own file is in,
+/// so the page's screen list, the overview's counts and the lookups group a
+/// screen by the card it belongs to, never by a bare repository:
+///
+/// - the card whose paths hold the screen's file (its route, renderer or
+///   schema file), matched as [`name_by_repo`] matches them; when several
+///   do, the most specific path wins;
+/// - else the card the file's own part sits in;
+/// - else the repository's main card (the one holding most of its files).
+///
+/// Sets the screen's `app` and `nav.app` to the card's id and `app_name` to
+/// its title; the folder a detector gave as `nav.app` stays as `nav.repo`.
+/// Placing twice changes nothing.
+fn place_screens(graph: &mut Value, names: &HashMap<String, String>) {
+    // (card id, folder, path inside it) for every card made from a repository.
+    let mut spans: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut card_ids: BTreeSet<String> = BTreeSet::new();
+    for n in arr(graph, "nodes").filter(|n| is_system(n) && n["kind"] != "external") {
+        let Some(id) = n["id"].as_str() else { continue };
+        for (folder, paths) in card_repos(n, names) {
+            card_ids.insert(id.to_string());
+            for p in paths {
+                spans.push((id.to_string(), folder.clone(), p));
+            }
+        }
+    }
+    if spans.is_empty() {
+        return;
+    }
+    let title: HashMap<String, String> = arr(graph, "nodes")
+        .filter_map(|n| {
+            Some((
+                n["id"].as_str()?.to_string(),
+                n["label"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let parents: HashMap<String, String> = arr(graph, "nodes")
+        .filter_map(|n| {
+            Some((
+                n["id"].as_str()?.to_string(),
+                n["parent"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let part_of: HashMap<&str, &str> = arr(graph, "files")
+        .filter_map(|f| Some((f["p"].as_str()?, f["n"].as_str()?)))
+        .collect();
+    // The card a path is in by the cards' paths: the longest that holds it.
+    let by_paths = |file: &str| -> Option<String> {
+        let mut segs = file.split('/').filter(|s| !s.is_empty());
+        let folder = segs.next()?;
+        let rest: Vec<&str> = segs.collect();
+        spans
+            .iter()
+            .filter(|(_, f, p)| {
+                f == folder && p.len() <= rest.len() && p.iter().zip(&rest).all(|(a, b)| a == b)
+            })
+            .max_by_key(|(_, _, p)| p.len())
+            .map(|(id, _, _)| id.clone())
+    };
+    // The card a file's own part sits in.
+    let by_part = |file: &str| -> Option<String> {
+        let mut cur = part_of.get(file)?.to_string();
+        for _ in 0..40 {
+            if card_ids.contains(&cur) {
+                return Some(cur);
+            }
+            cur = parents.get(&cur)?.clone();
+        }
+        None
+    };
+    // Each repository's main card: the one holding most of its files.
+    let mut held: HashMap<String, BTreeMap<String, usize>> = HashMap::new();
+    for f in arr(graph, "files") {
+        if let Some(p) = f["p"].as_str() {
+            if let (Some(card), Some(folder)) = (by_paths(p), p.split('/').next()) {
+                *held
+                    .entry(folder.to_string())
+                    .or_default()
+                    .entry(card)
+                    .or_default() += 1;
+            }
+        }
+    }
+    let main_card = |folder: &str| -> Option<String> {
+        if let Some(m) = held.get(folder) {
+            // most files, then the first card in the map's order on a tie
+            let order = |id: &String| {
+                spans
+                    .iter()
+                    .position(|(c, _, _)| c == id)
+                    .unwrap_or(usize::MAX)
+            };
+            return m
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| order(b.0).cmp(&order(a.0))))
+                .map(|(c, _)| c.clone());
+        }
+        spans
+            .iter()
+            .find(|(_, f, _)| f == folder)
+            .map(|(c, _, _)| c.clone())
+    };
+    let placed: Vec<Option<(String, String)>> = arr(graph, "screens")
+        .map(|s| {
+            let nav = &s["nav"];
+            let files: Vec<&str> = [s["file"].as_str(), nav["dispatcher"].as_str()]
+                .into_iter()
+                .flatten()
+                .chain(arr(nav, "evidence").filter_map(|e| e["file"].as_str()))
+                .collect();
+            let card = files
+                .iter()
+                .find_map(|f| by_paths(f))
+                .or_else(|| files.iter().find_map(|f| by_part(f)))
+                .or_else(|| files.iter().find_map(|f| main_card(f.split('/').next()?)))?;
+            let repo = nav["repo"]
+                .as_str()
+                .or(nav["app"].as_str().filter(|a| names.contains_key(*a)))
+                .or(files.first().and_then(|f| f.split('/').next()))
+                .unwrap_or("")
+                .to_string();
+            Some((card, repo))
+        })
+        .collect();
+    let Some(screens) = graph["screens"].as_array_mut() else {
+        return;
+    };
+    for (s, p) in screens.iter_mut().zip(placed) {
+        let Some((card, repo)) = p else { continue };
+        s["app"] = json!(card);
+        s["app_name"] = json!(title.get(&card).cloned().unwrap_or_else(|| card.clone()));
+        if s["nav"].is_object() {
+            s["nav"]["app"] = json!(card);
+            if !repo.is_empty() {
+                s["nav"]["repo"] = json!(repo);
+            }
+        }
+    }
 }
 
 fn arr<'a>(v: &'a Value, k: &str) -> impl Iterator<Item = &'a Value> {
@@ -589,6 +1156,85 @@ pub struct MapIndex {
     pub issues: Vec<IndexIssue>,
     /// Whether the map has a Health section at all.
     pub has_health: bool,
+    /// What the map covers, counted at build time (the Knowledge page's
+    /// card). Empty on an index written before it was counted.
+    #[serde(default)]
+    pub coverage: Coverage,
+    /// How the page's copy written with this index was made
+    /// ([`COPY_VERSION`]); 0 on one written before it was counted.
+    #[serde(default)]
+    pub copy: u32,
+}
+
+/// Raised when the page's copy of a map ([`viewer_copy`]) changes in a way
+/// the stored map already holds what it needs for, so the read API writes
+/// the copy again from the stored map instead of waiting for a build.
+/// 1: System cards titled by their repositories ([`name_by_repo`]). 2: a
+/// card split from a shared repository named by one folder word, not its
+/// path globs. 3: every screen under the System card its file is in
+/// ([`place_screens`]).
+pub const COPY_VERSION: u32 = 3;
+
+/// What a map covers, for the Knowledge page: screens per app, outside
+/// services, cloud links and repositories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Whether this was counted (an older index has no counts).
+    #[serde(default)]
+    pub counted: bool,
+    #[serde(default)]
+    pub screens: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub outside_services: u32,
+    /// Links between code and the cloud: what deploys or starts it.
+    #[serde(default)]
+    pub cloud_links: u32,
+    #[serde(default)]
+    pub repos: u32,
+    #[serde(default)]
+    pub journeys: u32,
+    /// Journeys still being traced (entries waiting for a later pass).
+    #[serde(default)]
+    pub journeys_pending: u32,
+}
+
+impl Coverage {
+    pub fn of(graph: &Value) -> Self {
+        let kind = |id: &str| {
+            id.strip_prefix("n:")
+                .and_then(|n| arr(graph, "nodes").find(|x| x["id"] == n))
+                .and_then(|x| x["kind"].as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let screens = screen_counts(graph)
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            counted: true,
+            screens,
+            outside_services: arr(graph, "nodes")
+                .filter(|n| n["kind"] == "external")
+                .count() as u32,
+            cloud_links: arr(graph, "links")
+                .filter(|l| {
+                    [&l["a"], &l["b"]]
+                        .iter()
+                        .any(|e| e.as_str().is_some_and(|id| kind(id) == "infra"))
+                })
+                .count() as u32,
+            repos: arr(&graph["meta"], "repos")
+                .count()
+                .max(repo_of_folder(graph).len()) as u32,
+            journeys: arr(graph, "flows").count() as u32,
+            journeys_pending: graph["coderhelm"]["journeys_pending"].as_u64().unwrap_or(0) as u32,
+        }
+    }
 }
 
 impl MapIndex {
@@ -633,6 +1279,8 @@ impl MapIndex {
             repo_parts,
             issues,
             has_health: graph.get("health").is_some(),
+            coverage: Coverage::of(graph),
+            copy: COPY_VERSION,
         }
     }
 
@@ -928,14 +1576,25 @@ pub fn for_viewer(mut graph: Value, now: &str) -> Value {
 /// labelled, read-only, without the sandbox's folder. CoderHelm's overlays
 /// are laid over it on the page.
 pub fn viewer_copy(graph: &Value, now: &str) -> Value {
-    for_viewer(labelled(graph.clone()), now)
+    let mut g = labelled(graph.clone());
+    name_by_repo(&mut g);
+    for_viewer(g, now)
 }
 
 /// The page's copy and the index of a map, gzipped, as they are stored.
 pub fn derived(graph: &Value, now: &str) -> (Vec<u8>, Vec<u8>) {
-    let view = gzip(viewer_copy(graph, now).to_string().as_bytes());
-    let index = gzip(&serde_json::to_vec(&MapIndex::of(graph)).unwrap_or_default());
+    let (view, index, _) = derived_with_index(graph, now);
     (view, index)
+}
+
+/// [`derived`] and the index itself. The index is counted on the copy, so
+/// screens are counted by the card they are under.
+fn derived_with_index(graph: &Value, now: &str) -> (Vec<u8>, Vec<u8>, MapIndex) {
+    let copy = viewer_copy(graph, now);
+    let view = gzip(copy.to_string().as_bytes());
+    let idx = MapIndex::of(&copy);
+    let index = gzip(&serde_json::to_vec(&idx).unwrap_or_default());
+    (view, index, idx)
 }
 
 /// Writes the page's copy and the index of `graph` next to it (the worker
@@ -948,7 +1607,7 @@ pub async fn store_derived(
     team_id: &str,
     graph: &Value,
 ) -> Result<MapIndex, String> {
-    let (view, index) = derived(graph, &chrono::Utc::now().to_rfc3339());
+    let (view, index, idx) = derived_with_index(graph, &chrono::Utc::now().to_rfc3339());
     s3.put_object()
         .bucket(bucket)
         .key(view_key(team_id))
@@ -968,7 +1627,7 @@ pub async fn store_derived(
         .send()
         .await
         .map_err(|e| format!("app map: could not keep the map's index: {e}"))?;
-    Ok(MapIndex::of(graph))
+    Ok(idx)
 }
 
 /// The team's map index and when it was written (unix seconds), if any.
@@ -996,11 +1655,58 @@ fn node(graph: &Value, id: &str) -> Option<Value> {
     arr(graph, "nodes").find(|n| n["id"] == id).cloned()
 }
 
-/// A short record for a map id (`n:`, `f:`, `r:`).
+/// Copies the fields `keys` that `from` has (and are not null) into `to`.
+fn keep(to: &mut Value, from: &Value, keys: &[&str]) {
+    for k in keys {
+        if !from[*k].is_null() {
+            to[*k] = from[*k].clone();
+        }
+    }
+}
+
+/// Where something on the map was found: up to `n` `file:line` places,
+/// with how each was found (`code`, or `inferred` from a name, a domain or
+/// an env key) — CoderHelm's detectors put these on what they add.
+fn evidence_json(v: &Value, n: usize) -> Value {
+    json!(arr(v, "evidence")
+        .take(n)
+        .map(|e| json!({"at": format!("{}:{}", e["file"].as_str().unwrap_or(""), e["line"].as_u64().unwrap_or(1)), "how": e["how"]}))
+        .collect::<Vec<_>>())
+}
+
+/// A part's own record: outside services say which vendor and how they were
+/// found, infra says which resource.
+fn node_json(x: &Value) -> Value {
+    let mut out =
+        json!({"id": x["id"], "label": x["label"], "kind": x["kind"], "summary": x["summary"]});
+    keep(
+        &mut out,
+        x,
+        &[
+            "level", "role", "repos", "vendor", "how", "inferred", "category", "env", "services",
+            "resource", "domains",
+        ],
+    );
+    if x.get("evidence").is_some() {
+        out["evidence"] = evidence_json(x, 5);
+    }
+    out
+}
+
+/// A short record for a map id (`n:`, `f:`, `r:`, `screen:`).
 fn describe_ref(graph: &Value, id: &str) -> Value {
     if let Some(n) = id.strip_prefix("n:") {
         if let Some(x) = node(graph, n) {
-            return json!({"id": id, "label": x["label"], "kind": x["kind"], "summary": x["summary"]});
+            let mut d = node_json(&x);
+            d["id"] = json!(id);
+            if let Some(o) = d.as_object_mut() {
+                o.remove("evidence");
+            }
+            return d;
+        }
+    } else if id.starts_with("screen:") {
+        if let Some(s) = arr(graph, "screens").find(|s| s["id"] == id) {
+            return screen_json(s);
         }
     } else if let Some(p) = id.strip_prefix("f:") {
         if let Some(f) = arr(graph, "files").find(|f| f["p"] == p) {
@@ -1014,26 +1720,98 @@ fn describe_ref(graph: &Value, id: &str) -> Value {
     json!({ "id": id })
 }
 
+/// A screen in short: where it is, which app and navigator hold it, and
+/// whether it needs a signed-in user. A screen a dynamic route dispatches
+/// to by type also says the type, its renderer and where it is declared,
+/// the route file that dispatches to it, and whether its URL pattern was
+/// read from the code (`url_from`) or is the route's own.
+fn screen_json(s: &Value) -> Value {
+    let mut out = json!({"id": s["id"], "url": s["url"], "name": s["name"], "app": s["app"], "file": s["file"]});
+    keep(&mut out, s, &["app_name"]);
+    let nav = &s["nav"];
+    if nav.is_object() {
+        keep(&mut out, nav, &["navigator", "group", "gate"]);
+        if !nav["app"].is_null() {
+            out["app"] = nav["app"].clone();
+        }
+        if let Some(route) = nav["dispatcher"].as_str() {
+            out["dispatch"] = json!({
+                "type": nav["type"],
+                "renderer": nav["renderer"],
+                "renderer_at": first_at(nav, s["file"].as_str().unwrap_or("")),
+                "route_file": route,
+                "url_from": nav["urlFrom"],
+            });
+            keep(&mut out["dispatch"], nav, &["types"]);
+        }
+    }
+    out
+}
+
+/// The screens in the order the overview lists them: an app's own screens
+/// (routes, screens a route dispatches to, app screens) before the content
+/// editor's document kinds and tools, which a large studio would otherwise
+/// push off the list.
+fn screens_listed(graph: &Value) -> Vec<&Value> {
+    let mut v: Vec<&Value> = arr(graph, "screens").collect();
+    v.sort_by_key(|s| matches!(s["kind"].as_str(), Some("page-kind" | "tool")));
+    v
+}
+
+/// One link as the lookups return it. Links CoderHelm's detectors added
+/// carry where they were found; `nav` links name their screens, `trigger`
+/// links the function they start, `webhook` links the endpoint called back.
 fn link_json(graph: &Value, l: &Value) -> Value {
-    json!({
+    let mut out = json!({
         "from": describe_ref(graph, l["a"].as_str().unwrap_or("")),
         "to": describe_ref(graph, l["b"].as_str().unwrap_or("")),
         "kind": l["k"],
         "labels": l["labels"],
         "inferred": l["inferred"],
-    })
+    });
+    if l.get("evidence").is_some() {
+        out["evidence"] = evidence_json(l, 3);
+    }
+    if let Some(to) = l["to"].as_str() {
+        out["screen"] = describe_ref(graph, to);
+    }
+    for (k, key) in [("unit", "runs"), ("route", "endpoint")] {
+        if let Some(r) = l[k].as_str() {
+            out[key] = describe_ref(graph, r);
+        }
+    }
+    keep(&mut out, l, &["tables", "via"]);
+    out
 }
 
 /// The whole map in short: parts, screens, Health counts, repositories.
 pub fn overview(graph: &Value) -> Value {
     json!({
         "project": graph["project"],
-        "parts": arr(graph, "nodes").map(|n| json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").take(80).map(|s| json!({"id": s["id"], "url": s["url"], "name": s["name"], "file": s["file"]})).collect::<Vec<_>>(),
+        "parts": arr(graph, "nodes").map(|n| { let mut p = json!({"id": n["id"], "parent": n["parent"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "files": n["stats"]["files"]}); keep(&mut p, n, &["role", "repos"]); p }).collect::<Vec<_>>(),
+        "screens": screens_listed(graph).into_iter().take(80).map(screen_json).collect::<Vec<_>>(),
+        "screen_count": screen_counts(graph),
+        "journeys": arr(graph, "flows").take(60).map(|f| json!({"id": f["id"], "title": f["title"], "steps": f["steps"].as_array().map(|a| a.len()).unwrap_or(0)})).collect::<Vec<_>>(),
+        "journeys_still_being_traced": graph["coderhelm"]["journeys_pending"].as_u64().unwrap_or(0),
         "health": graph["health"]["summary"],
         "repos": graph["meta"]["repos"],
         "counts": graph["meta"]["counts"],
     })
+}
+
+/// How many screens each app has (the overview lists the first 80), by
+/// the System card a screen is under ([`place_screens`]) when it is placed.
+fn screen_counts(graph: &Value) -> Value {
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for s in arr(graph, "screens") {
+        let app = s["app_name"]
+            .as_str()
+            .or(s["nav"]["app"].as_str())
+            .or(s["app"].as_str())
+            .unwrap_or("app");
+        *by.entry(app.to_string()).or_default() += 1;
+    }
+    json!(by)
 }
 
 /// One part: its sub-parts, files, endpoints, and the lines in and out.
@@ -1041,7 +1819,13 @@ pub fn part_view(graph: &Value, id: &str) -> Option<Value> {
     let n = node(graph, id)?;
     let children: Vec<Value> = arr(graph, "nodes")
         .filter(|c| c["parent"] == id)
-        .map(|c| json!({"id": c["id"], "label": c["label"], "kind": c["kind"], "summary": c["summary"]}))
+        .map(|c| {
+            let mut x = node_json(c);
+            if let Some(o) = x.as_object_mut() {
+                o.remove("evidence");
+            }
+            x
+        })
         .collect();
     let mut inside: BTreeSet<String> = BTreeSet::from([id.to_string()]);
     let mut grew = true;
@@ -1073,8 +1857,11 @@ pub fn part_view(graph: &Value, id: &str) -> Option<Value> {
         .take(200)
         .map(|l| link_json(graph, l))
         .collect();
+    let mut part = node_json(&n);
+    part["details"] = n["details"].clone();
+    part["stats"] = n["stats"].clone();
     Some(json!({
-        "part": {"id": n["id"], "label": n["label"], "kind": n["kind"], "summary": n["summary"], "details": n["details"], "stats": n["stats"]},
+        "part": part,
         "children": children,
         "files": files.iter().take(400).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"]})).collect::<Vec<_>>(),
         "endpoints": routes,
@@ -1096,16 +1883,38 @@ pub fn file_view(graph: &Value, path: &str) -> Option<Value> {
         .filter(|(_, r)| r["f"] == path)
         .map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "description": r["d"], "line": r["l"]}))
         .collect();
+    // the screens this file is, and the screens it registers (a navigator file)
+    let screens: Vec<Value> = arr(graph, "screens")
+        .filter(|s| {
+            s["file"] == path
+                || arr(&s["nav"], "evidence")
+                    .next()
+                    .is_some_and(|e| e["file"] == path)
+        })
+        .take(100)
+        .map(screen_json)
+        .collect();
     Some(json!({
         "file": {"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"], "repo": f["r"], "language": f["l"], "lines": f["loc"]},
         "endpoints": routes,
+        "screens": screens,
         "links": links,
     }))
 }
 
 /// Everything behind one screen, as Floorplan traced it, each step described.
 pub fn screen_view(graph: &Value, id_or_url: &str) -> Option<Value> {
-    let s = arr(graph, "screens").find(|s| s["id"] == id_or_url || s["url"] == id_or_url)?;
+    let q = id_or_url.trim();
+    let s = arr(graph, "screens")
+        .find(|s| s["id"] == q || s["url"] == q)
+        .or_else(|| {
+            // its name, as the overview and search list it ("Member checkout")
+            arr(graph, "screens").find(|s| {
+                s["name"]
+                    .as_str()
+                    .is_some_and(|n| !q.is_empty() && n.eq_ignore_ascii_case(q))
+            })
+        })?;
     let steps: Vec<Value> = arr(s, "behind")
         .map(|b| {
             let mut d = describe_ref(graph, b["id"].as_str().unwrap_or(""));
@@ -1114,9 +1923,81 @@ pub fn screen_view(graph: &Value, id_or_url: &str) -> Option<Value> {
             d
         })
         .collect();
+    let mut screen = screen_json(s);
+    screen["description"] = s["description"].clone();
+    if s["nav"].is_object() {
+        screen["evidence"] = evidence_json(&s["nav"], 3);
+    }
+    // where it leads, and what leads to it
+    let id = s["id"].as_str().unwrap_or("");
+    let file = format!("f:{}", s["file"].as_str().unwrap_or(""));
+    let nav: Vec<Value> = arr(graph, "links")
+        .filter(|l| l["k"] == "nav" && (l["to"] == id || l["a"] == file.as_str()))
+        .take(40)
+        .map(|l| link_json(graph, l))
+        .collect();
     Some(json!({
-        "screen": {"id": s["id"], "url": s["url"], "name": s["name"], "description": s["description"], "file": s["file"]},
+        "screen": screen,
         "behind": steps,
+        "navigation": nav,
+    }))
+}
+
+/// One journey (flow) by its id or the words of its title: each step in
+/// order, what happens there, the map item it stands on and the file:line
+/// it cites.
+pub fn flow_view(graph: &Value, id_or_words: &str) -> Option<Value> {
+    let q = id_or_words.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let words: Vec<String> = q
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let f = arr(graph, "flows").find(|f| f["id"] == q).or_else(|| {
+        arr(graph, "flows").find(|f| {
+            let hay = format!(
+                "{} {} {}",
+                f["id"].as_str().unwrap_or(""),
+                f["title"].as_str().unwrap_or(""),
+                f["description"].as_str().unwrap_or("")
+            )
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ");
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+    })?;
+    let linked = f["coderhelm"]["linked"].as_array();
+    let steps: Vec<Value> = arr(f, "steps")
+        .enumerate()
+        .map(|(i, s)| {
+            let mut d = describe_ref(graph, s["ref"].as_str().unwrap_or(""));
+            d["step"] = json!(i + 1);
+            d["note"] = s["note"].clone();
+            // the screen the step stands on, when its file holds several
+            if let Some(sc) = s["screen"].as_str().filter(|x| x.starts_with("screen:")) {
+                d["screen"] = describe_ref(graph, sc);
+            }
+            if let Some(ev) = s["evidence"].as_array() {
+                d["cites"] = json!(ev
+                    .iter()
+                    .filter_map(|e| Some(format!(
+                        "{}:{}",
+                        e["file"].as_str()?,
+                        e["line"].as_u64()?
+                    )))
+                    .collect::<Vec<_>>());
+            }
+            if linked.and_then(|l| l.get(i)) == Some(&json!(false)) {
+                d["inferred"] = json!(true);
+            }
+            d
+        })
+        .collect();
+    Some(json!({
+        "journey": {"id": f["id"], "title": f["title"], "description": f["description"]},
+        "steps": steps,
     }))
 }
 
@@ -1129,7 +2010,7 @@ pub fn search(graph: &Value, q: &str) -> Value {
         .take(8)
         .collect();
     if words.is_empty() {
-        return json!({"parts": [], "files": [], "endpoints": [], "screens": []});
+        return json!({"parts": [], "files": [], "endpoints": [], "screens": [], "journeys": []});
     }
     let hit = |texts: &[&Value]| {
         let hay: String = texts
@@ -1141,11 +2022,493 @@ pub fn search(graph: &Value, q: &str) -> Value {
         words.iter().all(|w| hay.contains(w))
     };
     json!({
-        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["summary"], &n["id"]])).take(20).map(|n| json!({"id": n["id"], "label": n["label"], "kind": n["kind"], "summary": n["summary"]})).collect::<Vec<_>>(),
+        "parts": arr(graph, "nodes").filter(|n| hit(&[&n["label"], &n["role"], &n["summary"], &n["id"], &n["vendor"], &json!(arr(n, "env").chain(arr(n, "repos")).chain(arr(n, "hosts")).chain(arr(n, "domains")).chain(arr(n, "services")).filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))])).take(20).map(|n| { let mut x = node_json(n); if let Some(o) = x.as_object_mut() { o.remove("evidence"); } x }).collect::<Vec<_>>(),
         "files": arr(graph, "files").filter(|f| hit(&[&f["p"], &f["name"], &f["d"]])).take(30).map(|f| json!({"path": f["p"], "name": f["name"], "description": f["d"], "part": f["n"]})).collect::<Vec<_>>(),
         "endpoints": arr(graph, "routes").enumerate().filter(|(_, r)| hit(&[&r["m"], &r["p"], &r["name"], &r["d"]])).take(30).map(|(i, r)| json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "file": r["f"]})).collect::<Vec<_>>(),
-        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"]])).take(20).map(|s| json!({"id": s["id"], "url": s["url"], "name": s["name"]})).collect::<Vec<_>>(),
+        "screens": arr(graph, "screens").filter(|s| hit(&[&s["url"], &s["name"], &s["description"], &s["nav"]["app"], &s["nav"]["navigator"], &s["nav"]["group"], &s["nav"]["type"], &s["nav"]["renderer"]])).take(20).map(screen_json).collect::<Vec<_>>(),
+        "journeys": arr(graph, "flows").filter(|f| hit(&[&f["id"], &f["title"], &f["description"]])).take(20).map(|f| json!({"id": f["id"], "title": f["title"]})).collect::<Vec<_>>(),
     })
+}
+
+// ── Impact: what changing one thing reaches ───────────────────────────────
+
+/// Most items [`impact`] lists in each of its groups; the rest are counted.
+pub const IMPACT_CAP: usize = 20;
+
+/// The methods an endpoint target may start with (`POST /slots/:id`).
+const METHODS: [&str; 9] = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY", "ALL",
+];
+
+/// What an impact target named.
+enum Target {
+    /// Endpoints by index in `routes`.
+    Endpoints(Vec<usize>),
+    File(String),
+    Part(String),
+}
+
+/// `file:line` of the first evidence on `v`, else `fallback` at line 1, so
+/// every citation is a real place.
+fn first_at(v: &Value, fallback: &str) -> String {
+    arr(v, "evidence")
+        .find_map(|e| {
+            Some(format!(
+                "{}:{}",
+                e["file"].as_str().filter(|f| !f.is_empty())?,
+                e["line"].as_u64().unwrap_or(1).max(1)
+            ))
+        })
+        .unwrap_or_else(|| format!("{fallback}:1"))
+}
+
+fn route_at(r: &Value) -> String {
+    format!(
+        "{}:{}",
+        r["f"].as_str().unwrap_or(""),
+        r["l"].as_u64().unwrap_or(1).max(1)
+    )
+}
+
+fn resolve(graph: &Value, target: &str) -> Option<Target> {
+    let t = target.trim().trim_start_matches("./");
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(i) = t.strip_prefix("r:").and_then(|i| i.parse::<usize>().ok()) {
+        return graph["routes"].get(i).map(|_| Target::Endpoints(vec![i]));
+    }
+    let same_path = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    if let Some((m, p)) = t.split_once(char::is_whitespace) {
+        let m = m.to_ascii_uppercase();
+        let p = p.trim();
+        if METHODS.contains(&m.as_str()) && p.starts_with('/') {
+            let hits: Vec<usize> = arr(graph, "routes")
+                .enumerate()
+                .filter(|(_, r)| {
+                    r["p"].as_str().is_some_and(|rp| same_path(rp, p))
+                        && r["m"]
+                            .as_str()
+                            .is_some_and(|rm| rm.eq_ignore_ascii_case(&m) || m == "ANY")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            return (!hits.is_empty()).then_some(Target::Endpoints(hits));
+        }
+    }
+    if arr(graph, "files").any(|f| f["p"] == t) {
+        return Some(Target::File(t.to_string()));
+    }
+    let id = t.strip_prefix("n:").unwrap_or(t);
+    if node(graph, id).is_some() {
+        return Some(Target::Part(id.to_string()));
+    }
+    if t.starts_with('/') {
+        let hits: Vec<usize> = arr(graph, "routes")
+            .enumerate()
+            .filter(|(_, r)| r["p"].as_str().is_some_and(|rp| same_path(rp, t)))
+            .map(|(i, _)| i)
+            .collect();
+        if !hits.is_empty() {
+            return Some(Target::Endpoints(hits));
+        }
+    }
+    None
+}
+
+/// Keeps the first [`IMPACT_CAP`] of `items`, counting the rest in `more`.
+fn capped(items: Vec<Value>, key: &str, more: &mut Map<String, Value>) -> Value {
+    if items.len() > IMPACT_CAP {
+        more.insert(key.into(), json!(items.len() - IMPACT_CAP));
+    }
+    json!(items.into_iter().take(IMPACT_CAP).collect::<Vec<_>>())
+}
+
+/// What changing one thing reaches across the whole app, in one answer:
+/// `target` is a file on the map (`harbor-api/src/bookings.js`), an
+/// endpoint (`POST /slots/:id/bookings`, or `r:0`) or a part's id. Lists the
+/// callers in other repositories and in the same one, the screens that use
+/// it (with their app and whether they need a signed-in user), the journeys
+/// that pass through it, the outside services it reaches (and those that
+/// call it), the cloud resources that start or deploy it, and the data links
+/// (tables). Every item cites a `file:line`; each group holds at most
+/// [`IMPACT_CAP`] items and counts the rest in `more`. `None` when the map
+/// has no such thing.
+pub fn impact(graph: &Value, target: &str) -> Option<Value> {
+    let t = resolve(graph, target)?;
+    let routes: Vec<&Value> = arr(graph, "routes").collect();
+    let file_of = |p: &str| arr(graph, "files").find(|f| f["p"] == p);
+    let repo_of = |p: &str| {
+        file_of(p)
+            .and_then(|f| f["r"].as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| p.split('/').next().unwrap_or("").to_string())
+    };
+    // What the target is, as map ids and file paths.
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    let mut eps: Vec<usize> = Vec::new();
+    let mut parts: BTreeSet<String> = BTreeSet::new();
+    let described = match &t {
+        Target::Endpoints(is) => {
+            eps = is.clone();
+            for i in is {
+                if let Some(f) = routes[*i]["f"].as_str() {
+                    paths.insert(f.to_string());
+                }
+            }
+            let r = routes[is[0]];
+            json!({"kind": "endpoint", "method": r["m"], "path": r["p"], "name": r["name"], "at": route_at(r)})
+        }
+        Target::File(p) => {
+            paths.insert(p.clone());
+            let f = file_of(p).cloned().unwrap_or(Value::Null);
+            json!({"kind": "file", "path": p, "name": f["name"], "part": f["n"], "repo": f["r"], "at": format!("{p}:1")})
+        }
+        Target::Part(id) => {
+            parts.insert(id.clone());
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for c in arr(graph, "nodes") {
+                    if let (Some(cid), Some(p)) = (c["id"].as_str(), c["parent"].as_str()) {
+                        if parts.contains(p) && parts.insert(cid.to_string()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            for f in arr(graph, "files") {
+                if f["n"].as_str().is_some_and(|n| parts.contains(n)) {
+                    if let Some(p) = f["p"].as_str() {
+                        paths.insert(p.to_string());
+                    }
+                }
+            }
+            let n = node(graph, id).unwrap_or(Value::Null);
+            let at = paths
+                .iter()
+                .next()
+                .map(|p| format!("{p}:1"))
+                .unwrap_or_else(|| first_at(&n, ""));
+            json!({"kind": "part", "id": id, "label": n["label"], "part_kind": n["kind"], "at": at})
+        }
+    };
+    if !matches!(t, Target::Endpoints(_)) {
+        eps = routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["f"].as_str().is_some_and(|f| paths.contains(f)))
+            .map(|(i, _)| i)
+            .collect();
+    }
+    let ep_ids: BTreeSet<String> = eps.iter().map(|i| format!("r:{i}")).collect();
+    let ep_labels: BTreeSet<String> = eps
+        .iter()
+        .map(|i| {
+            format!(
+                "{} {}",
+                routes[*i]["m"].as_str().unwrap_or(""),
+                routes[*i]["p"].as_str().unwrap_or("")
+            )
+            .to_ascii_uppercase()
+        })
+        .collect();
+    let only_endpoints = matches!(t, Target::Endpoints(_));
+    let inside = |id: &str| -> bool {
+        if let Some(p) = id.strip_prefix("f:") {
+            return paths.contains(p);
+        }
+        if let Some(n) = id.strip_prefix("n:") {
+            return parts.contains(n);
+        }
+        ep_ids.contains(id)
+    };
+    let home: BTreeSet<String> = paths.iter().map(|p| repo_of(p)).collect();
+    let kind_of = |id: &str| -> String {
+        id.strip_prefix("n:")
+            .and_then(|n| node(graph, n))
+            .and_then(|n| n["kind"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    // A link into an endpoint target counts when it is for one of them.
+    let for_endpoint = |l: &Value| -> bool {
+        if !only_endpoints {
+            return true;
+        }
+        if l["route"].as_str().is_some_and(|r| ep_ids.contains(r)) {
+            return true;
+        }
+        // An import of the endpoint's file is not a call to the endpoint.
+        if !matches!(l["k"].as_str(), Some("http" | "webhook")) {
+            return false;
+        }
+        let labels: Vec<String> = arr(l, "labels")
+            .filter_map(|x| x.as_str().map(|s| s.to_ascii_uppercase()))
+            .collect();
+        labels.is_empty() || labels.iter().any(|x| ep_labels.contains(x))
+    };
+
+    let mut elsewhere = Vec::new();
+    let mut here = Vec::new();
+    let mut outside = Vec::new();
+    let mut cloud = Vec::new();
+    let mut data = Vec::new();
+    for l in arr(graph, "links") {
+        let (a, b) = (l["a"].as_str().unwrap_or(""), l["b"].as_str().unwrap_or(""));
+        let k = l["k"].as_str().unwrap_or("");
+        let (a_in, b_in) = (inside(a), inside(b));
+        if a_in == b_in && k != "data" {
+            continue;
+        }
+        let other = if a_in { b } else { a };
+        let other_kind = kind_of(other);
+        match k {
+            "data" if a_in || b_in => data.push(json!({
+                "tables": l["tables"],
+                "from": describe_ref(graph, a)["path"],
+                "to": describe_ref(graph, b)["path"],
+                "labels": l["labels"],
+                "at": first_at(l, a.strip_prefix("f:").unwrap_or("")),
+            })),
+            "data" => {}
+            _ if other_kind == "infra" => cloud.push(json!({
+                "id": other,
+                "label": describe_ref(graph, other)["label"],
+                "resource": node(graph, other.trim_start_matches("n:")).map(|n| n["resource"].clone()).unwrap_or(Value::Null),
+                "how": k,
+                "labels": l["labels"],
+                "starts": l["unit"].as_str().map(|u| describe_ref(graph, u)["label"].clone()),
+                "at": first_at(l, if a_in { a } else { b }.trim_start_matches("f:")),
+            })),
+            "nav" => {}
+            _ if b_in && other.starts_with("f:") && for_endpoint(l) => {
+                let p = other.trim_start_matches("f:");
+                let repo = repo_of(p);
+                let item = json!({
+                    "from": p,
+                    "repo": repo,
+                    "kind": k,
+                    "labels": l["labels"],
+                    "at": first_at(l, p),
+                });
+                if home.contains(&repo) {
+                    here.push(item);
+                } else {
+                    elsewhere.push(item);
+                }
+            }
+            _ if other_kind == "external" && (a_in || for_endpoint(l)) => {
+                let n = node(graph, other.trim_start_matches("n:")).unwrap_or(Value::Null);
+                outside.push(json!({
+                    "id": other,
+                    "label": n["label"],
+                    "vendor": n["vendor"],
+                    "direction": if a_in { "uses" } else { "calls in" },
+                    "via": if a_in { a } else { b }.trim_start_matches("f:"),
+                    "labels": l["labels"],
+                    "at": first_at(l, if a_in { a } else { b }.trim_start_matches("f:")),
+                }));
+            }
+            _ => {}
+        }
+    }
+    // Outside services reached a few steps away, through what the target
+    // imports or calls.
+    let mut seen: BTreeSet<String> = paths.iter().map(|p| format!("f:{p}")).collect();
+    let mut front: Vec<String> = seen.iter().cloned().collect();
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for l in arr(graph, "links") {
+            let (a, b) = (l["a"].as_str().unwrap_or(""), l["b"].as_str().unwrap_or(""));
+            if !front.iter().any(|f| f == a) || !matches!(l["k"].as_str(), Some("import" | "http"))
+            {
+                continue;
+            }
+            if b.starts_with("f:") && seen.len() < 400 && seen.insert(b.to_string()) {
+                next.push(b.to_string());
+            } else if kind_of(b) == "external"
+                && !inside(a)
+                && !outside.iter().any(|o| o["id"] == b)
+            {
+                let n = node(graph, b.trim_start_matches("n:")).unwrap_or(Value::Null);
+                outside.push(json!({
+                    "id": b,
+                    "label": n["label"],
+                    "vendor": n["vendor"],
+                    "direction": "reaches",
+                    "via": a.trim_start_matches("f:"),
+                    "labels": l["labels"],
+                    "at": first_at(l, a.trim_start_matches("f:")),
+                }));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        front = next;
+    }
+    // Screens: the screen is one of the files, stands on one (or on one of
+    // the endpoints), or a navigator among them registers it.
+    let screens: Vec<Value> = arr(graph, "screens")
+        .filter(|s| {
+            let behind = arr(s, "behind").any(|b| b["id"].as_str().is_some_and(&inside));
+            let file = s["file"].as_str().is_some_and(|f| paths.contains(f));
+            let nav = arr(&s["nav"], "evidence")
+                .next()
+                .and_then(|e| e["file"].as_str())
+                .is_some_and(|f| paths.contains(f));
+            if only_endpoints {
+                arr(s, "behind").any(|b| b["id"].as_str().is_some_and(|i| ep_ids.contains(i)))
+            } else {
+                behind || file || nav
+            }
+        })
+        .map(|s| {
+            let mut x = screen_json(s);
+            x["gate"] = s["nav"]["gate"].clone();
+            x["at"] = json!(if s["nav"].is_object() {
+                first_at(&s["nav"], s["file"].as_str().unwrap_or(""))
+            } else {
+                format!("{}:1", s["file"].as_str().unwrap_or(""))
+            });
+            x
+        })
+        .collect();
+    let screen_ids: BTreeSet<String> = screens
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_string))
+        .collect();
+    // Journeys passing through it: a step stands on it, or on one of its
+    // screens, or cites one of its files.
+    let journeys: Vec<Value> = arr(graph, "flows")
+        .filter_map(|f| {
+            let mut steps = Vec::new();
+            let mut cites = Vec::new();
+            for (i, s) in arr(f, "steps").enumerate() {
+                let r = s["ref"].as_str().unwrap_or("");
+                let cited: Vec<String> = arr(s, "evidence")
+                    .filter_map(|e| {
+                        Some(format!(
+                            "{}:{}",
+                            e["file"].as_str()?,
+                            e["line"].as_u64().unwrap_or(1).max(1)
+                        ))
+                    })
+                    .collect();
+                let on_cite = !only_endpoints
+                    && arr(s, "evidence")
+                        .any(|e| e["file"].as_str().is_some_and(|p| paths.contains(p)));
+                let on_screen = s["screen"].as_str().is_some_and(|x| screen_ids.contains(x));
+                if inside(r) || screen_ids.contains(r) || on_screen || on_cite {
+                    steps.push(i + 1);
+                    cites.extend(cited);
+                }
+            }
+            (!steps.is_empty()).then(|| {
+                if cites.is_empty() {
+                    cites.extend(paths.iter().next().map(|p| format!("{p}:1")));
+                }
+                cites.dedup();
+                json!({"id": f["id"], "title": f["title"], "steps": steps, "at": cites})
+            })
+        })
+        .collect();
+    let endpoints: Vec<Value> = eps
+        .iter()
+        .map(|i| {
+            let r = routes[*i];
+            json!({"id": format!("r:{i}"), "method": r["m"], "path": r["p"], "name": r["name"], "at": route_at(r)})
+        })
+        .collect();
+    let elsewhere_repos: BTreeSet<String> = elsewhere
+        .iter()
+        .filter_map(|c| c["repo"].as_str().map(str::to_string))
+        .collect();
+    let mut more = Map::new();
+    Some(json!({
+        "target": described,
+        "endpoints": capped(endpoints, "endpoints", &mut more),
+        "callers_elsewhere": capped(elsewhere, "callers_elsewhere", &mut more),
+        "other_repos": elsewhere_repos,
+        "callers_here": capped(here, "callers_here", &mut more),
+        "screens": capped(screens, "screens", &mut more),
+        "journeys": capped(journeys, "journeys", &mut more),
+        "outside_services": capped(outside, "outside_services", &mut more),
+        "cloud": capped(cloud, "cloud", &mut more),
+        "data": capped(data, "data", &mut more),
+        "more": more,
+    }))
+}
+
+/// Every `file:line` the map itself names: its evidence (parts, links,
+/// screens, journey steps), its endpoints, and the first line of each file.
+pub fn known_places(graph: &Value) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for f in arr(graph, "files") {
+        if let Some(p) = f["p"].as_str() {
+            out.insert(format!("{p}:1"));
+        }
+    }
+    for r in arr(graph, "routes") {
+        out.insert(route_at(r));
+    }
+    let mut stack = vec![graph];
+    while let Some(x) = stack.pop() {
+        match x {
+            Value::Object(o) => {
+                if let Some(ev) = o.get("evidence").and_then(|e| e.as_array()) {
+                    for e in ev {
+                        if let Some(f) = e["file"].as_str() {
+                            out.insert(format!("{f}:{}", e["line"].as_u64().unwrap_or(1).max(1)));
+                        }
+                    }
+                }
+                stack.extend(o.values().filter(|v| v.is_object() || v.is_array()));
+            }
+            Value::Array(a) => stack.extend(a.iter().filter(|v| v.is_object() || v.is_array())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `cite` (`path:line`) is a real place on the map: one the map
+/// itself names ([`known_places`], what its lookups cite), or a line within
+/// the code lines it counted for that file. `repo` (`owner/name`) places a
+/// path written from the repository's root, or one starting with
+/// `owner/name/`.
+pub fn real_cite(graph: &Value, repo: &str, cite: &str) -> bool {
+    real_cite_in(&known_places(graph), graph, repo, cite)
+}
+
+/// [`real_cite`] with the map's places read once.
+pub fn real_cite_in(places: &BTreeSet<String>, graph: &Value, repo: &str, cite: &str) -> bool {
+    let Some((path, line)) = cite.trim().rsplit_once(':') else {
+        return false;
+    };
+    let Ok(line) = line.trim().parse::<u64>() else {
+        return false;
+    };
+    let path = path.trim().trim_matches('`');
+    let on_map = if arr(graph, "files").any(|f| f["p"] == path) {
+        Some(path.to_string())
+    } else {
+        map_path(graph, repo, path)
+    };
+    let Some(p) = on_map else {
+        return false;
+    };
+    if line == 0 {
+        return false;
+    }
+    if places.contains(&format!("{p}:{line}")) {
+        return true;
+    }
+    let lines = arr(graph, "files")
+        .find(|f| f["p"] == p.as_str())
+        .and_then(|f| f["loc"].as_u64())
+        .unwrap_or(0);
+    line <= lines
 }
 
 /// The top-level parts a set of map ids belongs to (for a mini map).
@@ -1228,7 +2591,17 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
     out["files"] = json!(files);
     out["routes"] = json!(routes);
     out["links"] = json!(links);
-    out["flows"] = json!([]);
+    // Journeys stay when every step is still on the smaller map.
+    out["flows"] = json!(arr(graph, "flows")
+        .filter_map(|f| {
+            let mut f = f.clone();
+            for s in f["steps"].as_array_mut()? {
+                let r = remap(s["ref"].as_str()?)?;
+                s["ref"] = json!(r);
+            }
+            Some(f)
+        })
+        .collect::<Vec<_>>());
     out["tour"] = json!([]);
     out["screens"] = json!([]);
     if let Some(o) = out.as_object_mut() {
@@ -1241,13 +2614,19 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
 // ── The map lookups (Chat and /mcp) ────────────────────────────────────────
 
 /// The map lookups, in the order they are offered.
-pub const TOOLS: [&str; 5] = [
+pub const TOOLS: [&str; 7] = [
     "map_overview",
     "map_find",
     "map_part",
     "map_screen",
     "map_file",
+    "map_flow",
+    "map_impact",
 ];
+
+/// What `map_impact` is told to be for, the same words everywhere it is
+/// offered (runs, Chat and `/mcp`).
+pub const IMPACT_DESCRIPTION: &str = "Before changing shared code or an endpoint: everything on the app map that changing one thing reaches, in one answer. Give a file's path on the map (repository folder first, like harbor-api/src/bookings.js), an endpoint (method and path, like POST /slots/:id/bookings) or a part's id. Returns the callers in other repositories and in the same one, the screens that use it (their app and whether they need a signed-in user), the journeys that pass through it, the outside services it reaches or that call it, the cloud resources that start or deploy it, and the data links (tables), each with the file:line it rests on.";
 
 pub fn is_tool(name: &str) -> bool {
     TOOLS.contains(&name)
@@ -1257,11 +2636,13 @@ pub fn is_tool(name: &str) -> bool {
 pub fn tool_defs() -> Vec<Value> {
     let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
     vec![
-        json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
-        json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints and screens whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
+        json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the journeys (user flows such as sign in or checkout), the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
+        json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints, screens and journeys whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
         json!({"name": TOOLS[2], "description": "One part of the app map by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
-        json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
+        json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slots/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
         json!({"name": TOOLS[4], "description": "One file by its path on the app map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
+        json!({"name": TOOLS[5], "description": "One journey on the app map (a user flow such as sign in, password reset or checkout), by its id or the words of its title (like \"mobile sign in\"): every step in order, from the screen through the requests, the server code and outside services to the next screen, each with what happens there and the file:line it cites. Use it to walk someone through a flow.", "input_schema": obj(json!({"journey": {"type": "string"}}), &["journey"])}),
+        json!({"name": TOOLS[6], "description": IMPACT_DESCRIPTION, "input_schema": obj(json!({"target": {"type": "string", "description": "A file's path on the map, an endpoint (METHOD /path) or a part's id."}}), &["target"])}),
     ]
 }
 
@@ -1274,7 +2655,10 @@ pub struct Lookups {
 }
 
 impl Lookups {
-    pub fn new(graph: Value) -> Self {
+    /// The lookups name System parts by their repositories, as the page
+    /// does ([`name_by_repo`]).
+    pub fn new(mut graph: Value) -> Self {
+        name_by_repo(&mut graph);
         Self {
             graph,
             ids: Vec::new(),
@@ -1315,6 +2699,12 @@ impl Lookups {
             ),
             "map_file" => file_view(&self.graph, &s("path"))
                 .unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
+            "map_flow" => flow_view(&self.graph, &s("journey")).unwrap_or_else(
+                || json!({"error": "No journey has that id or title; map_overview lists them."}),
+            ),
+            "map_impact" => impact(&self.graph, &s("target")).unwrap_or_else(
+                || json!({"error": "Nothing on the map has that path, endpoint or id; use map_find for them."}),
+            ),
             _ => json!({"error": "Unknown lookup."}),
         };
         let label = label(name, input);
@@ -1368,7 +2758,7 @@ impl Lookups {
     }
 }
 
-/// What a lookup is shown as: "Searched the app map for slip".
+/// What a lookup is shown as: "Searched the app map for slot".
 pub fn label(name: &str, input: &Value) -> String {
     let s = |k: &str| crate::truncate_str(input[k].as_str().unwrap_or("").trim(), 80).to_string();
     match name {
@@ -1377,6 +2767,11 @@ pub fn label(name: &str, input: &Value) -> String {
         "map_part" => format!("Opened the part {} on the app map", s("id")),
         "map_screen" => format!("Followed the screen {} on the app map", s("screen")),
         "map_file" => format!("Opened {} on the app map", s("path")),
+        "map_flow" => format!("Walked through the journey {} on the app map", s("journey")),
+        "map_impact" => format!(
+            "Looked up what changing {} reaches on the app map",
+            s("target")
+        ),
         _ => name.to_string(),
     }
 }
@@ -1510,6 +2905,126 @@ mod tests {
     }
 
     #[test]
+    fn a_map_from_another_extractor_queues_one_build() {
+        let now = 10_000;
+        let old = Status {
+            state: "ready".into(),
+            at: now,
+            built: now - 86_400,
+            built_repos: 3,
+            extractor: "older".into(),
+            ..Default::default()
+        };
+        // Made by another extractor: one build, marked as asked for this one.
+        let q = queue_for_extractor(Some(&old), now, "b1", "new").unwrap();
+        assert_eq!(
+            (q.state.as_str(), q.asked_extractor.as_str()),
+            ("queued", "new")
+        );
+        assert_eq!((q.extractor.as_str(), q.built_repos), ("older", 3));
+        // Asked again while it is queued, while it runs, and after it failed:
+        // nothing more is queued.
+        assert!(queue_for_extractor(Some(&q), now + 1, "b2", "new").is_none());
+        let running = take_turn(Some(&q), "b1", 0, now + 2).unwrap();
+        assert!(queue_for_extractor(Some(&running), now + 3, "b3", "new").is_none());
+        let f = failed(Some(&running), "b1", "GitHub didn't answer", now + 4).unwrap();
+        assert!(queue_for_extractor(Some(&f), now + 5, "b4", "new").is_none());
+        // A map from before maps carried the version counts as another's.
+        let unstamped = Status {
+            extractor: String::new(),
+            ..old.clone()
+        };
+        assert!(queue_for_extractor(Some(&unstamped), now, "b5", "new").is_some());
+        // The next release asks once more.
+        assert!(queue_for_extractor(Some(&f), now + 5, "b6", "newer").is_some());
+    }
+
+    #[test]
+    fn a_map_from_this_extractor_queues_none() {
+        let now = 10_000;
+        let same = Status {
+            state: "ready".into(),
+            at: now,
+            extractor: "new".into(),
+            ..Default::default()
+        };
+        assert!(queue_for_extractor(Some(&same), now, "b1", "new").is_none());
+        assert!(!made_by_another_extractor(Some(&same), true, "new"));
+        // No map at all: the first build is the first visit's, not this.
+        assert!(!made_by_another_extractor(None, false, "new"));
+        // A push's build already running builds with this extractor.
+        let pushed = queue_next(
+            Some(&Status {
+                extractor: "older".into(),
+                ..same.clone()
+            }),
+            now,
+            "p1",
+        )
+        .unwrap();
+        assert!(queue_for_extractor(Some(&pushed), now + 1, "b2", "new").is_none());
+    }
+
+    #[tokio::test]
+    async fn two_readers_at_once_queue_one_build() {
+        use std::sync::{Arc, Mutex};
+        let old = Status {
+            state: "ready".into(),
+            at: 10_000,
+            extractor: "older".into(),
+            ..Default::default()
+        };
+        // The status table: the status and its version.
+        let store = Arc::new(Mutex::new((Some(old), 1_i64)));
+        // Both readers read the old status before either writes.
+        let both_read = Arc::new(tokio::sync::Barrier::new(2));
+        let ask = |build: &'static str| {
+            let store = store.clone();
+            let both_read = both_read.clone();
+            let first = Arc::new(Mutex::new(true));
+            async move {
+                update_versioned(
+                    || {
+                        let (store, both_read, first) =
+                            (store.clone(), both_read.clone(), first.clone());
+                        async move {
+                            let seen = store.lock().unwrap().clone();
+                            let wait = std::mem::replace(&mut *first.lock().unwrap(), false);
+                            if wait {
+                                both_read.wait().await;
+                            }
+                            Ok((seen.0, Some(seen.1)))
+                        }
+                    },
+                    |next: Status, version: Option<i64>| {
+                        let store = store.clone();
+                        async move {
+                            let mut s = store.lock().unwrap();
+                            if Some(s.1) != version {
+                                return Ok(false);
+                            }
+                            *s = (Some(next), s.1 + 1);
+                            Ok(true)
+                        }
+                    },
+                    |cur| queue_for_extractor(cur, 10_100, build, "new"),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (a, b) = tokio::join!(ask("b1"), ask("b2"));
+        let written = [&a, &b]
+            .iter()
+            .filter(|u| matches!(u, Updated::Written(_)))
+            .count();
+        assert_eq!(written, 1, "{a:?} {b:?}");
+        let (st, v) = store.lock().unwrap().clone();
+        assert_eq!(v, 2);
+        assert_eq!(st.unwrap().asked_extractor, "new");
+    }
+
+    #[test]
     fn each_message_takes_its_own_turn_once() {
         let now = 10_000;
         let q = queue_next(None, now, "b1").unwrap();
@@ -1578,7 +3093,12 @@ mod tests {
         .unwrap();
         stamp_repos(
             &mut g,
-            &folders(&["harbor/harbor-web".into(), "harbor/harbor-api".into()]),
+            &folders(&[
+                "harbor/harbor-web".into(),
+                "harbor/harbor-api".into(),
+                "harbor/harbor-mobile".into(),
+                "harbor/harbor-infra".into(),
+            ]),
         );
         g
     }
@@ -1587,11 +3107,11 @@ mod tests {
     fn repositories_get_stable_folders() {
         let f = folders(&[
             "harbor/web".into(),
-            "marina/web".into(),
+            "library/web".into(),
             "harbor/api".into(),
         ]);
         assert_eq!(f["harbor/web"], "harbor-web");
-        assert_eq!(f["marina/web"], "marina-web");
+        assert_eq!(f["library/web"], "library-web");
         assert_eq!(f["harbor/api"], "api");
         let g = harbor();
         assert_eq!(
@@ -1612,9 +3132,9 @@ mod tests {
             WorkItem {
                 run_id: "r1".into(),
                 repo: "harbor/harbor-api".into(),
-                ticket: "DOCK-42".into(),
+                ticket: "WING-42".into(),
                 title: "Stop double bookings".into(),
-                why: "Two boaters could book one slip.".into(),
+                why: "Two patrons could book one slot.".into(),
                 pr_url: "https://github.example/harbor/harbor-api/pull/7".into(),
                 files: vec!["src/bookings.js".into(), "README.md".into()],
                 ..Default::default()
@@ -1629,7 +3149,7 @@ mod tests {
         let g = with_overlays(harbor(), Some(&runs), None);
         let r = &g["recent"];
         assert_eq!(r["tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(r["tasks"][0]["title"], "DOCK-42: Stop double bookings");
+        assert_eq!(r["tasks"][0]["title"], "WING-42: Stop double bookings");
         assert_eq!(r["tasks"][0]["request"], "");
         assert!(r["tasks"][0]["summary"]
             .as_str()
@@ -1637,7 +3157,7 @@ mod tests {
             .contains("pull/7"));
         assert_eq!(
             r["items"],
-            json!([{"id": "f:harbor-api/src/bookings.js", "task": 0, "change": "changed", "note": "Changed by Coderhelm's run for DOCK-42"}])
+            json!([{"id": "f:harbor-api/src/bookings.js", "task": 0, "change": "changed", "note": "Changed by Coderhelm's run for WING-42"}])
         );
         // No run on the map: no recent work at all.
         assert!(with_overlays(harbor(), Some(&runs[1..]), None)
@@ -1701,7 +3221,7 @@ mod tests {
     fn overlays_from_the_index_match_the_map_with_its_overlays() {
         let runs = [WorkItem {
             repo: "harbor/harbor-api".into(),
-            ticket: "DOCK-42".into(),
+            ticket: "WING-42".into(),
             title: "Stop double bookings".into(),
             files: vec!["src/bookings.js".into()],
             ..Default::default()
@@ -1731,7 +3251,15 @@ mod tests {
         let view: Value = serde_json::from_slice(&gunzip(&view, MAX_GRAPH_BYTES).unwrap()).unwrap();
         let idx: MapIndex =
             serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
-        assert_eq!(idx, MapIndex::of(&harbor()));
+        // counted on the page's copy: screens by the card they are under
+        assert_eq!(idx, MapIndex::of(&viewer_copy(&harbor(), now)));
+        assert_eq!(
+            idx.coverage.screens,
+            BTreeMap::from([
+                ("harbor-mobile".to_string(), 3),
+                ("harbor-web".to_string(), 1)
+            ])
+        );
         assert_eq!(view["meta"]["exported"]["by"], "Coderhelm");
         assert!(view["meta"]["root"].is_null());
         for (r, f) in [
@@ -1742,6 +3270,8 @@ mod tests {
         ] {
             let o = overlays(&idx, r, f);
             let mut want = for_viewer(with_overlays(harbor(), r, f), now);
+            // the page's copy names System cards by their repositories
+            name_by_repo(&mut want);
             let mut got = apply_overlays(view.clone(), &o);
             // Recent work is stamped when it is made.
             for g in [&mut want, &mut got] {
@@ -1760,15 +3290,15 @@ mod tests {
     /// A made-up map the size of a large team's: `files` files in 12 parts
     /// across 9 repositories, three lines per file, 20 Floorplan checks.
     fn synthetic(files: usize) -> Value {
-        let repos: Vec<String> = (0..9).map(|i| format!("dockyard/yard{i}")).collect();
+        let repos: Vec<String> = (0..9).map(|i| format!("bookshop/yard{i}")).collect();
         let folders = folders(&repos);
         let nodes: Vec<Value> = (0..12)
-            .map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Dock area {i}"), "kind": "service", "summary": "Looks after berths.", "stats": {"files": files / 12}}))
+            .map(|i| json!({"id": format!("part{i}"), "parent": null, "label": format!("Wing area {i}"), "kind": "service", "summary": "Looks after booths.", "stats": {"files": files / 12}}))
             .collect();
         let fs: Vec<Value> = (0..files)
             .map(|i| {
                 let r = &repos[i % 9];
-                json!({"p": format!("{}/src/area{}/berth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Berth keeper {i}"), "d": "Keeps one berth's bookings, its gate code and the boats that may use it, and tells the office when it changes.", "h": "0123456789abcdef", "s": [], "sig": ""})
+                json!({"p": format!("{}/src/area{}/booth_{i}_keeper.ts", folders[r], i % 40), "n": format!("part{}", i % 12), "r": folders[r], "l": "typescript", "loc": 120, "name": format!("Booth keeper {i}"), "d": "Keeps one booth's bookings, its gate code and the lockers that may use it, and tells the office when it changes.", "h": "0123456789abcdef", "s": [], "sig": ""})
             })
             .collect();
         let links: Vec<Value> = (0..files * 3)
@@ -1778,7 +3308,7 @@ mod tests {
             .map(|i| json!({"id": format!("open-endpoints:{}", fs[i * 17]["p"].as_str().unwrap()), "kind": "open-endpoints", "severity": if i % 3 == 0 { "high" } else { "medium" }, "title": "An endpoint anyone can call", "detail": "", "items": [format!("f:{}", fs[i * 17]["p"].as_str().unwrap())], "notes": {}, "locations": [{"file": fs[i * 17]["p"], "line": 10}], "fix": ""}))
             .collect();
         let mut g = json!({
-            "schema": GRAPH_SCHEMA, "project": {"name": "Dockyard", "summary": "Berths and bookings."},
+            "schema": GRAPH_SCHEMA, "project": {"name": "Bookshop", "summary": "Booths and bookings."},
             "meta": {"root": "/tmp/x", "agent": "claude", "repos": repos},
             "nodes": nodes, "files": fs, "links": links, "routes": [], "flows": [], "tour": [], "screens": [],
             "health": {"issues": issues, "checked": [], "appWide": []},
@@ -1815,8 +3345,8 @@ mod tests {
         let runs: Vec<WorkItem> = (0..60)
             .map(|i| WorkItem {
                 repo: paths[i % paths.len()].0.clone(),
-                ticket: format!("DOCK-{i}"),
-                title: "Tidy the berths".into(),
+                ticket: format!("WING-{i}"),
+                title: "Tidy the booths".into(),
                 files: (0..20)
                     .map(|j| paths[(i * 31 + j * 7) % paths.len()].1.clone())
                     .collect(),
@@ -1920,14 +3450,16 @@ mod tests {
     fn lookups_follow_the_map() {
         let g = harbor();
         let o = overview(&g);
-        assert_eq!(o["parts"].as_array().unwrap().len(), 3);
+        let parts = o["parts"].as_array().unwrap();
+        assert_eq!(parts.iter().filter(|p| p["parent"].is_null()).count(), 8);
+        assert_eq!(o["screen_count"], json!({"harbor-mobile": 3, "web": 1}));
         let p = part_view(&g, "api").unwrap();
-        assert_eq!(p["endpoints"][0]["path"], "/slips/:id/bookings");
+        assert_eq!(p["endpoints"][0]["path"], "/slots/:id/bookings");
         assert!(p["links"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l["from"]["path"] == "harbor-web/lib/slips.ts" && l["kind"] == "http"));
+            .any(|l| l["from"]["path"] == "harbor-web/lib/slots.ts" && l["kind"] == "http"));
         assert!(part_view(&g, "nope").is_none());
         let f = file_view(&g, "harbor-api/src/billing.js").unwrap();
         assert!(f["links"]
@@ -1935,7 +3467,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l["to"]["label"] == "Stripe"));
-        let s = screen_view(&g, "/slips/:id").unwrap();
+        let s = screen_view(&g, "/slots/:id").unwrap();
         let steps: Vec<&str> = s["behind"]
             .as_array()
             .unwrap()
@@ -1944,19 +3476,427 @@ mod tests {
             .collect();
         assert_eq!(steps.first(), Some(&"screen"));
         assert_eq!(steps.last(), Some(&"outside"));
-        assert_eq!(search(&g, "book slip")["endpoints"][0]["method"], "POST");
-        let parts = parts_of(&g, &["f:harbor-web/lib/slips.ts".into(), "r:0".into()]);
+        assert_eq!(search(&g, "book slot")["endpoints"][0]["method"], "POST");
+        let parts = parts_of(&g, &["f:harbor-web/lib/slots.ts".into(), "r:0".into()]);
         assert_eq!(
             parts,
             BTreeSet::from(["api".to_string(), "web".to_string()])
         );
         let mini = sub_map(&g, &BTreeSet::from(["api".to_string()]));
-        assert_eq!(mini["files"].as_array().unwrap().len(), 3);
+        assert_eq!(mini["files"].as_array().unwrap().len(), 7);
         assert!(mini["links"]
             .as_array()
             .unwrap()
             .iter()
             .all(|l| l["a"].as_str().unwrap().starts_with("f:harbor-api")));
+    }
+
+    /// What CoderHelm's detectors add reads plainly in the lookups: outside
+    /// services say how they were found, infra says what it starts, links
+    /// say where they were found, screens say their app and sign-in gate.
+    #[test]
+    fn lookups_show_services_infra_screens_and_where_each_was_found() {
+        let g = harbor();
+        // an outside service found only from env names: inferred, with its env and evidence
+        let t = part_view(&g, "ext-tidewatch").unwrap();
+        assert_eq!(t["part"]["how"], "env");
+        assert_eq!(t["part"]["inferred"], true);
+        assert_eq!(t["part"]["env"], json!(["TIDEWATCH_API_URL"]));
+        assert_eq!(t["part"]["evidence"][0]["at"], "harbor-api/src/tides.js:1");
+        let into = &t["links"][0];
+        assert_eq!(into["from"]["path"], "harbor-api/src/tides.js");
+        assert_eq!(into["kind"], "http");
+        assert_eq!(into["evidence"][0]["how"], "inferred");
+        // Stripe, drawn by the architecture job, gains how it was found and its callback
+        let s = part_view(&g, "stripe").unwrap();
+        assert_eq!(s["part"]["how"], "catalog");
+        assert!(s["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["kind"] == "webhook"
+                && l["to"]["path"] == "harbor-api/src/webhooks.js"
+                && l["endpoint"]["path"] == "/webhooks/stripe"));
+        // infra: the cloud part lists what runs, and the bucket starts the receipt code
+        let c = part_view(&g, "cloud").unwrap();
+        let kids: Vec<&str> = c["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k["resource"].as_str())
+            .collect();
+        assert!(
+            kids.contains(&"lambda") && kids.contains(&"bucket"),
+            "{kids:?}"
+        );
+        let f = file_view(&g, "harbor-api/src/receipts/index.js").unwrap();
+        let links = f["links"].as_array().unwrap();
+        let trig = links.iter().find(|l| l["kind"] == "trigger").unwrap();
+        assert_eq!(trig["from"]["resource"], "bucket");
+        assert_eq!(trig["runs"]["label"], "Harbor receipts function");
+        assert_eq!(trig["inferred"], false);
+        assert!(links.iter().any(|l| l["kind"] == "deploy"
+            && l["evidence"].as_array().unwrap().iter().any(|e| e["at"]
+                .as_str()
+                .unwrap()
+                .starts_with("harbor-api/.github/workflows/deploy-receipts.yml"))));
+        // a nightly load writes the table an entity holds
+        let e = file_view(&g, "harbor-api/src/entities/slot.entity.ts").unwrap();
+        assert!(e["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["kind"] == "data"
+                && l["from"]["path"] == "harbor-infra/dags/nightly_slots.py"
+                && l["tables"] == json!(["slot"])));
+        // screens: the navigator file lists the screens it registers, with their gates
+        let nav = file_view(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
+        let gates: Vec<(&str, &str)> = nav["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap(), s["gate"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            gates,
+            vec![
+                ("SignIn", "signed_out"),
+                ("SlotDetail", "signed_in"),
+                ("Slots", "signed_in")
+            ]
+        );
+        let sv = screen_view(&g, "screen:mobile:/(Stack)/SlotDetail").unwrap();
+        assert_eq!(sv["screen"]["app"], "harbor-mobile");
+        assert_eq!(
+            sv["screen"]["evidence"][0]["at"],
+            "harbor-mobile/app/navigation/RootNavigator.tsx:18"
+        );
+        let came_from = &sv["navigation"][0];
+        assert_eq!(came_from["kind"], "nav");
+        assert_eq!(
+            came_from["from"]["path"],
+            "harbor-mobile/app/screens/Slots.tsx"
+        );
+        assert_eq!(came_from["screen"]["name"], "SlotDetail");
+        // search finds services by their env names and screens by their app
+        assert_eq!(
+            search(&g, "tidewatch_api_url")["parts"][0]["id"],
+            "ext-tidewatch"
+        );
+        assert_eq!(
+            search(&g, "harbor-mobile signin")["screens"][0]["gate"],
+            "signed_out"
+        );
+    }
+
+    /// A content editor's many document kinds never push an app's own
+    /// screens (routes, the pages a route dispatches to) off the overview.
+    #[test]
+    fn the_overview_lists_app_screens_before_editor_kinds() {
+        let mut g = harbor();
+        let kinds: Vec<Value> = (0..90)
+            .map(|i| json!({"id": format!("screen:studio:/(structure)/k{i}"), "url": format!("/(structure)/k{i}"), "name": format!("Kind {i}"), "kind": "page-kind", "file": "harbor-web/lib/slots.ts", "behind": []}))
+            .collect();
+        let mut all = kinds;
+        all.extend(g["screens"].as_array().unwrap().iter().cloned());
+        all.push(json!({"id": "screen:web:/(notice)/*", "url": "/(notice)/*", "name": "Notice page", "kind": "screen", "fw": "dispatch", "file": "harbor-web/lib/slots.ts", "behind": [],
+            "nav": {"app": "harbor-web", "dispatcher": "harbor-web/app/slots/[id]/page.tsx", "type": "notice", "renderer": "NoticeRenderer", "urlFrom": "route", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}]}}));
+        g["screens"] = json!(all);
+        let o = overview(&g);
+        let listed = o["screens"].as_array().unwrap();
+        assert_eq!(listed.len(), 80);
+        assert!(listed.iter().any(|s| s["url"] == "/slots/:id"));
+        let notice = listed.iter().find(|s| s["name"] == "Notice page").unwrap();
+        assert_eq!(
+            notice["dispatch"]["renderer_at"],
+            "harbor-web/lib/slots.ts:2"
+        );
+        assert_eq!(
+            notice["dispatch"]["route_file"],
+            "harbor-web/app/slots/[id]/page.tsx"
+        );
+        // a screen nothing dispatches carries no dispatch record
+        let slot = listed.iter().find(|s| s["url"] == "/slots/:id").unwrap();
+        assert!(slot.get("dispatch").is_none());
+    }
+
+    /// The harbor map with one journey through the booking.
+    pub(crate) fn harbor_with_journey() -> Value {
+        let mut g = harbor();
+        g["flows"] = json!([{
+            "id": "book-a-slot", "title": "Book a slot", "description": "",
+            "steps": [
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        g
+    }
+
+    /// Every `at` in an answer, wherever it is.
+    fn cites_in(v: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![v];
+        while let Some(x) = stack.pop() {
+            match x {
+                Value::Object(o) => {
+                    match o.get("at") {
+                        Some(Value::String(s)) => out.push(s.clone()),
+                        Some(Value::Array(a)) => {
+                            out.extend(a.iter().filter_map(|s| s.as_str().map(str::to_string)))
+                        }
+                        _ => {}
+                    }
+                    stack.extend(o.values());
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// An endpoint other repositories call: its callers there with their
+    /// lines, the screens on it with their app and gate, the journey through
+    /// it; every citation a real place on the map.
+    #[test]
+    fn impact_of_an_endpoint_names_its_callers_elsewhere() {
+        let g = harbor_with_journey();
+        let v = impact(&g, "POST /slots/:id/bookings").unwrap();
+        assert_eq!(v["target"]["kind"], "endpoint");
+        assert_eq!(v["target"]["at"], "harbor-api/src/bookings.js:5");
+        let callers: Vec<(&str, &str)> = v["callers_elsewhere"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["from"].as_str().unwrap(), c["at"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            callers,
+            [
+                (
+                    "harbor-mobile/app/screens/SlotDetail.tsx",
+                    "harbor-mobile/app/screens/SlotDetail.tsx:6"
+                ),
+                ("harbor-web/lib/slots.ts", "harbor-web/lib/slots.ts:2"),
+            ]
+        );
+        assert_eq!(v["other_repos"], json!(["harbor-mobile", "harbor-web"]));
+        // An import of the endpoint's file is not a call to it.
+        assert_eq!(v["callers_here"], json!([]));
+        let screens = v["screens"].as_array().unwrap();
+        let detail = screens
+            .iter()
+            .find(|s| s["id"] == "screen:mobile:/(Stack)/SlotDetail")
+            .unwrap();
+        assert_eq!(detail["app"], "harbor-mobile");
+        assert_eq!(detail["gate"], "signed_in");
+        assert_eq!(
+            detail["at"],
+            "harbor-mobile/app/navigation/RootNavigator.tsx:18"
+        );
+        assert!(screens.iter().any(|s| s["id"] == "screen:web:/slots/:id"));
+        assert_eq!(v["journeys"][0]["id"], "book-a-slot");
+        assert_eq!(v["journeys"][0]["steps"], json!([2]));
+        // Stripe is reached through billing.js, which bookings.js imports.
+        let stripe = v["outside_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "n:stripe")
+            .unwrap();
+        assert_eq!(stripe["direction"], "reaches");
+        assert_eq!(stripe["at"], "harbor-api/src/billing.js:1");
+        for c in cites_in(&v) {
+            assert!(real_cite(&g, "", &c), "{c} isn't a real place");
+        }
+        // The same endpoint by its id; a path alone; nothing for a stranger.
+        assert_eq!(
+            impact(&g, "r:0").unwrap()["callers_elsewhere"],
+            v["callers_elsewhere"]
+        );
+        assert_eq!(
+            impact(&g, "/slots/:id/bookings").unwrap()["target"]["kind"],
+            "endpoint"
+        );
+        assert!(impact(&g, "DELETE /slots/:id/bookings").is_none());
+        assert!(impact(&g, "nowhere.js").is_none());
+    }
+
+    /// A file behind a screen and a journey: the screen with its gate, the
+    /// journey's step, and what the file reaches.
+    #[test]
+    fn impact_of_a_file_behind_a_screen_and_a_journey() {
+        let g = harbor_with_journey();
+        let v = impact(&g, "harbor-web/lib/slots.ts").unwrap();
+        assert_eq!(v["target"]["kind"], "file");
+        let s = &v["screens"][0];
+        assert_eq!(s["id"], "screen:web:/slots/:id");
+        assert_eq!(s["at"], "harbor-web/app/slots/[id]/page.tsx:1");
+        assert_eq!(v["journeys"][0]["id"], "book-a-slot");
+        assert_eq!(v["journeys"][0]["steps"], json!([2]));
+        assert!(v["journeys"][0]["at"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("harbor-web/lib/slots.ts:2")));
+        // The page that imports it is its caller in the same repository.
+        assert_eq!(
+            v["callers_here"][0]["from"],
+            "harbor-web/app/slots/[id]/page.tsx"
+        );
+        // The mobile sign-in screen is registered by the navigator file.
+        let nav = impact(&g, "harbor-mobile/app/navigation/RootNavigator.tsx").unwrap();
+        let gates: Vec<(&str, &str)> = nav["screens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap(), s["gate"].as_str().unwrap()))
+            .collect();
+        assert!(gates.contains(&("SignIn", "signed_out")));
+        assert!(gates.contains(&("Slots", "signed_in")));
+        // The table a nightly job writes.
+        let e = impact(&g, "harbor-api/src/entities/slot.entity.ts").unwrap();
+        assert_eq!(e["data"][0]["tables"], json!(["slot"]));
+        assert_eq!(e["data"][0]["at"], "harbor-infra/dags/nightly_slots.py:6");
+        for c in cites_in(&v)
+            .into_iter()
+            .chain(cites_in(&nav))
+            .chain(cites_in(&e))
+        {
+            assert!(real_cite(&g, "", &c), "{c} isn't a real place");
+        }
+    }
+
+    /// The code a Lambda runs: the function that deploys it and the bucket
+    /// whose uploads start it, each where the infrastructure says so.
+    #[test]
+    fn impact_of_a_lambda_names_what_deploys_and_starts_it() {
+        let g = harbor();
+        let v = impact(&g, "harbor-api/src/receipts/index.js").unwrap();
+        let cloud = v["cloud"].as_array().unwrap();
+        let deploy = cloud.iter().find(|c| c["how"] == "deploy").unwrap();
+        assert_eq!(deploy["id"], "n:infra-harbor-receipts-function");
+        assert_eq!(deploy["resource"], "lambda");
+        assert_eq!(deploy["at"], "harbor-infra/main.tf:5");
+        let trigger = cloud.iter().find(|c| c["how"] == "trigger").unwrap();
+        assert_eq!(trigger["id"], "n:infra-bucket-uploads");
+        assert_eq!(trigger["labels"], json!(["s3:ObjectCreated:*"]));
+        assert_eq!(trigger["starts"], "Harbor receipts function");
+        assert_eq!(trigger["at"], "harbor-infra/main.tf:28");
+        assert_eq!(v["outside_services"][0]["label"], "Amazon S3");
+        // A webhook endpoint: the outside service that calls in.
+        let w = impact(&g, "POST /webhooks/stripe").unwrap();
+        let s = &w["outside_services"].as_array().unwrap();
+        assert!(s
+            .iter()
+            .any(|o| o["id"] == "n:stripe" && o["direction"] == "calls in"));
+        // A part: everything in it.
+        let p = impact(&g, "api").unwrap();
+        assert_eq!(p["target"]["kind"], "part");
+        assert_eq!(p["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(p["other_repos"], json!(["harbor-mobile", "harbor-web"]));
+        // The lookup, its label and its place among the tools.
+        let mut l = Lookups::new(g);
+        let (found, label) = l.lookup("map_impact", &json!({"target": "POST /slots/:id/bookings"}));
+        assert!(found.get("error").is_none());
+        assert_eq!(
+            label,
+            "Looked up what changing POST /slots/:id/bookings reaches on the app map"
+        );
+        assert!(l.parts().contains(&"api".to_string()));
+        assert!(l.lookup("map_impact", &json!({"target": "x"})).0["error"].is_string());
+        assert!(is_tool("map_impact"));
+        assert!(tool_defs().iter().any(
+            |d| d["name"] == "map_impact" && d["input_schema"]["required"] == json!(["target"])
+        ));
+    }
+
+    /// A citation is a file on the map and a line inside it.
+    #[test]
+    fn real_citations_are_files_and_lines_on_the_map() {
+        let g = harbor();
+        assert!(real_cite(&g, "", "harbor-api/src/bookings.js:5"));
+        assert!(real_cite(&g, "harbor/harbor-api", "src/bookings.js:5"));
+        assert!(real_cite(&g, "", "harbor/harbor-api/src/bookings.js:5"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js:9999"));
+        assert!(!real_cite(&g, "", "harbor-api/src/nowhere.js:1"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js"));
+        assert!(!real_cite(&g, "", "harbor-api/src/bookings.js:0"));
+    }
+
+    /// What the Knowledge page's card counts, from the map at build time.
+    #[test]
+    fn coverage_counts_screens_services_cloud_and_repos() {
+        let c = MapIndex::of(&harbor()).coverage;
+        assert!(c.counted);
+        assert_eq!(
+            c.screens,
+            BTreeMap::from([("harbor-mobile".into(), 3), ("web".into(), 1)])
+        );
+        assert_eq!(c.outside_services, 4);
+        assert_eq!(c.cloud_links, 2);
+        assert_eq!(c.repos, 4);
+        // An index written before the counts reads as not counted.
+        let old: MapIndex = serde_json::from_value(json!({
+            "repos": {}, "files": [], "repo_parts": {}, "issues": [], "has_health": false
+        }))
+        .unwrap();
+        assert!(!old.coverage.counted);
+    }
+
+    /// A journey: found by id or title words, each step described with
+    /// what happens there and the lines it cites; listed in the overview
+    /// and search; kept on a mini map that holds every step.
+    #[test]
+    fn a_journey_is_walked_step_by_step() {
+        let mut g = harbor();
+        g["flows"] = json!([{
+            "id": "book-a-slot", "title": "Book a slot", "description": "", "custom": true,
+            "coderhelm": {"linked": [true, true, false]},
+            "steps": [
+                {"ref": "f:harbor-web/app/slots/[id]/page.tsx", "note": "The patron opens a slot.", "evidence": [{"file": "harbor-web/app/slots/[id]/page.tsx", "line": 3}]},
+                {"ref": "r:0", "note": "The page asks to book it.", "evidence": [{"file": "harbor-web/lib/slots.ts", "line": 2}, {"file": "harbor-api/src/bookings.js", "line": 5}]},
+                {"ref": "n:stripe", "note": "Stripe charges the card.", "evidence": [{"file": "harbor-api/src/billing.js", "line": 1}]},
+            ],
+        }]);
+        for q in ["book-a-slot", "book slot", "Book a SLOT"] {
+            let v = flow_view(&g, q).unwrap();
+            assert_eq!(v["journey"]["title"], "Book a slot", "{q}");
+        }
+        assert!(flow_view(&g, "sign in").is_none());
+        assert!(flow_view(&g, "  ").is_none());
+        let v = flow_view(&g, "book-a-slot").unwrap();
+        let steps = v["steps"].as_array().unwrap();
+        assert_eq!(steps[1]["method"], "POST");
+        assert_eq!(
+            steps[1]["cites"],
+            json!(["harbor-web/lib/slots.ts:2", "harbor-api/src/bookings.js:5"])
+        );
+        assert_eq!(steps[2]["label"], "Stripe");
+        assert_eq!(steps[2]["inferred"], true);
+        assert!(steps[1].get("inferred").is_none());
+        assert_eq!(
+            overview(&g)["journeys"],
+            json!([{"id": "book-a-slot", "title": "Book a slot", "steps": 3}])
+        );
+        assert_eq!(search(&g, "slot")["journeys"][0]["id"], "book-a-slot");
+        let mut b = Lookups::new(g.clone());
+        let (_, label) = b.lookup("map_flow", &json!({"journey": "book a slot"}));
+        assert_eq!(
+            label,
+            "Walked through the journey book a slot on the app map"
+        );
+        assert_eq!(b.parts(), vec!["api", "stripe", "web"]);
+        // On a mini map that holds every step it stays; otherwise it goes.
+        let all = sub_map(
+            &g,
+            &BTreeSet::from(["api".into(), "web".into(), "stripe".into()]),
+        );
+        assert_eq!(all["flows"][0]["steps"][1]["ref"], "r:0");
+        let api = sub_map(&g, &BTreeSet::from(["api".to_string()]));
+        assert_eq!(api["flows"], json!([]));
+        assert!(TOOLS.contains(&"map_flow") && tool_defs().iter().any(|d| d["name"] == "map_flow"));
     }
 
     /// The lookups Chat and /mcp share: they answer from the map, register
@@ -1967,13 +3907,13 @@ mod tests {
         let mut b = Lookups::new(harbor());
         let mut reg = crate::knowledge::answer::Registry::default();
         let (text, label, failed) =
-            b.cite(&mut reg, "map_screen", &json!({"screen": "/slips/:id"}));
+            b.cite(&mut reg, "map_screen", &json!({"screen": "/slots/:id"}));
         assert!(!failed && text.starts_with("[S1] "), "{text}");
-        assert_eq!(label, "Followed the screen /slips/:id on the app map");
+        assert_eq!(label, "Followed the screen /slots/:id on the app map");
         let s = reg.get("S1").unwrap();
         assert_eq!(s.kind, SOURCE_KIND);
         assert_eq!(s.href.as_deref(), Some("/app-map?focus=api,stripe,web"));
-        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips/:id"}));
+        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slots/:id"}));
         assert_eq!(
             v["behind"].as_array().unwrap().last().unwrap()["step"],
             "outside"
@@ -1995,7 +3935,7 @@ mod tests {
         // The overview and a search touch no part: no mini map.
         let mut b = Lookups::new(harbor());
         b.lookup("map_overview", &json!({}));
-        b.lookup("map_find", &json!({"query": "slip"}));
+        b.lookup("map_find", &json!({"query": "slot"}));
         assert!(b.mini_map("now").is_none());
         let names: Vec<String> = tool_defs()
             .iter()
@@ -2057,5 +3997,354 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(FLOORPLAN_VERSION.starts_with("floorplan--v"));
+    }
+
+    // ── System cards named by their repositories ───────────────────────────
+
+    fn card<'a>(g: &'a Value, id: &str) -> &'a Value {
+        arr(g, "nodes").find(|n| n["id"] == id).unwrap()
+    }
+
+    /// A map of the made-up harbor team's repositories with the cards given.
+    fn harbor_cards(nodes: Value) -> Value {
+        let mut g = json!({"schema": GRAPH_SCHEMA, "project": {"name": "Harbor"}, "nodes": nodes, "files": [], "links": []});
+        stamp_repos(
+            &mut g,
+            &folders(&[
+                "harbor/harbor-web".into(),
+                "harbor/harbor-api".into(),
+                "harbor/harbor-mobile".into(),
+                "harbor/harbor-infra".into(),
+                "harbor/harbor-jobs".into(),
+                "harbor/site".into(),
+            ]),
+        );
+        g
+    }
+
+    #[test]
+    fn a_card_that_is_one_repository_is_titled_by_its_name() {
+        let mut g = harbor();
+        name_by_repo(&mut g);
+        let api = card(&g, "api");
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        assert_eq!(api["repos"], json!(["harbor-api"]));
+        assert_eq!(api["summary"], "Takes bookings and charges for them.");
+        assert_eq!(card(&g, "web")["label"], "harbor-web");
+        assert_eq!(card(&g, "web")["role"], "Harbor website");
+        // the repository's own name, not the owner
+        assert!(!api["label"].as_str().unwrap().contains('/'));
+        // A cloud setup made from a repository's folder is that repository.
+        assert_eq!(card(&g, "cloud")["label"], "harbor-infra");
+        assert_eq!(card(&g, "cloud")["role"], "Cloud setup");
+    }
+
+    #[test]
+    fn a_card_over_several_repositories_names_them_all() {
+        let mut g = harbor_cards(json!([
+            {"id": "apps", "parent": null, "label": "Apps people use", "kind": "ui", "paths": ["harbor-web", "harbor-mobile"]},
+            {"id": "back", "parent": null, "label": "Back office", "kind": "service", "paths": ["harbor-api", "harbor-jobs", "harbor-infra", "site"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "apps")["label"], "harbor-web, harbor-mobile");
+        assert_eq!(card(&g, "apps")["role"], "Apps people use");
+        // Long: the first and how many more, every name still kept.
+        assert_eq!(card(&g, "back")["label"], "harbor-api +3 more");
+        assert_eq!(
+            card(&g, "back")["repos"],
+            json!(["harbor-api", "harbor-jobs", "harbor-infra", "site"])
+        );
+        assert_eq!(card(&g, "back")["role"], "Back office");
+        assert_eq!(
+            repo_title(&["harbor-api-gateway".into(), "harbor-mobile-app".into()]),
+            "harbor-api-gateway +1 more"
+        );
+    }
+
+    #[test]
+    fn cards_split_from_one_repository_say_which_folder() {
+        let mut g = harbor_cards(json!([
+            {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui", "paths": ["site/web"]},
+            {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/studio"]},
+            {"id": "api", "parent": null, "level": "system", "label": "Main server", "kind": "service", "paths": ["harbor-api"]},
+            {"id": "api-src", "parent": "api", "level": "part", "label": "Bookings", "kind": "service", "paths": ["harbor-api/src"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "web")["label"], "site / web");
+        assert_eq!(card(&g, "web")["role"], "Website");
+        assert_eq!(card(&g, "studio")["label"], "site / studio");
+        assert_eq!(card(&g, "studio")["role"], "Content studio");
+        assert_eq!(card(&g, "api")["label"], "harbor-api");
+        // A part inside a card keeps its own name.
+        assert_eq!(card(&g, "api-src")["label"], "Bookings");
+        assert!(card(&g, "api-src").get("role").is_none());
+    }
+
+    /// A monorepo's cards as a model writes their paths: globs, the
+    /// repository's shared folders beside the main app.
+    fn site_monorepo() -> Value {
+        let mut g = harbor_cards(json!([
+            {"id": "web", "parent": null, "level": "system", "label": "Website", "kind": "ui",
+             "paths": ["site/apps/web/**", "site/packages/**", "site/e2e/**", "site/.github/**", "site/scripts/**"]},
+            {"id": "studio", "parent": null, "level": "system", "label": "Content studio", "kind": "ui", "paths": ["site/apps/studio/**"]},
+            {"id": "fns", "parent": null, "level": "system", "label": "Image helpers", "kind": "worker", "paths": ["site/lambdas/**"]},
+            {"id": "api", "parent": null, "level": "system", "label": "Main server", "kind": "service", "paths": ["harbor-api/**"]},
+        ]));
+        g["files"] = json!([
+            {"p": "site/apps/web/app/page.tsx", "n": "web", "r": "site"},
+            {"p": "site/apps/web/app/slots/page.tsx", "n": "web", "r": "site"},
+            {"p": "site/packages/ui/button.tsx", "n": "web", "r": "site"},
+            {"p": "site/apps/studio/schemas/slot.ts", "n": "studio", "r": "site"},
+            {"p": "site/lambdas/resize/index.ts", "n": "fns", "r": "site"},
+        ]);
+        g
+    }
+
+    /// The monorepo with its screens as the detectors leave them: route
+    /// screens and screens a catch-all route dispatches to in the web app,
+    /// the studio's document kinds and tools, all under the bare folder.
+    fn site_with_screens() -> Value {
+        let mut g = site_monorepo();
+        let files = g["files"].as_array_mut().unwrap();
+        for (p, n) in [
+            ("site/apps/web/app/[...slug]/page.tsx", "web"),
+            ("site/apps/web/components/blocks/SlotList.tsx", "web"),
+            ("site/apps/web/components/blocks/Hero.tsx", "web"),
+            ("site/apps/studio/schemas/offer.ts", "studio"),
+            ("site/apps/studio/tools/import.tsx", "studio"),
+            ("site/tools/seed.ts", "web"),
+        ] {
+            files.push(json!({"p": p, "n": n, "r": "site"}));
+        }
+        let route = |id: &str, url: &str, file: &str| json!({"id": id, "url": url, "name": id, "file": file, "kind": "route", "nav": {"app": "site", "evidence": [{"file": file, "line": 1}]}});
+        let dispatched = |id: &str, file: &str| json!({"id": id, "url": "/:slug", "name": id, "file": file, "kind": "dispatch", "nav": {"app": "site", "dispatcher": "site/apps/web/app/[...slug]/page.tsx", "renderer": id, "evidence": [{"file": file, "line": 3}]}});
+        let studio = |id: &str, kind: &str, file: &str| json!({"id": id, "url": format!("/studio/{id}"), "name": id, "file": file, "kind": kind, "nav": {"app": "site", "evidence": [{"file": file, "line": 2}]}});
+        g["screens"] = json!([
+            route("screen:home", "/", "site/apps/web/app/page.tsx"),
+            route("screen:slots", "/slots", "site/apps/web/app/slots/page.tsx"),
+            dispatched("screen:slot-list", "site/apps/web/components/blocks/SlotList.tsx"),
+            dispatched("screen:hero", "site/apps/web/components/blocks/Hero.tsx"),
+            studio("screen:doc-slot", "page-kind", "site/apps/studio/schemas/slot.ts"),
+            studio("screen:doc-offer", "page-kind", "site/apps/studio/schemas/offer.ts"),
+            studio("screen:tool-import", "tool", "site/apps/studio/tools/import.tsx"),
+            // in no card's paths: under the card its part is in
+            route("screen:seed", "/seed", "site/tools/seed.ts"),
+            // a file the map doesn't hold, in no card: the repository's main card
+            route("screen:lost", "/lost", "site/other/lost.tsx"),
+            // Floorplan's own screen, already under a card id
+            {"id": "screen:fp", "url": "/about", "name": "About", "file": "site/apps/web/app/about/page.tsx", "app": "web"},
+        ]);
+        g
+    }
+
+    #[test]
+    fn every_screen_sits_under_the_card_its_file_is_in() {
+        let mut g = site_with_screens();
+        name_by_repo(&mut g);
+        let under: Vec<(&str, &str, &str)> = arr(&g, "screens")
+            .map(|s| {
+                (
+                    s["id"].as_str().unwrap(),
+                    s["app"].as_str().unwrap(),
+                    s["app_name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            under,
+            vec![
+                ("screen:home", "web", "site / web"),
+                ("screen:slots", "web", "site / web"),
+                ("screen:slot-list", "web", "site / web"),
+                ("screen:hero", "web", "site / web"),
+                ("screen:doc-slot", "studio", "site / studio"),
+                ("screen:doc-offer", "studio", "site / studio"),
+                ("screen:tool-import", "studio", "site / studio"),
+                ("screen:seed", "web", "site / web"),
+                ("screen:lost", "web", "site / web"),
+                ("screen:fp", "web", "site / web"),
+            ]
+        );
+        // the viewer groups by nav.app: a card's id, the folder kept as repo
+        let s = arr(&g, "screens")
+            .find(|s| s["id"] == "screen:hero")
+            .unwrap();
+        assert_eq!(
+            (&s["nav"]["app"], &s["nav"]["repo"]),
+            (&json!("web"), &json!("site"))
+        );
+        // No bare repository bucket, and the counts add up.
+        let counts = screen_counts(&g);
+        assert_eq!(counts, json!({"site / web": 7, "site / studio": 3}));
+        let total: u64 = counts
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert_eq!(total as usize, arr(&g, "screens").count());
+        // Placing twice changes nothing.
+        let once = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, once);
+    }
+
+    #[test]
+    fn the_overview_and_the_knowledge_counts_group_screens_by_card() {
+        let g = site_with_screens();
+        let mut l = Lookups::new(g.clone());
+        let (o, _) = l.lookup("map_overview", &json!({}));
+        assert_eq!(
+            o["screen_count"],
+            json!({"site / web": 7, "site / studio": 3})
+        );
+        assert!(
+            arr(&o, "screens").all(|s| s["app"] == "web" || s["app"] == "studio"),
+            "{o}"
+        );
+        let (sc, _) = l.lookup("map_screen", &json!({"screen": "screen:doc-offer"}));
+        assert_eq!(sc["screen"]["app_name"], "site / studio", "{sc}");
+        // the index the Knowledge page reads is counted on the page's copy
+        let (_, index) = derived(&g, "now");
+        let idx: MapIndex =
+            serde_json::from_slice(&gunzip(&index, MAX_GRAPH_BYTES).unwrap()).unwrap();
+        assert_eq!(
+            idx.coverage.screens,
+            BTreeMap::from([
+                ("site / studio".to_string(), 3),
+                ("site / web".to_string(), 7)
+            ])
+        );
+    }
+
+    #[test]
+    fn split_repository_cards_are_named_by_one_clean_folder() {
+        let mut g = site_monorepo();
+        name_by_repo(&mut g);
+        let titles: Vec<(&str, &str)> = ["web", "studio", "fns", "api"]
+            .iter()
+            .map(|id| (*id, card(&g, id)["label"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("web", "site / web"),
+                ("studio", "site / studio"),
+                ("fns", "site / lambdas"),
+                ("api", "harbor-api"),
+            ]
+        );
+        // One repository: no "+N more" for its several paths, and no globs anywhere.
+        assert_eq!(card(&g, "web")["repos"], json!(["site / web"]));
+        assert_eq!(card(&g, "web")["role"], "Website");
+        for n in arr(&g, "nodes") {
+            let l = n["label"].as_str().unwrap();
+            assert!(!l.contains('*') && !l.contains("more"), "{l}");
+        }
+    }
+
+    #[test]
+    fn two_cards_with_the_same_folder_word_take_the_shortest_path_that_differs() {
+        let mut g = harbor_cards(json!([
+            {"id": "a", "parent": null, "level": "system", "label": "Public site", "kind": "ui", "paths": ["site/apps/web/**"]},
+            {"id": "b", "parent": null, "level": "system", "label": "Staff site", "kind": "ui", "paths": ["site/admin/web/**"]},
+            {"id": "c", "parent": null, "level": "system", "label": "Shared code", "kind": "library", "paths": ["site/packages/**"]},
+        ]));
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "a")["label"], "site / apps/web");
+        assert_eq!(card(&g, "b")["label"], "site / admin/web");
+        // a card of only a container folder is named by it
+        assert_eq!(card(&g, "c")["label"], "site / packages");
+    }
+
+    #[test]
+    fn a_map_named_by_an_earlier_release_is_named_again_from_its_role() {
+        let mut g = site_monorepo();
+        // as the first release named it
+        let web = g["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|n| n["id"] == "web")
+            .unwrap();
+        web["role"] = json!("Website");
+        web["label"] = json!("site / apps/web/** +4 more");
+        web["repos"] = json!(["site / apps/web/**", "site / packages/**"]);
+        name_by_repo(&mut g);
+        assert_eq!(card(&g, "web")["label"], "site / web");
+        assert_eq!(card(&g, "web")["role"], "Website");
+        let once = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, once);
+    }
+
+    #[test]
+    fn journeys_read_split_cards_by_their_clean_names() {
+        let mut g = site_monorepo();
+        g["flows"] = json!([{"id": "book", "title": "Book a slot", "description": "", "steps": [
+            {"ref": "n:web", "note": "The slot page"},
+            {"ref": "n:api", "note": "Takes the booking"},
+            {"ref": "n:fns", "note": "Resizes the photo"},
+        ]}]);
+        let mut l = Lookups::new(g);
+        let (v, _) = l.lookup("map_flow", &json!({"journey": "book"}));
+        let through: Vec<&str> = arr(&v, "steps")
+            .map(|s| s["label"].as_str().unwrap())
+            .collect();
+        // What the page's journey line reads: "3 steps: site / web, then harbor-api, then site / lambdas".
+        assert_eq!(through, vec!["site / web", "harbor-api", "site / lambdas"]);
+    }
+
+    #[test]
+    fn a_card_that_is_no_repository_keeps_its_name() {
+        let mut g = harbor_cards(json!([
+            {"id": "coderhelm-outside", "parent": null, "label": "Outside services", "kind": "external", "paths": []},
+            {"id": "stripe", "parent": null, "label": "Stripe", "kind": "external", "paths": [], "stats": {"repos": ["harbor-api"]}},
+            {"id": "cloud", "parent": null, "label": "Cloud setup", "kind": "infra", "paths": []},
+            {"id": "elsewhere", "parent": null, "label": "Shared config", "kind": "config", "paths": ["not-a-repo/config"]},
+        ]));
+        let before = g.clone();
+        name_by_repo(&mut g);
+        assert_eq!(g, before);
+    }
+
+    #[test]
+    fn naming_a_map_twice_changes_nothing() {
+        let mut once = harbor();
+        name_by_repo(&mut once);
+        let mut twice = once.clone();
+        name_by_repo(&mut twice);
+        assert_eq!(once, twice);
+        // A map without CoderHelm's folders names its folders from Floorplan's own list.
+        let mut bare: Value = serde_json::from_str(include_str!(
+            "../../worker/floorplan/fixtures/harbor-graph.json"
+        ))
+        .unwrap();
+        name_by_repo(&mut bare);
+        assert_eq!(card(&bare, "api")["label"], "harbor-api");
+    }
+
+    #[test]
+    fn the_page_and_the_lookups_use_the_repository_names() {
+        let g = harbor();
+        let view = viewer_copy(&g, "now");
+        assert_eq!(card(&view, "api")["label"], "harbor-api");
+        assert_eq!(card(&view, "api")["role"], "Booking service");
+        assert_eq!(MapIndex::of(&g).copy, COPY_VERSION);
+        let mut l = Lookups::new(g);
+        let (o, _) = l.lookup("map_overview", &json!({}));
+        let api = arr(&o, "parts").find(|p| p["id"] == "api").unwrap();
+        assert_eq!(api["label"], "harbor-api");
+        assert_eq!(api["role"], "Booking service");
+        assert_eq!(api["repos"], json!(["harbor-api"]));
+        let (p, _) = l.lookup("map_part", &json!({"id": "api"}));
+        assert_eq!(p["part"]["label"], "harbor-api");
+        assert_eq!(p["part"]["role"], "Booking service");
+        // Found by its repository's name and by its role.
+        for q in ["harbor-api", "booking service"] {
+            let (f, _) = l.lookup("map_find", &json!({"query": q}));
+            assert!(arr(&f, "parts").any(|p| p["id"] == "api"), "{q}: {f}");
+        }
     }
 }

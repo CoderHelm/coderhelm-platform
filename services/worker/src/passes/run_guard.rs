@@ -1106,6 +1106,7 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
             only_from: None,
             extra: Vec::new(),
             add: Vec::new(),
+            needs: None,
         };
         match common::run_fail::fail_run(
             &state.dynamo,
@@ -1116,7 +1117,10 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
         )
         .await
         {
-            Ok(true) => super::webhooks::emit_run(state, team_id, run_id, "failed").await,
+            Ok(true) => {
+                let ended_as = common::run_fail::status_for(&why);
+                super::webhooks::emit_run(state, team_id, run_id, ended_as).await
+            }
             Ok(false) => {}
             Err(e) => warn!(run_id, error = %e, "Run guard: could not end the run"),
         }

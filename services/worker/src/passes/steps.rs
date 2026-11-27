@@ -75,6 +75,8 @@ pub fn under_ceiling(continuation: u32) -> bool {
 pub fn next_message(msg: &TicketMessage, run_id: &str, first_attempt_ms: u64) -> TicketMessage {
     let mut next = msg.clone();
     next.continuation = msg.continuation.saturating_add(1);
+    // A backoff is for the step it delays, never the ones after.
+    next.retry_after_secs = 0;
     next.continuation_run_id = Some(run_id.to_string());
     next.first_attempt_ms = first_attempt_ms;
     next

@@ -1,0 +1,869 @@
+{
+ "schema": "floorplan/graph@1",
+ "meta": {
+  "generatedAt": "2026-11-21T00:00:00.000Z",
+  "scanAt": "2026-11-21T00:00:00.000Z",
+  "rootName": "root",
+  "root": "/sandbox/root",
+  "audience": "everyone",
+  "agent": "none",
+  "repos": [
+   {
+    "path": "library-web",
+    "name": "library-web",
+    "branch": "main",
+    "head": "e290a049fd8ce21898c7eddda42835179589f699",
+    "remote": null
+   }
+  ],
+  "counts": {
+   "files": 9,
+   "loc": 95,
+   "unassigned": 0
+  }
+ },
+ "project": {
+  "name": "Library",
+  "summary": "A website where patrons find a booth and join the library."
+ },
+ "nodes": [
+  {
+   "id": "site",
+   "parent": null,
+   "label": "Library website",
+   "kind": "ui",
+   "summary": "Where patrons find a booth, sign up and pay for the season.",
+   "details": "",
+   "tags": [],
+   "paths": [
+    "library-web"
+   ],
+   "packages": [],
+   "hosts": [],
+   "stats": {
+    "files": 9,
+    "loc": 95,
+    "langs": {
+     "typescript": 95
+    },
+    "repos": [
+     "library-web"
+    ]
+   },
+   "level": "system"
+  }
+ ],
+ "files": [
+  {
+   "p": "library-web/app/[...slug]/page.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 18,
+   "name": "Slug detail page",
+   "d": "",
+   "auto": true,
+   "h": "240ea94a533c",
+   "sig": "f36e73540e3b",
+   "s": [
+    [
+     "Page",
+     "function",
+     15,
+     1,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/app/api/checkout/route.ts",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 4,
+   "name": "Checkout route handler",
+   "d": "",
+   "auto": true,
+   "h": "58c9e4bffc96",
+   "sig": "ac0768c3ec97",
+   "s": [
+    [
+     "POST",
+     "function",
+     1,
+     0,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/app/api/members/route.ts",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 4,
+   "name": "Members route handler",
+   "d": "",
+   "auto": true,
+   "h": "d766c8f7e7d9",
+   "sig": "6df03f591ec1",
+   "s": [
+    [
+     "POST",
+     "function",
+     1,
+     0,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/app/page.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 3,
+   "name": "Library web page",
+   "d": "",
+   "auto": true,
+   "h": "d14a5585d1f0",
+   "sig": "d73184793b61",
+   "s": [
+    [
+     "Home",
+     "function",
+     1,
+     1,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/components/BoothCard.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 3,
+   "name": "Booth card",
+   "d": "",
+   "auto": true,
+   "h": "59f54d44b761",
+   "sig": "9e434fe7fe38",
+   "s": [
+    [
+     "BoothCard",
+     "function",
+     1,
+     0,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/components/CheckoutForm.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 7,
+   "name": "Checkout form",
+   "d": "",
+   "auto": true,
+   "h": "d575577d1a9c",
+   "sig": "e61e9694e024",
+   "s": [
+    [
+     "CheckoutForm",
+     "function",
+     3,
+     0,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/components/SignupForm.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 10,
+   "name": "Signup form",
+   "d": "",
+   "auto": true,
+   "h": "663e1701fc2b",
+   "sig": "bf5d65be702b",
+   "s": [
+    [
+     "SignupForm",
+     "function",
+     4,
+     0,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "library-web/lib/renderers.tsx",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 25,
+   "name": "Renderers",
+   "d": "",
+   "auto": true,
+   "h": "0c666cc253a0",
+   "sig": "4fc73bf5b534",
+   "s": [
+    [
+     "BoothRenderer",
+     "function",
+     9,
+     0,
+     "One booth, by its number."
+    ],
+    [
+     "BoothListRenderer",
+     "function",
+     14,
+     0,
+     "Every booth."
+    ],
+    [
+     "MemberSignupRenderer",
+     "function",
+     19,
+     0,
+     "The form a new member signs up with."
+    ],
+    [
+     "MemberCheckoutRenderer",
+     "function",
+     24,
+     0,
+     "Where a new member pays for the first season."
+    ],
+    [
+     "NoticeRenderer",
+     "function",
+     29,
+     0,
+     "A notice to patrons."
+    ]
+   ]
+  },
+  {
+   "p": "library-web/lib/resolve.ts",
+   "n": "site",
+   "r": "library-web",
+   "l": "typescript",
+   "loc": 21,
+   "name": "Resolve",
+   "d": "",
+   "auto": true,
+   "h": "4ec83fe8d856",
+   "sig": "36101eeb2b1e",
+   "s": [
+    [
+     "PageType",
+     "type",
+     1,
+     0,
+     ""
+    ],
+    [
+     "PAGE_TYPES",
+     "const",
+     3,
+     0,
+     ""
+    ],
+    [
+     "PageMatch",
+     "type",
+     8,
+     0,
+     ""
+    ],
+    [
+     "resolvePage",
+     "function",
+     11,
+     0,
+     "What an address is: a few fixed paths, a booth by its number, and the rest from the content store."
+    ]
+   ]
+  }
+ ],
+ "routes": [
+  {
+   "f": "library-web/app/api/checkout/route.ts",
+   "m": "POST",
+   "p": "/api/checkout",
+   "l": 1,
+   "h": "POST",
+   "name": "Create api checkout",
+   "d": "",
+   "auto": true
+  },
+  {
+   "f": "library-web/app/api/members/route.ts",
+   "m": "POST",
+   "p": "/api/members",
+   "l": 1,
+   "h": "POST",
+   "name": "Create api members",
+   "d": "",
+   "auto": true
+  }
+ ],
+ "links": [
+  {
+   "a": "f:library-web/app/[...slug]/page.tsx",
+   "b": "f:library-web/lib/resolve.ts",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "resolvePage",
+    "PageType"
+   ]
+  },
+  {
+   "a": "f:library-web/app/[...slug]/page.tsx",
+   "b": "f:library-web/lib/renderers.tsx",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "BoothRenderer",
+    "BoothListRenderer",
+    "MemberSignupRenderer",
+    "MemberCheckoutRenderer",
+    "NoticeRenderer"
+   ]
+  },
+  {
+   "a": "f:library-web/lib/renderers.tsx",
+   "b": "f:library-web/lib/resolve.ts",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "PageMatch"
+   ]
+  },
+  {
+   "a": "f:library-web/lib/renderers.tsx",
+   "b": "f:library-web/components/SignupForm.tsx",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "SignupForm"
+   ]
+  },
+  {
+   "a": "f:library-web/lib/renderers.tsx",
+   "b": "f:library-web/components/CheckoutForm.tsx",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "CheckoutForm"
+   ]
+  },
+  {
+   "a": "f:library-web/lib/renderers.tsx",
+   "b": "f:library-web/components/BoothCard.tsx",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "BoothCard"
+   ]
+  },
+  {
+   "a": "f:library-web/components/CheckoutForm.tsx",
+   "b": "f:library-web/app/api/checkout/route.ts",
+   "k": "http",
+   "w": 1,
+   "labels": [
+    "POST /api/checkout"
+   ],
+   "inferred": true,
+   "calls": [
+    [
+     0,
+     5
+    ],
+    [
+     0,
+     5
+    ]
+   ],
+   "evidence": [
+    {
+     "file": "library-web/components/CheckoutForm.tsx",
+     "line": 5,
+     "how": "code",
+     "confidence": 0.9
+    }
+   ]
+  },
+  {
+   "a": "f:library-web/components/SignupForm.tsx",
+   "b": "f:library-web/app/api/members/route.ts",
+   "k": "http",
+   "w": 1,
+   "labels": [
+    "POST /api/members"
+   ],
+   "calls": [
+    [
+     1,
+     7
+    ]
+   ],
+   "inferred": false,
+   "evidence": [
+    {
+     "file": "library-web/components/SignupForm.tsx",
+     "line": 7,
+     "how": "code",
+     "confidence": 0.9
+    }
+   ]
+  }
+ ],
+ "flows": [],
+ "tour": [],
+ "health": {
+  "summary": {
+   "high": 0,
+   "medium": 1,
+   "low": 0
+  },
+  "issues": [
+   {
+    "id": "no-auth:library-web",
+    "kind": "unprotected-endpoint",
+    "severity": "medium",
+    "title": "None of library-web’s endpoints check who is calling",
+    "detail": "2 endpoints answer anyone who knows the address, with no login check in the code. That's fine only if this server is private (for example behind a company network or a gateway that checks logins); otherwise anyone could read or change its data.",
+    "items": [
+     "r:0",
+     "r:1"
+    ],
+    "notes": {
+     "r:0": "Changes data, no login check",
+     "r:1": "Changes data, no login check"
+    },
+    "locations": [
+     {
+      "file": "library-web/app/api/checkout/route.ts",
+      "line": 1
+     },
+     {
+      "file": "library-web/app/api/members/route.ts",
+      "line": 1
+     }
+    ],
+    "fix": "Review access control in library-web. None of these endpoints verify the caller in code:\n- POST /api/checkout — library-web/app/api/checkout/route.ts:1\n- POST /api/members — library-web/app/api/members/route.ts:1\n\nFirst tell me in plain words whether this server is reachable from the internet and whether anything in front of it (gateway, network rules) checks logins. If it is public, propose the smallest safe way to require login for the data-changing endpoints (POST/PUT/PATCH/DELETE) first, show me the plan, and wait for my OK before changing code."
+   }
+  ],
+  "checked": [
+   {
+    "check": "endpoints",
+    "label": "Endpoint sign-in",
+    "checked": true,
+    "text": "checked 2 endpoints"
+   },
+   {
+    "check": "supabase",
+    "label": "Supabase table rules",
+    "checked": false,
+    "text": "no Supabase found"
+   },
+   {
+    "check": "firebase",
+    "label": "Firebase rules",
+    "checked": false,
+    "text": "no rules files found"
+   },
+   {
+    "check": "stripe",
+    "label": "Stripe webhooks",
+    "checked": false,
+    "text": "no Stripe code found"
+   },
+   {
+    "check": "secrets",
+    "label": "Secrets in code",
+    "checked": true,
+    "text": "read 10 files"
+   }
+  ]
+ },
+ "screens": [
+  {
+   "id": "screen:site:/",
+   "url": "/",
+   "file": "library-web/app/page.tsx",
+   "app": "site",
+   "fw": "next-app",
+   "name": "Home",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/app/page.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    }
+   ]
+  },
+  {
+   "id": "screen:site:/*",
+   "url": "/*",
+   "file": "library-web/app/[...slug]/page.tsx",
+   "app": "site",
+   "fw": "next-app",
+   "name": "Page",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/app/[...slug]/page.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    },
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/lib/resolve.ts",
+     "note": "Helper code this screen uses",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/components/CheckoutForm.tsx",
+     "note": "Part of Renderers",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/components/SignupForm.tsx",
+     "note": "Part of Renderers",
+     "kind": "part"
+    },
+    {
+     "id": "f:library-web/components/BoothCard.tsx",
+     "note": "Part of Renderers",
+     "kind": "part"
+    },
+    {
+     "id": "r:0",
+     "note": "Asks the server to create api checkout",
+     "kind": "request"
+    },
+    {
+     "id": "f:library-web/app/api/checkout/route.ts",
+     "note": "Server code that handles “Create api checkout”",
+     "kind": "server"
+    }
+   ]
+  },
+  {
+   "id": "screen:site:/(booth-index)/*",
+   "url": "/(booth-index)/*",
+   "file": "library-web/lib/renderers.tsx",
+   "app": "site",
+   "fw": "dispatch",
+   "name": "Booth list",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    }
+   ],
+   "kind": "screen",
+   "source": "coderhelm",
+   "nav": {
+    "app": "library-web",
+    "navigator": "/*",
+    "group": "dispatched",
+    "gate": null,
+    "route": null,
+    "type": "booth-index",
+    "renderer": "BoothListRenderer",
+    "dispatcher": "library-web/app/[...slug]/page.tsx",
+    "urlFrom": "route",
+    "evidence": [
+     {
+      "file": "library-web/lib/renderers.tsx",
+      "line": 14,
+      "how": "code",
+      "confidence": 0.95
+     },
+     {
+      "file": "library-web/app/[...slug]/page.tsx",
+      "line": 9,
+      "how": "code",
+      "confidence": 0.9
+     }
+    ]
+   }
+  },
+  {
+   "id": "screen:site:/(notice)/*",
+   "url": "/(notice)/*",
+   "file": "library-web/lib/renderers.tsx",
+   "app": "site",
+   "fw": "dispatch",
+   "name": "Notice page",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    }
+   ],
+   "kind": "screen",
+   "source": "coderhelm",
+   "nav": {
+    "app": "library-web",
+    "navigator": "/*",
+    "group": "dispatched",
+    "gate": null,
+    "route": null,
+    "type": "notice",
+    "renderer": "NoticeRenderer",
+    "dispatcher": "library-web/app/[...slug]/page.tsx",
+    "urlFrom": "route",
+    "evidence": [
+     {
+      "file": "library-web/lib/renderers.tsx",
+      "line": 29,
+      "how": "code",
+      "confidence": 0.95
+     },
+     {
+      "file": "library-web/app/[...slug]/page.tsx",
+      "line": 12,
+      "how": "code",
+      "confidence": 0.9
+     }
+    ]
+   }
+  },
+  {
+   "id": "screen:site:/booths/:segment2",
+   "url": "/booths/:segment2",
+   "file": "library-web/lib/renderers.tsx",
+   "app": "site",
+   "fw": "dispatch",
+   "name": "Booth page",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    },
+    {
+     "id": "f:library-web/components/BoothCard.tsx",
+     "note": "A component on this screen",
+     "kind": "part"
+    }
+   ],
+   "kind": "screen",
+   "source": "coderhelm",
+   "nav": {
+    "app": "library-web",
+    "navigator": "/*",
+    "group": "dispatched",
+    "gate": null,
+    "route": "/booths/:segment2",
+    "type": "booth",
+    "renderer": "BoothRenderer",
+    "dispatcher": "library-web/app/[...slug]/page.tsx",
+    "urlFrom": "resolver",
+    "evidence": [
+     {
+      "file": "library-web/lib/renderers.tsx",
+      "line": 9,
+      "how": "code",
+      "confidence": 0.95
+     },
+     {
+      "file": "library-web/app/[...slug]/page.tsx",
+      "line": 8,
+      "how": "code",
+      "confidence": 0.9
+     },
+     {
+      "file": "library-web/lib/resolve.ts",
+      "line": 19,
+      "how": "code",
+      "confidence": 0.85
+     }
+    ]
+   }
+  },
+  {
+   "id": "screen:site:/members/checkout",
+   "url": "/members/checkout",
+   "file": "library-web/lib/renderers.tsx",
+   "app": "site",
+   "fw": "dispatch",
+   "name": "Member checkout",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    },
+    {
+     "id": "f:library-web/components/CheckoutForm.tsx",
+     "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "r:0",
+     "note": "Asks the server for create api checkout",
+     "kind": "request"
+    },
+    {
+     "id": "f:library-web/app/api/checkout/route.ts",
+     "note": "Server code that handles create api checkout",
+     "kind": "server"
+    }
+   ],
+   "kind": "screen",
+   "source": "coderhelm",
+   "nav": {
+    "app": "library-web",
+    "navigator": "/*",
+    "group": "dispatched",
+    "gate": null,
+    "route": "/members/checkout",
+    "type": "member-checkout",
+    "renderer": "MemberCheckoutRenderer",
+    "dispatcher": "library-web/app/[...slug]/page.tsx",
+    "urlFrom": "resolver",
+    "evidence": [
+     {
+      "file": "library-web/lib/renderers.tsx",
+      "line": 24,
+      "how": "code",
+      "confidence": 0.95
+     },
+     {
+      "file": "library-web/app/[...slug]/page.tsx",
+      "line": 11,
+      "how": "code",
+      "confidence": 0.9
+     },
+     {
+      "file": "library-web/lib/resolve.ts",
+      "line": 16,
+      "how": "code",
+      "confidence": 0.85
+     }
+    ]
+   }
+  },
+  {
+   "id": "screen:site:/members/join",
+   "url": "/members/join",
+   "file": "library-web/lib/renderers.tsx",
+   "app": "site",
+   "fw": "dispatch",
+   "name": "Member signup",
+   "description": "",
+   "behind": [
+    {
+     "id": "f:library-web/lib/renderers.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    },
+    {
+     "id": "f:library-web/components/SignupForm.tsx",
+     "note": "A component on this screen",
+     "kind": "part"
+    },
+    {
+     "id": "r:1",
+     "note": "Asks the server for create api members",
+     "kind": "request"
+    },
+    {
+     "id": "f:library-web/app/api/members/route.ts",
+     "note": "Server code that handles create api members",
+     "kind": "server"
+    }
+   ],
+   "kind": "screen",
+   "source": "coderhelm",
+   "nav": {
+    "app": "library-web",
+    "navigator": "/*",
+    "group": "dispatched",
+    "gate": null,
+    "route": "/members/join",
+    "type": "member-signup",
+    "renderer": "MemberSignupRenderer",
+    "dispatcher": "library-web/app/[...slug]/page.tsx",
+    "urlFrom": "resolver",
+    "evidence": [
+     {
+      "file": "library-web/lib/renderers.tsx",
+      "line": 19,
+      "how": "code",
+      "confidence": 0.95
+     },
+     {
+      "file": "library-web/app/[...slug]/page.tsx",
+      "line": 10,
+      "how": "code",
+      "confidence": 0.9
+     },
+     {
+      "file": "library-web/lib/resolve.ts",
+      "line": 13,
+      "how": "code",
+      "confidence": 0.85
+     }
+    ]
+   }
+  }
+ ],
+ "extract": {
+  "version": 1,
+  "ms": {
+   "infra": 0,
+   "screens": 0,
+   "screens:dispatch": 0,
+   "services": 0,
+   "calls": 0,
+   "webhooks": 0,
+   "data": 0,
+   "screens-merge": 0,
+   "total": 0
+  },
+  "notes": [],
+  "counts": {
+   "testHttpDropped": 0,
+   "services": 0,
+   "callLinks": 2,
+   "extraRoutes": 0,
+   "infra": {
+    "nodes": 0,
+    "links": 0
+   },
+   "webhooks": 0,
+   "dataLinks": 0,
+   "screensAdded": 5,
+   "fakeScreensDropped": 0,
+   "navLinks": 0
+  },
+  "otherHosts": [],
+  "webhooksUnnamed": []
+ }
+}

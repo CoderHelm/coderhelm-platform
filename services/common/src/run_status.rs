@@ -26,6 +26,10 @@ pub const AWAITING_CI: &str = "awaiting_ci";
 /// the data. It asks nobody and goes on by itself once a re-check shows
 /// the role has the read (`role_wait`).
 pub const AWAITING_SETUP: &str = "awaiting_setup";
+/// Waiting for another change to merge: what the ticket changes is made by
+/// another ticket's work that hasn't merged (`change_wait`). It asks nobody
+/// and goes on by itself when that change merges.
+pub const AWAITING_CHANGE: &str = "awaiting_change";
 pub const NEEDS_INPUT: &str = "needs_input";
 pub const NEEDS_OUTSIDE_CHANGE: &str = "needs_outside_change";
 /// An open pull request (anyone's) already does the work: the run linked it
@@ -50,12 +54,13 @@ pub const RETRIED: &str = "retried";
 pub const ARCHIVED: &str = "archived";
 
 /// Every status a run record carries.
-pub const ALL: [&str; 17] = [
+pub const ALL: [&str; 18] = [
     PENDING,
     QUEUED,
     RUNNING,
     AWAITING_CI,
     AWAITING_SETUP,
+    AWAITING_CHANGE,
     NEEDS_INPUT,
     NEEDS_OUTSIDE_CHANGE,
     COVERED_BY_PR,
@@ -232,6 +237,7 @@ mod tests {
             RUNNING,
             AWAITING_CI,
             AWAITING_SETUP,
+            AWAITING_CHANGE,
             NEEDS_INPUT,
             NEEDS_OUTSIDE_CHANGE,
             COVERED_BY_PR,

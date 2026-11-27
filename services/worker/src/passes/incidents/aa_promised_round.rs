@@ -2,7 +2,7 @@
 //! The run took review-fix rounds until its automatic fix budget was spent,
 //! handed the pull request over with two of its own review's findings still
 //! listed, and finished. The ready decision then held the draft every hour
-//! for three days on "CoderHelm fixes them in its review rounds; fix them on
+//! for days on "CoderHelm fixes them in its review rounds; fix them on
 //! the branch, or remove a finding from the list once a person has judged
 //! it." No round ever ran after the run was done: the hold promised work
 //! nothing queued, and the run page told the person CoderHelm was on it.
@@ -34,17 +34,17 @@ use crate::passes::own_review::{self, RoundBudget};
 use crate::passes::ready::{self, Ci, Decision, Facts};
 use crate::passes::resume;
 
-/// What the hold said for three days, with nothing queued behind it.
+/// What the hold said for days, with nothing queued behind it.
 const OLD_PROMISE: &str = "CoderHelm fixes them in its review rounds";
 
-const HEAD: &str = "b0413fa";
+const HEAD: &str = "a1b2c3d";
 
 fn body() -> String {
     format!(
-        "{}\n\n## Summary\nRe-index rows written behind the sync cursor.",
+        "{}\n\n## Summary\nRe-index bookings written behind the sync cursor.",
         own_review::section(&[
-            "The backfill skips rows with no parent (`sync/index.py:88`)".to_string(),
-            "The cursor reads the source's own timestamp (`sync/cursor.py:41`)".to_string(),
+            "The backfill skips bookings with no slot (`harbor/backfill.py:88`)".to_string(),
+            "The cursor reads the vendor's own timestamp (`harbor/cursor.py:41`)".to_string(),
         ])
     )
 }
@@ -53,7 +53,7 @@ fn facts(own_fixing: bool) -> Facts {
     Facts {
         draft: true,
         body: body(),
-        title: "fix(sync): re-index rows written behind the cursor".into(),
+        title: "fix(sync): re-index bookings written behind the cursor".into(),
         ci: Ci {
             green: true,
             why: String::new(),
@@ -147,7 +147,7 @@ fn with_rounds_left_one_round_is_queued_per_head_and_the_draft_waits_for_it() {
         "a fix round already ran on this head"
     );
     // A new head (the round pushed) may have its own.
-    assert_eq!(own_review::round_left(&ran, "c71e2d0", 8, 10), Ok(()));
+    assert_eq!(own_review::round_left(&ran, "d4e5f60", 8, 10), Ok(()));
 }
 
 #[test]
@@ -201,14 +201,14 @@ fn the_wait_for_a_round_is_bounded_like_every_wait() {
             .unwrap()
             .with_timezone(&chrono::Utc)
     };
-    let mut prior = DraftHold::new(Kind::Waiting, vec![Reason::new(&why, "")], 564, "").unwrap();
-    prior.since = "2026-11-10T03:31:22Z".into();
+    let mut prior = DraftHold::new(Kind::Waiting, vec![Reason::new(&why, "")], 42, "").unwrap();
+    prior.since = "2030-03-10T03:31:22Z".into();
     prior.head = HEAD.into();
     let mut f = facts(true);
     f.prior = Some(prior);
-    f.now = Some(t("2026-11-10T04:31:00Z"));
+    f.now = Some(t("2030-03-10T04:31:00Z"));
     assert!(matches!(ready::decide(&f), Decision::Wait { .. }));
-    f.now = Some(t("2026-11-10T05:32:00Z"));
+    f.now = Some(t("2030-03-10T05:32:00Z"));
     // Stalled: CoderHelm's own next action, never a person's hold.
     assert!(matches!(
         ready::decide(&f),

@@ -16,7 +16,13 @@
 //!   counts go on the analytics table by installation and hour
 //!   ([`counts_key`]) and in one `github_budget` log line per message.
 //! - **Work a person waits on comes first** ([`Priority::Foreground`]): a
-//!   run's steps, its fix rounds, a review. It may spend the whole budget.
+//!   review, a round a person asked for, a chat. It may spend the whole
+//!   budget.
+//! - **A run's own steps come next** ([`Priority::Run`]): its passes, its
+//!   CI wait and CI fix rounds, the merge steps, a description rebuilt. They
+//!   spend while at least [`PEOPLE_RESERVE_PCT`] percent of the hour's
+//!   budget is left, then wait for the reset, so a busy hour of runs never
+//!   leaves a review or a person's answer waiting for it.
 //! - **Sweeps come last** ([`Priority::Background`]). A sweep spends only
 //!   while at least [`RUN_RESERVE_PCT`] percent of the hour's budget is left
 //!   (the rest is the runs'), and never more than its own [`hourly_cap`] an
@@ -37,14 +43,20 @@
 /// while less than this is left.
 pub const RUN_RESERVE_PCT: u64 = 50;
 
+/// Percent of the hourly budget a run's own steps never spend: kept for the
+/// work a person waits on (a review, a person's answer, a chat).
+pub const PEOPLE_RESERVE_PCT: u64 = 10;
+
 /// The smallest hourly budget GitHub gives an installation.
 pub const SMALLEST_LIMIT: u64 = 5_000;
 
 /// Who a request is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
-    /// A person is waiting on it: a run's steps, a fix round, a review.
+    /// A person is waiting on it: a review, a round they asked for, a chat.
     Foreground,
+    /// A run's own steps: they leave the last of the hour to people.
+    Run,
     /// A sweep on a timer, or work nobody is waiting on.
     Background,
 }
@@ -53,8 +65,12 @@ pub enum Priority {
 pub mod caller {
     /// A ticket run's own steps (plan, implement, the pull request).
     pub const RUN: &str = "run";
-    /// A round on an open pull request: CI fix, review fix, feedback.
+    /// A round on an open pull request a person asked for (their review or
+    /// comment).
     pub const FIX_ROUND: &str = "fix_round";
+    /// A run waiting on its pull request's CI, and the CI fix rounds that
+    /// wait leads to.
+    pub const CI: &str = "ci";
     /// A pull request review.
     pub const REVIEW: &str = "review";
     /// The ready decision of a pull request.
@@ -111,11 +127,17 @@ pub mod caller {
     pub const SWEEP_WEEKLY: &str = "sweep:weekly";
     /// Quarantined tests: releases, followed fixes and removals.
     pub const SWEEP_QUARANTINE: &str = "sweep:quarantine";
+    /// Duplicate follow-ups closing themselves.
+    pub const SWEEP_FOLLOWUP_DEDUPE: &str = "sweep:followup_dedupe";
 
     /// The security release's reads (a finding's pull request or run)
     /// while `sweep:security` is held: a few each sweep, so the release
     /// makes progress whatever the hour's budget (see [`FLOOR`]).
     pub const SWEEP_SECURITY_FLOOR: &str = "sweep:security_floor";
+
+    /// A run's own steps: they spend until [`super::PEOPLE_RESERVE_PCT`]
+    /// percent of the hour is left, then wait for the reset.
+    pub const RUN_STEPS: &[&str] = &[RUN, CI, MERGE, TESTS, DESCRIPTION, SECURITY_EVENT];
 
     /// Background callers that may spend inside the runs' share, with their
     /// hourly cap of counted requests per installation. Their caps together
@@ -128,7 +150,7 @@ pub mod caller {
         (SWEEP_REVIEW, 120),
         (SWEEP_DRAFTS, 120),
         (SWEEP_PR_WATCH, 240),
-        (SWEEP_DEPLOYS, 300),
+        (SWEEP_DEPLOYS, 270),
         (SWEEP_REVIEW_REMINDER, 120),
         (SWEEP_PR_OUTCOMES, 120),
         (SWEEP_SKILLS, 60),
@@ -142,6 +164,7 @@ pub mod caller {
         (SWEEP_LEARNING, 100),
         (SWEEP_WEEKLY, 100),
         (SWEEP_QUARANTINE, 90),
+        (SWEEP_FOLLOWUP_DEDUPE, 30),
     ];
 }
 
@@ -150,6 +173,8 @@ pub mod caller {
 pub fn priority(caller: &str) -> Priority {
     if capped().any(|(c, _)| c == caller) {
         Priority::Background
+    } else if caller::RUN_STEPS.contains(&caller) {
+        Priority::Run
     } else {
         Priority::Foreground
     }
@@ -191,6 +216,11 @@ impl Budget {
             .saturating_sub(self.limit * RUN_RESERVE_PCT / 100)
     }
 
+    /// Whether what is left is the share kept for people.
+    pub fn people_only(&self) -> bool {
+        self.remaining < self.limit * PEOPLE_RESERVE_PCT / 100
+    }
+
     /// Whether this reading is over: the hour it describes has reset, and
     /// the next response tells the new budget.
     pub fn is_past(&self, now: u64) -> bool {
@@ -206,6 +236,8 @@ pub enum Hold {
     LimitSpent,
     /// What is left of the hour is the runs' share.
     ReservedForRuns,
+    /// What is left of the hour is kept for work a person waits on.
+    ReservedForPeople,
     /// The caller made its hour's requests for this installation.
     HourlyCap,
 }
@@ -215,6 +247,9 @@ impl Hold {
         match self {
             Hold::LimitSpent => "GitHub's hourly limit is spent",
             Hold::ReservedForRuns => "what is left of GitHub's hourly budget is kept for runs",
+            Hold::ReservedForPeople => {
+                "the last of GitHub's hourly budget is kept for reviews and people's answers"
+            }
             Hold::HourlyCap => "it made its requests for this hour",
         }
     }
@@ -254,8 +289,18 @@ pub fn decide(
             wait_secs: until - now,
         };
     }
-    if priority(caller) == Priority::Foreground {
-        return Spend::Go;
+    match priority(caller) {
+        Priority::Foreground => return Spend::Go,
+        Priority::Run => {
+            return match budget.filter(|b| !b.is_past(now) && b.people_only()) {
+                Some(b) => Spend::Hold {
+                    why: Hold::ReservedForPeople,
+                    wait_secs: b.reset.saturating_sub(now).max(60),
+                },
+                None => Spend::Go,
+            };
+        }
+        Priority::Background => {}
     }
     if let Some(b) = budget.filter(|b| !b.is_past(now) && !has_floor(caller)) {
         if b.background_left() == 0 {
@@ -355,11 +400,10 @@ mod tests {
     #[test]
     fn work_a_person_waits_on_spends_the_whole_budget() {
         for c in [
-            caller::RUN,
             caller::FIX_ROUND,
             caller::REVIEW,
             caller::READY,
-            caller::DESCRIPTION,
+            caller::SETUP,
             caller::CHAT,
             caller::MCP,
             caller::OTHER,
@@ -370,6 +414,42 @@ mod tests {
             assert_eq!(hourly_cap(c), None);
             assert_eq!(allowance(c, budget(1), None, 0, NOW), u64::MAX);
         }
+    }
+
+    #[test]
+    fn a_runs_own_steps_leave_the_last_of_the_hour_to_people() {
+        for c in caller::RUN_STEPS {
+            assert_eq!(priority(c), Priority::Run, "{c}");
+            assert_eq!(hourly_cap(c), None);
+            // Below the sweeps' reserve, a run still goes.
+            assert_eq!(decide(c, budget(2_000), None, 9_999, NOW), Spend::Go);
+            assert_eq!(decide(c, budget(500), None, 0, NOW), Spend::Go, "{c}");
+            // Under a tenth of the hour left: kept for people, until the reset.
+            assert_eq!(
+                decide(c, budget(499), None, 0, NOW),
+                Spend::Hold {
+                    why: Hold::ReservedForPeople,
+                    wait_secs: 1_800
+                },
+                "{c}"
+            );
+            assert_eq!(allowance(c, budget(499), None, 0, NOW), 0);
+        }
+        // ...while a review and a person's round go on to the last request.
+        for c in [caller::REVIEW, caller::FIX_ROUND, caller::CHAT, caller::MCP] {
+            assert_eq!(decide(c, budget(1), None, 0, NOW), Spend::Go, "{c}");
+        }
+        // A reading from before the reset says nothing about this hour.
+        let old = Some(Budget {
+            remaining: 3,
+            limit: 5_000,
+            reset: NOW - 10,
+        });
+        assert_eq!(decide(caller::RUN, old, None, 0, NOW), Spend::Go);
+        // No run step is also a sweep.
+        assert!(caller::RUN_STEPS
+            .iter()
+            .all(|r| !capped().any(|(c, _)| c == *r)));
     }
 
     #[test]
@@ -477,7 +557,12 @@ mod tests {
 
     #[test]
     fn a_spent_limit_sends_nothing_for_anyone_until_the_reset() {
-        for c in [caller::RUN, caller::FIX_ROUND, caller::SWEEP_SECURITY] {
+        for c in [
+            caller::RUN,
+            caller::CI,
+            caller::FIX_ROUND,
+            caller::SWEEP_SECURITY,
+        ] {
             assert_eq!(
                 decide(c, budget(0), Some(NOW + 731), 0, NOW),
                 Spend::Hold {

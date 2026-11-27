@@ -65,7 +65,7 @@ fn cipher(state: &WorkerState) -> common::mcp_credentials::Kms<'_> {
 
 /// The team's remote MCP servers (Connections page, OAuth or a key) for a
 /// plugin run, publish or results check.
-fn remote(
+pub(crate) fn remote(
     state: &WorkerState,
     team: &str,
     user: Option<&str>,
@@ -378,8 +378,8 @@ pub async fn sweep(state: &WorkerState) -> Res {
 /// The team's catalog MCP servers (the Connections page), through the MCP
 /// proxy. Remote OAuth servers join through `common::mcp_remote` once it is
 /// deployed.
-struct CatalogConnections<'a> {
-    state: &'a WorkerState,
+pub(crate) struct CatalogConnections<'a> {
+    pub(crate) state: &'a WorkerState,
 }
 
 impl CatalogConnections<'_> {
@@ -430,6 +430,14 @@ impl Connections for CatalogConnections<'_> {
         Ok(schemas
             .into_iter()
             .map(|t| ToolDef {
+                read_only: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a["readOnlyHint"].as_bool()),
+                destructive: t
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a["destructiveHint"].as_bool()),
                 name: t.name,
                 description: t.description,
                 input_schema: t.input_schema,
@@ -739,26 +747,16 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
         .unwrap_or_default();
     let base = common::plugins::chat::dashboard(&state.config.stage);
     if !p.notify.is_empty() {
-        let item = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key(
-                "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(team.to_string()),
-            )
-            .key(
-                "sk",
-                aws_sdk_dynamodb::types::AttributeValue::S(
-                    common::alert_notify::TEAM_SETTINGS_SK.into(),
-                ),
-            )
-            .send()
-            .await
-            .ok()
-            .and_then(|o| o.item().cloned())
-            .unwrap_or_default();
-        let mut channels = common::notify::store::open_all(&cipher(state), team, &item).await;
+        // A review request is for a person to act on: the team's "needs
+        // you" channel, never an alert channel that takes alerts only.
+        let mut channels = common::notify::route::team_channels(
+            &state.dynamo,
+            &cipher(state),
+            &state.config.settings_table_name,
+            team,
+            common::notify::route::Kind::Action,
+        )
+        .await;
         if p.notify == "teams" {
             channels.slack = None;
         } else if p.notify == "slack" {

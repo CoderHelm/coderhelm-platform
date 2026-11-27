@@ -1,10 +1,10 @@
 //! by. A web pull request ended with "restore ... to base" commits for
-//! files it never meant to touch: a signup form hook, a membership flow
-//! service, birthday validation, sign-in observability and their tests.
+//! files it never meant to touch: an account form hook, a tour
+//! service, date validation, logging and their tests.
 //! After red checks, the revert went back to the last green head and put
-//! back every file that differed from it, including twelve files a merge
+//! back every file that differed from it, including files a merge
 //! of the base had brought in, so old base code landed in the pull
-//! request. The scope check then saw twelve changed files no task named,
+//! request. The scope check then saw those changed files no task named,
 //! and a round put each one back to the base, one commit apiece. The
 //! build itself had no file boundary either: it could edit any file.
 //!
@@ -24,17 +24,17 @@ use crate::passes::write_guard::{RoundFor, ScopeGuard};
 use serde_json::json;
 
 const PLANNED: &[&str] = &[
-    "apps/web/src/components/blocks/portal-embed.tsx",
+    "apps/web/src/components/blocks/booking-embed.tsx",
     "apps/web/src/lib/routing/routing-service.ts",
-    "e2e/tests/browse/camp-registration.spec.ts",
+    "e2e/tests/browse/slot-booking.spec.ts",
 ];
 
 /// Files a merge of the base changed: never the pull request's.
 const BASE_FILES: &[&str] = &[
-    "apps/web/src/components/signup/use-signup-form.ts",
-    "apps/web/src/features/online-join/services/membershipFlowService.ts",
+    "apps/web/src/components/account/use-account-form.ts",
+    "apps/web/src/features/tours/services/tourService.ts",
     "apps/web/src/lib/validation-utils.ts",
-    "apps/web/src/test/lib/validation-utils-birthday.test.ts",
+    "apps/web/src/test/lib/validation-utils-dates.test.ts",
 ];
 
 fn s(v: &[&str]) -> Vec<String> {
@@ -45,7 +45,7 @@ fn plan() -> crate::passes::plan::PlanResult {
     crate::passes::plan::PlanResult {
         tasks: PLANNED
             .iter()
-            .map(|p| format!("- [ ] {p}: [modify] The camp registration change\n"))
+            .map(|p| format!("- [ ] {p}: [modify] The slot booking change\n"))
             .collect(),
         ..Default::default()
     }
@@ -74,7 +74,7 @@ fn the_build_of_the_plan_refuses_an_unplanned_file_until_it_says_why() {
     assert!(refused.contains("the plan's tasks"), "{refused}");
     // With a stated reason the plan gains the file and the pull request
     // says why.
-    let why = "the registration route reads its membership flag from this service";
+    let why = "the booking route reads its tour flag from this service";
     assert!(g.check(stray, Some(why)).is_ok());
     assert!(g.outside().iter().any(|(p, w)| p == stray && w == why));
     // A plan that names no file leaves the build unbounded, and the
@@ -171,8 +171,8 @@ fn churn_is_folded_after_every_round_and_before_ready() {
 }
 
 /// Audited runs: a planned-work round restored the shared file the plan
-/// changes and rebuilt it four times; a web run restored fourteen times and
-/// edited its page object ten. In planned-work, proof and fix rounds a
+/// changes and rebuilt it again and again; a web run restored files over
+/// and over and kept editing its page object. In planned-work, proof and fix rounds a
 /// planned file is never restored; any other file only to the base.
 #[test]
 fn a_round_on_the_pull_request_never_restores_a_planned_file() {
@@ -190,13 +190,13 @@ fn a_round_on_the_pull_request_never_restores_a_planned_file() {
         let no = g.restore(page, "main", "main").unwrap_err();
         assert!(no.contains("a file the plan changes"), "{round:?}: {no}");
         // Not from an older commit either.
-        assert!(g.restore(page, "3e4679a", "main").is_err(), "{round:?}");
+        assert!(g.restore(page, "aaa1111", "main").is_err(), "{round:?}");
         // A file outside the plan goes back to the base, and only there.
         assert!(
             g.restore(BASE_FILES[0], "main", "main").is_ok(),
             "{round:?}"
         );
-        let old = g.restore(BASE_FILES[0], "9a32d16", "main").unwrap_err();
+        let old = g.restore(BASE_FILES[0], "bbb2222", "main").unwrap_err();
         assert!(old.contains("only to the pull request's base"), "{old}");
     }
     // The build of the plan and a person's ask are not held by it.

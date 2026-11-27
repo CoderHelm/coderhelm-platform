@@ -36,7 +36,7 @@
     "origin": "real",
     "intent": "how_to",
     "question": "How can I cancel a booking?",
-    "wants": "The steps and rules for cancelling a slip booking, from the team's own policy documents."
+    "wants": "The steps and rules for cancelling a slot booking, from the team's own policy documents."
   },
   {
     "name": "real: a new leader asks what could be useful to them",
@@ -214,7 +214,7 @@
     "name": "how-to: get a full refund",
     "origin": "variant",
     "intent": "how_to",
-    "question": "how can a boater get a full refund?",
+    "question": "how can a patron get a full refund?",
     "wants": "The rule for a full refund (cancel at least 48 hours before arrival), from the code or policy."
   },
   {
@@ -292,8 +292,8 @@
     "origin": "variant",
     "intent": "correction",
     "history": [
-      ["user", "how long before arrival does a boater have to cancel for a full refund?"],
-      ["assistant", "A boater gets a full refund when they cancel at least 24 hours before arrival."]
+      ["user", "how long before arrival does a patron have to cancel for a full refund?"],
+      ["assistant", "A patron gets a full refund when they cancel at least 24 hours before arrival."]
     ],
     "question": "that's wrong, I'm pretty sure it's 48 hours",
     "wants": "A re-check of the code now, a plain admission that 24 hours was wrong, and the right rule (48 hours, half after that)."
@@ -348,7 +348,7 @@
     "intent": "small_talk",
     "history": [
       ["user", "What's running now?"],
-      ["assistant", "One run is working now: HAR-31, adding a waitlist to full slips."]
+      ["assistant", "One run is working now: HAR-31, adding a waitlist to full slots."]
     ],
     "question": "thanks!",
     "wants": "A short, warm acknowledgement. No lookups, no unrequested dump."
@@ -379,24 +379,24 @@
     "wants": "A short greeting, optionally one offer of help."
   },
   {
-    "name": "map: what happens when someone books a slip",
+    "name": "map: what happens when someone books a slot",
     "origin": "variant",
     "intent": "lookup",
-    "question": "What happens when someone books a slip?",
-    "wants": "Numbered steps in the order they happen, from the slip page on the Harbor website to the booking service and the card payment through Stripe, in plain words, citing the app map; file paths only where they help."
+    "question": "What happens when someone books a slot?",
+    "wants": "Numbered steps in the order they happen, from the slot page on the Harbor website to the booking service and the card payment through Stripe, in plain words, citing the app map; file paths only where they help."
   },
   {
-    "name": "map: what is behind the slip screen",
+    "name": "map: what is behind the slot screen",
     "origin": "variant",
     "intent": "lookup",
-    "question": "What's behind the /slips/:id screen?",
-    "wants": "What the slip screen uses, the request it sends, the booking service code that answers and the outside service behind it, from the app map, cited."
+    "question": "What's behind the /slots/:id screen?",
+    "wants": "What the slot screen uses, the request it sends, the booking service code that answers and the outside service behind it, from the app map, cited."
   },
   {
     "name": "map: which service charges the card",
     "origin": "variant",
     "intent": "lookup",
-    "question": "Which service charges the card when a boater books?",
+    "question": "Which service charges the card when a patron books?",
     "wants": "The booking service (harbor-api) charges the card through Stripe, said first, cited from the app map, then where in the code if it helps."
   },
   {

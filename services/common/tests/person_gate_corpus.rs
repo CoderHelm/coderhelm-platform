@@ -61,7 +61,7 @@ fn corpus() -> Vec<Case> {
             why_not: "how a page looks is a judgement only a person can make",
             ..case(Step, "Look at Studio: the page document, the title field", Review)
         },
-        case(OpenItem, "Missing from the end-to-end checklist: no step lists the 23 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 23 over-limit documents. Only a person can settle this: a product decision.", Do),
+        case(OpenItem, "Missing from the end-to-end checklist: no step lists the 17 documents over the limit. Settle: Add a checklist step owned by CoderHelm to query and post all 17 over-limit documents. Only a person can settle this: a product decision.", Do),
         // Outside-steps fixtures.
         Case {
             owner: "a content editor",
@@ -95,7 +95,7 @@ fn corpus() -> Vec<Case> {
             ..case(Question, "Where should the new helper live?", Decided)
         },
         case(Question, "Use the existing `title_size` field instead of creating a new one?", Decided),
-        case(Question, "What H1 and intro copy should each of the four venue pages use? (Default: '{Venue} Summer Camp Registration' plus one sentence.)", Decided),
+        case(Question, "What H1 and intro copy should each of the four library pages use? (Default: '{Library} Seasonal Slot Booking' plus one sentence.)", Decided),
         case(Question, "Should the card link open in a new tab?", Decided),
         Case {
             options: &["refund them in full", "offer a credit"],

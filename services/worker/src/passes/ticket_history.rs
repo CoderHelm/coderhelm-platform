@@ -1805,7 +1805,7 @@ mod tests {
                 Guard::Proceed => panic!("a second PR would be opened"),
             }
         }
-        // A plan without any decision doesn't slip through either.
+        // A plan without any decision doesn't slot through either.
         assert!(matches!(h.guard(None, "h1"), Guard::Proceed));
         assert_eq!(fix_location::route(None), Route::Ask);
     }

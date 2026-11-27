@@ -228,11 +228,10 @@ pub fn github_retry_gesture(payload: &serde_json::Value) -> bool {
 /// Whether `label` is the team's trigger label: the label itself (case
 /// ignored), or the label with a repository pinned after it
 /// (`coderhelm:acme/web`). One rule for the Jira trigger and for
-/// [`jira_retry_gesture`].
+/// [`jira_retry_gesture`]. A follow-up label (`coderhelm:followup:ABC-1`,
+/// `coderhelm-followup`) is never a trigger.
 pub fn is_trigger_label(label: &str, trigger_label: &str) -> bool {
-    let trigger = trigger_label.trim().to_ascii_lowercase();
-    let label = label.trim().to_ascii_lowercase();
-    !trigger.is_empty() && (label == trigger || label.starts_with(&format!("{trigger}:")))
+    common::followup_tickets::is_trigger_label(label, trigger_label)
 }
 
 /// A person's retry gesture on a Jira ticket, read from the event's
@@ -434,6 +433,9 @@ pub async fn gate_ticket_trigger(
             // Waiting for the role's reads goes on by itself (`role_wait`);
             // a second run would wait for the same item.
             "awaiting_setup" => h < 24 * 14,
+            // Waiting for another change to merge goes on by itself
+            // (`change_wait`).
+            "awaiting_change" => h < 24 * 30,
             _ => false,
         }
     }) {
@@ -1067,7 +1069,7 @@ mod tests {
         assert!(!n.contains("Title before"), "{n}");
     }
 
-    /// One alarm on a made-up marina's slip sensors fired four times in a
+    /// One alarm on a made-up library's slot sensors fired four times in a
     /// day. Each firing past the alert's repeat window started a new run
     /// beside the one already waiting on a person's answer, and each asked
     /// the same question again: the gate read every firing as an edited
@@ -1076,8 +1078,8 @@ mod tests {
     fn an_alert_firing_again_while_its_run_waits_starts_nothing() {
         let firing = |value: &str, at: &str| {
             let msg = serde_json::json!({
-                "AlarmName": "harbor-slip-sensor-drift",
-                "AlarmArn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:harbor-slip-sensor-drift",
+                "AlarmName": "harbor-slot-sensor-drift",
+                "AlarmArn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:harbor-slot-sensor-drift",
                 "NewStateValue": "ALARM",
                 "OldStateValue": "OK",
                 "NewStateReason": format!(

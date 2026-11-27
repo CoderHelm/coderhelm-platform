@@ -344,6 +344,9 @@ async fn smallest_change_gaps(
     let mut out = super::review_rules::wider_findings(&super::minimal_change::check(
         &files, &base, ticket, has_probe,
     ));
+    // App code that fails a build, deploy or page when CMS content is
+    // missing (`common::content_gap::content_throws`).
+    out.extend(super::review_rules::content_throw_findings(&files));
     // Each one names the line it is about, or it can't block
     // (`review_discipline::unactionable`).
     for f in out.iter_mut() {
@@ -2376,15 +2379,24 @@ async fn run_once(
             "reviewer",
             msg.pr_number,
         )
+        .await
+        .load_map(state)
         .await;
         let graph_tools = graphs.tools();
-        let system = if graph_tools.is_empty() {
-            system
-        } else {
+        let system = if graphs.has_graph_tools() {
             format!(
                 "{system}{}",
                 super::code_graph::prompt_line(super::code_graph::Role::Reviewer)
             )
+        } else {
+            system
+        };
+        let system = match graphs.map() {
+            Some(m) => format!(
+                "{system}{}",
+                m.prompt_line(super::code_graph::Role::Reviewer)
+            ),
+            None => system,
         };
         let knowledge =
             super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer", None).await;
@@ -3003,6 +3015,9 @@ async fn run_once(
         "reviewer",
         msg.pr_number,
     )
+    .await
+    // The app map: the change's callers in the team's other repositories.
+    .load_map(state)
     .await;
     let graph_context = if let Some(g) = graphs.ready() {
         let changed_paths: Vec<String> = compare["files"]
@@ -3030,6 +3045,28 @@ async fn run_once(
         }
     } else {
         String::new()
+    };
+    // The cross-repository impact check (`run_map`): an endpoint this pull
+    // request changes that other repositories call is put in front of the
+    // reviewer with each caller's file:line.
+    let graph_context = match graphs.map() {
+        Some(m) => {
+            let changed: Vec<(String, String)> = compare["files"]
+                .as_array()
+                .map(|fs| {
+                    fs.iter()
+                        .filter_map(|f| {
+                            Some((
+                                f["filename"].as_str()?.to_string(),
+                                f["patch"].as_str().unwrap_or("").to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{graph_context}{}", m.review_section(&changed))
+        }
+        None => graph_context,
     };
 
     // CI evidence: the PR's ACTUAL check results for this head, injected into
@@ -5759,6 +5796,13 @@ pub(crate) fn settle_own_findings(
             // follow-up, not a hold. A finding of it on code changed since
             // is new evidence and holds on its own (`review_discipline`).
             if matches!(s, Settled::Noted { .. }) {
+                // A style-level finding the rounds kept moving is a note
+                // for the reviewer, never a blocker (`own_review_ledger`).
+                if let Settled::Noted { why } = s {
+                    if super::own_review_ledger::is_style(&line) {
+                        super::review_policy::demote(f, &format!("A note, not a block: {why}."));
+                    }
+                }
                 settled.push(line);
                 continue;
             }

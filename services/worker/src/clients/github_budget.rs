@@ -44,6 +44,9 @@ pub struct Counts {
     pub limited: u64,
     /// Requests not sent (the limit was spent, or the budget was the runs').
     pub held: u64,
+    /// Reads answered from what this process kept (`github_cache`), with
+    /// no request: they can't have changed.
+    pub cached: u64,
 }
 
 #[derive(Default)]
@@ -61,6 +64,8 @@ struct Install {
     budget_at: u64,
     /// When the record was last read (epoch seconds).
     refreshed_at: u64,
+    /// Counted requests not yet logged, by caller and route.
+    routes: HashMap<(&'static str, String), u64>,
 }
 
 impl Install {
@@ -141,6 +146,96 @@ pub fn responded(installation_id: u64, status: u16, limited: bool, now: u64) {
         }
         *i.spent.entry(who.to_string()).or_default() += 1;
     });
+}
+
+/// A read the current task made was answered from what this process kept,
+/// with no request.
+pub fn served_kept(installation_id: u64, now: u64) {
+    let who = caller();
+    with(installation_id, now, |i| {
+        i.pending.entry((i.hour, who)).or_default().cached += 1;
+    });
+}
+
+/// Counts a counted request of the current task by its route
+/// ([`route_of`]), for the `github_budget` log line.
+pub fn route_sent(installation_id: u64, route: String, now: u64) {
+    let who = caller();
+    with(installation_id, now, |i| {
+        *i.routes.entry((who, route)).or_default() += 1;
+    });
+}
+
+/// The routes logged on a `github_budget` line at most.
+pub const MAX_ROUTES_LOGGED: usize = 15;
+
+/// A request's route with its names taken out, so requests count together
+/// by what they ask: `GET /repos/:o/:r/pulls/:n`.
+pub fn route_of(method: &str, url: &str) -> String {
+    let path = url
+        .split_once("://")
+        .map(|(_, rest)| rest.find('/').map_or("/", |i| &rest[i..]))
+        .unwrap_or(url);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < segs.len() {
+        let seg = segs[i];
+        let prev = out.last().map(String::as_str).unwrap_or("");
+        let named = |s: &str| {
+            if s.bytes().all(|b| b.is_ascii_digit()) {
+                ":n".to_string()
+            } else if (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                ":sha".to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        match prev {
+            "repos" if i + 1 < segs.len() => {
+                out.push(":o/:r".into());
+                i += 2;
+                continue;
+            }
+            // Everything after these names one thing.
+            "contents" | "ref" | "refs" | "compare" | "tarball" | "zipball" | "branches" => {
+                out.push(":name".into());
+                break;
+            }
+            _ => out.push(named(seg)),
+        }
+        i += 1;
+    }
+    format!("{method} /{}", out.join("/"))
+}
+
+/// The routes counted for the installation since the last call, most first:
+/// `run GET /repos/:o/:r/pulls/:n=41`.
+pub fn drain_routes(installation_id: u64) -> Vec<(String, u64)> {
+    let Ok(mut all) = LEDGER.lock() else {
+        return Vec::new();
+    };
+    let Some(inst) = all.get_mut(&installation_id) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = inst
+        .routes
+        .drain()
+        .map(|((who, route), n)| (format!("{who} {route}"), n))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// The `github_budget` log line's routes field: the most counted first.
+pub fn routes_field(routes: &[(String, u64)]) -> String {
+    routes
+        .iter()
+        .take(MAX_ROUTES_LOGGED)
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// GitHub said the installation's hourly budget is gone until `until`.
@@ -285,13 +380,22 @@ fn num(item: &HashMap<String, AttributeValue>, k: &str) -> u64 {
 /// and one log line per installation. Best effort: a failed write keeps
 /// nothing back, the log line still says it.
 pub async fn flush(state: &WorkerState) {
+    let mut logged: HashSet<u64> = HashSet::new();
     for u in drain() {
         let sum = |f: fn(&Counts) -> u64| u.counts.iter().map(|(_, c)| f(c)).sum::<u64>();
+        // Where the requests went, once per installation and message.
+        let routes = if logged.insert(u.installation_id) {
+            routes_field(&drain_routes(u.installation_id))
+        } else {
+            String::new()
+        };
         info!(
             installation = u.installation_id,
             callers = %callers_field(&u.counts),
+            routes = %routes,
             sent = sum(|c| c.sent),
             not_modified = sum(|c| c.not_modified),
+            cached = sum(|c| c.cached),
             limited = sum(|c| c.limited),
             held = sum(|c| c.held),
             remaining = u.budget.map(|b| b.remaining),
@@ -310,6 +414,7 @@ pub async fn flush(state: &WorkerState) {
             .map(|(caller, c)| (rules::count_attr(caller), c.sent))
             .collect();
         adds.push(("not_modified".into(), sum(|c| c.not_modified)));
+        adds.push(("cached".into(), sum(|c| c.cached)));
         adds.push(("limited".into(), sum(|c| c.limited)));
         adds.push(("held".into(), sum(|c| c.held)));
         adds.retain(|(_, v)| *v > 0);
@@ -600,10 +705,91 @@ mod tests {
         );
         // Written once: nothing is left to write.
         assert!(drain_of(id).is_empty());
+        drain_routes(id);
         // ...and the hour's spend is still known for the cap.
         assert_eq!(
             allowance(id, who::SWEEP_PR_WATCH, NOW),
             common::github_budget::hourly_cap(who::SWEEP_PR_WATCH).unwrap() - 2
+        );
+    }
+
+    #[test]
+    fn requests_count_together_by_what_they_ask() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for (method, url, route) in [
+            (
+                "GET",
+                "https://api.github.com/repos/acme/site/pulls/1573",
+                "GET /repos/:o/:r/pulls/:n",
+            ),
+            (
+                "GET",
+                "https://api.github.com/repos/acme/site/pulls/12/files?per_page=100&page=2",
+                "GET /repos/:o/:r/pulls/:n/files",
+            ),
+            (
+                "GET",
+                &format!("https://api.github.com/repos/acme/site/commits/{sha}/check-runs"),
+                "GET /repos/:o/:r/commits/:sha/check-runs",
+            ),
+            (
+                "GET",
+                "https://api.github.com/repos/acme/site/git/ref/heads/coderhelm/abc-1",
+                "GET /repos/:o/:r/git/ref/:name",
+            ),
+            (
+                "PUT",
+                "https://api.github.com/repos/acme/site/contents/apps/web/a.ts",
+                "PUT /repos/:o/:r/contents/:name",
+            ),
+            (
+                "GET",
+                "https://api.github.com/repos/acme/site/compare/main...feature",
+                "GET /repos/:o/:r/compare/:name",
+            ),
+            ("POST", "https://api.github.com/graphql", "POST /graphql"),
+            (
+                "GET",
+                "http://127.0.0.1:4100/repos/o/r/issues/7/comments",
+                "GET /repos/:o/:r/issues/:n/comments",
+            ),
+        ] {
+            assert_eq!(route_of(method, url), route, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_log_line_says_where_the_requests_went() {
+        let id = 910_007;
+        scoped(who::RUN, async {
+            for _ in 0..3 {
+                route_sent(id, "GET /repos/:o/:r/pulls/:n".into(), NOW);
+            }
+            route_sent(id, "GET /repos/:o/:r/git/ref/:name".into(), NOW);
+            served_kept(id, NOW);
+        })
+        .await;
+        scoped(who::CI, async {
+            route_sent(id, "GET /repos/:o/:r/commits/:sha/check-runs".into(), NOW)
+        })
+        .await;
+        let routes = drain_routes(id);
+        assert_eq!(
+            routes_field(&routes),
+            "run GET /repos/:o/:r/pulls/:n=3; ci GET /repos/:o/:r/commits/:sha/check-runs=1; \
+             run GET /repos/:o/:r/git/ref/:name=1"
+        );
+        assert!(drain_routes(id).is_empty(), "logged once");
+        let u = drain_of(id).pop().unwrap();
+        assert_eq!(
+            u.counts,
+            vec![(
+                who::RUN,
+                Counts {
+                    cached: 1,
+                    ..Default::default()
+                }
+            )]
         );
     }
 

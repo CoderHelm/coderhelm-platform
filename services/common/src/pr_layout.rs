@@ -582,11 +582,11 @@ mod tests {
     use super::*;
     use crate::pr_body::{FOOTER_END, FOOTER_START};
 
-    const LEAD: &str = "<!-- coderhelm:lead -->\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\n### Problem\n\nThe export poller gives up on the first timeout (OPS-41).\n\n### Changes\n\nRetries the export poller three times before it gives up.<!-- ch:summary-end -->\n- Approach: does this do what OPS-41 asks?\n\n### Risk\n\n**Risk:** Low. One module changes.\n\n**Rollback:** Revert this pull request.\n\n### Verification\n\nOn abc1234 (head of this PR):\n\n| Check | Result |\n|---|---|\n| lint (CI) | Passed |\n\n<!-- /coderhelm:lead -->";
+    const LEAD: &str = "<!-- coderhelm:lead -->\n<!-- coderhelm:body v1 ticket=HARBOR-57 head=abc1234 -->\n### Problem\n\nThe export poller gives up on the first timeout (HARBOR-57).\n\n### Changes\n\nRetries the export poller three times before it gives up.<!-- ch:summary-end -->\n- Approach: does this do what HARBOR-57 asks?\n\n### Risk\n\n**Risk:** Low. One module changes.\n\n**Rollback:** Revert this pull request.\n\n### Verification\n\nOn abc1234 (head of this PR):\n\n| Check | Result |\n|---|---|\n| lint (CI) | Passed |\n\n<!-- /coderhelm:lead -->";
 
     fn body() -> String {
         format!(
-            "<!-- coderhelm:draft-status -->\n**Draft:** CI is still running.\n<!-- /coderhelm:draft-status -->\n\nSource ticket: OPS-41\n\n{LEAD}\n\n## Summary\n\nRetries the export poller three times before it gives up.\n\n## Changes\n\n* `src/export/poller.rs`: the retry loop.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n## Risk\n\n**Low**: one module.\n\n## Verification\n\n<!-- coderhelm:unverified -->\n## Open items\n- The staging secret is not set.\n<!-- /coderhelm:unverified -->\n\n{FOOTER_START}\nOpened by CoderHelm from OPS-41\n{FOOTER_END}\n\nCloses #12\n\n<sub>Consulted: the platform agent</sub>\n\n<!-- coderhelm:built-for abc1234 0f -->"
+            "<!-- coderhelm:draft-status -->\n**Draft:** CI is still running.\n<!-- /coderhelm:draft-status -->\n\nSource ticket: HARBOR-57\n\n{LEAD}\n\n## Summary\n\nRetries the export poller three times before it gives up.\n\n## Changes\n\n* `src/export/poller.rs`: the retry loop.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n## Risk\n\n**Low**: one module.\n\n## Verification\n\n<!-- coderhelm:unverified -->\n## Open items\n- The staging secret is not set.\n<!-- /coderhelm:unverified -->\n\n{FOOTER_START}\nOpened by CoderHelm from HARBOR-57\n{FOOTER_END}\n\nCloses #12\n\n<sub>Consulted: the platform agent</sub>\n\n<!-- coderhelm:built-for abc1234 0f -->"
         )
     }
 
@@ -622,7 +622,7 @@ mod tests {
         // The footer line carries the closing keyword, and the stamp stays
         // last.
         assert!(
-            out.contains("Opened by CoderHelm from OPS-41 · Closes #12\n"),
+            out.contains("Opened by CoderHelm from HARBOR-57 · Closes #12\n"),
             "{out}"
         );
         assert!(
@@ -652,7 +652,7 @@ mod tests {
             "- The staging secret is not set.",
             "<!-- coderhelm:unverified -->",
             "<!-- /coderhelm:unverified -->",
-            "Source ticket: OPS-41",
+            "Source ticket: HARBOR-57",
         ] {
             assert!(flat.lines().any(|x| x == l), "lost: {l}\n{flat}");
         }

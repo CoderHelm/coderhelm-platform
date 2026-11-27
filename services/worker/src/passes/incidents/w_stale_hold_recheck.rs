@@ -7,11 +7,11 @@
 //! edited the description. A mention of CoderHelm on the pull request only
 //! resumes a fix round's unfinished work, and this one had none.
 //!
-//! The same run spent three fresh steps doing nothing. Each step started by
-//! rebuilding its stacked branch, the plan check at the start of the step
-//! measured the branch's own diff (23 of 38 tasks) and the check after the
-//! coder measured with the stacked base (37 of 38). The run guard counted
-//! each return to 37 as work done again, so it never stopped the steps,
+//! The same run spent several fresh steps doing nothing. Each step started
+//! by rebuilding its stacked branch, the plan check at the start of the
+//! step measured the branch's own diff (far fewer tasks done) and the check
+//! after the coder measured with the stacked base (nearly all done). The
+//! run guard counted each return to the higher count as work done again, so it never stopped the steps,
 //! though the coder wrote nothing in any of them.
 //!
 //! Guarantees:
@@ -51,13 +51,13 @@ fn held_description(version: Option<&str>) -> String {
         Some(v) => section.replace(&now, &proof::checked_by(v)),
         None => section.replace(&format!(" {now}"), ""),
     };
-    format!("## Summary\nOne Title Size setting for every venue block.\n\n{section}")
+    format!("## Summary\nOne Title Size setting for every library block.\n\n{section}")
 }
 
 fn facts(body: &str) -> Facts {
     Facts {
         draft: true,
-        title: "Add a Title Size setting to the venue page blocks".into(),
+        title: "Add a Title Size setting to the library page blocks".into(),
         body: body.to_string(),
         ci: Ci {
             green: true,
@@ -153,20 +153,20 @@ fn once_per_run_and_version_recorded_in_the_claim() {
 fn results_other_code_wrote_run_again_once_and_keep_their_rounds() {
     let mut l = Ledger::default();
     for r in [&mut l.rules, &mut l.links, &mut l.test_fix, &mut l.proof] {
-        r.head = "eeeb43e".into();
+        r.head = "eee1234".into();
         r.rounds = 2;
     }
     assert!(l.for_checks_version("v2"));
-    assert!(!l.rules.unchanged("eeeb43e"));
-    assert!(!l.links.unchanged("eeeb43e"));
-    assert!(!l.test_fix.unchanged("eeeb43e"));
+    assert!(!l.rules.unchanged("eee1234"));
+    assert!(!l.links.unchanged("eee1234"));
+    assert!(!l.test_fix.unchanged("eee1234"));
     assert_eq!(l.rules.rounds, 2, "the rounds a run had still count");
     // The proof check's gaps are never a check the change didn't pass.
-    assert!(l.proof.unchanged("eeeb43e"));
+    assert!(l.proof.unchanged("eee1234"));
     // The same code again: its results stand.
-    l.rules.head = "eeeb43e".into();
+    l.rules.head = "eee1234".into();
     assert!(!l.for_checks_version("v2"));
-    assert!(l.rules.unchanged("eeeb43e"));
+    assert!(l.rules.unchanged("eee1234"));
 }
 
 #[test]
@@ -218,15 +218,15 @@ fn the_step_is_rebuilt_from_the_run_record() {
 
 #[test]
 fn a_dip_coderhelm_caused_and_its_return_are_not_progress() {
-    // The incident's counts: 37 at the end of a step, 23 after the rebuild
-    // at the start of the next, 37 again with nothing written.
+    // The counts: 29 at the end of a step, 18 after the rebuild
+    // at the start of the next, 29 again with nothing written.
     let mut g = GuardState::default();
-    assert!(g.apply(&Progress::TasksDone(37)));
+    assert!(g.apply(&Progress::TasksDone(29)));
     for _ in 0..8 {
         g.on_continuation(1.0);
-        assert!(!g.apply(&Progress::TasksDone(23)));
+        assert!(!g.apply(&Progress::TasksDone(18)));
         assert!(
-            !g.apply(&Progress::TasksDone(37)),
+            !g.apply(&Progress::TasksDone(29)),
             "a return with nothing written is not progress"
         );
     }
@@ -235,11 +235,11 @@ fn a_dip_coderhelm_caused_and_its_return_are_not_progress() {
     // Someone else moved the base and the run's coder redoes the work: that
     // is progress, still a bounded number of times.
     let mut g = GuardState::default();
-    assert!(g.apply(&Progress::TasksDone(37)));
+    assert!(g.apply(&Progress::TasksDone(29)));
     g.on_continuation(1.0);
-    assert!(!g.apply(&Progress::TasksDone(23)));
+    assert!(!g.apply(&Progress::TasksDone(18)));
     g.on_own_code();
-    assert!(g.apply(&Progress::TasksDone(30)));
+    assert!(g.apply(&Progress::TasksDone(24)));
     assert_eq!(g.continuations, 0);
 
     // The coder writing is reported from the one place every round writes,

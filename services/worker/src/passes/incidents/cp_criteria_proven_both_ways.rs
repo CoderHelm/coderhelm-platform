@@ -1,15 +1,15 @@
-//! cp. A ticket said one thing: on a venue's summer camps page, the sports
-//! filter showed two Multi-Sport chips; it should show one. The run planned
-//! and wrote about 530 lines of unit tests over five test files and never
+//! cp. A ticket said one thing: on a library's slots page, the wing
+//! filter showed two Guest-Wing chips; it should show one. The run planned
+//! and wrote hundreds of lines of unit tests over several test files and never
 //! loaded the page the ticket names: no end-to-end test, nothing run on
 //! staging or the preview. It added three helpers to one file in the same
 //! change (`slugToIds` beside the existing `slugToId`, then
-//! `dedupeSportsBySlug` and `dedupeSportOptionsBySlug`, two copies of the
+//! `dedupeWingsBySlug` and `dedupeWingOptionsBySlug`, two copies of the
 //! same first-per-key filter) with no shared logic. A person later replaced
 //! the two dedupe helpers with one, cut the unit tests and added the one
-//! end-to-end test of the page. Across the 53 runs audited with it, twelve
-//! pull requests whose ticket named a page had no end-to-end spec, and
-//! eleven of thirteen that changed one never ran it on staging.
+//! end-to-end test of the page. Across the runs audited with it, many pull
+//! requests whose ticket named a page had no end-to-end spec, and most of
+//! those that changed one never ran it on staging.
 //!
 //! Guarantee: the plan maps each criterion (the acceptance list, else the
 //! Expected lines) that names a page or what a person sees to an
@@ -37,26 +37,26 @@ use crate::passes::plan_shape;
 use common::ci_repro::{self as repro, Record};
 use common::e2e_proof::{self as ep, Outcome, Proof};
 
-const TITLE: &str = "Duplicate Multi-Sport filter showing on the Acme Club Summer Camps page";
+const TITLE: &str = "Duplicate Guest-Wing filter showing on the Acme Library Slots page";
 /// The ticket as it was written (plain text, no acceptance heading).
-const BODY: &str = "Steps to reproduce\nGo to /acme-club/summer-camps\nScroll to the sports filter\nObserved\nTwo Multi-Sport filters show\nExpected\nOnly one multi-sport filter to show";
-const HEAD: &str = "395769a5f00d";
+const BODY: &str = "Steps to reproduce\nGo to /acme-library/slots\nScroll to the wing filter\nObserved\nTwo Guest-Wing filters show\nExpected\nOnly one guest-wing filter to show";
+const HEAD: &str = "c0ffee5a1b2d";
 
 fn plan(design: &str) -> PlanResult {
     PlanResult {
         design: design.into(),
-        tasks: "- [ ] apps/web/src/utils/filterMaps.ts: one sport per slug".into(),
+        tasks: "- [ ] apps/web/src/utils/filterMaps.ts: one wing per slug".into(),
         ..Default::default()
     }
 }
 
 /// The plan's proof as the run wrote it: unit tests only.
-const PLAN_BEFORE: &str = "## Reuse\n- `slugToId` in apps/web/src/utils/filterMaps.ts\n\n## Proof\nUnit tests: filterMaps.test.ts for the slug helpers; sports-filter-dedupe.test.tsx renders one chip per slug; filter-nav-sport-grid.test.tsx renders one button per slug.\n";
+const PLAN_BEFORE: &str = "## Reuse\n- `slugToId` in apps/web/src/utils/filterMaps.ts\n\n## Proof\nUnit tests: filterMaps.test.ts for the slug helpers; wing-filter-dedupe.test.tsx renders one chip per slug; filter-nav-wing-grid.test.tsx renders one button per slug.\n";
 
 /// The same plan with the criteria map the person's fix needed.
 fn plan_after() -> String {
     format!(
-        "{PLAN_BEFORE}\n## Criteria map\n- Only one multi-sport filter shows | page: /acme-club/summer-camps | e2e: e2e/tests/browse/venues.spec.ts › the camps page shows one Multi-Sport chip | asserts: exactly one chip named Multi-Sport in the sports filter\n"
+        "{PLAN_BEFORE}\n## Criteria map\n- Only one guest-wing filter shows | page: /acme-library/slots | e2e: e2e/tests/browse/libraries.spec.ts › the slots page shows one Guest-Wing chip | asserts: exactly one chip named Guest-Wing in the wing filter\n"
     )
 }
 
@@ -64,32 +64,32 @@ fn plan_after() -> String {
 fn helpers_patch() -> String {
     [
         "@@ -562,21 +562,77 @@",
-        " export const slugToId = (allSports: SportItem[], slug: string) => {",
-        "   const found = allSports.find((s) => normalizeSportName(s.label) === slug);",
+        " export const slugToId = (allWings: WingItem[], slug: string) => {",
+        "   const found = allWings.find((s) => normalizeWingName(s.label) === slug);",
         "   return found?.id || slug;",
         " };",
         " ",
-        "+export const slugToIds = (allSports: SportItem[], slug: string): string[] =>",
+        "+export const slugToIds = (allWings: WingItem[], slug: string): string[] =>",
         "+  Array.from(",
         "+    new Set(",
-        "+      allSports",
-        "+        .filter((s) => Boolean(s?.id) && normalizeSportName(s.label) === slug)",
+        "+      allWings",
+        "+        .filter((s) => Boolean(s?.id) && normalizeWingName(s.label) === slug)",
         "+        .map((s) => s.id)",
         "+    )",
         "+  );",
         "+",
-        "+export const dedupeSportsBySlug = (allSports: SportItem[]): SportItem[] => {",
+        "+export const dedupeWingsBySlug = (allWings: WingItem[]): WingItem[] => {",
         "+  const seen = new Set<string>();",
-        "+  return allSports.filter((sport): sport is SportItem => {",
-        "+    if (!sport?.id) return false;",
-        "+    const slug = normalizeSportName(sport.label);",
+        "+  return allWings.filter((wing): wing is WingItem => {",
+        "+    if (!wing?.id) return false;",
+        "+    const slug = normalizeWingName(wing.label);",
         "+    if (seen.has(slug)) return false;",
         "+    seen.add(slug);",
         "+    return true;",
         "+  });",
         "+};",
         "+",
-        "+export const dedupeSportOptionsBySlug = <T extends { value: string }>(",
+        "+export const dedupeWingOptionsBySlug = <T extends { value: string }>(",
         "+  options: T[]",
         "+): T[] => {",
         "+  const seen = new Set<string>();",
@@ -110,8 +110,8 @@ fn leg(target: &str, out: &str) -> repro::Leg {
 
 fn proof(test: &str, base_out: &str, change_out: &str) -> Proof {
     Proof {
-        criterion: "Only one multi-sport filter to show".into(),
-        page: "/acme-club/summer-camps".into(),
+        criterion: "Only one guest-wing filter to show".into(),
+        page: "/acme-library/slots".into(),
         test: test.into(),
         record: Record {
             head: HEAD.into(),
@@ -130,17 +130,17 @@ fn proof(test: &str, base_out: &str, change_out: &str) -> Proof {
 fn the_plan_maps_the_criterion_to_a_test_of_its_page() {
     let c = ep::criteria(TITLE, BODY, &[]);
     assert_eq!(c.len(), 1);
-    assert_eq!(c[0].text, "Only one multi-sport filter to show");
-    assert_eq!(c[0].page.as_deref(), Some("/acme-club/summer-camps"));
+    assert_eq!(c[0].text, "Only one guest-wing filter to show");
+    assert_eq!(c[0].page.as_deref(), Some("/acme-library/slots"));
     // The run's plan: unit tests only, sent back.
     let g = plan_shape::criteria_gaps(&plan(PLAN_BEFORE), TITLE, BODY, true);
     assert_eq!(g.len(), 1, "{g:?}");
-    assert!(g[0].contains("## Criteria map") && g[0].contains("/acme-club/summer-camps"));
+    assert!(g[0].contains("## Criteria map") && g[0].contains("/acme-library/slots"));
     assert!(g[0].contains("never replace it"));
     // A unit test named in the map is no end-to-end test.
     let unit = plan_after().replace(
-        "e2e/tests/browse/venues.spec.ts",
-        "apps/web/src/test/components/sports-filter-dedupe.test.tsx",
+        "e2e/tests/browse/libraries.spec.ts",
+        "apps/web/src/test/components/wing-filter-dedupe.test.tsx",
     );
     assert!(
         plan_shape::criteria_gaps(&plan(&unit), TITLE, BODY, true)[0]
@@ -162,8 +162,8 @@ fn the_plan_maps_the_criterion_to_a_test_of_its_page() {
 
 #[test]
 fn each_criterion_runs_both_ways_before_it_is_done() {
-    let t = "e2e/tests/browse/venues.spec.ts › the camps page shows one Multi-Sport chip";
-    let red = "  1) [chromium] › venues.spec.ts › the camps page shows one Multi-Sport chip\n    Error: expect(locator).toHaveCount(expected) failed\n    Expected: 1\n    Received: 2\n  1 failed\n";
+    let t = "e2e/tests/browse/libraries.spec.ts › the slots page shows one Guest-Wing chip";
+    let red = "  1) [chromium] › libraries.spec.ts › the slots page shows one Guest-Wing chip\n    Error: expect(locator).toHaveCount(expected) failed\n    Expected: 1\n    Received: 2\n  1 failed\n";
     let green = "  1 passed (4.2s)\n";
     // The run's change had no end-to-end test of the page.
     let none = Proof {
@@ -178,7 +178,7 @@ fn each_criterion_runs_both_ways_before_it_is_done() {
     assert!(none
         .instruction()
         .unwrap()
-        .contains("loads `/acme-club/summer-camps`"));
+        .contains("loads `/acme-library/slots`"));
     // A test that passes on staging too doesn't test the ticket.
     let both = proof(t, green, green);
     assert!(matches!(ep::outcome(&both), Outcome::NotTheTicket(_)));
@@ -241,7 +241,7 @@ fn twin_helpers_in_one_change_are_found_and_stopped() {
     let parallel = minimal_change::parallel_structures(&diff, &[]);
     assert!(parallel
         .iter()
-        .all(|w| !w.what.contains("dedupeSportOptionsBySlug")));
+        .all(|w| !w.what.contains("dedupeWingOptionsBySlug")));
     assert!(parallel.iter().any(|w| w
         .what
         .contains("`slugToIds` next to the existing `slugToId`")));
@@ -251,12 +251,12 @@ fn twin_helpers_in_one_change_are_found_and_stopped() {
     assert_eq!(twins.len(), 1, "{found:?}");
     assert!(twins[0]
         .what
-        .contains("`dedupeSportOptionsBySlug` next to `dedupeSportsBySlug`"));
+        .contains("`dedupeWingOptionsBySlug` next to `dedupeWingsBySlug`"));
 
     // The coder's guard: the second helper in the build names what it shares.
     let g = ExploreGuard::for_build();
     let base =
-        "export const slugToId = (allSports: SportItem[], slug: string) => {\n  return slug;\n};\n";
+        "export const slugToId = (allWings: WingItem[], slug: string) => {\n  return slug;\n};\n";
     let new_side: String = helpers_patch()
         .lines()
         .skip(1)
@@ -265,7 +265,7 @@ fn twin_helpers_in_one_change_are_found_and_stopped() {
         .collect::<Vec<_>>()
         .join("\n");
     let (first, _) = new_side
-        .split_once("export const dedupeSportOptionsBySlug")
+        .split_once("export const dedupeWingOptionsBySlug")
         .unwrap();
     let first = format!("{first}\n");
     assert!(g
@@ -285,7 +285,7 @@ fn twin_helpers_in_one_change_are_found_and_stopped() {
         )
         .unwrap_err();
     assert!(
-        e.contains("`dedupeSportOptionsBySlug` like `dedupeSportsBySlug`"),
+        e.contains("`dedupeWingOptionsBySlug` like `dedupeWingsBySlug`"),
         "{e}"
     );
 }

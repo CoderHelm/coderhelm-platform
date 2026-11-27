@@ -1,13 +1,13 @@
 //! A bug is reproduced on the base before any code is planned, and the fix
 //! goes in the mechanism the reproduction lands in.
 //!
-//! A ticket named four camps filed under the wrong sport. The camps' names
-//! carried a suffix ("Squash Camp-Half Day"), and the existing overrides
-//! table matched names exactly, so its entries for those camps never
-//! matched. The run's own notes said as much, then planned a keyword
-//! matcher beside the table, rewrote how every camp of that source got its
-//! sport, moved other programs to a different lookup and asked the team a
-//! question one page load answered. The right change stripped the suffix in
+//! A ticket named four tours filed under the wrong activity. The
+//! tours' names carried a suffix ("City Walk-Half Day"), and the
+//! existing overrides table matched names exactly, so its entries for those
+//! tours never matched. The run's own notes said as much, then planned a
+//! keyword matcher beside the table, rewrote how every tour of that source
+//! got its activity, moved other records to a different lookup and asked
+//! the team a question one page load answered. The right change stripped the suffix in
 //! the lookup and added two entries, with a test built from the exact names
 //! stored on staging that failed on the base.
 //!
@@ -160,8 +160,8 @@ fn is_uuid(w: &str) -> bool {
             .all(|(n, p)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// The records a ticket names: its uuids, numbered ids (`id 8204`, `#8204`,
-/// `(8204)`), and backticked or quoted names, each once.
+/// The records a ticket names: its uuids, numbered ids (`id 1001`, `#1001`,
+/// `(1001)`), and backticked or quoted names, each once.
 pub fn ticket_ids(ticket: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |s: &str| {
@@ -545,11 +545,11 @@ pub fn question_gaps(questions: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    const TICKET: &str = "Observed\nWhen filtering for Volleyball, Squash Camp-Half Day (a0000002-0000-4000-8000-000000000002) shows.\nExpected\nSquash Camp- Full Day (a0000003-0000-4000-8000-000000000003)";
+    const TICKET: &str = "Observed\nWhen filtering for Food Tasting, City Walk-Half Day (a0000002-0000-4000-8000-000000000002) shows.\nExpected\nCity Walk- Full Day (a0000003-0000-4000-8000-000000000003)";
 
     fn design(reproduce: &str) -> String {
         format!(
-            "## Reuse\n- `CAMP_OVERRIDES`\n\n## Reproduce\n{reproduce}\n\n## Smallest change\nx\n"
+            "## Reuse\n- `TOUR_OVERRIDES`\n\n## Reproduce\n{reproduce}\n\n## Smallest change\nx\n"
         )
     }
 
@@ -563,11 +563,11 @@ mod tests {
     }
 
     const CMD: &str =
-        "python -c \"from dags.common import get_override as g; print(g('Squash Camp-Half Day'))\"";
+        "python -c \"from dags.common import get_override as g; print(g('City Walk-Half Day'))\"";
 
     fn good() -> String {
         design(&format!(
-            "Inputs: a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003; staging lookup L2: `Squash Camp-Half Day`, `Squash Camp-Full Day`, `Squash Camp- Full Day`\nRan on base: `{CMD}`\nOutput:\n```\nNone\n```\nWrong line: dags/common.py:99 `return CAMP_OVERRIDES.get(normalized)` matches the whole name, suffix included."
+            "Inputs: a0000002-0000-4000-8000-000000000002, a0000003-0000-4000-8000-000000000003; staging lookup L2: `City Walk-Half Day`, `City Walk-Full Day`, `City Walk- Full Day`\nRan on base: `{CMD}`\nOutput:\n```\nNone\n```\nWrong line: dags/common.py:99 `return TOUR_OVERRIDES.get(normalized)` matches the whole name, suffix included."
         ))
     }
 
@@ -582,8 +582,8 @@ mod tests {
             ]
         );
         let ids =
-            ticket_ids("Group id 8204 and #8214, the `Hockey Camp` and \"Squash Camp\", not 2026.");
-        assert_eq!(ids, vec!["8204", "8214", "Hockey Camp", "Squash Camp"]);
+            ticket_ids("Group id 1001 and #1002, the `River Cruise` and \"City Walk\", not 2026.");
+        assert_eq!(ids, vec!["1001", "1002", "River Cruise", "City Walk"]);
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn unverified_is_kept_only_after_trying() {
-        let d = design("Inputs: a0000002-0000-4000-8000-000000000002 a0000003-0000-4000-8000-000000000003 from staging rows\nUnverified: the module imports Airflow, which the sandbox can't install\nWrong line: dags/common.py:99 `CAMP_OVERRIDES.get`");
+        let d = design("Inputs: a0000002-0000-4000-8000-000000000002 a0000003-0000-4000-8000-000000000003 from staging rows\nUnverified: the module imports Airflow, which the sandbox can't install\nWrong line: dags/common.py:99 `TOUR_OVERRIDES.get`");
         let g = reproduce_gaps(&d, TICKET, &[], true, true);
         assert!(g.iter().any(|l| l.contains("never tried")), "{g:?}");
         let failed = Attempt {
@@ -647,38 +647,38 @@ mod tests {
         // A new keyword step beside the override table.
         let g = reuse_gaps(
             &d,
-            "Add `resolve_camp_sport_id`: override first, then a keyword match on the name.",
+            "Add `resolve_tour_stop_id`: override first, then a keyword match on the name.",
             "a keyword step is added after the override",
         );
         assert_eq!(g.len(), 2, "{g:?}");
-        assert!(g[0].contains("`CAMP_OVERRIDES`"));
+        assert!(g[0].contains("`TOUR_OVERRIDES`"));
         assert!(g[1].contains("keyword"));
         // The lookup itself, fixed.
         let g = reuse_gaps(
             &d,
-            "Strip the trailing `-Half Day`/`-Full Day` before `CAMP_OVERRIDES.get`; add 2 entries.",
+            "Strip the trailing `-Half Day`/`-Full Day` before `TOUR_OVERRIDES.get`; add 2 entries.",
             "strip the suffix in the lookup",
         );
         assert!(g.is_empty(), "{g:?}");
         // A stated reason keeps a new path.
         let g = reuse_gaps(
             &d,
-            "`CAMP_OVERRIDES` can't hold this: the source gives no name.",
+            "`TOUR_OVERRIDES` can't hold this: the source gives no name.",
             "a keyword match",
         );
         assert!(g.is_empty(), "{g:?}");
         assert_eq!(
-            wrong_names("dags/a.py:9 `return MAP.get(k)` in `get_sport`"),
-            vec!["get_sport"]
+            wrong_names("dags/a.py:9 `return MAP.get(k)` in `get_activity`"),
+            vec!["get_activity"]
         );
     }
 
     #[test]
     fn a_question_a_lookup_answers_is_looked_up_first() {
         let q = vec![
-            "- Inactive Squash camps: decided with the default: they show under the filter as today".to_string(),
+            "- Inactive City Walk tours: decided with the default: they show under the filter as today".to_string(),
             "- Brand colours: decided with the default: unchanged".to_string(),
-            "- Is the sport active in staging? Looked up: L7 shows active=false".to_string(),
+            "- Is the activity active in staging? Looked up: L7 shows active=false".to_string(),
         ];
         let g = question_gaps(&q);
         assert_eq!(g.len(), 1, "{g:?}");

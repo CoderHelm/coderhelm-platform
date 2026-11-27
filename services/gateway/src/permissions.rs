@@ -290,6 +290,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "run_close::close_runs",
             "run_close::reopen_run",
             "run_close::close_superseded",
+            "followup_dedupe::dedupe",
         ],
     },
     Capability {
@@ -715,6 +716,11 @@ pub const CAPABILITIES: &[Capability] = &[
             "skills::set_use_translated",
             "skills::set_always_apply",
             "skills::set_reviews",
+            "skill_runs::create",
+            "skill_runs::update",
+            "skill_runs::remove",
+            "skill_runs::run_now",
+            "skill_runs::resolve",
         ],
     },
     Capability {
@@ -748,6 +754,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "alerts::delete_route",
             "alerts::get_notify",
             "alerts::put_notify",
+            "alerts::get_updates_notify",
+            "alerts::put_updates_notify",
             "alerts::get_budget",
             "alerts::put_budget",
             "alerts::test_notify",

@@ -9,6 +9,7 @@ const { postReply, parentIdOf } = require("./thread-reply");
 const { versionFields } = require("./version");
 const { relatedTickets } = require("./related");
 const { registerIfVersionChanged, registerAgainReply } = require("./register");
+const followups = require("./followups");
 
 /** Jira's comment calls as the app, for a threaded reply (see thread-reply.js). */
 const jiraComments = {
@@ -137,12 +138,9 @@ exports.handler = async (event, context) => {
 
     const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
 
-    // Extract repo from label if present (coderhelm:owner/repo)
-    const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
-    let commentRepoOwner, commentRepoName;
-    if (repoLabel) {
-      [commentRepoOwner, commentRepoName] = repoLabel.replace("coderhelm:", "").split("/");
-    }
+    // Extract repo from label if present (coderhelm:owner/repo); a
+    // follow-up label (coderhelm:followup:KEY) is no repository.
+    const { owner: commentRepoOwner, name: commentRepoName } = followups.repoOfLabels(labels);
 
     // Download image attachments from the issue (same as issue-update path)
     const imageAttachments = await fetchImageAttachments(fields);
@@ -215,11 +213,8 @@ exports.handler = async (event, context) => {
 
   // Extract repo from explicit label if present (coderhelm:owner/repo)
   const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
-  const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
-  let repoOwner, repoName;
-  if (repoLabel) {
-    [repoOwner, repoName] = repoLabel.replace("coderhelm:", "").split("/");
-  }
+  // A follow-up label (coderhelm:followup:KEY) is no repository.
+  const { owner: repoOwner, name: repoName } = followups.repoOfLabels(labels);
 
   // Download image attachments from the ticket
   const imageAttachments = await fetchImageAttachments(fields);
@@ -310,11 +305,187 @@ exports.listProjectsHandler = async (request) => {
   }
 };
 
+// ── Follow-up tickets (see followups.js) ─────────────────────────────────────
+
+/** A JSON answer for a web trigger. */
+const answer = (statusCode, obj) => ({
+  statusCode,
+  headers: { "Content-Type": ["application/json"] },
+  body: JSON.stringify(obj),
+});
+
+/** Jira's error text from a failed call, one line, at most 300 characters. */
+async function jiraError(res) {
+  const text = await res.text().catch(() => "");
+  try {
+    const v = JSON.parse(text);
+    const parts = [...(v.errorMessages || []), ...Object.values(v.errors || {})];
+    if (parts.length > 0) return parts.join("; ").slice(0, 300);
+  } catch (_) {
+    // not JSON: the text itself
+  }
+  return text.replace(/\s+/g, " ").trim().slice(0, 300);
+}
+
+/** Links `newKey` to `sourceKey` with the site's "relates to" type. */
+async function linkToSource(newKey, sourceKey, requestedType) {
+  const types = await api.asApp().requestJira(route`/rest/api/3/issueLinkType`);
+  if (!types.ok) return { ok: false, error: `link types unreadable (${types.status}): ${await jiraError(types)}` };
+  const name = followups.pickLinkType((await types.json()).issueLinkTypes, requestedType);
+  if (!name) return { ok: false, error: "this site has no \"relates to\" link type" };
+  const res = await api.asApp().requestJira(route`/rest/api/3/issueLink`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: { name }, inwardIssue: { key: newKey }, outwardIssue: { key: sourceKey } }),
+  });
+  if (!res.ok) return { ok: false, type: name, error: `${res.status}: ${await jiraError(res)}` };
+  return { ok: true, type: name };
+}
+
+/**
+ * The follow-ups already filed from `followup.source` in `projectKey`
+ * (read only): key, summary, description text and status.
+ */
+async function listFollowups(body) {
+  const { projectKey, followup } = body;
+  const jql = followups.dedupeJql(projectKey, followup && followup.source);
+  if (!jql) {
+    return answer(400, { error: "projectKey and followup.source must be keys" });
+  }
+  const found = await api.asApp().requestJira(route`/rest/api/3/search/jql`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jql,
+      maxResults: followups.MAX_DEDUPE,
+      fields: ["summary", "description", "status"],
+    }),
+  });
+  if (!found.ok) {
+    return answer(found.status, { error: "search_failed", details: await jiraError(found), project: projectKey });
+  }
+  return answer(200, { followup: 1, issues: followups.listedIssues((await found.json()).issues) });
+}
+
+/**
+ * Files one follow-up ticket of `followup.source` in `projectKey`, once:
+ * checks the app's permissions, returns the ticket already filed for the
+ * same draft, else creates it with the picked issue type and links it.
+ */
+async function fileFollowup(body) {
+  const { projectKey, summary, description, labels, issueType, followup } = body;
+  const source = followup && followup.source;
+  if (!followups.isIssueKey(source)) {
+    return answer(400, { error: "followup.source must be an issue key" });
+  }
+  // 1. The app's own permissions in the project, so a gap is named exactly.
+  const perms = await api
+    .asApp()
+    .requestJira(
+      route`/rest/api/3/mypermissions?projectKey=${projectKey}&permissions=${followups.NEEDED_PERMISSIONS.join(",")}`
+    );
+  if (!perms.ok) {
+    return answer(perms.status, {
+      error: "permissions_unreadable",
+      details: await jiraError(perms),
+      project: projectKey,
+    });
+  }
+  const missing = followups.missingPermissions(await perms.json());
+  if (missing.includes("BROWSE_PROJECTS") || missing.includes("CREATE_ISSUES")) {
+    return answer(403, {
+      error: "missing_permission",
+      missing,
+      words: followups.permissionWords(missing),
+      project: projectKey,
+    });
+  }
+  // 2. The ticket already filed for this draft.
+  const jql = followups.dedupeJql(projectKey, source);
+  if (jql) {
+    const found = await api.asApp().requestJira(route`/rest/api/3/search/jql`, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ jql, maxResults: followups.MAX_DEDUPE, fields: ["summary", "issuelinks"] }),
+    });
+    if (found.ok) {
+      const same = ((await found.json()).issues || []).find((i) =>
+        followups.sameSummary(i.fields && i.fields.summary, summary)
+      );
+      if (same) {
+        let linked = { ok: true, existing: true };
+        if (!followups.linkedTo(same, source)) {
+          linked = missing.includes("LINK_ISSUES")
+            ? { ok: false, error: "missing_permission", missing: ["LINK_ISSUES"] }
+            : await linkToSource(same.key, source, followup.linkType);
+        }
+        return answer(200, { key: same.key, id: same.id, existing: true, linked, followup: 1 });
+      }
+    }
+  }
+  // 3. The issue type, from the project's creatable types.
+  const meta = await api.asApp().requestJira(route`/rest/api/3/issue/createmeta/${projectKey}/issuetypes`);
+  if (!meta.ok) {
+    return answer(meta.status, { error: "issue_types_unreadable", details: await jiraError(meta), project: projectKey });
+  }
+  const metaBody = await meta.json();
+  const type = followups.pickIssueType(metaBody.issueTypes || metaBody.values, issueType);
+  if (!type) {
+    return answer(400, { error: "no_issue_type", project: projectKey });
+  }
+  const fields = {
+    project: { key: projectKey },
+    summary: String(summary).slice(0, 254),
+    issuetype: { id: type.id },
+    // Only follow-up labels: never `coderhelm` or the team's trigger, so the
+    // new ticket starts no run of its own. No assignee is ever set.
+    labels: followups.followupLabels(labels, source),
+  };
+  if (description) fields.description = followups.descriptionAdf(description);
+  const res = await api.asApp().requestJira(route`/rest/api/3/issue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fields }),
+  });
+  if (!res.ok) {
+    return answer(res.status, { error: "create_failed", details: await jiraError(res), project: projectKey });
+  }
+  const created = await res.json();
+  // 4. The link to the source ticket.
+  const linked = missing.includes("LINK_ISSUES")
+    ? { ok: false, error: "missing_permission", missing: ["LINK_ISSUES"] }
+    : await linkToSource(created.key, source, followup.linkType);
+  return answer(201, {
+    key: created.key,
+    id: created.id,
+    existing: false,
+    issue_type: type.name,
+    issue_type_from: type.from,
+    linked,
+    followup: 1,
+  });
+}
+
 // ── Web trigger: create a Jira ticket ────────────────────────────────────────
 exports.createTicketHandler = async (request) => {
   try {
     const body = JSON.parse(request.body || "{}");
     const { projectKey, summary, description, labels } = body;
+
+    // A follow-up of a ticket a run worked on: checked, deduplicated, typed
+    // and linked (fileFollowup). Only with the shared secret.
+    if (body.followup) {
+      // The list of follow-ups already filed: read only, no summary.
+      const listing = body.followup.list === true;
+      if (!projectKey || (!summary && !listing)) {
+        return answer(400, { error: "projectKey and summary required" });
+      }
+      const config = await storage.get("coderhelm-config");
+      if (!config || !config.forgeSecret || body.forge_secret !== config.forgeSecret) {
+        return answer(401, { error: "unauthorized" });
+      }
+      return listing ? await listFollowups(body) : await fileFollowup(body);
+    }
 
     if (!projectKey || !summary) {
       return { statusCode: 400, body: JSON.stringify({ error: "projectKey and summary required" }) };

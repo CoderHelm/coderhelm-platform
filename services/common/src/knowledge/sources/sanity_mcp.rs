@@ -1743,7 +1743,7 @@ mod tests {
     async fn a_query_answered_in_sanitys_xml_is_read() {
         let mcp = server(|tool, _| match tool {
             "query_documents" => Ok(json!({"content": [{"type": "text", "text":
-                "Query executed successfully. Found 1 total document, returning 1 (40 tokens): \n<documents>\n  <document>{\n  \"chTypes\": [\n    \"post\",\n    \"venue\"\n  ]\n}</document>\n</documents>\n<count>1</count>\n<totalAvailable>1</totalAvailable>\n"}]})),
+                "Query executed successfully. Found 1 total document, returning 1 (40 tokens): \n<documents>\n  <document>{\n  \"chTypes\": [\n    \"post\",\n    \"library\"\n  ]\n}</document>\n</documents>\n<count>1</count>\n<totalAvailable>1</totalAvailable>\n"}]})),
             _ => Ok(text_result(&json!([]))),
         });
         let c = SanityMcp {
@@ -1761,7 +1761,7 @@ mod tests {
             )
             .await
             .expect("the answer is read");
-        assert_eq!(v, json!(["post", "venue"]));
+        assert_eq!(v, json!(["post", "library"]));
     }
 
     fn doc(id: &str, rev: &str, at: &str) -> Value {

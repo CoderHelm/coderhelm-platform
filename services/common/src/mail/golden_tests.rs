@@ -46,6 +46,16 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
             Some("Acme"),
         ),
         (
+            "skill_run_result",
+            "skill_run_result",
+            json!({
+                "skill": "visit-count",
+                "outcome": "Finished: /classes grew from 120 to 400.\nReport: reports/2026-11-30.html",
+                "run_link": format!("{APP}/runs/detail?id=r1"),
+            }),
+            Some("Acme"),
+        ),
+        (
             "knowledge_signin",
             "knowledge_signin",
             json!({"source": "Engineering wiki", "problem": "The sign-in expired on 2026-10-30.", "link": format!("{APP}/settings/knowledge/")}),

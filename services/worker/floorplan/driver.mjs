@@ -17,13 +17,25 @@
 //   result.b64    every script's --json result, the worksheets and the files
 //                 the model jobs need (gzipped JSON, base64)
 //   state.b64     root/floorplan as a gzipped tar (base64), for the next run
-//   graph.b64     floorplan/graph.json, gzipped (base64), when the build wrote one
+//   graph.b64     floorplan/graph.json with CoderHelm's additions (coderhelm/index.mjs:
+//                 screens, outside services, calls, infra, webhooks and data links),
+//                 gzipped (base64), when the build wrote one
+//   Each is split into parts (`result.b64.000`, `.001`, ...) when it is
+//   larger than PART, so a large map stays under the sandbox's cap on one
+//   returned file; the worker joins the parts in order.
 //
-// Vendored files are never edited; everything CoderHelm-specific is here.
+// Journeys (coderhelm/flows.mjs) are re-checked against this build's code
+// and kept in root/floorplan/coderhelm/flows.json; what the model must
+// (re)write goes back in result.flows.todo.
+//
+// Vendored files are never edited; everything CoderHelm-specific is here and in coderhelm/.
+// Floorplan's own graph.json stays as its build wrote it (refresh compares against it); the
+// additions go only into the copy handed back.
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
+import { prepare as prepareFlows, STORE as FLOWS_STORE } from './coderhelm/flows.mjs';
 
 const HERE = process.cwd();
 const SKILL = path.join(HERE, 'fp', 'skills', 'floorplan');
@@ -35,6 +47,8 @@ const env = { ...process.env, FLOORPLAN_UNATTENDED: '1', FLOORPLAN_AGENT: 'none'
 
 /** The only files an answer may become, inside the map folder. */
 const ANSWER_PATH = /^floorplan\/(architecture\.json|recent-work\.json|descriptions\/[A-Za-z0-9_.-]{1,120}\.json)$/;
+/** One returned file, at most (the sandbox keeps files up to 5 MiB). */
+const PART = Number(process.env.CODERHELM_OUT_PART) || 4 * 1024 * 1024;
 
 function git(cwd, args) {
   return spawnSync('git', ['-c', 'safe.directory=*', '-c', 'user.email=map@coderhelm.invalid', '-c', 'user.name=App map', ...args], { cwd, env, encoding: 'utf8' });
@@ -92,12 +106,53 @@ if (result.build?.ok) {
 }
 if (fs.existsSync(arch)) result.architecture = JSON.parse(fs.readFileSync(arch, 'utf8'));
 
+// The map as the page gets it: Floorplan's build, then CoderHelm's
+// detectors (hook H2), then the journeys on top of both. Floorplan's own
+// graph.json in the map folder stays as Floorplan wrote it.
+const graphFile = path.join(MAP, 'graph.json');
+let graphOut = null;
+if (result.build?.ok && fs.existsSync(graphFile)) {
+  let g = JSON.parse(fs.readFileSync(graphFile, 'utf8'));
+  // hook H2: CoderHelm's detectors on the built map; a failure keeps Floorplan's map as it is
+  let t = Date.now();
+  try {
+    const { enrich } = await import('./coderhelm/index.mjs');
+    const scanFile = path.join(MAP, '.cache', 'scan.json');
+    const scan = fs.existsSync(scanFile) ? JSON.parse(fs.readFileSync(scanFile, 'utf8')) : {};
+    g = await enrich({ root: ROOT, skill: SKILL, graph: g, scan });
+    result.coderhelm = { ok: true, ms: Date.now() - t, counts: g.extract?.counts, notes: g.extract?.notes };
+  } catch (e) {
+    result.coderhelm = { ok: false, ms: Date.now() - t, error: String(e?.stack || e).slice(0, 2000) };
+  }
+  // Journeys: the stored ones re-checked against this build (0 tokens),
+  // and the entries the model must (re)write, with the candidates it may
+  // use.
+  const storeFile = path.join(ROOT, FLOWS_STORE);
+  t = Date.now();
+  try {
+    const prev = fs.existsSync(storeFile) ? JSON.parse(fs.readFileSync(storeFile, 'utf8')) : null;
+    const p = prepareFlows(ROOT, g, prev);
+    fs.mkdirSync(path.dirname(storeFile), { recursive: true });
+    fs.writeFileSync(storeFile, JSON.stringify(p.store) + '\n');
+    if (job.flows === 'visible') g.flows = [...(g.flows || []).filter((f) => !f.coderhelm), ...p.flows];
+    result.flows = { report: { ...p.report, ms: Date.now() - t }, todo: p.todo, kept: p.store.flows, viewer: p.flows };
+  } catch (e) {
+    result.flows = { error: String(e?.stack || e).slice(0, 2000) };
+  }
+  graphOut = JSON.stringify(g);
+  if (result.coderhelm) result.coderhelm.bytes = graphOut.length;
+}
+
 fs.mkdirSync(OUT, { recursive: true });
-fs.writeFileSync(path.join(OUT, 'result.b64'), zlib.gzipSync(JSON.stringify(result)).toString('base64'));
+/** Writes one output, split into parts when it is larger than PART. */
+function out(name, b64) {
+  if (b64.length <= PART) return fs.writeFileSync(path.join(OUT, name), b64);
+  for (let i = 0; i * PART < b64.length; i++) fs.writeFileSync(path.join(OUT, `${name}.${String(i).padStart(3, '0')}`), b64.slice(i * PART, (i + 1) * PART));
+}
+out('result.b64', zlib.gzipSync(JSON.stringify(result)).toString('base64'));
 // The map's own files for the next run; the generated page and its helpers
 // are left out (the dashboard has its own copy of the viewer).
 const tgz = path.join(HERE, 'state.tgz');
 const tar = spawnSync('tar', ['czf', tgz, '-C', ROOT, '--exclude=floorplan/index.html', '--exclude=floorplan/artifact.html', '--exclude=floorplan/serve.mjs', '--exclude=floorplan/query.mjs', '--exclude=floorplan/page-safety.mjs', 'floorplan'], { env });
-if (tar.status === 0) fs.writeFileSync(path.join(OUT, 'state.b64'), fs.readFileSync(tgz).toString('base64'));
-const graph = path.join(MAP, 'graph.json');
-if (result.build?.ok && fs.existsSync(graph)) fs.writeFileSync(path.join(OUT, 'graph.b64'), zlib.gzipSync(fs.readFileSync(graph)).toString('base64'));
+if (tar.status === 0) out('state.b64', fs.readFileSync(tgz).toString('base64'));
+if (graphOut) out('graph.b64', zlib.gzipSync(graphOut).toString('base64'));

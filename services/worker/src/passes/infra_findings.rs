@@ -556,6 +556,23 @@ async fn cards(
             r.finding.id
         );
         let msg = records::card(r, &url);
+        // A P0 is an alert; a P1 is news for the updates channel.
+        let kind = if r.tier() == Some(Tier::P0) {
+            common::notify::route::Kind::Alert
+        } else {
+            common::notify::route::Kind::Update
+        };
+        let channels = channels.get(kind);
+        if channels.is_empty() {
+            common::claim::release(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                team_id,
+                &sk,
+            )
+            .await;
+            continue;
+        }
         let sent = common::notify::deliver_recorded(
             &common::notify::Http(&state.http),
             &channels,
@@ -1434,7 +1451,7 @@ mod tests {
     const TICKET: &str = "SEC-0A1B2C3D4E5F";
 
     fn day() -> chrono::DateTime<Utc> {
-        at("2026-11-13T10:00:00Z")
+        at("2030-03-15T10:00:00Z")
     }
 
     /// A record whose fix run opened pull request 7 and the guard passed it.
@@ -1447,9 +1464,9 @@ mod tests {
             &[],
             number,
             "https://github.com/acme/infra/pull/7",
-            "2026-11-12T09:00:00Z",
+            "2030-03-14T09:00:00Z",
         );
-        r.updated_at = "2026-11-12T09:00:00Z".into();
+        r.updated_at = "2030-03-14T09:00:00Z".into();
         r
     }
 
@@ -1505,10 +1522,10 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_run_releases_its_record_and_a_working_one_is_left() {
         let mut a = pr_record();
-        a.claim(TICKET, at("2026-11-13T09:00:00Z"));
+        a.claim(TICKET, at("2030-03-15T09:00:00Z"));
         let mut b = pr_record();
         b.finding.id = "other".into();
-        b.claim("SEC-BBBBBBBBBBBB", at("2026-11-13T09:00:00Z"));
+        b.claim("SEC-BBBBBBBBBBBB", at("2030-03-15T09:00:00Z"));
         let mut recs = vec![a, b];
         let runs = Fake::default();
         runs.run(
@@ -1531,7 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn a_pull_request_the_record_never_learned_is_read_by_the_guard_first() {
         let mut a = pr_record();
-        a.claim(TICKET, at("2026-11-13T09:00:00Z"));
+        a.claim(TICKET, at("2030-03-15T09:00:00Z"));
         let mut recs = vec![a];
         let github = Fake::default();
         github.branch_prs.lock().unwrap().insert(
@@ -1560,9 +1577,9 @@ mod tests {
         // and only a run that begins from then on is the round.
         let mut r = pr_record();
         r.ticket = TICKET.into();
-        let (step, _) = after_guard(&mut r, &[WHY.to_string()], 7, "u", "2026-11-13T09:00:00Z");
+        let (step, _) = after_guard(&mut r, &[WHY.to_string()], 7, "u", "2030-03-15T09:00:00Z");
         assert_eq!(step, records::GuardStep::FixRound);
-        assert_eq!(Claim::claimed_at(&r), Some(at("2026-11-13T09:15:00Z")));
+        assert_eq!(Claim::claimed_at(&r), Some(at("2030-03-15T09:15:00Z")));
         assert_eq!(newly_drafted(&r), None);
         let mut recs = vec![r];
         let github = Fake::default();

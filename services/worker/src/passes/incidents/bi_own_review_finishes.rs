@@ -32,10 +32,10 @@ use crate::passes::pr_watch::{self, Act, Performed};
 const OLD: &str = "made no progress";
 
 /// The finding the run deferred, as two reviews worded it.
-const NAV: &str = "Site navbar and footer still render on the portal page; signup-portal isn't in settings.blankLayout (`apps/web/src/lib/routing/renderers.tsx:1632`)";
-const NAV_AGAIN: &str = "The site navbar and footer still render on the portal pages because `signup-portal` isn't in settings.blankLayout (`apps/web/src/lib/routing/renderers.tsx:1636`)";
-const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/signup.spec.ts:121`)";
-const H1: &str = "Test plan says one H1; the spec asserts none (`e2e/specs/browse.md:191`)";
+const NAV: &str = "Site navbar and footer still render on the portal page; booking-portal isn't in settings.bareLayout (`apps/web/src/lib/routing/page-shell.tsx:412`)";
+const NAV_AGAIN: &str = "The site navbar and footer still render on the portal pages because `booking-portal` isn't in settings.bareLayout (`apps/web/src/lib/routing/page-shell.tsx:416`)";
+const LINT: &str = "e2e lint fails on the two new files (`e2e/tests/slot-booking.spec.ts:88`)";
+const H1: &str = "Test plan says one H1; the spec asserts none (`e2e/specs/library-browse.md:64`)";
 
 /// What the round's log carried.
 fn the_blocked_round_log() -> Vec<serde_json::Value> {
@@ -99,7 +99,7 @@ fn rounds_the_tools_blocked_are_not_no_progress_and_the_omission_is_fixed() {
     assert_eq!(l.decide(&[], 0.0, 200.0), Plan::Ready);
     assert!(l.findings.iter().all(|t| t.settled == Some(Settled::Fixed)));
     assert_eq!(
-        ledger::completion(Some(("APPROVE", "6470f1dabc")), "6470f1dabc", &l),
+        ledger::completion(Some(("APPROVE", "abc1230def")), "abc1230def", &l),
         Completion::Complete
     );
     end.status = "completed".into();
@@ -108,7 +108,7 @@ fn rounds_the_tools_blocked_are_not_no_progress_and_the_omission_is_fixed() {
 
 #[test]
 fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred() {
-    let ticket = "### Ticket: Sign-up pages\nAdd the four register pages.\n\n### Comment on the ticket by a teammate\nKeep your site's header and footer. You do not need to remove the footer, although the portal's optimal experience is without a footer.";
+    let ticket = "### Ticket: Slot booking pages\nAdd the four slot booking pages.\n\n### Comment on the ticket by a teammate\nKeep the site's header and footer on these pages. The footer can stay even though the booking portal looks cleaner without it.";
     let mut l = Ledger::default();
     let open = vec![NAV.to_string()];
     l.observe(&open, ticket);
@@ -116,7 +116,7 @@ fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred(
         &mut l,
         &open,
         vec![],
-        &format!("{TICKET_CONFLICT} {NAV} :: \"Keep your site's header and footer\""),
+        &format!("{TICKET_CONFLICT} {NAV} :: \"Keep the site's header and footer\""),
     );
     l.observe(&[NAV_AGAIN.to_string()], ticket);
     let Plan::Settle {
@@ -132,10 +132,10 @@ fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred(
     assert!(lines[0].contains("the ticket rules it out"), "{lines:?}");
     // The review of the head then names it as a note, never a hold.
     let mut findings: Vec<crate::passes::review_agent::Finding> = serde_json::from_value(serde_json::json!([
-        {"file": "apps/web/src/lib/routing/renderers.tsx", "line": 1640, "severity": "medium", "category": "correctness",
+        {"file": "apps/web/src/lib/routing/page-shell.tsx", "line": 420, "severity": "medium", "category": "correctness",
          "evidence": "verified-defect",
-         "title": "Site navbar and footer still render on the portal pages; signup-portal isn't in settings.blankLayout",
-         "body": "NavbarServer and Footer read the hide list from settings.blankLayout."}
+         "title": "Site navbar and footer still render on the portal pages; booking-portal isn't in settings.bareLayout",
+         "body": "SiteHeader and SiteFooter read the hide list from settings.bareLayout."}
     ]))
     .unwrap();
     let mut own_open = vec![NAV_AGAIN.to_string()];
@@ -146,7 +146,7 @@ fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred(
     assert!(findings[0].body.contains("the ticket says"));
     // The reviewer is told the ticket and its comments.
     let section = crate::passes::review_pr::own_ticket_section(ticket);
-    assert!(section.contains("Keep your site's header and footer"));
+    assert!(section.contains("Keep the site's header and footer"));
     assert!(section.contains("Never raise a finding that asks for something these rule out"));
 }
 
@@ -154,7 +154,7 @@ fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred(
 fn the_run_is_never_completed_while_its_review_asks_for_changes() {
     let l = Ledger::default();
     assert!(matches!(
-        ledger::completion(Some(("REQUEST_CHANGES", "6470f1dabc")), "6470f1dabc", &l),
+        ledger::completion(Some(("REQUEST_CHANGES", "abc1230def")), "abc1230def", &l),
         Completion::Continue(_)
     ));
     // Every completion path asks the guard first.
@@ -207,9 +207,9 @@ fn a_finished_run_whose_findings_were_settled_is_never_shown_working() {
     let standing = common::merge_standing::decide(
         "your-team/web",
         &common::merge_standing::Facts {
-            head: "6470f1dabc".into(),
+            head: "abc1230def".into(),
             reviewer_on: true,
-            own_verdict: Some(("REQUEST_CHANGES".into(), "6470f1dabc".into())),
+            own_verdict: Some(("REQUEST_CHANGES".into(), "abc1230def".into())),
             working: pr_watch::is_working(&Act::FixFindings, Performed::Settled, "completed"),
             auto_merge: true,
             ..Default::default()
@@ -223,26 +223,26 @@ fn a_finished_run_whose_findings_were_settled_is_never_shown_working() {
 fn coderhelm_adds_the_pull_request_labels_itself() {
     use crate::passes::outside_work::{self, Abilities, Action, Doer, NoteStep};
     let s = NoteStep {
-        step: "Add PR labels E2E:signup and CI:E2E, sending the existing labels too".into(),
+        step: "Add PR labels E2E:booking and CI:E2E, sending the existing labels too".into(),
         by: "person".into(),
         owner: "a repository admin".into(),
         how: "GitHub labels API".into(),
         why_person: "CoderHelm's GitHub App is not allowed to start workflows in this repository"
             .into(),
         grant: "give the app Actions: write".into(),
-        values: vec!["labels += E2E:signup, CI:E2E".into()],
+        values: vec!["labels += E2E:booking, CI:E2E".into()],
         kind: "e2e".into(),
         ..Default::default()
     };
     assert_eq!(
         s.labels_named(),
-        vec!["E2E:signup".to_string(), "CI:E2E".to_string()]
+        vec!["E2E:booking".to_string(), "CI:E2E".to_string()]
     );
     assert!(s.adds_labels_only());
     assert_eq!(s.doer(), Doer::Person);
     match outside_work::action_for(&s, &Abilities::default(), &Default::default()) {
         Action::Label(l, r) => {
-            assert_eq!(l, "E2E:signup,CI:E2E");
+            assert_eq!(l, "E2E:booking,CI:E2E");
             assert!(r.file.is_empty(), "no workflow to wait for");
         }
         other => panic!("{other:?}"),

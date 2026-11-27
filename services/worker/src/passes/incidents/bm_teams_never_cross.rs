@@ -291,7 +291,7 @@ fn a_reused_run_id_never_shows_another_teams_events() {
             ),
         ])
     };
-    let today = "2026-11-15";
+    let today = "2030-03-15";
     assert!(common::run_events::owned_by(&row(TEAM_A), TEAM_A, today));
     assert!(!common::run_events::owned_by(&row(TEAM_B), TEAM_A, today));
 }
@@ -340,6 +340,7 @@ const CACHES: &[(&str, &str)] = &[
     ("common/src/reply_compose.rs::CACHE", "thread key plus a hash of the whole prompt it was written from"),
     ("common/src/review_check.rs::REFUSED", "installation id"),
     ("common/src/usage.rs::P", "model prices; install-wide config"),
+    ("common/src/customer_guard/mod.rs::SET", "the common-words list; no data"),
     ("common/src/usage.rs::WARNED", "model id; log throttle"),
     ("gateway/src/mcp_server.rs::SEEN", "grant or key id; throttle"),
     ("gateway/src/middleware/auth.rs::SEEN", "(team, user); throttle"),

@@ -97,6 +97,24 @@ class Teams(unittest.TestCase):
         self.assertFalse(h.valid_webhook_url("https://evil.com@prod-1.logic.azure.com/x"))
         self.assertFalse(h.valid_webhook_url("http://prod-1.logic.azure.com/x"))
 
+    def test_findings_never_reach_an_alerts_only_channel(self):
+        teams = "https://prod-1.westus.logic.azure.com/workflows/t"
+        other = "https://prod-2.westus.logic.azure.com/workflows/u"
+        alerts = {"enabled": True, "teams_webhook_url": teams}
+        # Saved before kinds existed: alerts only.
+        self.assertEqual(h.channel_kinds(h.TEAM_CHANNEL_SK, alerts), {"alert"})
+        self.assertEqual(h.team_update_channels("TEAM#a", alerts, {}), {})
+        # The updates channel takes them.
+        updates = {"enabled": True, "teams_webhook_url": other}
+        self.assertEqual(h.channel_kinds(h.UPDATES_CHANNEL_SK, updates), {"action", "update"})
+        self.assertEqual(h.team_update_channels("TEAM#a", alerts, updates), {"teams": other})
+        # An alert channel set to take updates does, after the updates channel.
+        more = dict(alerts, kinds=["alert", "update"])
+        self.assertEqual(h.team_update_channels("TEAM#a", more, {}), {"teams": teams})
+        self.assertEqual(h.team_update_channels("TEAM#a", more, updates), {"teams": other})
+        # Off takes nothing.
+        self.assertEqual(h.team_update_channels("TEAM#a", more, dict(updates, enabled=False)), {"teams": teams})
+
     def test_channel_choice(self):
         team = "https://prod-1.westus.logic.azure.com/workflows/t"
         own = "https://prod-2.westus.logic.azure.com/workflows/o"

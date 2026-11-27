@@ -96,8 +96,8 @@ pub fn is_raw_id(token: &str) -> bool {
         && t.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// `line` without the parenthesised raw ids that follow a name: "Events
-/// page (0f3c2a1b-...)" is "Events page". An id in code, in a link, or
+/// `line` without the parenthesised raw ids that follow a name: "Slots
+/// page (0f3c2a1b-...)" is "Slots page". An id in code, in a link, or
 /// with no name before it stays.
 pub fn without_raw_ids(line: &str) -> String {
     let mut out = line.to_string();
@@ -338,10 +338,10 @@ mod tests {
 
     #[test]
     fn filler_goes_and_the_fact_beside_it_stays() {
-        let r = review("- Approach: decide whether this does what OPS-1 asks. CoderHelm's conclusion: nothing is out of the ordinary.");
+        let r = review("- Approach: decide whether this does what HARBOR-1 asks. CoderHelm's conclusion: nothing is out of the ordinary.");
         assert_eq!(
             r.body,
-            "- Approach: decide whether this does what OPS-1 asks."
+            "- Approach: decide whether this does what HARBOR-1 asks."
         );
         let r = review("Nothing is out of the ordinary.\nKept.");
         assert_eq!(r.body, "Kept.");
@@ -351,9 +351,9 @@ mod tests {
     fn a_raw_id_beside_a_name_goes_and_one_alone_stays() {
         assert_eq!(
             without_raw_ids(
-                "Studio: Events page (0f3c2a1b-9d8e-4c7b-a6f5-e4d3c2b1a0f9), hero field."
+                "Studio: Slots page (0f3c2a1b-9d8e-4c7b-a6f5-e4d3c2b1a0f9), listing Summary field."
             ),
-            "Studio: Events page, hero field."
+            "Studio: Slots page, listing Summary field."
         );
         let alone = "The document `0f3c2a1b-9d8e-4c7b-a6f5-e4d3c2b1a0f9` was read.";
         assert_eq!(without_raw_ids(alone), alone);

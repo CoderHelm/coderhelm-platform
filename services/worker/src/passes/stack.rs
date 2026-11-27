@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(d.number, 21);
         let d = pick_series(
             &open,
-            "Part 2 of 3: Section titles on venues",
+            "Part 2 of 3: Section titles on libraries",
             "acme",
             "web",
             "x",

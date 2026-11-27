@@ -1,17 +1,17 @@
-//! cn. A ticket asked to show camp descriptions without literal HTML
+//! cn. A ticket asked to show slot descriptions without literal HTML
 //! entities. The proof check before the pull request listed gaps that asked
 //! to confirm things: which stored descriptions hold entities, and whether
 //! the live page shows them. The fix round did that work: four database
-//! queries, three page checks and a run of the checks, for $1.95. It wrote
+//! queries, three page checks and a run of the checks, at a real cost. It wrote
 //! no code, because the gaps asked for answers, not changes. The check
 //! then saw the same branch head, said "the code hasn't changed since the
 //! last check, so that result stands", reused the result from before the
 //! round, counted the round as no progress and listed the same gaps under
 //! Open items. The answers never reached the judge.
 //!
-//! Across 53 runs, 27 of 39 proof fix rounds wrote no code ($19 of $29),
-//! and the note "the code hasn't changed ... result stands" followed 52
-//! times.
+//! Across many runs, most proof fix rounds wrote no code (and most of
+//! their cost), and the note "the code hasn't changed ... result stands"
+//! followed again and again.
 //!
 //! Guarantee: a fix round that made a lookup or ran a check is judged
 //! again on the same head, with what it brought (`proof::round_answered`,
@@ -42,10 +42,10 @@ fn answers() -> RunEvidence {
             "L1".into(),
             "Production database",
             LookupOutcome::Answered,
-            "SELECT count(*) FROM class WHERE description ~ '&[a-z]+;'",
-            "212 rows",
+            "SELECT count(*) FROM tour WHERE description ~ '&[a-z]+;'",
+            "48 rows",
         )],
-        checks: vec!["test: vitest run src/utils/htmlContent.test.ts: PASS".into()],
+        checks: vec!["test: vitest run src/utils/html-text.test.ts: PASS".into()],
         ..Default::default()
     }
 }

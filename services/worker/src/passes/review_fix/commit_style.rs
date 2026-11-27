@@ -236,12 +236,12 @@ mod tests {
     #[test]
     fn a_ticket_key_single_line_history_gives_a_keyed_single_line() {
         let style = learn(&s(&[
-            "OPS-12: Lower the sync log level",
-            "OPS-11: Add retry to the poller",
+            "HARBOR-77: Lower the sync log level",
+            "HARBOR-76: Add retry to the poller",
             "Merge pull request #9 from org/branch",
-            "OPS-10: Fix typo",
-            "OPS-9: Bump client",
-            "OPS-8: Handle empty pages",
+            "HARBOR-75: Fix typo",
+            "HARBOR-74: Bump client",
+            "HARBOR-73: Handle empty pages",
         ]));
         assert_eq!(style.key_prefix, Some(KeyPrefix::Colon));
         assert!(style.single_line);
@@ -249,10 +249,13 @@ mod tests {
         assert_eq!(style.samples, 5);
         let m = compose(
             &style,
-            Some("OPS-13"),
-            &s(&["OPS-13: Log unchanged runs at DEBUG", "Add a caplog test"]),
+            Some("HARBOR-78"),
+            &s(&[
+                "HARBOR-78: Log unchanged runs at DEBUG",
+                "Add a caplog test",
+            ]),
         );
-        assert_eq!(m, "OPS-13: Log unchanged runs at DEBUG");
+        assert_eq!(m, "HARBOR-78: Log unchanged runs at DEBUG");
     }
 
     #[test]

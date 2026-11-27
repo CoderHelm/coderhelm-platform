@@ -1166,11 +1166,11 @@ jobs:
             e.test
         );
         assert_eq!(
-            e.file_command("tests/test_camp_sport.py").as_deref(),
-            Some("python tests/test_camp_sport.py")
+            e.file_command("tests/test_tour_stop.py").as_deref(),
+            Some("python tests/test_tour_stop.py")
         );
         // A file the loop doesn't run, and a path that isn't safe.
-        assert_eq!(e.file_command("dags/camp_sport.py"), None);
+        assert_eq!(e.file_command("dags/tour_stop.py"), None);
         assert_eq!(e.file_command("tests/test_a.py; rm -rf /"), None);
         // A runner takes the file.
         let e = from_workflows(&[("t.yml".into(), PY.into())], &[]).unwrap();

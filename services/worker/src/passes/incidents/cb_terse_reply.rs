@@ -4,10 +4,10 @@
 //! linking it, the person @-mentioned a second time, "you asked for a
 //! rebase with main:", two clauses on how the merge was done, and "It's
 //! pushed to pull request #N" linking the pull request the reply sat on.
-//! The owner called it insane.
+//! The owner objected to how long and noisy it was.
 //!
 //! Guarantee: the branch update says its outcome in one line ("Merged main
-//! in (15401ad).", plus one short reason only when it is a merge where a
+//! in (7c0ffee).", plus one short reason only when it is a merge where a
 //! rebase was asked), posted as written with no model rewriting it. Every
 //! comment passes the thread rules (`comment_style::tidy` and `lint_on`):
 //! under the newest comment a reply carries no quote, no header and no
@@ -24,14 +24,14 @@ use serde_json::{json, Value};
 
 use crate::passes::branch_update::{asks_rebase, reply, MergeWhy, Outcome};
 
-const T0: i64 = 1_795_000_000_000;
-const SHA: &str = "15401ad9e0c4b2";
+const T0: i64 = 1_900_000_000_000;
+const SHA: &str = "7c0ffee3a9d1b5";
 
-/// What the model wrote that day (names changed).
-const INSANE: &str = "@sam you asked for a rebase with main: the branch is now up to date with main as a merge commit (15401ad), because force pushes aren't allowed here, so the result is the same code as a rebase. It's pushed to [pull request #1547](https://github.com/acme/web/pull/1547).";
+/// What the model wrote (names changed).
+const LONG_REPLY: &str = "@sam you asked for a rebase with main: the branch is now up to date with main as a merge commit (7c0ffee), because force pushes aren't allowed here, so the result is the same code as a rebase. It's pushed to [pull request #482](https://github.com/acme/web/pull/482).";
 
 fn place() -> Place {
-    Place::github("acme", "web", 1547)
+    Place::github("acme", "web", 482)
 }
 
 /// The thread: CoderHelm's status from earlier, then sam's comment.
@@ -41,7 +41,7 @@ fn thread(also_after: bool) -> View {
         author: "sam".into(),
         text: "@CoderHelm rebase with main".into(),
         at_ms: T0 + 60_000,
-        url: "https://github.com/acme/web/pull/1547#issuecomment-900".into(),
+        url: "https://github.com/acme/web/pull/482#issuecomment-900".into(),
         ..Default::default()
     }];
     if also_after {
@@ -105,20 +105,20 @@ impl Channel for Thread {
     }
 }
 
-/// The model, answering what it answered that day.
+/// The model, answering what it answered in the incident.
 struct Recorded(AtomicUsize);
 
 #[async_trait::async_trait]
 impl Composer for Recorded {
     async fn compose(&self, _: &str, _: &str, _: &Value) -> Option<Value> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Some(json!({"action": "reply", "text": INSANE}))
+        Some(json!({"action": "reply", "text": LONG_REPLY}))
     }
 }
 
 fn facts() -> Facts {
     Facts::default()
-        .github_pr("acme/web", 1547, "Spring catalog page", "open")
+        .github_pr("acme/web", 482, "Slot map page", "open")
         .github_commit("acme/web", SHA, "Merge main into coderhelm/abc-1")
         .state("the branch update is pushed")
 }
@@ -161,12 +161,12 @@ fn the_branch_update_says_its_outcome_in_one_line() {
     // They asked for a rebase and got a merge: one short reason.
     assert_eq!(
         reply(&merged, "main", asks_rebase("rebase with main"), false),
-        "Merged main in (15401ad). Force pushes are off here, so it's a merge instead of a rebase."
+        "Merged main in (7c0ffee). Force pushes are off here, so it's a merge instead of a rebase."
     );
     // They asked to merge main in: nothing to explain.
     assert_eq!(
         reply(&merged, "main", asks_rebase("merge main in"), false),
-        "Merged main in (15401ad)."
+        "Merged main in (7c0ffee)."
     );
 }
 
@@ -186,7 +186,7 @@ async fn the_reply_under_the_newest_comment_is_the_line_and_nothing_else() {
     assert_eq!(
         log,
         vec![format!(
-            "reply 900: Merged main in (15401ad). Force pushes are off here, so it's a merge instead of a rebase."
+            "reply 900: Merged main in (7c0ffee). Force pushes are off here, so it's a merge instead of a rebase."
         )]
     );
     // The line is the answer: no model rewrote it at length.
@@ -195,25 +195,18 @@ async fn the_reply_under_the_newest_comment_is_the_line_and_nothing_else() {
 
 #[tokio::test]
 async fn whatever_a_model_writes_the_thread_rules_hold() {
-    // Another path still asks the model, and it answers as it did that day.
+    // Another path still asks the model, and it answers as it did in the incident.
     let model = Recorded(AtomicUsize::new(0));
     let mut facts = facts();
     facts.state = "the branch update is pushed".into();
-    let log = replay(thread(false), "Merged main in (15401ad).", &facts, &model).await;
+    let log = replay(thread(false), "Merged main in (7c0ffee).", &facts, &model).await;
     assert_eq!(model.0.load(Ordering::SeqCst), 1);
     assert_eq!(log.len(), 1, "{log:?}");
     let body = log[0].strip_prefix("reply 900: ").expect("a reply to sam");
-    for never in [
-        "> ",
-        "replying to",
-        "@sam",
-        "you asked",
-        "pull/1547",
-        "#1547",
-    ] {
+    for never in ["> ", "replying to", "@sam", "you asked", "pull/482", "#482"] {
         assert!(!body.contains(never), "{never}: {body}");
     }
-    assert!(body.contains("15401ad"), "{body}");
+    assert!(body.contains("7c0ffee"), "{body}");
     assert!(lint_on(body, &place()).is_empty(), "{body}");
 }
 
@@ -222,7 +215,7 @@ async fn under_an_older_comment_the_reply_quotes_it_and_nothing_more() {
     let model = Recorded(AtomicUsize::new(0));
     let log = replay(
         thread(true),
-        "Merged main in (15401ad).",
+        "Merged main in (7c0ffee).",
         &facts().as_written(),
         &model,
     )
@@ -235,19 +228,19 @@ async fn under_an_older_comment_the_reply_quotes_it_and_nothing_more() {
         !body.contains("replying to") && !body.contains('@'),
         "{body}"
     );
-    assert!(body.ends_with("Merged main in (15401ad)."), "{body}");
+    assert!(body.ends_with("Merged main in (7c0ffee)."), "{body}");
     assert!(lint_on(body, &place()).is_empty(), "{body}");
 }
 
 #[test]
 fn the_old_reply_breaks_the_rules_and_tidy_fixes_what_it_can() {
     let old = format!(
-        "> @CoderHelm rebase with main\n\n@sam, replying to [your comment](https://github.com/acme/web/pull/1547#issuecomment-900).\n\n{INSANE}"
+        "> @CoderHelm rebase with main\n\n@sam, replying to [your comment](https://github.com/acme/web/pull/482#issuecomment-900).\n\n{LONG_REPLY}"
     );
     assert!(!lint_on(&old, &place()).is_empty());
     let after = tidy(&old, &place());
     assert!(
-        !after.contains("replying to") && !after.contains("@sam") && !after.contains("pull/1547"),
+        !after.contains("replying to") && !after.contains("@sam") && !after.contains("pull/482"),
         "{after}"
     );
     assert!(!after.to_lowercase().contains("you asked"), "{after}");

@@ -72,6 +72,7 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("map_part", Risk::Read),
     ("map_screen", Risk::Read),
     ("map_file", Risk::Read),
+    ("map_flow", Risk::Read),
     // The app map's model jobs (worker/src/passes/app_map.rs), as Floorplan's
     // workflow names them: read-only lookups in the repositories and the
     // answer itself.
@@ -143,6 +144,8 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     // Outside steps CoderHelm runs after the PR opens (worker outside_exec).
     ("start_workflow", Risk::Write),
     ("write_content", Risk::Write),
+    // Follow-up tickets a run files in the team's tracker (worker followups).
+    ("file_followup_tickets", Risk::Write),
     ("update_pr_description", Risk::Write),
     ("confluence_append", Risk::Write),
     // Release steps CoderHelm runs after a pull request (see the worker's

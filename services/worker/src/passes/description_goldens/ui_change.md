@@ -2,13 +2,13 @@
 <!-- coderhelm:body v1 ticket=KEY-123 head=d78bb24 -->
 ### Problem
 
-Hero subtitle character limit ([KEY-123](https://tracker.example.com/browse/KEY-123)).
+Listing summary character limit ([KEY-123](https://tracker.example.com/browse/KEY-123)).
 
 ### Changes
 
-Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characters, so editors fix long subtitles before they break the hero layout. Editors can still publish.<!-- ch:summary-end --> Done outside the diff: post the 23 documents already over the limit on KEY-123.
-- Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit subtitles block publishing? CoderHelm's conclusion: all checks on this head passed.
-- Read first: [`apps/studio/schemaTypes/blocks/hero-block-validation.ts`](https://github.com/acme/site/blob/d78bb24/apps/studio/schemaTypes/blocks/hero-block-validation.ts) (the rule, +21 lines); then the other 2 files.
+Adds a Studio warning when a Listing (Default) summary is longer than 200 characters, so editors fix long summaries before they break the listing layout. Editors can still publish.<!-- ch:summary-end --> Done outside the diff: post the 17 documents already over the limit on KEY-123.
+- Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit summaries block publishing? CoderHelm's conclusion: all checks on this head passed.
+- Read first: [`apps/studio/schemaTypes/blocks/listing-block-validation.ts`](https://github.com/acme/site/blob/d78bb24/apps/studio/schemaTypes/blocks/listing-block-validation.ts) (the rule, +21 lines); then the other 2 files.
 
 ### Needed from you
 
@@ -33,24 +33,24 @@ On d78bb24 (head of this PR):
 | Lint and typecheck (CI) | Passed |
 | Unit tests (CI) | Passed |
 | Studio build (CI) | Passed |
-| Studio in local dev, manual (CoderHelm) | Passed; warning shows at 161 characters; Publish stays enabled |
+| Studio in local dev, manual (CoderHelm) | Passed; warning shows at 201 characters; Publish stays enabled |
 
-See it: [the preview](https://preview.example.com/studio), document `/private-events/weddings`, Hero, Sub Title field.
+See it: [the preview](https://preview.example.com/studio), document `/slots/summer-carrels`, Listing, Summary field.
 
-How to check: `npm test -- hero-block-validation`.
+How to check: `npm test -- listing-block-validation`.
 
 | Before | After |
 |---|---|
-| <img src="https://github.com/user-attachments/assets/before-example" width="380" alt="Sub Title field with a 190-character subtitle and no warning"> | <img src="https://github.com/user-attachments/assets/after-example" width="380" alt="Same field showing the warning 'Over 160 characters (190)'"> |
+| <img src="https://github.com/user-attachments/assets/before-example" width="380" alt="Summary field with a 236-character summary and no warning"> | <img src="https://github.com/user-attachments/assets/after-example" width="380" alt="Same field showing the warning 'Over 200 characters (236)'"> |
 
 <!-- /coderhelm:lead -->
 
 <details><!-- fold -->
 <summary>Implementation notes</summary><!-- fold -->
 
-- `hero-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 160 characters, so publishing is never blocked.
-- `hero-block.ts` and `schemaTypes/index.ts`: register the rule on the Default variant only; other Hero variants have their own layouts.
-- Rejected: `Rule.max(160)`, which is an error and would block 23 published documents from being re-saved.
+- `listing-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 200 characters, so publishing is never blocked.
+- `listing-block.ts` and `schemaTypes/index.ts`: register the rule on the Default variant only; other Listing variants have their own layouts.
+- Rejected: `Rule.max(200)`, which is an error and would block 17 published documents from being re-saved.
 
 </details><!-- fold -->
 
@@ -67,8 +67,8 @@ Every check on this head:
 
 <!-- coderhelm:evidence -->
 ## Steps and evidence
-- Done: Post the 23 documents already over the limit on KEY-123 (posted on the ticket for the content team).
-- Checked: Studio in local dev, manual, warning shows at 161 characters; Publish stays enabled.
+- Done: Post the 17 documents already over the limit on KEY-123 (posted on the ticket for the content team).
+- Checked: Studio in local dev, manual, warning shows at 201 characters; Publish stays enabled.
 <!-- /coderhelm:evidence -->
 
 </details><!-- fold -->

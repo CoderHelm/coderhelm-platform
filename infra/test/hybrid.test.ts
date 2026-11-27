@@ -251,6 +251,15 @@ test("a self-hosted install has no name check and no zone rights in its worker",
   assert.ok(!alarms.some((a: string) => a.includes("hybrid-name")));
 });
 
+test("every install alarms when deploys stop being recorded", () => {
+  const own = synth(resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] }));
+  for (const mon of [hosted()["coderhelm-prod-monitoring"], own["coderhelm-prod-monitoring"]]) {
+    const alarms = Object.values(mon.findResources("AWS::CloudWatch::Alarm")).map((r: any) => r.Properties.AlarmName);
+    assert.ok(alarms.includes("coderhelm-prod-deploy-records-stalled"));
+    assert.ok(str(mon.findResources("AWS::Logs::MetricFilter")).includes("deploy_records_stalled"));
+  }
+});
+
 // ── CoderHelm's signing key (common::hybrid::hosted_sig) ──────────────────
 
 test("CoderHelm signs with an Ed25519 key in KMS that only its tagged signers may use", () => {

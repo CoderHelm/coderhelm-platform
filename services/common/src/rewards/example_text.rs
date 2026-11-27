@@ -237,7 +237,7 @@ pub fn legacy_split(text: &str, body_cap: usize) -> (String, String) {
 mod tests {
     use super::*;
 
-    const PR_BODY: &str = "Source ticket: OPS-1\n\n<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n> - **Waiting on CI:** lint <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->\n\n**Summary** Retry the import once with the same key.\n\n## Changes\n- Add `retry_once` to the client\n- Keep the key\n\nCloses #4\n<details><summary>Logs</summary>ok</details>";
+    const PR_BODY: &str = "Source ticket: HARBOR-1\n\n<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n> - **Waiting on CI:** lint <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->\n\n**Summary** Retry the import once with the same key.\n\n## Changes\n- Add `retry_once` to the client\n- Keep the key\n\nCloses #4\n<details><summary>Logs</summary>ok</details>";
 
     #[test]
     fn clean_drops_comments_callouts_and_boilerplate() {

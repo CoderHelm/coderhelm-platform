@@ -972,6 +972,7 @@ pub async fn capture(
         .run_script(
             crate::clients::sandbox::ScriptRun {
                 key: &key,
+                max_files: crate::clients::sandbox::MAX_SCRIPT_FILES,
                 source,
                 cmd: &cmd,
                 secret: (!secret.is_empty()).then_some(secret.as_str()),

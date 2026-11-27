@@ -273,7 +273,7 @@ pub fn says_unreadable(text: &str) -> bool {
 mod tests {
     use super::*;
 
-    const COMMENT: &str = "## E2E results\n\n❌ 1 failed, 41 passed\n\n  1) [chromium] › tests/checkout/registration.spec.ts:88:7 › Camp registration › pays with a saved card\n\n    Error: expect(locator).toBeVisible() failed\n    Locator: getByTestId('payment-confirmation')\n";
+    const COMMENT: &str = "## E2E results\n\n❌ 1 failed, 41 passed\n\n  1) [chromium] › tests/checkout/booking.spec.ts:88:7 › Slot booking › pays with a saved card\n\n    Error: expect(locator).toBeVisible() failed\n    Locator: getByTestId('payment-confirmation')\n";
 
     /// A pull request said it couldn't read the log while the e2e
     /// workflow's comment named the failing test and its error.
@@ -286,7 +286,7 @@ mod tests {
         let f = read("E2E on preview", &s).unwrap();
         assert_eq!(
             f.tests,
-            vec!["tests/checkout/registration.spec.ts › pays with a saved card".to_string()]
+            vec!["tests/checkout/booking.spec.ts › pays with a saved card".to_string()]
         );
         assert!(f.error.starts_with("Error: expect(locator).toBeVisible()"));
         assert_eq!(f.source, "comment on the pull request");
@@ -336,7 +336,7 @@ mod tests {
             Cause::ThisChange(_)
         ));
         assert!(matches!(cause(&f, &none, None), Cause::Unknown(_)));
-        let changed = vec!["e2e/tests/checkout/registration.spec.ts".to_string()];
+        let changed = vec!["e2e/tests/checkout/booking.spec.ts".to_string()];
         assert!(matches!(cause(&f, &changed, None), Cause::ThisChange(_)));
     }
 }

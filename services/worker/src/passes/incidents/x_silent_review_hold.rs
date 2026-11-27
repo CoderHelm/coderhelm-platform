@@ -1,5 +1,5 @@
 //! x. A new-feature run finished and handed its draft pull request over for
-//! review. The review job started ("Reviewing PR from label") and ended two
+//! review. The review job started ("Reviewing PR from label") and ended
 //! seconds later with no log line, no verdict, no review record and no live
 //! status: a hand-off of a draft was skipped ("reviewed when it is marked
 //! ready") on a path that said nothing, and its ending was dropped because
@@ -8,13 +8,13 @@
 //! other, and the pull request was held on every sweep, naming nothing a
 //! person could do, although the repository's CI was green.
 //!
-//! The four items that held it were CoderHelm's own sandbox failing: the
+//! The items that held it were CoderHelm's own sandbox failing: the
 //! sandbox switched Node to the repository's version, that Node had no
 //! pnpm, and the install, type-check, lint and unit steps each exited 127
 //! with `pnpm: command not found`. Each was counted against the change, and
 //! the run spent a fix round on it.
 //!
-//! A second pull request the same night lost its review the same way: a push
+//! Another pull request lost its review the same way: a push
 //! review CoderHelm skipped as its own push during the run kept the head's
 //! claim and its dedup key, so the run's own review was dropped as a repeat
 //! and the hand-off as "already being reviewed".
@@ -73,7 +73,7 @@ fn held_facts() -> Facts {
         },
         approved: false,
         review_missing: true,
-        head: "eeeb43e1913dfaef6930eaf02c6523af3ae4d26c".into(),
+        head: "eee1234abcdef0123456789abcdef0123456789a".into(),
         ..Default::default()
     }
 }

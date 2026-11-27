@@ -94,7 +94,7 @@ impl LabelRules {
 }
 
 /// A name GitHub will accept as a new label, and that clearly extends its
-/// family (non-empty after the prefix): `E2E:camps`, not `E2E:` or `E2E: x y`.
+/// family (non-empty after the prefix): `E2E:slots`, not `E2E:` or `E2E: x y`.
 fn valid_new_label(name: &str, rules: &LabelRules) -> bool {
     let n = name.trim();
     if n.is_empty() || n.len() > 50 {
@@ -634,20 +634,20 @@ mod tests {
 
     #[test]
     fn family_labels_can_be_added_before_they_exist() {
-        // Only CI:E2E / CI:DEPLOY_STAGING exist in GitHub; E2E:camps doesn't yet.
+        // Only CI:E2E / CI:DEPLOY_STAGING exist in GitHub; E2E:slots doesn't yet.
         let existing: Vec<RepoLabel> = repo()
             .into_iter()
             .filter(|l| !l.name.starts_with("E2E:"))
             .collect();
         let d = decide(
-            &[pick("E2E:camps", "Sold out / waitlist state")],
+            &[pick("E2E:slots", "Sold out / waitlist state")],
             &existing,
             &[],
             &rules(),
         );
         assert_eq!(
             d.add,
-            vec![("E2E:camps".into(), "Sold out / waitlist state".into())]
+            vec![("E2E:slots".into(), "Sold out / waitlist state".into())]
         );
         // a new family member still has to be a sane label name
         let bad = decide(

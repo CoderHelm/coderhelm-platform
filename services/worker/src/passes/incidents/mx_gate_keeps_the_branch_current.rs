@@ -1,13 +1,12 @@
-//! mx. A person approved someone's pull request (21:29:27) and the
-//! auto-merge gate armed. At 21:29:30 it found the pull request conflicting
-//! with its base and stopped (`updating:false`): on a person's pull request
-//! it never brought the base in. At 21:41 a person pushed the conflict
-//! resolution; CoderHelm reviewed only the pull request's own change since
-//! its approval and approved 0516eab. The gate armed at 21:45:51 and
-//! stopped a second later "waiting on approvals": the person's approval
-//! was of 78e785a, and the gate counted only approvals of the head, though
-//! GitHub still counted it. Nothing woke it; the person dismissed their
-//! approval and approved again to move it.
+//! mx. A person approved someone's pull request and the auto-merge gate
+//! armed. Seconds later it found the pull request conflicting with its base
+//! and stopped (`updating:false`): on a person's pull request it never
+//! brought the base in. Later a person pushed the conflict resolution;
+//! CoderHelm reviewed only the pull request's own change since its approval
+//! and approved bbb2222. The gate armed and stopped a second later "waiting
+//! on approvals": the person's approval was of aaa1111, and the gate counted
+//! only approvals of the head, though GitHub still counted it. Nothing woke
+//! it; the person dismissed their approval and approved again to move it.
 //!
 //! Guarantee: a conflict or a branch behind its base is CoderHelm's
 //! maintenance on anyone's pull request, done as soon as the gate is armed;
@@ -24,14 +23,14 @@ use crate::passes::review_actions::approval_state;
 use common::merge_gate::STATE_WAITING_APPROVAL;
 use serde_json::{json, Value};
 
-const APPROVED: &str = "78e785a1c0ffee00000000000000000000000000";
-const HEAD: &str = "0516eab2c0ffee00000000000000000000000000";
+const APPROVED: &str = "aaa11111c0ffee00000000000000000000000000";
+const HEAD: &str = "bbb22222c0ffee00000000000000000000000000";
 
 fn src() -> &'static str {
     include_str!("../await_merge.rs")
 }
 
-/// The reviews at 21:45:52: the person's approval of the earlier commit and
+/// The reviews once the gate armed again: the person's approval of the earlier commit and
 /// CoderHelm's approval of the head.
 fn reviews(person_state: &str) -> Value {
     json!([
@@ -67,7 +66,7 @@ fn view(person_state: &str, decision: Option<&str>) -> GateView {
 
 #[test]
 fn a_conflict_on_a_persons_pr_is_brought_in_by_coderhelm_not_a_stop() {
-    // 21:29:30: GitHub reports the pull request conflicting.
+    // When the gate armed: GitHub reports the pull request conflicting.
     let pr = json!({"mergeable": false, "mergeable_state": "dirty"});
     assert_eq!(needs_base(&pr), Some(BaseNeed::Conflict));
     assert_eq!(
@@ -101,7 +100,7 @@ fn a_conflict_on_a_persons_pr_is_brought_in_by_coderhelm_not_a_stop() {
         },
     );
     assert_eq!(mark, Mark::Waiting);
-    assert!(text.contains("CoderHelm merged `main` into this branch (0516eab)"));
+    assert!(text.contains("CoderHelm merged `main` into this branch (bbb2222)"));
     assert!(text.contains("the approval carries to it"));
     // Only a conflict it can't resolve is reported, with the files, once
     // per head (`claim_base_update`).
@@ -118,7 +117,7 @@ fn a_conflict_on_a_persons_pr_is_brought_in_by_coderhelm_not_a_stop() {
 
 #[test]
 fn an_approval_github_still_counts_is_the_person_key() {
-    // 21:45:52: the person's approval of 78e785a stands on GitHub.
+    // The person's approval of aaa1111 stands on GitHub.
     let mut v = view("APPROVED", Some("APPROVED"));
     assert!(v.approvals.approved_at_head.is_empty());
     assert!(person_key(&v));
@@ -146,8 +145,8 @@ fn a_wait_on_a_person_names_exactly_what_is_missing() {
     let (_, line) = missing_person_line(&v, true);
     assert_eq!(
         line,
-        "@a-person's approval of 78e785a was dismissed when new commits were pushed (the head \
-         is now 0516eab); a re-approval of 0516eab is all that's left"
+        "@a-person's approval of aaa1111 was dismissed when new commits were pushed (the head \
+         is now bbb2222); a re-approval of bbb2222 is all that's left"
     );
     assert!(d.lines.iter().any(|(_, l)| l == &line));
     // When the push was CoderHelm's own base merge, it says so.
@@ -155,7 +154,7 @@ fn a_wait_on_a_person_names_exactly_what_is_missing() {
     v.base_merge_at_head = true;
     assert!(missing_person_line(&v, true)
         .1
-        .contains("dismissed by CoderHelm's merge of `main` at 0516eab"));
+        .contains("dismissed by CoderHelm's merge of `main` at bbb2222"));
     // The branch's required count, and that CoderHelm's approval doesn't
     // count toward it.
     let mut v = view("COMMENTED", Some("REVIEW_REQUIRED"));
@@ -173,13 +172,14 @@ fn a_wait_on_a_person_names_exactly_what_is_missing() {
     let mut v = view("APPROVED", Some("APPROVED"));
     v.requested = vec!["a-reviewer".into()];
     assert!(person_key(&v));
-    // The same line goes to the team's channel.
+    // The line goes on the run page (the record's detail) and the one
+    // status comment; waiting on people never goes to a team channel
+    // (`nt_alerts_channel_alerts_only`).
     let m = wait_message("acme", "web", 7, "Fix the schedule", "https://x/7", &line);
     assert!(m.summary.contains("acme/web#7"));
     assert_eq!(m.buttons.len(), 1);
-    // And on the run page (the record's detail) and the one status comment.
     let eval = fn_src(src(), "async fn evaluate(");
-    assert!(eval.contains("tell_team("));
+    assert!(!eval.contains("tell_team("));
     assert!(eval.contains("find(|(m, _)| *m != Mark::Done)"));
 }
 
@@ -239,12 +239,12 @@ fn the_gate_queues_the_review_of_its_own_base_merge_and_the_approval_carries() {
     // Keyed like the gateway's push review: a labelled PR is reviewed once.
     assert_eq!(m.dedup_key, format!("head#{HEAD}"));
     // The review takes the carry-forward path: CoderHelm's latest review
-    // approved 78e785a in full.
+    // approved aaa1111 in full.
     let records = vec![ReviewRecord {
         verdict: "APPROVE".into(),
         posted_as: "APPROVE".into(),
         head_sha: APPROVED.into(),
-        created_at: "2026-11-18T21:29:00Z".into(),
+        created_at: "2030-03-12T14:29:00Z".into(),
         body: "Looks right.".into(),
         posted_body: "**Approved.** What was checked: the schedule's window.".into(),
         ..Default::default()

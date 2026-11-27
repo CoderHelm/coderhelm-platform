@@ -1017,7 +1017,7 @@ pub(crate) fn failure_excerpt(logs: &str) -> String {
         "panicked",
     ];
     let clean = |l: &str| -> String {
-        // GitHub's timestamp prefix (`2026-11-11T19:52:01.1234567Z `).
+        // GitHub's timestamp prefix (`2030-03-11T19:52:01.1234567Z `).
         let t = l.trim();
         // A step's command echoed back (`\u{1b}[36;1m...`) is the script,
         // never what failed: a pull request once quoted a comment line of
@@ -1310,8 +1310,26 @@ pub(crate) fn with_ci_failing(body: &str, section: &str) -> String {
     }
 }
 
+/// The CI fix rounds a run ran and the fixes it pushed, as its record has
+/// them (`ci_fix_attempts`, `ci_fix_commits`): what every red ending counts,
+/// never the attempts of the last round alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub rounds: u32,
+    pub pushed: u32,
+}
+
+/// [`Tally`] from the run record.
+pub(crate) async fn ci_tally(state: &WorkerState, team_id: &str, run_id: &str) -> Tally {
+    Tally {
+        rounds: run_number(state, team_id, run_id, "ci_fix_attempts").await,
+        pushed: run_number(state, team_id, run_id, "ci_fix_commits").await,
+    }
+}
+
 /// The run's reason while its pull request's CI fails, in one sentence.
-pub(crate) fn ci_failing_reason(checks: &[String], excerpt: &str, tried: usize) -> String {
+/// Rounds that changed no code are said as such (`common::ci_unrelated::rounds_said`).
+pub(crate) fn ci_failing_reason(checks: &[String], excerpt: &str, tally: Tally) -> String {
     let names = if checks.is_empty() {
         "the repository's CI".to_string()
     } else {
@@ -1321,10 +1339,9 @@ pub(crate) fn ci_failing_reason(checks: &[String], excerpt: &str, tried: usize) 
     if !excerpt.trim().is_empty() {
         r.push_str(&format!(": {}", common::truncate_str(excerpt.trim(), 240)));
     }
-    if tried > 0 {
-        r.push_str(&format!(
-            ". CoderHelm made {tried} fix attempt(s) without getting it green"
-        ));
+    let rounds = common::ci_unrelated::rounds_said(tally.rounds, tally.pushed);
+    if !rounds.is_empty() {
+        r.push_str(&format!(". {rounds}"));
     }
     r.push_str(". The pull request stays a draft until CI passes");
     r
@@ -1453,8 +1470,8 @@ mod ci_triage_tests {
     /// "fixed"; on a head already re-run, the attempt is spent.
     #[test]
     fn an_infrastructure_failure_is_rerun_once() {
-        let logs = "2026-11-11T19:50:01.0000000Z  FAIL  src/test/integration/real-server.test.ts\n\
-                    2026-11-11T19:50:01.0000000Z Error: getaddrinfo ENOTFOUND search-staging.example.internal";
+        let logs = "2030-03-11T19:50:01.0000000Z  FAIL  src/test/integration/real-server.test.ts\n\
+                    2030-03-11T19:50:01.0000000Z Error: getaddrinfo ENOTFOUND search-staging.example.internal";
         let infra = looks_infra(logs);
         assert!(
             infra.as_deref().unwrap_or("").contains("ENOTFOUND"),
@@ -1484,12 +1501,12 @@ mod ci_triage_tests {
 
     #[test]
     fn the_failure_excerpt_is_the_error_not_the_upload_step() {
-        let logs = "2026-11-11T19:50:00.1234567Z ##[group]Upload report\n\
-                    2026-11-11T19:50:00.1234567Z Uploaded 14 files\n\
-                    2026-11-11T19:49:58.1234567Z   1) [chromium] venues.spec.ts:131 the Info heading lines up\n\
-                    2026-11-11T19:49:58.1234567Z     Error: expect(received).toBeLessThanOrEqual(expected)\n\
-                    2026-11-11T19:49:58.1234567Z     Expected: <= 1\n\
-                    2026-11-11T19:49:58.1234567Z     Received:    32";
+        let logs = "2030-03-11T19:50:00.1234567Z ##[group]Upload report\n\
+                    2030-03-11T19:50:00.1234567Z Uploaded 14 files\n\
+                    2030-03-11T19:49:58.1234567Z   1) [chromium] libraries.spec.ts:131 the Info heading lines up\n\
+                    2030-03-11T19:49:58.1234567Z     Error: expect(received).toBeLessThanOrEqual(expected)\n\
+                    2030-03-11T19:49:58.1234567Z     Expected: <= 1\n\
+                    2030-03-11T19:49:58.1234567Z     Received:    32";
         let e = failure_excerpt(logs);
         assert!(
             e.starts_with("Error: expect(received).toBeLessThanOrEqual(expected)"),
@@ -1517,12 +1534,12 @@ mod ci_triage_tests {
             2,
             3,
             &["changed nothing: the log only showed the report upload".into()],
-            "--- comment by e2e-reporter[bot] ---\n1 failed: venues.spec.ts:131",
+            "--- comment by e2e-reporter[bot] ---\n1 failed: libraries.spec.ts:131",
         );
         assert!(fb.contains("CI fix attempt 2 of 3"));
         assert!(fb.contains("Reproduce first: call run_checks"));
         assert!(fb.contains("- Attempt 1: changed nothing"));
-        assert!(fb.contains("venues.spec.ts:131"));
+        assert!(fb.contains("libraries.spec.ts:131"));
         let checks = vec!["Deploy Preview".to_string()];
         let excerpt = "Error: expect(received).toBeLessThanOrEqual(expected) / Expected: <= 1";
         let section = ci_failing_section(
@@ -1539,9 +1556,20 @@ mod ci_triage_tests {
         // Written again, it replaces the old section.
         let again = with_ci_failing(&body, &section);
         assert_eq!(again.matches(CI_FAILING_START).count(), 1);
-        let reason = ci_failing_reason(&checks, excerpt, 3);
+        let reason = ci_failing_reason(
+            &checks,
+            excerpt,
+            Tally {
+                rounds: 3,
+                pushed: 0,
+            },
+        );
         assert!(reason.starts_with("CI is failing: Deploy Preview: Error: expect"));
-        assert!(reason.contains("3 fix attempt(s)"));
+        assert!(
+            reason.contains("3 CI fix rounds changed no code"),
+            "{reason}"
+        );
+        assert!(!reason.contains("without getting it green"));
         assert!(reason.contains("stays a draft"));
     }
 
@@ -2427,6 +2455,39 @@ pub async fn run(
             .await?;
             return Ok(());
         }
+        // A failure the CI fix round already showed isn't this change's,
+        // red again after its one re-run on the same head: classified, no
+        // fix round (`common::ci_unrelated`).
+        let head_now = branch_head.clone().unwrap_or_default();
+        if let Some(s) = load_unrelated(state, &msg.team_id, &msg.run_id)
+            .await
+            .filter(|s| {
+                s.rerun == common::ci_unrelated::Rerun::Started
+                    && s.on(&head_now)
+                    && failing_workflows(&events)
+                        .iter()
+                        .all(|c| s.checks.is_empty() || s.checks.contains(c))
+            })
+        {
+            return finish_unrelated(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                &github,
+                &PrRef {
+                    owner: &repo_owner,
+                    repo: &repo_name,
+                    branch: &branch,
+                    number: pr_number,
+                    url: &pr_url,
+                },
+                &usage,
+                wall_clock_secs(created_at, &start),
+                &events,
+                s,
+            )
+            .await;
+        }
         info!(run_id = msg.run_id, "CI failed — attempting fix");
         super::record_ci_outcome(
             state,
@@ -2890,6 +2951,43 @@ pub async fn run(
                 repair.note()
             );
         }
+        // A red check that names missing content, data or a migration is
+        // read before any fix round, so it never spends the budget
+        // (`common::content_gap`): a failing test that waits only on the
+        // change's own content step CoderHelm can't run ends the CI loop
+        // with that step before merge; any other content gap has the round
+        // make the code tolerate it first.
+        let gap_text = format!("{excerpt_line}\n{logs}");
+        let test_failed = evidence.as_ref().is_some_and(|e| !e.tests.is_empty());
+        let mut content_brief = String::new();
+        match content_verdict(state, &msg.team_id, &msg.run_id, &gap_text, test_failed).await {
+            common::content_gap::Verdict::AwaitsStep { gap, step } => {
+                super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                let check = failing_wf.first().cloned().unwrap_or_default();
+                return finish_awaits_content(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    &github,
+                    &PrRef {
+                        owner: &repo_owner,
+                        repo: &repo_name,
+                        branch: &branch,
+                        number: pr_number,
+                        url: &pr_url,
+                    },
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                    &events,
+                    (&gap, &step, &check, branch_head.as_deref().unwrap_or("")),
+                )
+                .await;
+            }
+            common::content_gap::Verdict::TolerateFirst(gap) => {
+                content_brief = common::content_gap::tolerance_brief(&gap);
+            }
+            common::content_gap::Verdict::NotContent => {}
+        }
         let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
         // Atomically claim a shared auto-fix slot (skipped when the cycle cap has
         // already tripped, so we don't consume a slot on the way out).
@@ -2927,7 +3025,7 @@ pub async fn run(
         // aren't working (noop commits, placeholder stubs, wrong fixes). Stop
         // churning the PR and hand it to a human — this fires long before the
         // coarse cycle cap above.
-        if check_and_record_stall(state, &msg.team_id, &msg.run_id, &logs).await {
+        if check_and_record_stall(state, &msg.team_id, &msg.run_id, &gap_text).await {
             warn!(
                 run_id = msg.run_id,
                 "CI fixes stalled on the same failure — the PR stays a draft with what fails"
@@ -3080,6 +3178,20 @@ pub async fn run(
              Failure summary:\n{failure_logs}{repro_brief}{logs_brief}\n\n\
              Full logs:\n{logs}{review_context}{base_note}{lock_context}"
         );
+        // The same failure met again with no progress: this round is told
+        // what the last one concluded and takes another approach
+        // (`common::content_gap::repeat_brief`), before the stall halt.
+        let repeats = run_number(state, &msg.team_id, &msg.run_id, "stall_count").await;
+        if repeats > 0 {
+            let last = run_text(state, &msg.team_id, &msg.run_id, "last_fix_account").await;
+            let gap = common::content_gap::names_gap(&gap_text);
+            feedback.push_str(&common::content_gap::repeat_brief(
+                repeats,
+                &last,
+                gap.as_ref(),
+            ));
+        }
+        feedback.push_str(&content_brief);
 
         // The CI fix is a round of its own (common::run_round): its own
         // budget, on the run record while it works, and parked for a fresh
@@ -3340,11 +3452,13 @@ pub async fn run(
                         if let Some(line) = &unverified {
                             message = format!("{message}\n\n{line}");
                         }
-                        match super::round::land(
+                        match super::round::land_agreeing(
                             &gh,
                             &ci_round.wip_branch,
                             &ci_round.base_sha,
                             &message,
+                            pr_number,
+                            result.evidence.latest_notes(),
                         )
                         .await
                         {
@@ -3370,6 +3484,8 @@ pub async fn run(
                             &result.conversation_log,
                         )
                         .await;
+                        save_fix_account(state, &msg.team_id, &msg.run_id, &result.evidence.notes)
+                            .await;
                         if !result.files_modified.is_empty() {
                             super::round::clear(state, &msg.team_id, &msg.run_id).await;
                         }
@@ -3392,6 +3508,48 @@ pub async fn run(
                         .await;
 
                         if result.files_modified.is_empty() {
+                            // The round changed no code and showed the
+                            // failure isn't this change's: re-run once, then
+                            // classified. Never another attempt at code that
+                            // isn't wrong, never a failed run.
+                            let report_tests = evidence
+                                .as_ref()
+                                .map(|e| e.tests.clone())
+                                .unwrap_or_default();
+                            if let Some(standing) = unrelated_standing(
+                                state,
+                                &ticket_msg,
+                                &github,
+                                &msg.run_id,
+                                (&repro_head, &branch),
+                                &failing_wf,
+                                &report_tests,
+                                result.evidence.latest_notes(),
+                            )
+                            .await
+                            {
+                                super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                                super::webhooks::emit_ci_fix_completed(
+                                    state,
+                                    &ci_fix,
+                                    "no_changes",
+                                    0,
+                                )
+                                .await;
+                                return rerun_unrelated(
+                                    state,
+                                    &msg,
+                                    &ticket_msg,
+                                    &github,
+                                    &pr_ref,
+                                    &usage,
+                                    wall_clock_secs(created_at, &start),
+                                    &events,
+                                    &failed_run_ids,
+                                    standing,
+                                )
+                                .await;
+                            }
                             let said = result
                                 .evidence
                                 .notes
@@ -3784,6 +3942,22 @@ pub async fn run(
                     run_id = msg.run_id,
                     "A workflow passed but others are still running — waiting for full CI"
                 );
+                // A wait with no progress ends (`common::ci_watch`): the
+                // stuck checks are re-run once, then the run stops waiting
+                // and names them.
+                if ci_wait_watchdog(
+                    state,
+                    &msg,
+                    &github,
+                    (&repo_owner, &repo_name, pr_number),
+                    branch_head.as_deref().unwrap_or(&branch),
+                    created_at,
+                )
+                .await
+                {
+                    mark_events_processed(state, &msg.run_id, &events).await;
+                    return Ok(());
+                }
                 // Leave events unprocessed so the next resume re-evaluates with the
                 // full set (and still sees any review feedback that rode along).
                 let still_active = set_run_awaiting_ci(
@@ -4474,6 +4648,7 @@ async fn fix_context(
         base_branch: t.base_branch.to_string(),
         image_attachments,
         continuation: 0,
+        retry_after_secs: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
         resume_from: None,
@@ -4506,6 +4681,7 @@ async fn fix_context(
         .await,
         related: Vec::new(),
         new_run_id: None,
+        followup_of: None,
         after_merge: false,
         merged_note: common::merged_ticket::note_of(run_record),
     };
@@ -4715,6 +4891,9 @@ async fn run_fix_round(
             // What this step was too short to start is owed: the next step
             // of the round runs it first, with its full time.
             round.feedback = super::implement::owed_first(&round.feedback, &r.owed);
+            // What it wrote and put back on purpose is settled: the next
+            // step goes on from it instead of deciding it again.
+            round.feedback = run_round::settled_first(&round.feedback, &r.conversation_log);
             if round.may_continue() {
                 park_round(
                     state,
@@ -4810,7 +4989,16 @@ async fn run_fix_round(
             // commit, one push.
             let message =
                 super::round::round_message(state, &msg.team_id, &ctx.ticket_msg, &round).await;
-            match super::round::land(&gh, &round.wip_branch, &round.base_sha, &message).await {
+            match super::round::land_agreeing(
+                &gh,
+                &round.wip_branch,
+                &round.base_sha,
+                &message,
+                pr.number,
+                r.evidence.latest_notes(),
+            )
+            .await
+            {
                 super::round::Landed::Pushed { files } => {
                     super::round::clear(state, &msg.team_id, &msg.run_id).await;
                     // The pull request changed: its description is rewritten
@@ -5005,6 +5193,14 @@ async fn round_fault(
     super::add_progress_note(state, &msg.team_id, &msg.run_id, &plan.note).await;
     if plan.clean {
         super::round::start_clean(gh, &mut round).await;
+    }
+    // A change refused for undoing an earlier review fix: the next step is
+    // told why, so it keeps that fix or says why it must go
+    // (`round_agree::undoes`).
+    if why.contains(super::round_agree::UNDO_MARK) {
+        round
+            .feedback
+            .push_str(&format!("\n\nYour last change wasn't landed: {why}."));
     }
     park_round(state, msg, ctx, pr, &round, true, created_at, start).await
 }
@@ -5598,6 +5794,17 @@ async fn recheck_planned_work(
     ctx: &mut FixContext,
     pr: &PrRef<'_>,
 ) -> Option<Vec<super::proof::Finding>> {
+    // One verdict on planned work per head (`proof::PLANNED_FIELD`): what
+    // the proof check said on this head stands.
+    let head = ctx
+        .github
+        .get_ref(pr.owner, pr.repo, pr.branch)
+        .await
+        .unwrap_or_default();
+    let stored = super::proof::load_planned(state, &msg.team_id, &msg.run_id).await;
+    if let Some(left) = super::proof::planned_on(stored.as_ref(), &head) {
+        return Some(left.to_vec());
+    }
     let plan = super::run_plan_files(state, &ctx.ticket_msg).await?;
     // Generated outputs their generator settled are never planned work left.
     let settled = super::steps::load(state, &msg.team_id, &msg.run_id)
@@ -5677,6 +5884,19 @@ async fn recheck_planned_work(
             &msg.team_id,
             &msg.run_id,
             &super::round_agree::skipped_note(&skipped),
+        )
+        .await;
+    }
+    if !head.is_empty() {
+        let left: Vec<super::proof::Finding> = super::proof::planned_work(&found)
+            .into_iter()
+            .cloned()
+            .collect();
+        super::proof::save_planned(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &super::proof::PlannedVerdict { head, left },
         )
         .await;
     }
@@ -7632,6 +7852,379 @@ pub(crate) fn held_tried(
         .collect()
 }
 
+/// The run's standing for a failure shown to be outside its change
+/// (`common::ci_unrelated`), when it has one.
+pub(crate) async fn load_unrelated(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> Option<common::ci_unrelated::Standing> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#f")
+        .expression_attribute_names("#f", common::ci_unrelated::FIELD)
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()?
+        .item?
+        .get(common::ci_unrelated::FIELD)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| common::ci_unrelated::from_json(s))
+}
+
+async fn save_unrelated(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    s: &common::ci_unrelated::Standing,
+) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #f = :v")
+        .expression_attribute_names("#f", common::ci_unrelated::FIELD)
+        .expression_attribute_values(":v", attr_s(&common::ci_unrelated::to_json(s)))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not keep the failure's standing on the run");
+    }
+}
+
+/// Whether a CI fix round that changed no code showed the failure isn't
+/// this change's (`common::ci_unrelated::classify`). A check that never runs
+/// on the base branch gets its base from the failing tests' own runs there
+/// first (`ci_repro::from_test_history`).
+#[allow(clippy::too_many_arguments)]
+async fn unrelated_standing(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    github: &GitHubClient,
+    run_id: &str,
+    (head, branch): (&str, &str),
+    checks: &[String],
+    report_tests: &[String],
+    account: &str,
+) -> Option<common::ci_unrelated::Standing> {
+    if head.is_empty() || !common::ci_unrelated::claims_not_ours(account) {
+        return None;
+    }
+    let mut tests = report_tests.to_vec();
+    for t in common::ci_unrelated::tests_named(account) {
+        if !tests.contains(&t) {
+            tests.push(t);
+        }
+    }
+    if let Some(check) = checks.first() {
+        super::ci_repro::from_test_history(state, ticket_msg, run_id, head, check, &tests).await;
+    }
+    let records = super::ci_repro::load(state, &ticket_msg.team_id, run_id).await;
+    let changed = github
+        .compare_changed_files(
+            &ticket_msg.repo_owner,
+            &ticket_msg.repo_name,
+            &ticket_msg.base_branch,
+            branch,
+        )
+        .await
+        .unwrap_or_default();
+    common::ci_unrelated::classify(account, &records, head, checks, report_tests, &changed)
+}
+
+/// A failure the CI fix round showed isn't this change's: its failed jobs
+/// run again once (a flake or a data race passes), and the run waits for
+/// CI on them. When GitHub won't run them again, it is classified now
+/// ([`finish_unrelated`]). Never a failed run, never another fix round.
+#[allow(clippy::too_many_arguments)]
+async fn rerun_unrelated(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ticket_msg: &TicketMessage,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    usage: &TokenUsage,
+    duration: u64,
+    events: &[RunEvent],
+    failed_runs: &[u64],
+    mut s: common::ci_unrelated::Standing,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut started = false;
+    for id in failed_runs {
+        match github.rerun_failed_jobs(pr.owner, pr.repo, *id).await {
+            Ok(()) => started = true,
+            Err(e) => {
+                warn!(run_id = msg.run_id, workflow_run_id = id, error = %e, "Could not re-run the failed jobs")
+            }
+        }
+    }
+    if !started {
+        s.rerun = common::ci_unrelated::Rerun::CouldNot;
+        return finish_unrelated(
+            state,
+            ticket_msg,
+            &msg.run_id,
+            github,
+            pr,
+            usage,
+            duration,
+            events,
+            s,
+        )
+        .await;
+    }
+    s.rerun = common::ci_unrelated::Rerun::Started;
+    s.at = chrono::Utc::now().to_rfc3339();
+    save_unrelated(state, &msg.team_id, &msg.run_id, &s).await;
+    super::record_ci_outcome(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        super::CiOutcome::Rerun(s.head.clone()),
+    )
+    .await;
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        &common::ci_unrelated::rerun_note(&s),
+    )
+    .await;
+    mark_events_processed(state, &msg.run_id, events).await;
+    if set_run_awaiting_ci(
+        state,
+        ticket_msg,
+        &msg.run_id,
+        pr.url,
+        pr.number,
+        pr.branch,
+        usage,
+        duration,
+    )
+    .await?
+    {
+        send_delayed_resume(state, msg, 120).await;
+    }
+    Ok(())
+}
+
+/// The change's outside steps, as the content-gap reading needs them
+/// (`common::content_gap::Step`): a step is blocked when it is a person's,
+/// or when its last try said CoderHelm lacks the access.
+pub(crate) fn content_steps(
+    d: &super::fix_location::FixDecision,
+) -> Vec<common::content_gap::Step> {
+    let Some(c) = d.outside_change.as_ref() else {
+        return Vec::new();
+    };
+    c.steps
+        .iter()
+        .filter(|s| s.doer() != super::outside_work::Doer::ThisPr)
+        .map(|s| {
+            let r = s.result.to_lowercase();
+            common::content_gap::Step {
+                text: format!("{} {} {}", s.step, s.how, s.migration),
+                writes_content: s.step_kind().writes(),
+                done: s.done,
+                blocked: s.doer() == super::outside_work::Doer::Person
+                    || (!s.done
+                        && (r.starts_with("not done")
+                            || r.contains("no staging cms write connection")
+                            || r.contains("grant:"))),
+            }
+        })
+        .collect()
+}
+
+/// Reads a red check for a content gap against the run's own outside
+/// steps, read fresh (an outside step's last try may be newer than the
+/// record this invocation loaded).
+async fn content_verdict(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    failure: &str,
+    test_failed: bool,
+) -> common::content_gap::Verdict {
+    let steps = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("fix_decision")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| super::outside_exec::decision_of(&i))
+        .map(|d| content_steps(&d))
+        .unwrap_or_default();
+    common::content_gap::classify(failure, test_failed, &steps)
+}
+
+/// A failing test waits only on the change's own content step that
+/// CoderHelm can't run: no fix round is spent on it. The pull request says
+/// what to run before merge, the run's note says it, the pull request goes
+/// ready by the one ready decision, and the run is completed
+/// (`ci_end` = `awaits_content`), never failed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_awaits_content(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    usage: &TokenUsage,
+    duration: u64,
+    events: &[RunEvent],
+    (gap, step, check, head): (&common::content_gap::Gap, &str, &str, &str),
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let team_id = &ticket_msg.team_id;
+    super::record_ci_outcome(
+        state,
+        team_id,
+        run_id,
+        super::CiOutcome::HandedOff(super::GaveUp::AwaitsContent),
+    )
+    .await;
+    record_ci_cause(state, team_id, run_id, &gap.line).await;
+    mark_events_processed(state, run_id, events).await;
+    let section =
+        common::ci_lines::failing_section(head, &common::content_gap::section(gap, step, check));
+    match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
+        Ok(p) => {
+            let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &body).await
+            {
+                warn!(run_id, error = %e, "Could not write the content step on the pull request");
+            }
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the pull request to name the content step")
+        }
+    }
+    let note = common::content_gap::run_note(gap, step, check);
+    super::add_progress_note(state, team_id, run_id, &note).await;
+    if !head.is_empty() {
+        super::pr_watch::mark_ci_head(state, team_id, run_id, head).await;
+    }
+    mark_pr_ready(state, team_id, github, pr.owner, pr.repo, pr.number).await;
+    info!(
+        run_id,
+        check, "Red only on a content step before merge: no fix round, the run completed"
+    );
+    complete_run_with_status(
+        state,
+        ticket_msg,
+        run_id,
+        common::run_status::COMPLETED,
+        pr.url,
+        pr.number,
+        pr.branch,
+        usage,
+        duration,
+    )
+    .await
+}
+
+/// Keeps what a CI fix round concluded, for the next round that meets the
+/// same failure (`common::content_gap::repeat_brief`).
+async fn save_fix_account(state: &WorkerState, team_id: &str, run_id: &str, account: &str) {
+    let account = common::truncate_str(account.trim(), 1500);
+    if account.is_empty() {
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET last_fix_account = :a")
+        .expression_attribute_values(":a", attr_s(account))
+        .send()
+        .await;
+}
+
+/// The failure stays red after its one re-run (or none could start): it is
+/// the run's own CI outcome (`ci_end` = `unrelated_test`), named with its
+/// proof on the pull request and the run, the failing test is handed to
+/// its own fix, the pull request goes ready by the one ready decision, and
+/// the run is completed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_unrelated(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    usage: &TokenUsage,
+    duration: u64,
+    events: &[RunEvent],
+    mut s: common::ci_unrelated::Standing,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let team_id = &ticket_msg.team_id;
+    if s.fix.is_empty() {
+        if let Some(test) = s.tests.first().cloned() {
+            s.fix = super::e2e::fix_unrelated_test(
+                state,
+                ticket_msg,
+                pr.number,
+                &test,
+                &s.proof.join("\n"),
+            )
+            .await;
+        }
+    }
+    save_unrelated(state, team_id, run_id, &s).await;
+    super::record_ci_outcome(
+        state,
+        team_id,
+        run_id,
+        super::CiOutcome::HandedOff(super::GaveUp::UnrelatedTest),
+    )
+    .await;
+    mark_events_processed(state, run_id, events).await;
+    let section = common::ci_lines::failing_section(&s.head, &common::ci_unrelated::section(&s));
+    match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
+        Ok(p) => {
+            let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &body).await
+            {
+                warn!(run_id, error = %e, "Could not write the failure outside the change on the pull request");
+            }
+        }
+        Err(e) => warn!(run_id, error = %e, "Could not read the pull request to name the failure"),
+    }
+    let note = common::ci_unrelated::run_note(&s);
+    super::add_progress_note(state, team_id, run_id, &note).await;
+    super::pr_watch::mark_ci_head(state, team_id, run_id, &s.head).await;
+    mark_pr_ready(state, team_id, github, pr.owner, pr.repo, pr.number).await;
+    info!(run_id, checks = ?s.checks, tests = ?s.tests, "A failure outside the change, red after its re-run: classified, the run completed");
+    complete_run_with_status(
+        state,
+        ticket_msg,
+        run_id,
+        common::run_status::COMPLETED,
+        pr.url,
+        pr.number,
+        pr.branch,
+        usage,
+        duration,
+    )
+    .await
+}
+
 /// The one way a run stops fixing a red CI: the pull request says what
 /// fails (the check, the error, what was tried, what is needed), stays a
 /// draft through the one ready decision (`ready::decide` holds on a failing
@@ -7721,7 +8314,8 @@ async fn hand_off_red_ci(
             warn!(run_id = msg.run_id, error = %e, "Could not read the pull request to say what fails")
         }
     }
-    let reason = ci_failing_reason(&checks, excerpt, tried.len());
+    let tally = ci_tally(state, &msg.team_id, &msg.run_id).await;
+    let reason = ci_failing_reason(&checks, excerpt, tally);
     super::add_progress_note(state, &msg.team_id, &msg.run_id, &reason).await;
     // The one ready decision: a failing check holds the draft, named.
     mark_pr_ready(state, &msg.team_id, github, pr.owner, pr.repo, pr.number).await;
@@ -7826,9 +8420,10 @@ pub(crate) async fn end_red_ci_rounds(
     }
     // The one ready decision: a failing check holds the draft, named.
     mark_pr_ready(state, &msg.team_id, github, pr.owner, pr.repo, number).await;
+    let tally = ci_tally(state, &msg.team_id, run_id).await;
     let reason = format!(
         "{}. {}",
-        ci_failing_reason(checks, excerpt, tried.len()),
+        ci_failing_reason(checks, excerpt, tally),
         tried.join("; ")
     );
     if ending != super::supervisor::Ending::Failed {
@@ -7907,7 +8502,11 @@ async fn finish_security_red(
     let reason = format!(
         "{}{}",
         super::ready::NOTE_PREFIX,
-        ci_failing_reason(checks, excerpt, tried.len())
+        ci_failing_reason(
+            checks,
+            excerpt,
+            ci_tally(state, &ticket_msg.team_id, run_id).await
+        )
     );
     super::add_progress_note(state, &ticket_msg.team_id, run_id, &reason).await;
     mark_pr_ready(
@@ -8384,7 +8983,7 @@ pub(crate) async fn red_ci_blocks_completion(
 pub(crate) fn ci_state_of_record(ci_last: &str, ci_end: &str) -> super::outcome::CiState {
     use super::outcome::CiState;
     match (ci_last, ci_end) {
-        ("failed", "red_on_base" | "unrelated_test") => CiState::RedOnBase,
+        ("failed", end) if common::content_gap::allows_done(end) => CiState::RedOnBase,
         ("failed", _) => CiState::Failing("the pull request's checks".to_string()),
         _ => CiState::Green,
     }
@@ -9148,6 +9747,101 @@ async fn resume_multi_repo(
     Ok(())
 }
 
+/// One look at a CI wait with no result yet (`common::ci_watch`): the
+/// pending set is kept with when it last changed; an hour without progress
+/// re-runs the stuck checks' workflows once, and a second hour stops the
+/// wait. Returns true when the run finished (the caller stops).
+async fn ci_wait_watchdog(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    github: &GitHubClient,
+    (owner, repo, pr_number): (&str, &str, u64),
+    head: &str,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    use common::ci_watch::{self, Step};
+    let Ok(checks) = github.list_ci_for_ref(owner, repo, head).await else {
+        return false;
+    };
+    let pending = ci_watch::pending_of(&checks);
+    let now = chrono::Utc::now().timestamp();
+    let prev =
+        ci_watch::from_json(&run_text(state, &msg.team_id, &msg.run_id, ci_watch::FIELD).await);
+    let (wait, step) = ci_watch::step(prev.as_ref(), head, &pending, now);
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("SET #w = :w")
+        .expression_attribute_names("#w", ci_watch::FIELD)
+        .expression_attribute_values(":w", attr_s(&ci_watch::to_json(&wait)))
+        .send()
+        .await;
+    match step {
+        Step::Wait => false,
+        Step::Rerun => {
+            let mut started = 0;
+            for id in ci_watch::pending_run_ids(&checks) {
+                if github.rerun_workflow_run(owner, repo, id).await.is_ok() {
+                    started += 1;
+                }
+            }
+            warn!(run_id = msg.run_id, pending = ?wait.pending, started, "CI made no progress for an hour: re-running the stuck checks once");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &ci_watch::rerun_note(&wait, started),
+            )
+            .await;
+            false
+        }
+        Step::Stop => {
+            warn!(run_id = msg.run_id, pending = ?wait.pending, "CI made no progress after a re-run: the wait stops");
+            if pr_number > 0 {
+                mark_pr_ready(state, &msg.team_id, github, owner, repo, pr_number).await;
+            }
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &ci_watch::stop_note(&wait, now),
+            )
+            .await;
+            set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+            true
+        }
+    }
+}
+
+/// Arms the run's one delayed CI check (`common::ci_watch::may_arm`):
+/// false when another is already due, so a webhook resume never starts a
+/// second wait chain.
+async fn arm_delayed_check(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) -> bool {
+    use common::ci_watch;
+    let now = chrono::Utc::now().timestamp();
+    let due = now + i64::from(delay_seconds.max(0));
+    match state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("SET #d = :due")
+        .condition_expression("attribute_not_exists(#d) OR #d <= :late")
+        .expression_attribute_names("#d", ci_watch::DUE_FIELD)
+        .expression_attribute_values(":due", attr_n(due as u64))
+        .expression_attribute_values(":late", attr_n((now + ci_watch::DUE_SLACK_SECS) as u64))
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => !format!("{e:?}").contains("ConditionalCheckFailed"),
+    }
+}
+
 /// Counts one more re-arm of the CI wait loop and says whether it may go on.
 async fn may_poll_again(state: &WorkerState, msg: &ResumeMessage) -> bool {
     let polls = state
@@ -9253,6 +9947,13 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
     );
     if state.config.ci_fix_queue_url.is_empty() {
         warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
+        return;
+    }
+    // One wait chain per run: a delayed check while another is due adds
+    // nothing but a second chain (`common::ci_watch::may_arm`). An
+    // immediate re-drive (a short delay) always goes.
+    if delay_seconds >= 60 && !arm_delayed_check(state, msg, delay_seconds).await {
+        info!(run_id = %msg.run_id, "A delayed CI check is already due — not arming another");
         return;
     }
     if !may_poll_again(state, msg).await {

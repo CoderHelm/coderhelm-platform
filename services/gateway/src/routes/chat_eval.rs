@@ -1,7 +1,7 @@
 //! Chat's answer-quality evals: questions about a made-up team's code, with
 //! pass criteria checked in code.
 //!
-//! The fixture is two small repositories of an invented marina booking app
+//! The fixture is two small repositories of an invented library booking app
 //! (`northwind/harbor-api`, `northwind/harbor-web`). Each case asks one of
 //! the questions people ask Chat ("How is harbor-api put together?",
 //! "Where are refunds handled?", "What does src/jobs/expireHolds.ts do?") and
@@ -50,8 +50,8 @@ pub const WEB: &str = "northwind/harbor-web";
 const API_FILES: &[(&str, &str)] = &[
     (
         "README.md",
-        "# Harbor API\n\nThe booking service behind the Harbor marina app. Boaters book slips \
-         (berths) by the night; the API holds a slip while the boater pays, confirms the booking \
+        "# Harbor API\n\nThe booking service behind the Harbor library app. Patrons book slots \
+         (booths) by the night; the API holds a slot while the patron pays, confirms the booking \
          when the card payment clears, and refunds cancelled bookings.\n\n## Running it\n\n\
          `npm install`, then `npm run dev`. It needs a Postgres database (`DATABASE_URL`).\n\n\
          ## Layout\n\nRoutes live in `src/routes`, business rules in `src/services`, the \
@@ -82,18 +82,18 @@ const API_FILES: &[(&str, &str)] = &[
     (
         "src/routes/index.ts",
         "import { Router } from \"express\";\nimport { bookings } from \"./bookings\";\n\
-         import { refunds } from \"./refunds\";\nimport { slips } from \"./slips\";\n\n\
+         import { refunds } from \"./refunds\";\nimport { slots } from \"./slots\";\n\n\
          export const routes = Router();\nroutes.use(\"/bookings\", bookings);\n\
-         routes.use(\"/refunds\", refunds);\nroutes.use(\"/slips\", slips);\n",
+         routes.use(\"/refunds\", refunds);\nroutes.use(\"/slots\", slots);\n",
     ),
     (
         "src/routes/bookings.ts",
         "import { Router } from \"express\";\nimport { z } from \"zod\";\n\
-         import { holdSlip, confirmBooking } from \"../services/bookingService\";\n\n\
-         export const bookings = Router();\n\nconst Hold = z.object({ slipId: z.string(), \
+         import { holdSlot, confirmBooking } from \"../services/bookingService\";\n\n\
+         export const bookings = Router();\n\nconst Hold = z.object({ slotId: z.string(), \
          nights: z.number().int().min(1).max(30) });\n\nbookings.post(\"/\", async (req, res) => {\n  \
-         const body = Hold.parse(req.body);\n  res.status(201).json(await holdSlip(req.user.id, \
-         body.slipId, body.nights));\n});\n\nbookings.post(\"/:id/confirm\", async (req, res) => {\n  \
+         const body = Hold.parse(req.body);\n  res.status(201).json(await holdSlot(req.user.id, \
+         body.slotId, body.nights));\n});\n\nbookings.post(\"/:id/confirm\", async (req, res) => {\n  \
          res.json(await confirmBooking(req.params.id));\n});\n",
     ),
     (
@@ -106,25 +106,25 @@ const API_FILES: &[(&str, &str)] = &[
          body.reason));\n});\n",
     ),
     (
-        "src/routes/slips.ts",
+        "src/routes/slots.ts",
         "import { Router } from \"express\";\nimport { db } from \"../db/pool\";\n\n\
-         export const slips = Router();\n\nslips.get(\"/\", async (_req, res) => {\n  \
-         res.json((await db.query(\"select * from slips where active\")).rows);\n});\n",
+         export const slots = Router();\n\nslots.get(\"/\", async (_req, res) => {\n  \
+         res.json((await db.query(\"select * from slots where active\")).rows);\n});\n",
     ),
     (
         "src/services/bookingService.ts",
         "import { db } from \"../db/pool\";\nimport { charge } from \"../payments/cardGateway\";\n\n\
-         /** Holds a slip for 30 minutes while the boater pays. */\nexport async function \
-         holdSlip(userId: string, slipId: string, nights: number) {\n  const price = await \
-         nightlyPrice(slipId);\n  return db.one(\n    \"insert into bookings (user_id, slip_id, \
+         /** Holds a slot for 30 minutes while the patron pays. */\nexport async function \
+         holdSlot(userId: string, slotId: string, nights: number) {\n  const price = await \
+         nightlyPrice(slotId);\n  return db.one(\n    \"insert into bookings (user_id, slot_id, \
          nights, amount_cents, status, hold_expires_at) values ($1, $2, $3, $4, 'held', now() + \
-         interval '30 minutes') returning *\",\n    [userId, slipId, nights, price * nights],\n  \
+         interval '30 minutes') returning *\",\n    [userId, slotId, nights, price * nights],\n  \
          );\n}\n\nexport async function confirmBooking(id: string) {\n  const b = await \
          db.one(\"select * from bookings where id = $1\", [id]);\n  await charge(b.user_id, \
          b.amount_cents, `booking ${id}`);\n  return db.one(\"update bookings set status = \
-         'confirmed' where id = $1 returning *\", [id]);\n}\n\nasync function nightlyPrice(slipId: \
-         string) {\n  return (await db.one(\"select price_cents from slips where id = $1\", \
-         [slipId])).price_cents;\n}\n",
+         'confirmed' where id = $1 returning *\", [id]);\n}\n\nasync function nightlyPrice(slotId: \
+         string) {\n  return (await db.one(\"select price_cents from slots where id = $1\", \
+         [slotId])).price_cents;\n}\n",
     ),
     (
         "src/services/refundService.ts",
@@ -164,8 +164,8 @@ const API_FILES: &[(&str, &str)] = &[
     ),
     (
         "src/jobs/expireHolds.ts",
-        "import { db } from \"../db/pool\";\n\n/**\n * Frees slips whose hold ran out: a booking \
-         stays 'held' for 30 minutes while the\n * boater pays (see holdSlip). Runs every five \
+        "import { db } from \"../db/pool\";\n\n/**\n * Frees slots whose hold ran out: a booking \
+         stays 'held' for 30 minutes while the\n * patron pays (see holdSlot). Runs every five \
          minutes from runner.ts.\n */\nexport async function expireHolds() {\n  const { rowCount } = \
          await db.query(\n    \"update bookings set status = 'expired' where status = 'held' and \
          hold_expires_at < now()\",\n  );\n  if (rowCount) console.log(`expired ${rowCount} \
@@ -199,7 +199,7 @@ const API_FILES: &[(&str, &str)] = &[
 const WEB_FILES: &[(&str, &str)] = &[
     (
         "README.md",
-        "# Harbor web\n\nThe boater-facing Next.js site. It calls harbor-api for slips, bookings \
+        "# Harbor web\n\nThe patron-facing Next.js site. It calls harbor-api for slots, bookings \
          and refunds.\n",
     ),
     (
@@ -209,7 +209,7 @@ const WEB_FILES: &[(&str, &str)] = &[
     ),
     (
         "app/page.tsx",
-        "export default function Home() {\n  return <h1>Find a slip</h1>;\n}\n",
+        "export default function Home() {\n  return <h1>Find a slot</h1>;\n}\n",
     ),
     (
         "app/bookings/[id]/cancel.tsx",
@@ -263,7 +263,7 @@ pub const CASES: &[Case] = &[
     },
     Case {
         name: "where something is handled",
-        question: "Where are refunds handled, and how much does a boater get back?",
+        question: "Where are refunds handled, and how much does a patron get back?",
         uses_any: &[SEARCH_CODE, LIST_FILES, READ_FILE],
         cites: &["src/services/refundService.ts"],
         facts: &[&["issuerefund"], &["48"], &["half", "50%", "/ 2"]],
@@ -422,7 +422,7 @@ pub struct WorkStore {
 pub fn work_store() -> WorkStore {
     WorkStore {
         runs: vec![
-            run_item(TEAM, "01JC0000000000000000000005", "running", "HAR-31", "Add a waitlist to full slips",
+            run_item(TEAM, "01JC0000000000000000000005", "running", "HAR-31", "Add a waitlist to full slots",
                 &[("current_pass", "implement"), ("created_at", "2026-11-14T09:00:00Z"), ("updated_at", "2026-11-14T09:20:00Z")]),
             run_item(TEAM, "01JC0000000000000000000004", "awaiting_ci", "HAR-27", "Embed the booking portal on the signup pages",
                 &[("current_pass", "ci_fix"), ("created_at", "2026-11-11T15:00:00Z"), ("updated_at", "2026-11-12T10:05:00Z"),
@@ -889,7 +889,7 @@ mod tests {
                 Box::new(|b| {
                     let s = id_for(&last_result(b), "src/jobs/expireHolds.ts").unwrap();
                     say(&format!(
-                        "It frees slips whose 30 minutes hold ran out, marking those bookings expired [{s}]. \
+                        "It frees slots whose 30 minutes hold ran out, marking those bookings expired [{s}]. \
                          It runs every five minutes [{s}]."
                     ))
                 }),
@@ -1018,7 +1018,7 @@ mod tests {
                 Box::new(|b| {
                     let r = ids_of(b, "run");
                     say(&format!(
-                        "Two runs are active: HAR-31 \"Add a waitlist to full slips\" is working now, in the implement step [{}]; \
+                        "Two runs are active: HAR-31 \"Add a waitlist to full slots\" is working now, in the implement step [{}]; \
                          HAR-27 is waiting on its pull request's checks [{}].",
                         r[0], r[1]
                     ))
@@ -1086,7 +1086,7 @@ mod tests {
                     ids_of(b, "pull_request")[0].clone(),
                 );
                 say(&format!(
-                    "{count}\n\n**Needs you now**\n- [ABC-1 Retry the export job](/runs/detail?id=01A): answer the run's question, since Nov 14 [{run}]\n  - Which retry limit should the job use? Possible answers: 3 tries; 5 tries\n                     - [ABC-10 Payments fail on retry](https://team.atlassian.net/browse/ABC-10): move it forward, Highest priority [{ticket}]\n                     - [acme/web#41 Add slips](https://github.com/acme/web/pull/41): review it, your review was asked for [{pr}]"
+                    "{count}\n\n**Needs you now**\n- [ABC-1 Retry the export job](/runs/detail?id=01A): answer the run's question, since Nov 14 [{run}]\n  - Which retry limit should the job use? Possible answers: 3 tries; 5 tries\n                     - [ABC-10 Payments fail on retry](https://team.atlassian.net/browse/ABC-10): move it forward, Highest priority [{ticket}]\n                     - [acme/web#41 Add slots](https://github.com/acme/web/pull/41): review it, your review was asked for [{pr}]"
                 ))
             }),
         ]

@@ -386,6 +386,123 @@ async fn team_trigger_label(state: &AppState, team_id: &str) -> String {
         .unwrap_or_else(|| "coderhelm".to_string())
 }
 
+/// The source CoderHelm's own record names for a follow-up it filed
+/// (`FOLLOWUP_OF#<key>`), `None` when the key is no follow-up's.
+pub(crate) async fn followup_record_source(
+    state: &AppState,
+    team_id: &str,
+    key: &str,
+) -> Option<String> {
+    let item = followup_record(state, team_id, key).await?;
+    Some(
+        item.get("source")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+/// CoderHelm's record of a follow-up it filed, by the follow-up's key.
+pub(crate) async fn followup_record(
+    state: &AppState,
+    team_id: &str,
+    key: &str,
+) -> Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&common::followup_tickets::of_record_sk(key)))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+}
+
+/// A follow-up ticket an event would have started a run on.
+struct HeldFollowup<'a> {
+    key: &'a str,
+    source: &'a str,
+    title: &'a str,
+    body: &'a str,
+    repo: &'a str,
+    ticket_type: Option<String>,
+}
+
+/// Keeps what the event said of a held follow-up on CoderHelm's record of
+/// it (so a person's Start a run reads the ticket from there), and comments
+/// on the ticket the first time only.
+async fn hold_followup(
+    state: &AppState,
+    team_id: &str,
+    jira_config: Option<
+        &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    >,
+    h: &HeldFollowup<'_>,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let first = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&common::followup_tickets::of_record_sk(h.key)))
+        .update_expression(
+            "SET #k = :k, #src = if_not_exists(#src, :src), #repo = if_not_exists(#repo, :repo), \
+             held_title = :t, held_body = :b, held_type = :ty, held_at = :now, \
+             noticed_at = if_not_exists(noticed_at, :now)",
+        )
+        .expression_attribute_names("#k", "key")
+        .expression_attribute_names("#src", "source")
+        .expression_attribute_names("#repo", "repo")
+        .expression_attribute_values(":k", attr_s(h.key))
+        .expression_attribute_values(":src", attr_s(h.source))
+        .expression_attribute_values(":repo", attr_s(h.repo))
+        .expression_attribute_values(":t", attr_s(h.title))
+        .expression_attribute_values(":b", attr_s(h.body))
+        .expression_attribute_values(":ty", attr_s(h.ticket_type.as_deref().unwrap_or("")))
+        .expression_attribute_values(":now", attr_s(&now))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
+        .send()
+        .await;
+    let first = match first {
+        Ok(out) => out
+            .attributes()
+            .is_none_or(|old| !old.contains_key("noticed_at")),
+        Err(e) => {
+            warn!(team_id, key = h.key, error = %e, "Held follow-up not recorded");
+            return;
+        }
+    };
+    if !first {
+        return;
+    }
+    let url = jira_config
+        .and_then(|c| c.get("add_comment_url"))
+        .and_then(|v| v.as_s().ok())
+        .filter(|u| !u.is_empty());
+    let Some(url) = url else { return };
+    let say = common::conversation::Say::note(
+        "followup_held",
+        common::followup_tickets::held_comment(h.source),
+    );
+    if let Err(e) =
+        super::conversation::jira_at(state, team_id, url, h.key, say, "note", "A follow-up").await
+    {
+        warn!(team_id, key = h.key, error = %e, "Held follow-up comment not posted: the next event tries again");
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(team_id))
+            .key("sk", attr_s(&common::followup_tickets::of_record_sk(h.key)))
+            .update_expression("REMOVE noticed_at")
+            .send()
+            .await;
+    }
+}
+
 /// Shared payload processing for both token-based and Forge webhook paths.
 async fn process_jira_payload(
     state: &AppState,
@@ -599,6 +716,45 @@ async fn process_jira_payload(
         team_id,
         installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
     );
+
+    // A follow-up CoderHelm filed never starts a run from its label or
+    // assignee, even when a person added the trigger label by hand: one
+    // comment says so and how a person starts it (Start a run in
+    // CoderHelm). Follow-ups never cascade.
+    let followup_of = match common::followup_tickets::source_of_labels(&issue_labels) {
+        Some(src) => Some(src),
+        None => followup_record_source(state, team_id, ticket_key)
+            .await
+            .or_else(|| common::followup_tickets::source_of_body(&body_text)),
+    };
+    if let Some(of) = followup_of {
+        info!(team_id, ticket_key, of = %of, "Jira follow-up: no run starts from its label or assignee");
+        let held = HeldFollowup {
+            key: ticket_key,
+            source: &of,
+            title: &title,
+            body: &body_text,
+            repo: &if repo_owner.is_empty() {
+                String::new()
+            } else {
+                format!("{repo_owner}/{repo_name}")
+            },
+            ticket_type: common::messages::ticket_type_of_jira(issue),
+        };
+        hold_followup(state, team_id, jira_config.as_ref(), &held).await;
+        log_jira_event(
+            state,
+            started,
+            team_id,
+            event_type,
+            ticket_key,
+            &title,
+            "followup_held",
+            None,
+        )
+        .await;
+        return Ok(StatusCode::OK);
+    }
 
     // Trigger gate: block while a run is in flight; on a completed latest
     // run, only re-trigger when the ticket content actually changed. The

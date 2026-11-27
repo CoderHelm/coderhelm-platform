@@ -621,7 +621,9 @@ impl Abilities {
         out.push_str(if self.staging_write {
             "- Staging CMS write connection: yes (CoderHelm can change staging content, never production)\n"
         } else {
-            "- Staging CMS write connection: none for this repository\n"
+            "- Staging CMS write connection: none for this repository (a staging content or \
+             migration step is a person's step before merge; the code tolerates the content \
+             being missing)\n"
         });
         out
     }
@@ -1357,6 +1359,7 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
             ]
             .iter()
             .any(|w| t.contains(w))
+                || common::stop_rules::tooling::names_own_read(&t)
             {
                 out.push(format!(
                     "Step {n} (`{}`) is work CoderHelm's own tools do (reading workflow runs, \
@@ -1428,6 +1431,12 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
                     "Step {n} is a read query CoderHelm can run itself: make it `by: coderhelm`."
                 ));
             }
+        }
+        // A staging content step CoderHelm can't run: no write connection.
+        // It is a person's step before merge, decided here, never found
+        // after the pull request opens; the code never fails on its absence.
+        if s.doer() == Doer::CoderHelm && s.is_content() && !s.is_production() && !a.staging_write {
+            out.push(no_write_connection_gap(n, &s.step));
         }
         if s.doer() == Doer::CoderHelm
             && s.is_content()
@@ -1508,6 +1517,22 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
         }
     }
     out
+}
+
+/// What a plan is told when it has CoderHelm change staging content the
+/// repository gives it no write connection for (`common::content_gap`).
+pub fn no_write_connection_gap(n: usize, step: &str) -> String {
+    format!(
+        "Step {n} (`{}`) has CoderHelm change staging content, but this repository has no staging \
+         CMS write connection, so CoderHelm can't run it. Make it a person's step before merge \
+         (`by: person`, `reason: grant`, `why_person`: no staging CMS write connection, `grant`: \
+         add one in Settings, Repositories, Staging CMS) and say so in the note's \
+         \"Needed from you\". The code must tolerate the content being missing: leave the field \
+         or block out and log a warning, never throw in a build or deploy. A test that reads \
+         that content fails by name until the step runs, and the pull request lists the step \
+         before merge.",
+        one_line(step)
+    )
 }
 
 /// The outside-step gaps of a plan: its decision's note checked against

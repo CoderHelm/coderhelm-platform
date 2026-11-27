@@ -62,6 +62,7 @@ pub const ID_APPS: &str = "connected_apps";
 pub const ID_KNOWLEDGE: &str = "knowledge";
 pub const ID_CODE_GRAPH: &str = "code_graph";
 pub const ID_MEMORY: &str = "team_memory";
+pub const ID_TRACKER: &str = "ticket_tracker";
 
 /// The tool that runs a script kept with a skill (or in the repository) in
 /// the sandbox.
@@ -269,6 +270,67 @@ pub fn catalogue(s: &Setup) -> Vec<Capability> {
     ];
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// The team's ticket tracker, as a run on one of its tickets has it: Jira
+/// through the Coderhelm app (`jira_site`, `jira_files`: the app's
+/// create-ticket trigger is registered), else GitHub issues in the
+/// repository. A run's planner gets it beside the catalogue, so a step on
+/// the tracker (filing the follow-up tickets an audit drafts) is never
+/// handed to a person as "connect Jira".
+pub fn tracker(jira: Option<(&str, bool)>, github_issues: bool) -> Capability {
+    let tool = crate::followup_tickets::TOOL;
+    let with_tool: &[&str] = &[crate::followup_tickets::TOOL];
+    match jira {
+        Some((site, files)) => {
+            let on = if site.trim().is_empty() {
+                "the team's Jira site".to_string()
+            } else {
+                site.trim().trim_end_matches('/').to_string()
+            };
+            let does = if files {
+                format!(
+                    "Jira is connected through the Coderhelm app on {on}: CoderHelm reads \
+                     tickets, comments on them, and files follow-up tickets ({tool}) in the \
+                     source ticket's project, linked to it and labelled coderhelm. Write the \
+                     drafts in `followup_tickets`; CoderHelm files them and posts the new keys \
+                     on the ticket."
+                )
+            } else {
+                format!(
+                    "Jira is connected through the Coderhelm app on {on}: CoderHelm reads \
+                     tickets and comments on them. Write follow-up drafts in \
+                     `followup_tickets`: CoderHelm files them where it can and otherwise posts \
+                     them on the ticket."
+                )
+            };
+            cap(
+                ID_TRACKER,
+                "Ticket tracker",
+                &does,
+                "Never a person's step and never a reason to ask for Jira access: Jira is \
+                 connected. Only a project permission Jira reports missing goes to a person, \
+                 by its name.",
+                if files { with_tool } else { &[] },
+            )
+        }
+        None => cap(
+            ID_TRACKER,
+            "Ticket tracker",
+            &if github_issues {
+                format!(
+                    "No Jira for this team: follow-up tickets go in as GitHub issues in the \
+                     repository ({tool}). Write the drafts in `followup_tickets`."
+                )
+            } else {
+                "No Jira for this team and no issues write on the GitHub App: follow-up \
+                 drafts in `followup_tickets` are posted on the ticket or pull request."
+                    .to_string()
+            },
+            "Never a person's step: CoderHelm files or posts the drafts itself.",
+            if github_issues { with_tool } else { &[] },
+        ),
+    }
 }
 
 /// The catalogue every run has before a team's own connections are known:
