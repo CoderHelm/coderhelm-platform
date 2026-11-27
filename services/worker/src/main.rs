@@ -504,7 +504,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                     &team_id,
                     &run_id,
                     &common::run_fail::RunFailure {
-                        reason: &format!("Feedback pass failed: {reason}"),
+                        cause: common::run_fail::Cause::Error(&format!(
+                            "Feedback pass failed: {reason}"
+                        )),
                         pass: Some("feedback"),
                         ..Default::default()
                     },

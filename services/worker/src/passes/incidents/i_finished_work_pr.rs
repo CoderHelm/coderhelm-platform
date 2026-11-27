@@ -92,8 +92,16 @@ fn planned_round(
     let section = proof::unfinished_section(&proof::parse_findings(&reply).unwrap());
     let after = finish_planned::listed(&section);
     gh.pr_mut(21).body = completeness::with_section(&body, Section::Unfinished, section);
-    let next = finish_planned::next(&before, Some(&after), pushed.len(), &[], round);
-    end.status = finish_planned::run_status(&next, pushed.len()).into();
+    let next = finish_planned::next(
+        &before,
+        Some(&after),
+        &finish_planned::Ran::Finished {
+            files: pushed.len(),
+        },
+        &[],
+        round,
+    );
+    end.status = finish_planned::status_after(&next, pushed.len()).into();
     match next {
         Next::Ready => {
             if draft_hold(&gh.pr(21).body, "Add the card block", false).is_none() {
@@ -109,7 +117,7 @@ fn planned_round(
             &[],
             now(),
         )),
-        Next::Stop(why) => {
+        Next::WaitLimit(why) | Next::Stop(why) => {
             end.said(why);
             None
         }
@@ -205,7 +213,13 @@ fn a_round_whose_check_cannot_answer_claims_nothing_done() {
     let round = open_the_pull_request(&mut gh, &mut end).unwrap();
     let before = finish_planned::listed(&gh.pr(21).body);
     assert_eq!(
-        finish_planned::next(&before, None, 0, &[], &round),
+        finish_planned::next(
+            &before,
+            None,
+            &finish_planned::Ran::Finished { files: 0 },
+            &[],
+            &round
+        ),
         Next::Again { stalled: 1 }
     );
 }
@@ -228,7 +242,7 @@ fn the_pipeline_parks_the_round_and_the_resume_runs_it() {
     assert!(pending.contains("after_planned_round("));
     let after = fn_src(resume, "\nasync fn after_planned_round(");
     assert!(after.contains("recheck_planned_work("));
-    assert!(after.contains("finish_planned::run_status(&next, files)"));
+    assert!(after.contains("finish_planned::status_after(&next, files)"));
     assert!(after.contains("Section::Unfinished"));
     assert!(after.contains("mark_pr_ready("));
     let stop = &after[after.find("Next::Stop(reason) => {").unwrap()..];

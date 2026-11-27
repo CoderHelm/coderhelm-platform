@@ -79,7 +79,7 @@ fn a_security_fix_with_red_ci_goes_ready_with_the_failing_checks_as_its_note() {
     assert!(hand_off.find("take_out_failing_bumps(").unwrap() < ending);
     assert!(ending < hand_off.find("wait_for_review(").unwrap());
     let rounds = fn_src(resume, "\npub(crate) async fn end_red_ci_rounds(");
-    assert!(rounds.find("finish_security_red(").unwrap() < rounds.find("fail_run(").unwrap());
+    assert!(rounds.find("finish_security_red(").unwrap() < rounds.find("stop_red(").unwrap());
     let finish = fn_src(resume, "\nasync fn finish_security_red(");
     assert!(finish.contains("mark_pr_ready(") && finish.contains("COMPLETED"));
     assert!(!finish.contains("needs_input") && !finish.contains("wait_for_review("));

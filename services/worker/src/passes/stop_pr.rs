@@ -779,7 +779,7 @@ async fn ship(
         .expression_attribute_values(":s", super::attr_s(common::run_status::AWAITING_CI))
         .expression_attribute_values(
             ":sri",
-            super::attr_s(&format!("{}#{run_id}", common::run_status::AWAITING_CI)),
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
         )
         .expression_attribute_values(":pu", super::attr_s(&url))
         .expression_attribute_values(":pn", super::attr_n(number))

@@ -1,6 +1,7 @@
 use axum::extract::Query;
 use axum::response::IntoResponse;
 use axum::{extract::State, http::StatusCode, Extension, Json};
+use common::run_ending::EndWrite;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -2815,8 +2816,13 @@ async fn mark_retried(state: &AppState, team_id: &str, run_id: &str) {
         .key("run_id", attr_s(run_id))
         .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
         .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s("retried"))
-        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                run_id,
+                &common::run_ending::superseded("the run a person's Retry started"),
+            ),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .send()
         .await;
@@ -3008,7 +3014,18 @@ async fn resume_round(
         .expression_attribute_names("#round", common::run_round::FIELD)
         .expression_attribute_values(":from", attr_s(&text("status")))
         .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(
+                if status == common::run_status::RUNNING {
+                    common::run_ending::Working::Running
+                } else {
+                    common::run_ending::Working::AwaitingCi
+                },
+                run_id,
+            )
+            .sri_attr(),
+        )
         .expression_attribute_values(":p", attr_s(pass))
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()));
     update = match &route {
@@ -3321,8 +3338,13 @@ pub async fn reset_and_rerun(
         .key("run_id", attr_s(&run_id))
         .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
         .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s("retried"))
-        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                &run_id,
+                &common::run_ending::superseded("the run a person's Retry started"),
+            ),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .send()
         .await;
@@ -3439,7 +3461,10 @@ pub async fn re_review_run(
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", attr_s("running"))
-        .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::Running, &run_id).sri_attr(),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":p", attr_s("feedback"))
         .send()
@@ -3497,8 +3522,19 @@ pub async fn cancel_run(
             "SET #s = :s, status_run_id = :sri, updated_at = :t, cancelled_by = :cb, cancel_reason = :cr",
         )
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s("cancelled"))
-        .expression_attribute_values(":sri", attr_s(&format!("cancelled#{run_id}")))
+        // Stopped by the person who cancelled, named (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                &run_id,
+                &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+                    reason: common::run_ending::Stop::CancelledBy {
+                        who: claims.email.clone(),
+                    },
+                    tried: Default::default(),
+                }),
+            ),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cb", attr_s(&claims.email))
         .expression_attribute_values(":cr", attr_s("cancelled_by_user"))
@@ -6775,7 +6811,9 @@ pub async fn health(
                     // Only while still running (it may have finished since
                     // the read); the pass is the one the record names.
                     let failure = common::run_fail::RunFailure {
-                        reason: "Run timed out (worker process was terminated)",
+                        cause: common::run_fail::Cause::Error(
+                            "Run timed out (worker process was terminated)",
+                        ),
                         only_from: Some("running"),
                         ..Default::default()
                     };

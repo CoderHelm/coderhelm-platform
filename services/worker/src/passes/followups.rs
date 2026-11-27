@@ -23,6 +23,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::connected_access::{self, Reach};
 use common::followup_tickets::{self as ft, Draft, Filed, Linked, Tracker};
+use common::run_ending::EndWrite;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1409,12 +1410,21 @@ pub async fn finish_delivered(
         )
         .condition_expression(common::run_status::not_ended("#status"))
         .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s(status))
+        // Finished with its findings as the answer (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                run_id,
+                &common::run_ending::answered(&format!(
+                    "the findings report on the run and the ticket: {}",
+                    common::truncate_str(report.trim(), 300)
+                )),
+            ),
+        )
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(start.elapsed().as_secs()))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .expression_attribute_values(
             ":mcp",
             AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),

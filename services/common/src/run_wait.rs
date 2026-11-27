@@ -210,26 +210,67 @@ pub trait NeedsInput {
 
 impl NeedsInput for UpdateItemFluentBuilder {
     fn needs_input(self, run_id: &str, wait: &WaitingOn, why: &HandBack) -> Self {
-        let [s, sri, wo] = needs_input_values(run_id, wait, why);
-        self.expression_attribute_values(":s", s)
-            .expression_attribute_values(":sri", sri)
+        use crate::run_ending::EndWrite;
+        let (w, wo) = needs_input_write(run_id, wait, why);
+        self.run_status(":s", &w)
             .expression_attribute_values(":wo", wo)
     }
 }
 
-/// The values [`NeedsInput::needs_input`] sets, in order `:s`, `:sri` and
-/// `:wo`: for a write built without a client (`run_fail::update`).
-pub fn needs_input_values(run_id: &str, wait: &WaitingOn, why: &HandBack) -> [AttributeValue; 3] {
+/// Who a wait for `why` waits on, through the one gate
+/// (`run_ending::gate`): a permission or limit only a person changes, or a
+/// person named by their part in the run.
+pub fn ending_of(wait: &WaitingOn, why: &HandBack) -> crate::run_ending::RunEnd {
+    use crate::handback::HumanOnly as H;
+    use crate::run_ending::{RunEnd, WaitOn, Waiting};
+    let h = why.why();
+    let action = wait.action.clone();
+    let on = match h {
+        H::Credential | H::MissingAccess | H::UsageLimit | H::Approval => WaitOn::Permission {
+            what: h.label().to_string(),
+            action,
+        },
+        _ => {
+            let who = if wait.action.starts_with("Review pull request")
+                || wait.action.starts_with("Review the pull request")
+            {
+                "the pull request's reviewer"
+            } else {
+                match h {
+                    H::ProductDecision | H::AmbiguousTicket => "the ticket's owner",
+                    H::HeldByAnother => "whoever holds the other work on the ticket",
+                    H::PersonAction => "the person who acted on the run",
+                    _ => "the team",
+                }
+            };
+            WaitOn::Person {
+                who: who.to_string(),
+                action,
+            }
+        }
+    };
+    let evidence = if wait.detail.trim().is_empty() {
+        why.need().to_string()
+    } else {
+        wait.detail.clone()
+    };
+    RunEnd::Waiting(Waiting { on, evidence })
+}
+
+/// The status write for a wait on a person, and its `:wo` value.
+pub fn needs_input_write(
+    run_id: &str,
+    wait: &WaitingOn,
+    why: &HandBack,
+) -> (crate::run_ending::Write, AttributeValue) {
     let mut wait = wait.clone();
     wait.handback = why.why().code().to_string();
     if wait.detail.trim().is_empty() {
         wait.detail = bounded(why.need(), MAX_DETAIL_CHARS);
     }
-    [
-        AttributeValue::S(NEEDS_INPUT.into()),
-        AttributeValue::S(format!("{NEEDS_INPUT}#{run_id}")),
-        wait.to_attr(),
-    ]
+    let w = crate::run_ending::gate(run_id, &ending_of(&wait, why));
+    debug_assert_eq!(w.status(), NEEDS_INPUT);
+    (w, wait.to_attr())
 }
 
 /// Whether a run waiting since `since` is due its one reminder at `now`:

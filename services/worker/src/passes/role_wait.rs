@@ -10,12 +10,13 @@
 //! [`wake`] sends a re-check of every waiting run of a team at once: the
 //! daily role check, and a read that worked again in another run.
 
+use common::run_ending::EndWrite;
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::messages::{RoleReadsWaitMessage, WorkerMessage};
 use common::role_wait::{self, Waiting, FAST_POLLS, POLL_SECS};
-use common::run_status::{AWAITING_SETUP, CLOSED, RETRIED};
+use common::run_status::{AWAITING_SETUP, CLOSED};
 use tracing::{info, warn};
 
 use super::attr_s;
@@ -235,8 +236,10 @@ async fn go_on(state: &WorkerState, team_id: &str, run_id: &str, item: &Item, w:
         .update_expression("SET #s = :r, status_run_id = :sri, retried_as = :n, updated_at = :t")
         .condition_expression("#s = :w")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":r", attr_s(RETRIED))
-        .expression_attribute_values(":sri", attr_s(&format!("{RETRIED}#{run_id}")))
+        .run_status(
+            ":r",
+            &common::run_ending::gate(run_id, &common::run_ending::superseded(&new_run)),
+        )
         .expression_attribute_values(":n", attr_s(&new_run))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":w", attr_s(AWAITING_SETUP))

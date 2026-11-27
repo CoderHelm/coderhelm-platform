@@ -253,7 +253,7 @@ fn neither_loop_ends_by_waiting_on_a_comment() {
     let red = fn_src(rs, "\npub(crate) async fn end_red_ci_rounds(");
     let (revert, fail) = (
         red.find("take_out_failing_bumps(").unwrap(),
-        red.find("super::fail_run(").unwrap(),
+        red.find("stop_red(").unwrap(),
     );
     assert!(revert < fail);
     // The own-review rounds defer what is open and finish.

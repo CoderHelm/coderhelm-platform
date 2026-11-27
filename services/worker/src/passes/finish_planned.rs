@@ -21,6 +21,11 @@
 //! - A round that ends with an edit refused and no task finished made no
 //!   progress, whatever else it pushed: the next round is told which edits
 //!   were refused and how to make them ([`next_round`]).
+//! - A round that never ran its work (its steps ran out, a fault stopped
+//!   it before it landed, [`Ran::Unfinished`]) is not a stall: it runs again
+//!   with the stalls it had. One the team's usage limit refused
+//!   ([`Ran::Limited`]) never ran either: the run waits on the limit
+//!   ([`Next::WaitLimit`]), the ending every run takes at the limit.
 //! - Two rounds in a row with no progress stop the work ([`Next::Stop`]):
 //!   the run says once which tasks are still not done and why (the refused
 //!   files by name), its status is `needs_input` (never `completed`), and
@@ -135,6 +140,19 @@ pub fn drop_settled(items: Vec<String>, settled: &[Refusal]) -> Vec<String> {
         .collect()
 }
 
+/// How a planned-work round ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ran {
+    /// It ran to its end; its commit changed this many files.
+    Finished { files: usize },
+    /// It never finished its work: its steps ran out, or a fault stopped it
+    /// before it landed anything. Not a stall: nothing was judged.
+    Unfinished,
+    /// The team's usage limit refused its model calls: it never ran. The
+    /// limit's words.
+    Limited(String),
+}
+
 /// What follows a planned-work round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -142,19 +160,22 @@ pub enum Next {
     Ready,
     /// Another round, with this many stalled rounds before it.
     Again { stalled: u32 },
+    /// The round never ran for the team's usage limit: the run waits on the
+    /// limit (the usage-limit ending every run takes), its stalls unchanged.
+    WaitLimit(String),
     /// The work stops: this reason names the tasks and why.
     Stop(String),
 }
 
 /// What follows a round. `before`: the tasks listed when it started;
 /// `after`: the tasks the check lists now (`None` when the check couldn't
-/// answer: nothing is claimed done then); `pushed_files`: the files the
-/// round's commit changed; `refused`: the edits the round was refused and
-/// never made.
+/// answer: nothing is claimed done then); `ran`: how the round ended;
+/// `refused`: the edits the round was refused and never made. Only a round
+/// that ran to its end with no progress counts as stalled.
 pub fn next(
     before: &[String],
     after: Option<&[String]>,
-    pushed_files: usize,
+    ran: &Ran,
     refused: &[Refusal],
     round: &Round,
 ) -> Next {
@@ -162,6 +183,26 @@ pub fn next(
     if after.is_empty() {
         return Next::Ready;
     }
+    let pushed_files = match ran {
+        Ran::Finished { files } => *files,
+        Ran::Limited(why) => return Next::WaitLimit(why.clone()),
+        // A round that didn't run its work is run again with the stalls it
+        // had, under the same runaway ceiling.
+        Ran::Unfinished if round.number >= steps::MAX_RUN_STEPS => {
+            return Next::Stop(stop_reason(
+                after,
+                &format!(
+                    "the work reached the safety ceiling of {} planned-work rounds",
+                    steps::MAX_RUN_STEPS
+                ),
+            ));
+        }
+        Ran::Unfinished => {
+            return Next::Again {
+                stalled: round.stalled,
+            }
+        }
+    };
     let progress =
         super::supervisor::progressed(after.len() < before.len(), pushed_files, refused.len());
     if progress {
@@ -207,15 +248,15 @@ pub fn next(
 
 /// The run's status after a round: waiting on CI while there are new
 /// commits or another round is parked, completed once nothing is left and
-/// nothing new was pushed, and `needs_input` when the work stopped (never
-/// `completed`: the tasks are still not done).
-pub fn run_status(next: &Next, pushed_files: usize) -> &'static str {
+/// nothing new was pushed, and `needs_input` when the work stopped or waits
+/// on the usage limit (never `completed`: the tasks are still not done).
+pub fn status_after(next: &Next, pushed_files: usize) -> &'static str {
     use common::run_status::{AWAITING_CI, COMPLETED, NEEDS_INPUT};
     match next {
         Next::Ready if pushed_files > 0 => AWAITING_CI,
         Next::Ready => COMPLETED,
         Next::Again { .. } => AWAITING_CI,
-        Next::Stop(_) => NEEDS_INPUT,
+        Next::WaitLimit(_) | Next::Stop(_) => NEEDS_INPUT,
     }
 }
 
@@ -286,21 +327,21 @@ mod tests {
         .unwrap();
         // A task finished: progress.
         assert_eq!(
-            next(&three, Some(&two), 0, &[], &r),
+            next(&three, Some(&two), &Ran::Finished { files: 0 }, &[], &r),
             Next::Again { stalled: 0 }
         );
         // Pushed changes, nothing finished yet: progress (the head moved).
         assert_eq!(
-            next(&two, Some(&two), 3, &[], &r),
+            next(&two, Some(&two), &Ran::Finished { files: 3 }, &[], &r),
             Next::Again { stalled: 0 }
         );
         // No change at all: one stalled round, then the second stops.
         assert_eq!(
-            next(&two, Some(&two), 0, &[], &r),
+            next(&two, Some(&two), &Ran::Finished { files: 0 }, &[], &r),
             Next::Again { stalled: 1 }
         );
         r = next_round(&r, &two, 1, &[], now());
-        match next(&two, Some(&two), 0, &[], &r) {
+        match next(&two, Some(&two), &Ran::Finished { files: 0 }, &[], &r) {
             Next::Stop(why) => {
                 assert!(why.contains("rounds 1 and 2 made no progress"), "{why}");
                 assert!(why.contains("- a\n- b"), "{why}");
@@ -309,11 +350,14 @@ mod tests {
         }
         // A check that couldn't answer claims nothing done.
         assert_eq!(
-            next(&two, None, 0, &[], &r).clone(),
-            next(&two, Some(&two), 0, &[], &r)
+            next(&two, None, &Ran::Finished { files: 0 }, &[], &r).clone(),
+            next(&two, Some(&two), &Ran::Finished { files: 0 }, &[], &r)
         );
         // Nothing left: ready.
-        assert_eq!(next(&two, Some(&[]), 0, &[], &r), Next::Ready);
+        assert_eq!(
+            next(&two, Some(&[]), &Ran::Finished { files: 0 }, &[], &r),
+            Next::Ready
+        );
     }
 
     /// A round that ends with an edit refused and no task finished made no
@@ -330,12 +374,18 @@ mod tests {
         // It pushed other files: still no progress, because the edit the
         // task needs is the one it couldn't make.
         assert_eq!(
-            next(&items, Some(&items), 4, &refused, &r),
+            next(
+                &items,
+                Some(&items),
+                &Ran::Finished { files: 4 },
+                &refused,
+                &r
+            ),
             Next::Again { stalled: 1 }
         );
         // The same push with nothing refused is progress.
         assert_eq!(
-            next(&items, Some(&items), 4, &[], &r),
+            next(&items, Some(&items), &Ran::Finished { files: 4 }, &[], &r),
             Next::Again { stalled: 0 }
         );
         // A task finished is progress whatever was refused.
@@ -343,7 +393,7 @@ mod tests {
             next(
                 &["a".to_string(), "b".to_string()],
                 Some(&items),
-                1,
+                &Ran::Finished { files: 1 },
                 &refused,
                 &r
             ),
@@ -355,7 +405,13 @@ mod tests {
         assert!(second.feedback.contains("`src/lib/metadata.ts`"));
         assert!(second.feedback.contains("outside_plan"));
         // Refused again: the work stops and says which file, once.
-        match next(&items, Some(&items), 2, &refused, &second) {
+        match next(
+            &items,
+            Some(&items),
+            &Ran::Finished { files: 2 },
+            &refused,
+            &second,
+        ) {
             Next::Stop(why) => {
                 assert!(why.contains("rounds 1 and 2 made no progress"), "{why}");
                 assert!(
@@ -397,10 +453,56 @@ mod tests {
         let after = drop_settled(items.clone(), &settled);
         assert!(after.is_empty());
         let r = first_round(&unfinished_section(&[planned(&items[0])]), now()).unwrap();
-        assert_eq!(next(&items, Some(&after), 0, &other, &r), Next::Ready);
+        assert_eq!(
+            next(
+                &items,
+                Some(&after),
+                &Ran::Finished { files: 0 },
+                &other,
+                &r
+            ),
+            Next::Ready
+        );
         // Work in another file stays.
         let elsewhere = vec!["`src/page.tsx` is not written.".to_string()];
         assert_eq!(drop_settled(elsewhere.clone(), &settled), elsewhere);
+    }
+
+    /// A round that never ran (the usage limit refused its calls, or it
+    /// stopped before it landed anything) is not a stall: two in a row
+    /// never stop the work.
+    #[test]
+    fn rounds_that_never_ran_are_not_stalls() {
+        let items = vec!["a".to_string(), "b".to_string()];
+        let r = first_round(&unfinished_section(&[planned("a"), planned("b")]), now()).unwrap();
+        let limit = "Monthly cache read tokens limit reached (9.1M of 9M).".to_string();
+        let mut round = r.clone();
+        for _ in 0..2 {
+            assert_eq!(
+                next(
+                    &items,
+                    Some(&items),
+                    &Ran::Limited(limit.clone()),
+                    &[],
+                    &round
+                ),
+                Next::WaitLimit(limit.clone())
+            );
+            let again = next(&items, Some(&items), &Ran::Unfinished, &[], &round);
+            assert_eq!(again, Next::Again { stalled: 0 });
+            round = next_round(&round, &items, 0, &[], now());
+        }
+        assert_eq!(
+            status_after(&Next::WaitLimit(limit), 0),
+            common::run_status::NEEDS_INPUT
+        );
+        // The stalls a round had stay as they were.
+        let mut stalled = r.clone();
+        stalled.stalled = 1;
+        assert_eq!(
+            next(&items, Some(&items), &Ran::Unfinished, &[], &stalled),
+            Next::Again { stalled: 1 }
+        );
     }
 
     #[test]
@@ -409,13 +511,13 @@ mod tests {
         let mut r = first_round(&unfinished_section(&[planned("a"), planned("b")]), now()).unwrap();
         for _ in 1..steps::MAX_RUN_STEPS {
             assert_eq!(
-                next(&items, Some(&items), 1, &[], &r),
+                next(&items, Some(&items), &Ran::Finished { files: 1 }, &[], &r),
                 Next::Again { stalled: 0 }
             );
             r = next_round(&r, &items, 0, &[], now());
         }
         assert!(matches!(
-            next(&items, Some(&items), 1, &[], &r),
+            next(&items, Some(&items), &Ran::Finished { files: 1 }, &[], &r),
             Next::Stop(_)
         ));
     }
