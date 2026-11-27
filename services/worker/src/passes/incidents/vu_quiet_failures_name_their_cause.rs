@@ -1,4 +1,4 @@
-//! vt. Three failures on one install that each logged every day and that
+//! vu. Three failures on one install that each logged every day and that
 //! nobody could act on:
 //!
 //! - The agent's memory-read counter failed on every run, logged only as

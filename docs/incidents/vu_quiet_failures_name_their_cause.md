@@ -1,4 +1,4 @@
-# vt. `vt_quiet_failures_name_their_cause`
+# vu. `vu_quiet_failures_name_their_cause`
 
 **What happened:** One install logged three failures every day that nobody could act on. The agent's memory-read counter failed on every run, logged only as "service error": its update named the attribute `reads`, which DynamoDB reserves, so DynamoDB refused it each time. A data source in the install's own account was refused `rds-data:BeginTransaction` on every daily check: the role's template grants that call only on the databases its stack names, and the stack the release keeps current in that account named none, while nobody is ever asked to update that role. The access stack that runs that update was weeks behind, and its card read "the deploy role may not make  yet", naming nothing. And gateway requests hit the Lambda's limit with nothing logged between START and END.
 

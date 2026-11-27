@@ -87,7 +87,7 @@ async fn main() -> Result<(), Error> {
     let scheduler = timed!(common::plugins::schedule::aws_sdk_scheduler);
     let sm = timed!(aws_sdk_secretsmanager);
     // Where this deployment's dashboard and API are (config, or SSM).
-    common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
+    common::public_urls::init(timed!(common::public_urls::ssm)).await;
 
     // Load secrets from Secrets Manager
     let secrets_name =

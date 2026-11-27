@@ -14,7 +14,8 @@
 //! no invocation deadline, and requests run as they always did; the calls
 //! are still timed.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
 
 use axum::{
     extract::{MatchedPath, Request},
@@ -141,12 +142,12 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_request_that_never_finishes_is_named_and_answered() {
         let r = run_within(
             "GET".into(),
             "/api/runs/:id".into(),
-            Some(Duration::from_secs(28)),
+            Some(Duration::from_millis(200)),
             std::future::pending::<Response>(),
         )
         .await;
@@ -155,7 +156,7 @@ mod tests {
             (t.method.as_str(), t.route.as_str()),
             ("GET", "/api/runs/:id")
         );
-        assert!(t.elapsed_ms >= 28_000 && t.budget_ms == 28_000, "{t:?}");
+        assert!(t.elapsed_ms >= 200 && t.budget_ms == 200, "{t:?}");
     }
 
     /// A DynamoDB client, timed as main() builds them, pointed at a port
