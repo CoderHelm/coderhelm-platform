@@ -35,6 +35,7 @@ pub mod ask;
 pub mod bedrock_sync;
 pub mod chunk;
 pub mod extract;
+pub mod health;
 pub mod pack;
 pub mod remote;
 pub mod remote_mcp;

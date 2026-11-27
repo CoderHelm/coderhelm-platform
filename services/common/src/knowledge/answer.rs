@@ -59,6 +59,11 @@ pub struct SourceRef {
     /// the path and lines and links to them at this commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<CodeRef>,
+    /// For a knowledge passage: its base's sync health when it was read
+    /// (`health::Health::line`), so a passage from a failing or overdue
+    /// source says so wherever it is shown. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
 }
 
 /// A place in a repository at one commit.
@@ -111,6 +116,16 @@ impl Registry {
 
     /// Registers knowledge passages; returns their ids in order.
     pub fn add_hits(&mut self, hits: &[Hit]) -> Vec<String> {
+        self.add_hits_with_health(hits, &|_| String::new())
+    }
+
+    /// [`Registry::add_hits`], each passage carrying its base's sync health
+    /// (`health_of(kb_id)`, empty when there is nothing to say).
+    pub fn add_hits_with_health(
+        &mut self,
+        hits: &[Hit],
+        health_of: &dyn Fn(&str) -> String,
+    ) -> Vec<String> {
         hits.iter()
             .map(|h| {
                 self.add(SourceRef {
@@ -124,6 +139,7 @@ impl Registry {
                     base: h.kb_name.clone(),
                     url: original_url(&h.url),
                     source_kind: h.source_kind.clone(),
+                    health: health_of(&h.kb_id),
                     ..Default::default()
                 })
             })
@@ -163,6 +179,9 @@ fn render_one(r: &SourceRef, body: &str) -> String {
     }
     if r.authoritative {
         out.push_str(" source_of_truth=\"yes\"");
+    }
+    if !r.health.is_empty() {
+        out.push_str(&format!(" source_health=\"{}\"", attr(&r.health)));
     }
     out.push_str(">\n");
     out.push_str(body.trim_end());
