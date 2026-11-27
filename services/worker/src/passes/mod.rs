@@ -2386,8 +2386,13 @@ async fn run_passes(
     // Set when Coderhelm chose the repo itself (repo, why), so a no-changes
     // result can say where it looked.
     let mut auto_pick: Option<(String, String)> = None;
+    // The repo the ticket names as its own, read once: routing starts there,
+    // and no repo switch later in the run ever leaves it
+    // (`repo_pick::switch_blocked`).
+    let mut named_repo: Option<String> = None;
     if matches!(msg.source, TicketSource::Jira) {
         let team_repos = plan::fetch_team_repo_list(state, &msg.team_id).await;
+        named_repo = repo_pick::ticket_named_repo(&msg.title, &msg.body, &team_repos);
         let repos: Vec<String> = team_repos
             .iter()
             .filter(|r| r.enabled)
@@ -2436,7 +2441,7 @@ async fn run_passes(
         }
 
         if resolved.is_none() && stop.is_none() {
-            if let Some(r) = repo_pick::ticket_named_repo(&msg.title, &msg.body, &team_repos) {
+            if let Some(r) = named_repo.clone() {
                 // The ticket says which repo it is for: that wins over the
                 // project's default and over the model's pick.
                 info!(run_id, repo = %r, "Repo named on the ticket itself");
@@ -2570,6 +2575,55 @@ async fn run_passes(
             .unwrap_or(false);
         if !unchanged {
             warn!(run_id, error = %e, "Could not record the run's repo");
+        }
+    }
+
+    // --- A Retry of a run that worked in another repo starts over here ---
+    // A person's Retry (`resume_from`) takes up the earlier run's plan,
+    // branch and finished work only when that run worked in this run's repo.
+    // One that ended up in another repo than the one the ticket names left
+    // a plan made for that repo: taken up as final, it skipped the repo
+    // check, its files moved the run back there, and the run went on with
+    // the earlier pull request. This run plans again here instead, and
+    // CoderHelm's own pull request the earlier run left in the other repo is
+    // closed with a note (`repo_pick::retry_start`).
+    let mut retry_started_over = false;
+    if let Some(prev) = msg
+        .resume_from
+        .clone()
+        .filter(|r| !msg.same_run() && !r.is_empty() && r != run_id)
+    {
+        let earlier = history.run_repo(&prev).to_string();
+        if let repo_pick::RetryStart::StartOver { close_in } =
+            repo_pick::retry_start(&earlier, &repo, named_repo.as_deref())
+        {
+            info!(run_id, retried = %prev, earlier = %earlier, repo = %repo, "Retry: the earlier run worked in another repo — starting over here");
+            msg.resume_from = None;
+            retry_started_over = true;
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Retry: the earlier run worked in {earlier}; this run starts over in {repo} with a new plan"
+                ),
+            )
+            .await;
+            if let Some(left) = close_in {
+                for line in close_left_repo_prs(
+                    state,
+                    &provider,
+                    &github,
+                    &mut history,
+                    &prev,
+                    &left,
+                    &repo,
+                )
+                .await
+                {
+                    add_progress_note(state, &msg.team_id, run_id, &line).await;
+                }
+            }
         }
     }
 
@@ -3465,42 +3519,28 @@ async fn run_passes(
         // The repo the ticket names as its own is never left for one the
         // plan merely mentions more: work the plan puts in another repo
         // goes there as a linked pull request (`infra_repo::link_named_change`).
-        let named = if switch_to.is_some() && matches!(msg.source, TicketSource::Jira) {
-            let list = plan::fetch_team_repo_list(state, &msg.team_id).await;
-            repo_pick::ticket_named_repo(&msg.title, &msg.body, &list)
-        } else {
-            None
-        };
-        let here = format!("{}/{}", msg.repo_owner, msg.repo_name);
-        if let Some(stay) = named.as_ref().filter(|n| n.eq_ignore_ascii_case(&here)) {
-            warn!(
-                run_id,
-                suggested = %switch_to.as_deref().unwrap_or_default(),
-                repo = %stay,
-                "Repo check suggests another repo, but the ticket names this one — staying"
-            );
-            add_progress_note(
-                state,
-                &msg.team_id,
-                run_id,
-                &format!(
-                    "Stayed in {stay}: the ticket names it as its repo ({} only suggested {})",
-                    if v.switch_reason.is_empty() {
-                        "the repo check"
-                    } else {
-                        v.switch_reason.as_str()
-                    },
-                    switch_to.as_deref().unwrap_or_default()
-                ),
-            )
-            .await;
+        let blocked = switch_to
+            .as_deref()
+            .and_then(|to| repo_pick::switch_blocked(named_repo.as_deref(), to));
+        if let (Some(named), Some(to)) = (blocked, switch_to.as_deref()) {
+            stay_in_named_repo(state, msg, run_id, named, to, &v.switch_reason).await;
         } else if let Some(again) = switch_to
             .as_ref()
             .filter(|_| ps.switched || !ps.may_replan())
         {
             warn!(run_id, suggested = %again, "Repo check suggests switching again — staying");
         } else if let Some(better_repo) = switch_to {
-            if switch_run_repo(state, msg, run_id, &github, &better_repo, &v.switch_reason).await {
+            if switch_run_repo(
+                state,
+                msg,
+                run_id,
+                &github,
+                &better_repo,
+                &v.switch_reason,
+                named_repo.as_deref(),
+            )
+            .await
+            {
                 ps.switched = true;
                 ps.replans = ps.replans.saturating_add(1);
                 ps.repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -5161,7 +5201,10 @@ false,
         // on it. That holds with an open pull request on the branch too: the
         // continuation used to go through create_branch there, which kept the
         // head but said "Created branch" in every step.
-        let keep_own_branch = (same_run || retry_keeps_branch)
+        // A retry that started over here (the earlier run worked in another
+        // repo) keeps the ticket's branch already in this repo: commits an
+        // earlier attempt made here are picked up, never reset or made twice.
+        let keep_own_branch = (same_run || retry_keeps_branch || retry_started_over)
             && !skip_branch_reset
             && ticket_update_pr.is_none()
             && github
@@ -5171,6 +5214,8 @@ false,
         if ticket_update_pr.is_some() {
             // Progress note already posted; the branch keeps the PR's head.
         } else if keep_own_branch {
+            // The coder is told the branch holds earlier work to finish.
+            msg.retry_of_run = true;
             info!(run_id, branch = %branch_name, "Continuation: keeping the earlier attempt's commits");
             add_progress_note(
                 state,
@@ -5363,8 +5408,16 @@ false,
             effective_complexity = "medium".to_string();
         }
 
-        // If plan files exist in a different repo, switch before implement
-        if let Some(ref better_repo) = plan_warnings.switch_repo {
+        // If plan files exist in a different repo, switch before implement,
+        // unless the ticket names the repo the run is in: a plan taken up
+        // as final (a continuation, a retry) never moves the run off it.
+        let leaves_named = plan_warnings
+            .switch_repo
+            .as_deref()
+            .and_then(|to| repo_pick::switch_blocked(named_repo.as_deref(), to));
+        if let (Some(named), Some(to)) = (leaves_named, plan_warnings.switch_repo.as_deref()) {
+            stay_in_named_repo(state, msg, run_id, named, to, &plan_warnings.switch_reason).await;
+        } else if let Some(ref better_repo) = plan_warnings.switch_repo {
             let (new_owner, new_name) = better_repo.split_once('/').unwrap_or(("", ""));
             if !new_owner.is_empty() && !new_name.is_empty() {
                 warn!(
@@ -5761,7 +5814,7 @@ false,
                 "Multi-repo run set to awaiting_ci"
             );
             let repos: Vec<String> = run_prs.iter().map(|p| p.repo.clone()).collect();
-            supersede_moved_prs(&github, &history, &repos, &primary.url).await;
+            supersede_moved_prs(state, &provider, &github, &history, &repos, &primary.url).await;
 
             // Schedule a safety-net resume
             if !state.config.ci_fix_queue_url.is_empty() {
@@ -7337,6 +7390,8 @@ false,
         // The plan moved the change out of a repo an earlier run of this ticket
         // opened a PR in: that PR is closed with a note naming this one.
         supersede_moved_prs(
+            state,
+            &provider,
             &github,
             &history,
             &[format!("{}/{}", msg.repo_owner, msg.repo_name)],
@@ -11369,15 +11424,14 @@ fn own_pr_branch_for_ticket(prs: &serde_json::Value, ticket_id: &str) -> Option<
 /// now. A PR in a repository the run still changes is never closed: the
 /// re-run continues on it.
 async fn supersede_moved_prs(
+    state: &WorkerState,
+    provider: &crate::agent::provider::ModelProvider,
     github: &GitHubClient,
     history: &ticket_history::TicketHistory,
     repos: &[String],
     now_at: &str,
 ) {
     for p in history.own_open_prs_elsewhere(repos) {
-        let Some((owner, name)) = p.repo.split_once('/') else {
-            continue;
-        };
         let note = format!(
             "Superseded by {now_at}: the plan for this ticket now changes {} instead of `{}`, \
              so this pull request is closed. Its branch `{}` is kept.",
@@ -11389,22 +11443,110 @@ async fn supersede_moved_prs(
             p.repo,
             p.branch
         );
-        if let Err(e) = crate::passes::conversation::github(
-            github,
-            owner,
-            name,
-            p.number,
-            common::conversation::Say::note("superseded", &note),
-        )
-        .await
-        {
-            warn!(repo = %p.repo, pr = p.number, error = %e, "Could not note the superseded PR; leaving it open");
-            continue;
-        }
-        if let Err(e) = github.close_pull_request(owner, name, p.number).await {
-            warn!(repo = %p.repo, pr = p.number, error = %e, "Could not close the superseded PR");
+        if let Err(e) = close_own_pr(state, provider, github, p, &note).await {
+            warn!(repo = %p.repo, pr = p.number, why = %e, "Superseded PR left open");
         }
     }
+}
+
+/// The agent-permission check for CoderHelm closing its own pull request
+/// `number` in `repo` (`close_pull_request`, a write). Never waits on a
+/// card: a close the gate refuses or asks about leaves the pull request
+/// open, and `Err` says why.
+async fn may_close_own_pr(
+    state: &WorkerState,
+    provider: &crate::agent::provider::ModelProvider,
+    repo: &str,
+    number: u64,
+) -> Result<(), String> {
+    use common::agent_policy::{Agent, Outcome, Request, Wait};
+    let ctx = provider.scope.ctx(Agent::Coder).repo(repo);
+    let gate = crate::agent::policy::gate(state, ctx, None).with_wait(Wait::Return);
+    let args = serde_json::json!({ "repo": repo, "number": number });
+    match gate
+        .check(Request {
+            tool: "close_pull_request",
+            args: &args,
+            why: "close CoderHelm's own pull request for this ticket that the work left",
+        })
+        .await
+    {
+        Outcome::Run { .. } => Ok(()),
+        Outcome::Refused { message, .. } | Outcome::Pending { message, .. } => Err(message),
+        Outcome::Stop(stop) => {
+            crate::agent::policy::record_stop(&stop);
+            Err("agents are stopped".into())
+        }
+    }
+}
+
+/// Closes CoderHelm's own pull request `p`, after the agent-permission
+/// check, with `note` posted first (once: the note has its own slot on the
+/// pull request). A note that can't be posted leaves it open. The branch is
+/// kept.
+async fn close_own_pr(
+    state: &WorkerState,
+    provider: &crate::agent::provider::ModelProvider,
+    github: &GitHubClient,
+    p: &ticket_history::EarlierPr,
+    note: &str,
+) -> Result<(), String> {
+    let Some((owner, name)) = p.repo.split_once('/') else {
+        return Err(format!("`{}` is not owner/name", p.repo));
+    };
+    may_close_own_pr(state, provider, &p.repo, p.number).await?;
+    crate::passes::conversation::github(
+        github,
+        owner,
+        name,
+        p.number,
+        common::conversation::Say::note("superseded", note),
+    )
+    .await
+    .map_err(|e| format!("could not post the note: {e}"))?;
+    github
+        .close_pull_request(owner, name, p.number)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("could not close it: {e}"))
+}
+
+/// A person's Retry of a run that worked in another repo than the one the
+/// ticket names (`repo_pick::RetryStart::StartOver`): CoderHelm's own pull
+/// requests that run left open there are closed, each with a short note
+/// naming the ticket's repo. Recorded closed in `history`, so the run's later
+/// supersede step never notes or closes them again. Returns what the run
+/// page says.
+async fn close_left_repo_prs(
+    state: &WorkerState,
+    provider: &crate::agent::provider::ModelProvider,
+    github: &GitHubClient,
+    history: &mut ticket_history::TicketHistory,
+    retried: &str,
+    left: &str,
+    named: &str,
+) -> Vec<String> {
+    let mut said = Vec::new();
+    for p in history.own_open_prs_of_run(retried, left) {
+        let note = repo_pick::left_repo_note(named, &p.repo, &p.branch);
+        match close_own_pr(state, provider, github, &p, &note).await {
+            Ok(()) => {
+                history.mark_closed(&p.repo, p.number);
+                said.push(format!(
+                    "Closed my pull request #{} in {}: the ticket names {named}",
+                    p.number, p.repo
+                ));
+            }
+            Err(why) => {
+                warn!(repo = %p.repo, pr = p.number, why = %why, "Left the earlier run's PR open");
+                said.push(format!(
+                    "Left my pull request #{} in {} open: {why}",
+                    p.number, p.repo
+                ));
+            }
+        }
+    }
+    said
 }
 
 /// Whether a GitHub login is CoderHelm's app (it opens CoderHelm's PRs).
@@ -14241,9 +14383,44 @@ async fn restore_plan_hash(state: &WorkerState, msg: &TicketMessage, context_has
         .await;
 }
 
+/// A repo switch the ticket's named repo refused
+/// (`repo_pick::switch_blocked`): the run stays, and its page says so.
+async fn stay_in_named_repo(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    named: &str,
+    suggested: &str,
+    reason: &str,
+) {
+    let here = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    warn!(
+        run_id,
+        suggested = %suggested,
+        repo = %here,
+        named = %named,
+        "Repo check suggests another repo, but the ticket names this one — staying"
+    );
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!(
+            "Stayed in {here}: the ticket names {named} as its repo ({} only suggested {suggested})",
+            if reason.is_empty() {
+                "the repo check"
+            } else {
+                reason
+            },
+        ),
+    )
+    .await;
+}
+
 /// Moves the run to `repo` before anything is built: the message, its
 /// default branch and the run record. No branch is made here. False when
-/// `repo` isn't `owner/name`.
+/// `repo` isn't `owner/name`, or when the move would leave the repo the
+/// ticket names (`named`).
 async fn switch_run_repo(
     state: &WorkerState,
     msg: &mut TicketMessage,
@@ -14251,6 +14428,7 @@ async fn switch_run_repo(
     github: &GitHubClient,
     repo: &str,
     reason: &str,
+    named: Option<&str>,
 ) -> bool {
     let Some((owner, name)) = repo
         .split_once('/')
@@ -14258,6 +14436,10 @@ async fn switch_run_repo(
     else {
         return false;
     };
+    if let Some(named) = repo_pick::switch_blocked(named, repo) {
+        stay_in_named_repo(state, msg, run_id, named, repo, reason).await;
+        return false;
+    }
     warn!(
         run_id,
         from = %format!("{}/{}", msg.repo_owner, msg.repo_name),

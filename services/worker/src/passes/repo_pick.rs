@@ -253,6 +253,55 @@ pub fn ticket_named_repo(title: &str, body: &str, repos: &[TeamRepo]) -> Option<
     only_enabled(named_repos(title, repos))
 }
 
+/// The repo the ticket names, when a switch to `to` would leave it: every
+/// repo switch asks this first and stays when it answers. Work the plan puts
+/// in another connected repo goes there as a linked pull request
+/// (`infra_repo::link_named_change`), never by moving the run. `None` when
+/// the ticket names no repo, or names `to` itself.
+pub fn switch_blocked<'a>(named: Option<&'a str>, to: &str) -> Option<&'a str> {
+    named.filter(|n| !n.eq_ignore_ascii_case(to.trim()))
+}
+
+/// How a person's Retry of an earlier run starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryStart {
+    /// The earlier run worked in this run's repo: its plan and branch are
+    /// taken up.
+    TakeUp,
+    /// The earlier run worked in another repo: this run plans again here,
+    /// and never takes up a plan made for that repo. `close_in` is that repo
+    /// when the ticket names this one: CoderHelm's own pull request the
+    /// earlier run left there is closed with a note.
+    StartOver { close_in: Option<String> },
+}
+
+/// The retry decision, from the repo the earlier run's record holds, this
+/// run's repo and the repo the ticket names. An earlier repo that isn't
+/// known (no record, or a record from before its repo was set) takes up as
+/// before.
+pub fn retry_start(earlier_repo: &str, here: &str, named: Option<&str>) -> RetryStart {
+    let earlier = earlier_repo.trim();
+    let known = earlier
+        .split_once('/')
+        .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty());
+    if !known || earlier.eq_ignore_ascii_case(here.trim()) {
+        return RetryStart::TakeUp;
+    }
+    let names_here = named.is_some_and(|n| n.eq_ignore_ascii_case(here.trim()));
+    RetryStart::StartOver {
+        close_in: names_here.then(|| earlier.to_string()),
+    }
+}
+
+/// The note on CoderHelm's own pull request in a repo the ticket doesn't
+/// name, as a retry closes it: short and neutral, naming where the work is.
+pub fn left_repo_note(named: &str, repo: &str, branch: &str) -> String {
+    format!(
+        "Closed by CoderHelm: this ticket names `{named}` as its repo, so the work continues \
+         there instead of in `{repo}`. The branch `{branch}` is kept."
+    )
+}
+
 /// Weak signal: some disabled repo's name (full or bare, any shape) appears
 /// in the ticket. When true, the code-evidence shortcut must not bypass the
 /// model, which then judges whether the ticket really means that repo.
@@ -305,6 +354,53 @@ mod tests {
                 enabled: false,
             },
         ]
+    }
+
+    #[test]
+    fn a_switch_never_leaves_the_repo_the_ticket_names() {
+        let named = Some("Acme/api");
+        assert_eq!(switch_blocked(named, "Acme/web-app"), Some("Acme/api"));
+        // Into the named repo (from a pin elsewhere) is not leaving it.
+        assert_eq!(switch_blocked(named, "acme/API"), None);
+        // A ticket that names no repo: the repo check decides as before.
+        assert_eq!(switch_blocked(None, "Acme/web-app"), None);
+    }
+
+    #[test]
+    fn a_retry_starts_over_when_the_earlier_run_worked_elsewhere() {
+        let named = Some("Acme/api");
+        assert_eq!(
+            retry_start("Acme/web-app", "Acme/api", named),
+            RetryStart::StartOver {
+                close_in: Some("Acme/web-app".into())
+            }
+        );
+        // Same repo (any case): the plan and branch are taken up.
+        assert_eq!(
+            retry_start("acme/api", "Acme/api", named),
+            RetryStart::TakeUp
+        );
+        // An earlier repo not known: as before.
+        assert_eq!(retry_start("", "Acme/api", named), RetryStart::TakeUp);
+        assert_eq!(retry_start("/", "Acme/api", named), RetryStart::TakeUp);
+        // Moved, but the ticket names no repo (or not this one): planned
+        // again, and nothing is closed on a guess.
+        assert_eq!(
+            retry_start("Acme/web-app", "Acme/api", None),
+            RetryStart::StartOver { close_in: None }
+        );
+        assert_eq!(
+            retry_start("Acme/web-app", "Acme/api", Some("Acme/docs")),
+            RetryStart::StartOver { close_in: None }
+        );
+    }
+
+    #[test]
+    fn the_close_note_says_where_the_work_is() {
+        let n = left_repo_note("Acme/api", "Acme/web-app", "coderhelm/x-1");
+        assert!(n.contains("`Acme/api`") && n.contains("`Acme/web-app`"));
+        assert!(n.contains("`coderhelm/x-1` is kept"));
+        assert!(n.len() < 240, "{n}");
     }
 
     #[test]
