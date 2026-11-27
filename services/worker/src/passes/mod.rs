@@ -2374,7 +2374,9 @@ async fn run_passes(
     }
 
     // --- Resolve repo for Jira tickets ---
-    // For Jira: explicit pin on the message > the repo of the ticket's own
+    // For Jira: explicit pin on the message > the repo the ticket names as
+    // its own (`repo_pick::ticket_named_repo`: a `Repo:` line, or a title
+    // naming one connected repo) > the repo of the ticket's own
     // pull request (CoderHelm's, merged or open, or one that names the
     // ticket) > project mapping > LLM select_repo > single repo. A repo the
     // ticket names (pinned, or plainly
@@ -2430,6 +2432,16 @@ async fn run_passes(
                         }
                     }
                 }
+            }
+        }
+
+        if resolved.is_none() && stop.is_none() {
+            if let Some(r) = repo_pick::ticket_named_repo(&msg.title, &msg.body, &team_repos) {
+                // The ticket says which repo it is for: that wins over the
+                // project's default and over the model's pick.
+                info!(run_id, repo = %r, "Repo named on the ticket itself");
+                auto_pick = Some((r.clone(), "the ticket names it as its repo.".to_string()));
+                resolved = Some(r);
             }
         }
 
@@ -3450,7 +3462,39 @@ async fn run_passes(
         )
         .await;
         let switch_to = v.switch_repo.take();
-        if let Some(again) = switch_to
+        // The repo the ticket names as its own is never left for one the
+        // plan merely mentions more: work the plan puts in another repo
+        // goes there as a linked pull request (`infra_repo::link_named_change`).
+        let named = if switch_to.is_some() && matches!(msg.source, TicketSource::Jira) {
+            let list = plan::fetch_team_repo_list(state, &msg.team_id).await;
+            repo_pick::ticket_named_repo(&msg.title, &msg.body, &list)
+        } else {
+            None
+        };
+        let here = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        if let Some(stay) = named.as_ref().filter(|n| n.eq_ignore_ascii_case(&here)) {
+            warn!(
+                run_id,
+                suggested = %switch_to.as_deref().unwrap_or_default(),
+                repo = %stay,
+                "Repo check suggests another repo, but the ticket names this one — staying"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Stayed in {stay}: the ticket names it as its repo ({} only suggested {})",
+                    if v.switch_reason.is_empty() {
+                        "the repo check"
+                    } else {
+                        v.switch_reason.as_str()
+                    },
+                    switch_to.as_deref().unwrap_or_default()
+                ),
+            )
+            .await;
+        } else if let Some(again) = switch_to
             .as_ref()
             .filter(|_| ps.switched || !ps.may_replan())
         {
@@ -3974,24 +4018,41 @@ async fn run_passes(
     // repository gets its own linked pull request, when one defines the
     // resource and the team's permissions allow it.
     let mut approved_repos: Vec<String> = Vec::new();
+    // Any other run whose plan puts part of the change in another connected
+    // repository (an `other_repo` step, or the outside change naming that
+    // repository) opens that pull request too, never a note that it "has to
+    // be made there" with stand-in work in this one.
     if fix_route == fix_location::Route::CodeAndOutside && plan_result.repo_tasks.is_empty() {
-        if let Some(ev) = log_ev.as_ref() {
-            if infra_repo::link_outside_change(
-                state,
-                &github,
-                &provider,
-                msg,
-                run_id,
-                &mut plan_result,
-                ev,
-                implement_deadline,
-            )
-            .await
-            {
-                fix_route = fix_location::Route::Code;
-                if let Some(r) = plan_result.repo_tasks.get(1) {
-                    approved_repos.push(format!("{}/{}", r.owner, r.name).to_ascii_lowercase());
-                }
+        let linked = match log_ev.as_ref() {
+            Some(ev) => {
+                infra_repo::link_outside_change(
+                    state,
+                    &github,
+                    &provider,
+                    msg,
+                    run_id,
+                    &mut plan_result,
+                    ev,
+                    implement_deadline,
+                )
+                .await
+            }
+            None => {
+                infra_repo::link_named_change(
+                    state,
+                    &provider,
+                    msg,
+                    run_id,
+                    &mut plan_result,
+                    implement_deadline,
+                )
+                .await
+            }
+        };
+        if linked {
+            fix_route = fix_location::Route::Code;
+            if let Some(r) = plan_result.repo_tasks.get(1) {
+                approved_repos.push(format!("{}/{}", r.owner, r.name).to_ascii_lowercase());
             }
         }
     }

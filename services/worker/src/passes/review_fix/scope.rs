@@ -15,7 +15,9 @@ and line it is on) and the fix as numbered hunks. For every hunk, say whether a 
 for it. \"requested\": the hunk does what a comment asks, or is needed for it to work (an \
 import, a test for the requested change, the test runner, its config, its dev dependency and \
 `test` script when a comment asks for a test in a package without one, a call site the \
-requested change forces to change, a fix for a CI failure listed with the comments). \"out_of_scope\": nothing in the comments asks \
+requested change forces to change, a fix for a CI failure listed with the comments; when a \
+comment asks to remove, cut down or make smaller something in its file, the hunks that remove or \
+shorten it there). \"out_of_scope\": nothing in the comments asks \
 for it: a similar line elsewhere the comment did not name, the same change applied to \
 neighbouring code, a refactor, a rename, reformatting, or a cleanup. When a comment names one \
 place, changes to other places that look the same are out of scope unless the comment says to \
@@ -144,6 +146,69 @@ pub fn out_of_scope(verdicts: &[Verdict]) -> Vec<usize> {
         .collect()
 }
 
+/// Words of a comment that asks for less: something taken out, cut down or
+/// made smaller.
+const ASKS_FOR_LESS: &[&str] = &[
+    "out of proportion",
+    "wider than the ticket",
+    "remove",
+    "delete",
+    "drop ",
+    "cut ",
+    "cut it",
+    "trim",
+    "shrink",
+    "smaller",
+    "fewer",
+    "too large",
+    "too big",
+    "too long",
+    "not needed",
+    "unneeded",
+    "unnecessary",
+    "nobody asked",
+    "no one asked",
+];
+
+/// Whether a comment asks for less in its file.
+pub fn asks_for_less(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ASKS_FOR_LESS.iter().any(|w| t.contains(w))
+}
+
+/// A hunk that shortens a file a comment asks to cut down is what the
+/// comment asked for, whatever the judge said: putting it back re-adds the
+/// code the comment wanted gone. A review once found "a test out of
+/// proportion to the change"; the fix cut the test down, the judge called
+/// the removals out of scope, and the round pushed nothing, twice. Returns
+/// how many verdicts it turned.
+pub fn keep_asked_removals(
+    verdicts: &mut [Verdict],
+    hunks: &[NumberedHunk],
+    requests: &[Request],
+) -> usize {
+    let mut turned = 0;
+    for v in verdicts.iter_mut().filter(|v| !v.requested) {
+        let Some(h) = hunks.iter().find(|h| h.id == v.id) else {
+            continue;
+        };
+        if h.hunk.added.len() >= h.hunk.removed.len() {
+            continue;
+        }
+        let asked = requests.iter().position(|r| {
+            r.path == h.hunk.path
+                && (asks_for_less(&r.body) || r.context.iter().any(|c| asks_for_less(c)))
+        });
+        if let Some(i) = asked {
+            v.requested = true;
+            v.comment = i + 1;
+            v.reason = "the comment asks for less in this file and the hunk shortens it".into();
+            turned += 1;
+        }
+    }
+    turned
+}
+
 /// What the scope check found, for the evidence: one line per hunk taken
 /// out, with the file and the judge's reason.
 pub fn reverted_lines(verdicts: &[Verdict], hunks: &[NumberedHunk]) -> Vec<String> {
@@ -184,6 +249,47 @@ mod tests {
         assert!(!v[1].requested);
         assert_eq!(missing, vec![3]);
         assert_eq!(out_of_scope(&v), vec![2]);
+    }
+
+    #[test]
+    fn removals_a_comment_asks_for_are_never_put_back() {
+        let hunk = |id: usize, path: &str, removed: usize, added: usize| NumberedHunk {
+            id,
+            hunk: super::super::hunks::Hunk {
+                path: path.into(),
+                old_start: 0,
+                old_end: removed,
+                new_start: 0,
+                removed: vec!["x\n".to_string(); removed],
+                added: vec!["y\n".to_string(); added],
+                before: vec![],
+                after: vec![],
+            },
+        };
+        let hunks = vec![
+            hunk(1, "e2e/theme.spec.ts", 40, 2),
+            hunk(2, "e2e/theme.spec.ts", 1, 3),
+            hunk(3, "src/other.ts", 10, 0),
+        ];
+        let requests = vec![Request {
+            path: "e2e/theme.spec.ts".into(),
+            line: Some(1),
+            body: "A test out of proportion to the change".into(),
+            context: vec![],
+        }];
+        let mut v: Vec<Verdict> = (1..=3)
+            .map(|id| Verdict {
+                id,
+                requested: false,
+                comment: 0,
+                reason: "a cleanup".into(),
+            })
+            .collect();
+        assert_eq!(keep_asked_removals(&mut v, &hunks, &requests), 1);
+        assert!(v[0].requested, "the cut-down hunk stays");
+        assert!(!v[1].requested, "a hunk that adds is still judged");
+        assert!(!v[2].requested, "another file is still judged");
+        assert!(!asks_for_less("Rename `x` to `y`"));
     }
 
     #[test]

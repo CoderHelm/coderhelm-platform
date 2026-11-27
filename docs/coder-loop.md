@@ -329,6 +329,31 @@ The causes were in the loop, not only in prompt wording:
 
    (`incidents::rp_reproduce_before_planning`)
 
+## Which repo, and when a wait ends
+
+- **The ticket's repo.** A Jira ticket that names its repo (a `Repo:` line, or a
+  title naming one connected repo) runs there. That comes before the project's
+  default repo and the model's pick, and the plan's repo check never moves the
+  run away from it (`repo_pick::ticket_named_repo`).
+- **Work in another repo.** When the plan puts part of the change in another
+  connected repo, that repo gets its own linked pull request in the same run,
+  if the team's agent permissions allow it (`infra_repo::link_named_change`).
+  An outside step that asks for a pull request elsewhere is never run against
+  this pull request; it says why (`outside_work::other_repo_pr`).
+- **Review and plan agree.** Hunks that shorten a file a review comment asks to
+  cut down are kept by the scope check. A quoted template line is never a test
+  command. Planned work in a file CoderHelm's review asked for less of, or in a
+  file whose review fix a round was refused for undoing, is not planned work
+  left (`round_agree::settled_by_review`, `finish_planned::drop_settled`).
+- **Every wait ends.** An outside step stops waiting after 30 minutes when the
+  workflow it started never shows up, 6 hours when its run never ends, a day
+  when an approval is never answered, or at once when the pull request merges
+  or closes. The run page says what it waits on and until when. The CI wait
+  follows the current head (`ci_watch::for_head`). Without Actions: write no
+  re-run is tried; the run says so once (`outside_exec::actions_write_missing`).
+
+(`incidents::vq_two_repo_ticket_runs_end`)
+
 ## What is deterministic
 
 Everything above except the model's own writing: the searches, section checks,

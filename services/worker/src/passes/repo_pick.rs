@@ -205,6 +205,54 @@ pub fn ticket_names_only_disabled(text: &str, repos: &[TeamRepo]) -> Option<Stri
     }
 }
 
+/// The labels a ticket writes its repo under, at the start of a line.
+const REPO_LABELS: &[&str] = &["repo:", "repository:", "repo -", "target repo:"];
+
+/// The repo the ticket itself names as its own, when that is plain and the
+/// repo is connected and turned on: a `Repo: owner/name` line (or
+/// `Repository:`), else a title that names exactly one connected repo. The
+/// ticket's own words win over the project's default repo and over what a
+/// plan later mentions: a ticket that said "Repo: the infra repo" in its
+/// first line was once planned in the web repo, because the plan named the
+/// web repo more often, and built a stand-in test there. `None` when the
+/// ticket names no repo, names several, or names one that is not on.
+pub fn ticket_named_repo(title: &str, body: &str, repos: &[TeamRepo]) -> Option<String> {
+    let only_enabled = |named: Vec<&TeamRepo>| -> Option<String> {
+        match named.as_slice() {
+            [one] if one.enabled => Some(one.full_name.clone()),
+            _ => None,
+        }
+    };
+    let declared: Vec<&str> = body
+        .lines()
+        .chain(title.lines())
+        .filter_map(|l| {
+            let t = l.trim().trim_start_matches(['*', '-', '#', '>', ' ']);
+            let lower = t.to_ascii_lowercase();
+            let p = REPO_LABELS.iter().find(|p| lower.starts_with(*p))?;
+            // The repo is the first word after the label; the rest of the
+            // line is the ticket's prose, which may name other repos.
+            t[p.len()..]
+                .trim_start_matches(['*', ' ', '`'])
+                .split_whitespace()
+                .next()
+                .map(|w| w.trim_matches(['*', '`', '.', ',', ';', ':', '(', ')', '"', '\'']))
+        })
+        .collect();
+    if !declared.is_empty() {
+        let mut named: Vec<&TeamRepo> = Vec::new();
+        for d in &declared {
+            for r in named_repos(d, repos) {
+                if !named.iter().any(|n| n.full_name == r.full_name) {
+                    named.push(r);
+                }
+            }
+        }
+        return only_enabled(named);
+    }
+    only_enabled(named_repos(title, repos))
+}
+
 /// Weak signal: some disabled repo's name (full or bare, any shape) appears
 /// in the ticket. When true, the code-evidence shortcut must not bypass the
 /// model, which then judges whether the ticket really means that repo.
@@ -319,6 +367,71 @@ mod tests {
             "Add a retry to the checkout button.",
             &disabled
         ));
+    }
+
+    fn harbor() -> Vec<TeamRepo> {
+        vec![
+            TeamRepo {
+                full_name: "Harbor/harbor".into(),
+                enabled: true,
+            },
+            TeamRepo {
+                full_name: "Harbor/harbor-infra".into(),
+                enabled: true,
+            },
+            TeamRepo {
+                full_name: "Harbor/harbor-docs".into(),
+                enabled: false,
+            },
+        ]
+    }
+
+    /// The ticket's `Repo:` line is the repo, even when its body talks
+    /// about the web repo's page more than once.
+    #[test]
+    fn a_repo_line_on_the_ticket_names_its_repo() {
+        let body = "Summary\nRepo: Harbor/harbor-infra. Add the `theme` key to the feature \
+                    list. The page in Harbor/harbor reads it; Harbor/harbor needs nothing.";
+        assert_eq!(
+            ticket_named_repo("Feature flag for the theme parameter", body, &harbor()),
+            Some("Harbor/harbor-infra".into())
+        );
+        // A bare distinctive name on the line works too.
+        assert_eq!(
+            ticket_named_repo("x", "**Repository:** harbor-infra", &harbor()),
+            Some("Harbor/harbor-infra".into())
+        );
+    }
+
+    #[test]
+    fn a_title_naming_one_connected_repo_names_it() {
+        assert_eq!(
+            ticket_named_repo(
+                "Add the theme key to the feature list (harbor-infra)",
+                "",
+                &harbor()
+            ),
+            Some("Harbor/harbor-infra".into())
+        );
+    }
+
+    #[test]
+    fn several_names_a_disabled_one_or_none_leave_the_pick_to_routing() {
+        let r = harbor();
+        assert_eq!(
+            ticket_named_repo("x", "Repo: Harbor/harbor-infra\nRepo: Harbor/harbor", &r),
+            None
+        );
+        assert_eq!(ticket_named_repo("x", "Repo: Harbor/harbor-docs", &r), None);
+        assert_eq!(
+            ticket_named_repo("Fix the header", "No repo said.", &r),
+            None
+        );
+        // A name glued to other name characters is no mention.
+        assert_eq!(
+            ticket_named_repo("Rename harbor-infra_feature_list", "", &r),
+            None
+        );
     }
 
     #[test]

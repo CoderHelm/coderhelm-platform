@@ -2651,6 +2651,16 @@ fn is_staging_route(r: &Route) -> bool {
 /// The action for a CoderHelm step.
 pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
     let target = s.target();
+    // A code change in another repository is no step this executor can do
+    // on this pull request (it once ran the infra repo's checks on the web
+    // repo's head and waited a day): the run makes it as a linked pull
+    // request (`infra_repo::link_named_change`).
+    if let Some(repo) = other_repo_pr(s, c) {
+        return Action::Cannot(format!(
+            "the change belongs in {repo}, another repository: it is made by a linked pull \
+             request there, which this run's plan did not open"
+        ));
+    }
     // Labels on the pull request: added through the issues API, whatever
     // workflow they start. A route that runs on one of them is waited for.
     let labels = s.labels_named();
@@ -2726,6 +2736,24 @@ pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
         StepKind::Content | StepKind::Migration => Action::Write(target),
         StepKind::Verify | StepKind::Other => check_action(s, a, c),
     }
+}
+
+/// The other repository a step asks for a pull request in ("PR in
+/// owner/name", "pull request against owner/name"), when it is not the
+/// repository the steps run on.
+pub fn other_repo_pr(s: &NoteStep, c: &OutsideChange) -> Option<String> {
+    static PR_IN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PR_IN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:pr|pull request)\s+(?:in|on|to|against|for)\s+`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+        )
+        .expect("valid regex")
+    });
+    let here = c.placed.as_ref().map(|p| p.repo.as_str()).unwrap_or("");
+    let words = format!("{} {}", s.step, s.how);
+    re.captures_iter(&words)
+        .map(|m| m[1].trim_end_matches(['.', ',', ';', ':', '`']).to_string())
+        .find(|r| !here.is_empty() && !r.eq_ignore_ascii_case(here))
 }
 
 /// The mutations a step runs: its own, else the ones in its migration file
@@ -3270,5 +3298,47 @@ mod tests {
         };
         assert_eq!(outside_repo(&none, &repos), Some(&repos[0]));
         assert_eq!(outside_repo(&none, &[]), None);
+    }
+
+    /// A step asking for a pull request in another repository is no step
+    /// on this one: it is never run as this head's checks, it says why.
+    #[test]
+    fn a_pull_request_in_another_repo_is_not_this_executors_step() {
+        let c = OutsideChange {
+            placed: Some(Placement {
+                repo: "harbor/harbor".into(),
+                branch: "coderhelm/theme-key".into(),
+                pr_number: 7,
+            }),
+            ..Default::default()
+        };
+        let s = NoteStep {
+            how: "PR in harbor/harbor-infra; CI lint and plan".into(),
+            kind: "other".into(),
+            ..step(
+                "coderhelm",
+                "Open the infra PR with the feature list entry; run its checks",
+            )
+        };
+        assert_eq!(
+            other_repo_pr(&s, &c).as_deref(),
+            Some("harbor/harbor-infra")
+        );
+        match action_for(&s, &Abilities::default(), &c) {
+            Action::Cannot(why) => assert!(why.contains("linked pull request"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // A pull request on this repository is its own step.
+        let own = NoteStep {
+            how: "PR on harbor/harbor".into(),
+            ..step("coderhelm", "Read the checks")
+        };
+        assert_eq!(other_repo_pr(&own, &c), None);
+        // A file path is no repository.
+        let path = NoteStep {
+            how: "run e2e/tests/site.spec.ts".into(),
+            ..step("coderhelm", "Run the spec")
+        };
+        assert_eq!(other_repo_pr(&path, &c), None);
     }
 }

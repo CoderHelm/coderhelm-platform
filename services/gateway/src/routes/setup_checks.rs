@@ -205,7 +205,7 @@ pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str, &str)] = &[
         "actions",
         "write",
         "Actions",
-        "Without Actions: write, CoderHelm can't start a workflow itself (a deploy, an end-to-end run): it adds the label that starts one where the workflow has one, and otherwise the step waits.",
+        "Without Actions: write, CoderHelm can't start a workflow itself (a deploy, an end-to-end run) or re-run a failed job: it adds the label that starts one where the workflow has one, and says once on the run that a re-run was not possible.",
     ),
 ];
 
@@ -489,10 +489,10 @@ pub fn github_workflow_starts(app: &Value) -> Check {
         G,
         "Starting workflows",
         format!(
-            "The GitHub app needs Actions: write to start workflows with workflow_dispatch; it has Actions: {got}."
+            "The GitHub app needs Actions: write to start workflows with workflow_dispatch and to re-run failed jobs; it has Actions: {got}."
         ),
         "CoderHelm starts workflows through the pull request labels they run on and reads end-to-end results from the checks, runs, comments and published report; nothing on a pull request asks a person for this.",
-        Fix::text("Only if the team wants CoderHelm to start workflows itself: set Actions to Read and write on the app's Permissions and events page; an organization owner accepts the permission update once.")
+        Fix::text("Only if the team wants CoderHelm to start workflows and re-run failed jobs itself: set Actions to Read and write on the app's Permissions and events page; an organization owner accepts the permission update once.")
             .url(format!("{}/permissions", app_settings_url(app))),
     )
 }
