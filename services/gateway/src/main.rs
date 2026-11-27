@@ -2011,6 +2011,9 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
             "/jira/trigger/:install_id/:trigger/:token",
             post(routes::hybrid_jira::trigger),
         )
+        // How a release did on an install, when its admin turned the report
+        // on: stable promotion waits for it (routes::hybrid_release).
+        .route("/releases/evidence", post(routes::hybrid_release::evidence))
         // Support tickets from installs (routes::hybrid_support).
         .route("/support/tickets", post(routes::hybrid_support::tickets))
         .route("/support/messages", post(routes::hybrid_support::messages))

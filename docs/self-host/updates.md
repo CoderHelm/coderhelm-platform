@@ -24,15 +24,19 @@ The first self-host release is **v0.7.0**. Older `v0.2.x` to `v0.6.0` tags in th
 
 Each install follows one channel, chosen in **Settings, then System, then Automatic updates**:
 
-- **Stable** *(the default)*: releases that have run as a beta for a day with no reported problem. Version numbers look like `v0.8.38`.
+- **Stable** *(the default)*: betas that live installs showed working. Version numbers look like `v0.8.38`.
 - **Beta (nightly)**: a new build of `main` each night that anything in a self-host release changed, the morning after it merged. Version numbers look like `v0.8.38-beta.20261105`. Beta installs get stable releases too.
 
 How a release moves from one to the other:
 
 1. **Every night** (at 06:17 UTC), when anything in a self-host release changed on `main` since the last release, CoderHelm cuts a beta from the commit the hosted service runs. It is signed and checked exactly like a stable release, and published on GitHub as a prerelease. Each beta gets its own version number, one above the last release of either kind.
-2. **A day later** (each day at 10:17 UTC), the newest beta that has been out for at least 24 hours becomes stable: the same commit, released again as the same number without the suffix (`v0.8.38-beta.20261105` becomes `v0.8.38`). It has its own tag, signature and files, checked the same way as every release.
-3. **A reported problem holds it.** A beta stays on the beta channel while an open issue with the `release-blocker` label in [the repository](https://github.com/CoderHelm/coderhelm-platform/issues) names it (or the stable version it would become). The next clean beta is promoted instead. Installs don't send update results to CoderHelm, so this label is the only signal: if an update to a beta fails or rolls back for you, open an issue that names the version.
-4. **An urgent fix** can go out the same day: a maintainer promotes a beta right away, or releases the commit the hosted service runs straight to stable.
+2. **It becomes stable on evidence, never on age.** A beta is promoted only when a live install on the beta channel reported it installed, with its post-update watch ended healthy, and real work finished on it: at least one run, and at least one Chat answer when that install uses Chat. Those reports come from installs whose admin turned on [the release report](#the-release-report). The newest such beta becomes stable: the same commit, released again as the same number without the suffix (`v0.8.38-beta.20261105` becomes `v0.8.38`), with its own tag, signature and files. Its release notes say what the evidence was (counts only). The promotion runs after every beta is published and once a day at 10:17 UTC as a backstop, so it never waits on GitHub's schedule.
+3. **A regression found in a beta holds it for good.** A beta is never promoted when an install rolled it back, or while an open issue with the `release-blocker` label in [the repository](https://github.com/CoderHelm/coderhelm-platform/issues) names it (or the stable version it would become). A newer beta that carries the fix is promoted on its own evidence instead. A beta that broke something the watch doesn't probe (Chat, say) never collects the evidence it needs, so it never becomes stable either.
+4. **An urgent fix** can go out the same day: a maintainer releases the commit the hosted service runs straight to stable.
+
+### The release report
+
+**Settings, then System**, `report` in the API (`PUT /api/system/auto-update` with `"report": true`; off by default). When it is on, the hourly update check tells CoderHelm how the release that last finished its post-update watch did on this install: its version, whether the watch ended healthy or rolled it back, how many runs and how many Chat answers finished on it, and whether this install uses Chat at all. Nothing else is sent: no team, person, repository, ticket or text. It goes signed with the install's [hybrid registration](./hybrid.md), so an install without one sends nothing. Stable promotion waits for such a report, so a beta install that turns it on helps every stable install.
 
 Switching from Beta to Stable never goes back to an older version: the install stays on its beta until a newer stable release is out. The stable release of the same number counts as newer (`v0.8.38` comes after `v0.8.38-beta.20261105`), so that is usually the next day.
 

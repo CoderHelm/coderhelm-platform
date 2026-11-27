@@ -646,6 +646,24 @@ test("the release roles: only release.yml on a v* tag in the approved release en
   ]);
   w.hasOutput("ReleasePublisherRoleArn", {});
   w.hasOutput("ReleaseLatestRoleArn", {});
+  // Release evidence: auto-release.yml on main in release-auto, one Query on one partition.
+  const evidenceRole = Object.values(w.findResources("AWS::IAM::Role")).find((r: any) => r.Properties.RoleName === "coderhelm-prod-release-evidence") as any;
+  assert.equal(evidenceRole.Properties.AssumeRolePolicyDocument.Statement.length, 1, "one way in");
+  assert.deepEqual(evidenceRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition, {
+    StringEquals: {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:environment:release-auto",
+      "token.actions.githubusercontent.com:job_workflow_ref": "CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main",
+      "token.actions.githubusercontent.com:ref": "refs/heads/main",
+    },
+  });
+  const evidencePolicies = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes("ReleaseEvidenceRole"));
+  assert.equal(evidencePolicies.length, 1);
+  const evidenceStatements = plainStatements(evidencePolicies[0].Properties.PolicyDocument.Statement);
+  assert.deepEqual(evidenceStatements.map((st: any) => st.Action), ["dynamodb:Query", "kms:Decrypt"]);
+  assert.deepEqual(evidenceStatements[0].Condition, { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["RELEASE_EVIDENCE"] } });
+  assert.ok(evidenceStatements[1].Condition.StringEquals["kms:ViaService"]);
+  w.hasOutput("ReleaseEvidenceRoleArn", {});
   // The workflow writes templates only with If-None-Match, and latest.json only with the second role.
   const wf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "release.yml"), "utf8");
   // Templates go up through .github/scripts/publish-once.sh; latest.json in the workflow.
@@ -692,6 +710,7 @@ test("the release roles: only release.yml on a v* tag in the approved release en
   const sh = synth(selfHost());
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-publisher"));
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-latest"));
+  assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-evidence"));
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("jira-app-latest"));
 });
 

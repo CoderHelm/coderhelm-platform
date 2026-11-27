@@ -7,23 +7,37 @@ name: Auto release
 #   beta     nightly: vX.Y.Z-beta.YYYYMMDD of main's deployed head, when
 #            anything that ships changed since the last release. A GitHub
 #            prerelease; launch/beta.json names it.
-#   stable   vX.Y.Z: the newest beta, promoted once it has been out for a day
-#            with no open "release-blocker" issue naming it (same commit,
-#            same number without the suffix); or, for an urgent fix, cut
-#            straight from the deployed commit (deploy.yml run by hand with
-#            "stable release", or this file by hand with mode stable).
-#            launch/latest.json names it (and beta.json, when newer).
+#   stable   vX.Y.Z: the newest beta proven on a live install, promoted
+#            on that evidence, never on age (same commit, same number
+#            without the suffix; .github/scripts/auto_release.py, "ready"):
+#            an install reported it installed with a healthy post-update
+#            watch and real work finished on it (a run, and a Chat answer
+#            where Chat is used), and no regression was found in it (no
+#            install rolled it back, no open "release-blocker" issue names
+#            it). Or, for an urgent fix, cut straight from the deployed
+#            commit (deploy.yml run by hand with "stable release", or this
+#            file by hand with mode stable). launch/latest.json names it
+#            (and beta.json, when newer).
 #
 # What starts it:
 #   schedule 06:17     nightly: tonight's beta (once main's head is deployed).
-#   schedule 10:17     the promotion: the newest beta out for a day becomes
-#                      stable. Hours after the nightly run, so last night's
-#                      beta (published by about 08:00) is a full day old.
+#   a beta's publish   the promotion, right after each beta is published (a
+#                      run of this file by hand, mode promote): GitHub's
+#                      schedule can start hours late, so promotion never
+#                      waits on it.
+#   schedule 10:17     the promotion again, as a backstop. Running it twice
+#                      changes nothing: a stable tag is created once, and a
+#                      beta whose stable release exists is skipped.
 #   deploy.yml         after its CDK deploy, by hand with "stable release":
 #                      a stable release of exactly the commit it deployed.
 #   by hand            mode promote (the newest ready beta, or the one in
-#                      "version", whatever its age), beta or stable (main's
-#                      head, once deployed).
+#                      "version", once it is ready too), beta or stable
+#                      (main's head, once deployed).
+#
+#   evidence  promotions only, in "release-auto": reads the installs'
+#             release reports (one Query of the RELEASE_EVIDENCE partition
+#             of the settings table, with a role that may read nothing
+#             else: infra/lib/worker-stack.ts). Counts only, no install id.
 #
 #   plan      on refs/heads/main only: what to release
 #             (.github/scripts/auto_release.py), or a skip.
@@ -70,6 +84,10 @@ on:
     secrets:
       AWS_ACCOUNT_ID:
         required: true
+      # Kept in the "release-auto" environment, which wins over anything a
+      # caller passes; named here only so a called run may read it.
+      RELEASE_TAG_APP_KEY:
+        required: false
   workflow_dispatch:
     inputs:
       mode:
@@ -79,13 +97,13 @@ on:
         options: [promote, beta, stable]
         default: promote
       version:
-        description: "promote only: the beta (vX.Y.Z-beta.YYYYMMDD) or the stable vX.Y.Z it becomes. Empty: the newest beta out for a day."
+        description: "promote only: the beta (vX.Y.Z-beta.YYYYMMDD) or the stable vX.Y.Z it becomes, once proven on a live install. Empty: the newest proven beta."
         required: false
         type: string
   schedule:
     # Nightly, 06:17 UTC: tonight's beta.
     - cron: "17 6 * * *"
-    # 10:17 UTC: promote the newest beta that has been out for a day.
+    # 10:17 UTC: the promotion's backstop (each beta's publish starts one too).
     - cron: "17 10 * * *"
 
 permissions: {}
@@ -96,8 +114,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The installs' release reports, for a promotion. Nothing from the
+  # repository runs here. A failure leaves the reports out, and a promotion
+  # without them promotes nothing.
+  evidence:
+    name: Release reports from live installs
+    if: (github.event_name == 'workflow_dispatch' && inputs.mode == 'promote') || (github.event_name == 'schedule' && github.event.schedule == '17 10 * * *')
+    runs-on: ubuntu-latest
+    environment: release-auto
+    permissions:
+      id-token: write # the AWS role
+    outputs:
+      reports: ${{ steps.read.outputs.reports }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-evidence
+          role-duration-seconds: 900
+          aws-region: us-east-1
+      - id: read
+        name: Read the reports
+        run: |
+          aws dynamodb query --table-name coderhelm-prod-settings \
+            --key-condition-expression "pk = :p" --expression-attribute-values '{":p":{"S":"RELEASE_EVIDENCE"}}' \
+            --projection-expression "#v, watch, runs, answers, chat" --expression-attribute-names '{"#v":"version"}' \
+            --output json > "$RUNNER_TEMP/reports.json"
+          echo "reports=$(jq -c '{Items: .Items}' "$RUNNER_TEMP/reports.json")" >> "$GITHUB_OUTPUT"
+          echo "$(jq '.Items | length' "$RUNNER_TEMP/reports.json") report(s)"
+
   plan:
     name: Plan the releases
+    needs: evidence
+    # Also when there is no evidence job (not a promotion) or it failed.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -201,6 +250,7 @@ jobs:
           COMMIT: ${{ steps.guard.outputs.commit }}
           CI_RED: ${{ steps.ci.outputs.red }}
           VERSION: ${{ inputs.version }}
+          REPORTS: ${{ needs.evidence.outputs.reports }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$MODE" = nightly ]; then
@@ -213,6 +263,11 @@ jobs:
           args=(--repo "$GITHUB_REPOSITORY" --mode "$MODE" --notes-dir "$RUNNER_TEMP/notes" --github-output "$GITHUB_OUTPUT")
           [ -n "$COMMIT" ] && args+=(--commit "$COMMIT")
           [ "$MODE" = promote ] && [ -n "$VERSION" ] && args+=(--version "$VERSION")
+          # The installs' reports; none read (empty) promotes nothing.
+          if [ "$MODE" = promote ] && [ -n "$REPORTS" ]; then
+            printf '%s' "$REPORTS" > "$RUNNER_TEMP/reports.json"
+            args+=(--evidence "$RUNNER_TEMP/reports.json")
+          fi
           python3 .github/scripts/auto_release.py plan "${args[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.plan.outputs.count != '0'
@@ -320,18 +375,38 @@ jobs:
         if: matrix.kind != 'promote'
         with:
           subject-path: ${{ runner.temp }}/*.release-tag
+      # Creating a v* ref on a commit whose workflow files differ from main's
+      # (a promoted beta, once main moved on and changed a workflow) needs
+      # the "workflows" permission, which this run's own token can never
+      # have: GitHub answers 403 "Resource not accessible by integration".
+      # The release-tag App's token (Contents and Workflows, this repository
+      # only; docs/self-host/updates-security.md, "The release-tag App")
+      # creates the ref when the App is set up in "release-auto". Without it,
+      # the run's token is used, as before.
+      - id: app
+        name: The release-tag App's token
+        if: vars.RELEASE_TAG_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_TAG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_TAG_APP_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
       # The annotated tag carries the signature (base64 of the bundle) in its
       # message; a beta's also carries its stable tag's. Creating the ref
-      # fails when it exists, so nothing is moved.
+      # fails when it exists, so nothing is moved. A refusal prints GitHub's
+      # whole answer, with the permissions it wanted.
       - name: Create the tag
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: |
           msg="$RUNNER_TEMP/tag-message"
           {
             case "$KIND" in
               stable) printf '%s\n\nReleased automatically by .github/workflows/auto-release.yml after the deploy of main at %s.\n' "$TAG" "$COMMIT" ;;
-              beta) printf '%s\n\nBeta (nightly) release, cut automatically by .github/workflows/auto-release.yml from main at %s.\nIt becomes %s on the stable channel after a day with no reported problem.\n' "$TAG" "$COMMIT" "$STABLE_TAG" ;;
+              beta) printf '%s\n\nBeta (nightly) release, cut automatically by .github/workflows/auto-release.yml from main at %s.\nIt becomes %s on the stable channel once a live install shows it working.\n' "$TAG" "$COMMIT" "$STABLE_TAG" ;;
               promote) printf '%s\n\nStable release: the beta %s (main at %s), promoted by .github/workflows/auto-release.yml.\n' "$TAG" "$BETA" "$COMMIT" ;;
             esac
             printf 'How to check it: docs/self-host/updates-security.md\n\n'
@@ -345,9 +420,19 @@ jobs:
               echo "-----END CODERHELM STABLE ATTESTATION-----"
             fi
           } > "$msg"
-          obj=$(jq -n --rawfile m "$msg" --arg t "$TAG" --arg o "$COMMIT" '{tag: $t, message: $m, object: $o, type: "commit"}' \
-            | gh api "repos/$GITHUB_REPOSITORY/git/tags" --input - --jq .sha)
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$obj" >/dev/null
+          call() {
+            local what="$1"; shift
+            if ! out=$(gh api -i "$@" 2>&1); then
+              echo "::error::$what was refused. GitHub's answer:" >&2
+              printf '%s\n' "$out" | grep -viE '^(authorization|set-cookie):' >&2
+              exit 1
+            fi
+            printf '%s\n' "$out" | sed '1,/^\r\{0,1\}$/d'
+          }
+          jq -n --rawfile m "$msg" --arg t "$TAG" --arg o "$COMMIT" '{tag: $t, message: $m, object: $o, type: "commit"}' > "$RUNNER_TEMP/tag.json"
+          obj=$(call "Creating the tag object" "repos/$GITHUB_REPOSITORY/git/tags" --input "$RUNNER_TEMP/tag.json" | jq -r .sha)
+          [[ "$obj" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no tag object"; exit 1; }
+          GH_TOKEN="$REF_TOKEN" call "Creating refs/tags/$TAG" "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$obj" >/dev/null
           echo "Created $TAG ($obj) on $COMMIT"
       # The tag, fetched back from GitHub, checks out as installs check it
       # (main's installer code).
@@ -364,10 +449,18 @@ jobs:
             const commit = await verifySourceTag(process.env.TAG, { runner: new Runner({ log: () => {} }), log: console.log });
             if (commit !== process.env.COMMIT) { console.error(`the tag points to ${commit}, not ${process.env.COMMIT}`); process.exit(1); }
           '
+      # A tag the App created starts release.yml by itself (its push); one the
+      # run's token created doesn't. Either way it starts once.
       - name: Start the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref "$TAG"
+        run: |
+          for _ in $(seq 1 6); do
+            n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --branch "$TAG" --limit 5 --json headSha --jq "[.[] | select(.headSha == \"$COMMIT\")] | length")
+            if [ "$n" -gt 0 ]; then echo "Release started by the tag's push"; exit 0; fi
+            sleep 10
+          done
+          gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref "$TAG"
 
   publish:
     name: Publish ${{ matrix.tag }}
@@ -386,7 +479,7 @@ jobs:
     permissions:
       contents: write # the release notes
       id-token: write # the AWS roles
-      actions: read # the Release run
+      actions: write # the Release run; start the promotion after a beta
     env:
       KIND: ${{ matrix.kind }}
       CHANNEL: ${{ matrix.channel }}
@@ -404,7 +497,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1 || { echo "::error::$TAG was not created (see its Attest and tag job)"; exit 1; }
           id=""
           for _ in $(seq 1 60); do
-            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch --branch "$TAG" --limit 5 --json databaseId,headBranch,headSha \
+            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --branch "$TAG" --limit 5 --json databaseId,headBranch,headSha \
               --jq "[.[] | select(.headBranch == \"$TAG\" and .headSha == \"$COMMIT\")][0].databaseId // empty")
             [ -n "$id" ] && break
             sleep 10
@@ -559,10 +652,9 @@ jobs:
           {
             case "$KIND" in
               stable) echo "Self-host release ${TAG}, cut right away after the deploy of main at ${COMMIT}." ;;
-              beta) echo "Beta (nightly) self-host release ${TAG}, from main at ${COMMIT}. Installs on the Beta channel get it. It becomes ${STABLE_TAG} on the Stable channel after a day with no reported problem." ;;
+              beta) echo "Beta (nightly) self-host release ${TAG}, from main at ${COMMIT}. Installs on the Beta channel get it. It becomes ${STABLE_TAG} on the Stable channel once a live install shows it working (see that release's notes)." ;;
               promote)
-                if [ "$MODE" = promote ]; then how="promoted by a maintainer"; else how="promoted after a day on the Beta channel with no reported problem"; fi
-                echo "Self-host release ${TAG}: the beta ${BETA} (main at ${COMMIT}), ${how}." ;;
+                echo "Self-host release ${TAG}: the beta ${BETA} (main at ${COMMIT}), promoted on evidence from live installs (below)." ;;
             esac
             echo
             echo "Install: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} init\`, then deploy. Update: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}\`. Check an install: \`npx -y github:${GITHUB_REPOSITORY} doctor\`. Verify it yourself: docs/self-host/updates-security.md."
@@ -573,3 +665,11 @@ jobs:
           url=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url)
           { echo "### Released [$TAG]($url)"; echo; cat "$f"; } >> "$GITHUB_STEP_SUMMARY"
           echo "Released $TAG: $url"
+      # Each beta's publish starts the promotion (the schedule is a backstop):
+      # the newest beta proven on a live install becomes stable, whenever
+      # that is. A queued promotion runs after this run (one at a time).
+      - name: Start the promotion
+        if: matrix.kind == 'beta'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run auto-release.yml -R "$GITHUB_REPOSITORY" --ref main -f mode=promote

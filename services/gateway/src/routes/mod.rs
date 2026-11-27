@@ -47,6 +47,7 @@ pub mod hybrid_admin;
 pub mod hybrid_email;
 pub mod hybrid_install;
 pub mod hybrid_jira;
+pub mod hybrid_release;
 pub mod hybrid_support;
 pub mod infra_security;
 pub mod infrastructure;

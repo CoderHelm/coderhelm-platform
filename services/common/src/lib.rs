@@ -142,6 +142,8 @@ pub mod log_incident;
 pub mod one_run;
 /// Reachability read from the code: imports, calls, lockfile parents.
 pub mod reachability;
+/// Counts of finished runs and Chat answers per release (release evidence).
+pub mod release_use;
 /// One repo's reviewer settings: the page's view and the saved item.
 pub mod review_config;
 /// Language runtimes (a JDK, Node.js, Python, Go) against their own advisories.

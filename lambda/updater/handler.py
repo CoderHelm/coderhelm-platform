@@ -159,6 +159,11 @@ DEFAULT_SETTINGS = {
     "majors": "ask",
     # The "What's new" email: weekly, biweekly or off.
     "digest": "weekly",
+    # Tell CoderHelm how each release did here (`release_report`): the
+    # version, how the post-update watch ended, and how many runs and Chat
+    # answers finished on it. Nothing else. Stable promotion waits for such
+    # a report from a live install, so a beta install helps by turning it on.
+    "report": False,
 }
 DIGESTS = {"weekly": timedelta(days=7), "biweekly": timedelta(days=14), "off": None}
 
@@ -258,6 +263,10 @@ def validate_settings(raw, base=None):
         if raw["digest"] not in DIGESTS:
             raise ValueError("digest: weekly, biweekly or off")
         s["digest"] = raw["digest"]
+    if "report" in raw:
+        if not isinstance(raw["report"], bool):
+            raise ValueError("report: true or false")
+        s["report"] = raw["report"]
     return s
 
 
@@ -4791,6 +4800,73 @@ def watch_step(store, env, now, health=None, metrics=None, cfn=None):
         return None
 
 
+# ── Release evidence ──────────────────────────────────────────────────────
+#
+# With the `report` setting on, the hourly check tells CoderHelm how the
+# release whose post-update watch ended did here: its version, the watch's
+# end (healthy, or rolled back), and how many runs and Chat answers finished
+# on it (common::release_use counts them on this install's settings table),
+# plus whether this install uses Chat at all. Signed with the install's
+# hybrid registration (services/gateway/src/routes/hybrid_release.rs). No
+# team, person, repository or text is ever sent. Stable promotion
+# (.github/scripts/auto_release.py) waits for such a report.
+
+RELEASE_USE_PK = "RELEASE_USE"
+REPORT_PATH = "/hybrid/releases/evidence"
+REPORTED = "RELEASE_REPORTED"
+WATCH_ENDS = {"healthy": "healthy", "rolled_back": "rolled_back"}
+
+
+def release_use(store):
+    """{version: {"runs": n, "answers": n}} from this install's counts."""
+    out, start = {}, None
+    for _ in range(20):
+        kw = {"TableName": store.t, "KeyConditionExpression": "pk = :p",
+              "ExpressionAttributeValues": {":p": {"S": RELEASE_USE_PK}}}
+        if start:
+            kw["ExclusiveStartKey"] = start
+        page = store.c.query(**kw)
+        for i in page.get("Items") or []:
+            v = (i.get("sk") or {}).get("S", "").removeprefix("VERSION#")
+            num = lambda k: int(float((i.get(k) or {}).get("N") or 0))  # noqa: E731
+            out[v] = {"runs": num("runs"), "answers": num("answers")}
+        start = page.get("LastEvaluatedKey")
+        if not start:
+            break
+    return out
+
+
+def release_report_body(w, use):
+    """The report for a watch that ended, or None when there is nothing to say."""
+    watch = WATCH_ENDS.get((w or {}).get("status"))
+    v = (w or {}).get("version") or ""
+    if not watch or not parse_version(v):
+        return None
+    mine = use.get(v) or {}
+    return {"version": v, "watch": watch, "runs": int(mine.get("runs") or 0), "answers": int(mine.get("answers") or 0),
+            "chat": any(int(c.get("answers") or 0) > 0 for c in use.values())}
+
+
+def release_report(store, env, now, settings, send=None):
+    """Send the report when it is on and says something new. Never fails the check."""
+    if not settings.get("report"):
+        return None
+    try:
+        body = release_report_body(store.get(WATCH), release_use(store))
+        if not body or store.get(REPORTED) == body:
+            return None
+        creds = relay_credentials(env)
+        if not creds:
+            logger.warning("Release report not sent: this install isn't registered with CoderHelm")
+            return None
+        (send or relay_call)(env, creds, REPORT_PATH, body)
+        store.put(REPORTED, body)
+        return body
+    except Exception as e:  # noqa: BLE001  the next hourly check sends it again
+        logger.warning(f"Release report not sent: {e}")
+        return None
+
+
 def mark_unhealthy(store, now, w, why):
     """The update's own row says what was seen, and auto-update never takes
     that release again by itself (an admin can still press Update)."""
@@ -5799,6 +5875,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
                     d = dict(d, action="none", reason="AWS is busy, retrying at the next check")
         remind_waiting(store, env, now, current)
         send_digest(store, env, now, settings, rel, current)
+        release_report(store, env, now, settings)
         logger.info(json.dumps(d))
         return d
 
