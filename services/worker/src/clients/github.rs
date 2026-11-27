@@ -101,7 +101,7 @@ async fn ok_or_body(
         &body,
         now,
     ) {
-        Some(wait_secs) => Err(Box::new(RateLimited { wait_secs, message })),
+        Some(wait_secs) => Err(Box::new(RateLimited::logged(wait_secs, message, "github"))),
         None => Err(message.into()),
     }
 }
@@ -158,6 +158,20 @@ impl std::fmt::Display for RateLimited {
 }
 
 impl std::error::Error for RateLimited {}
+
+impl RateLimited {
+    /// The error, logged once as the structured rate-limit line
+    /// (`common::github_budget::RATE_LIMITED_EVENT`) the install alarms on.
+    fn logged(wait_secs: u64, message: String, source: &'static str) -> Self {
+        tracing::warn!(
+            event = common::github_budget::RATE_LIMITED_EVENT,
+            source,
+            wait_secs,
+            "GitHub request rate limited: {message}"
+        );
+        RateLimited { wait_secs, message }
+    }
+}
 
 #[cfg(test)]
 impl RateLimited {
@@ -1582,10 +1596,11 @@ impl GitHubClient {
             super::github_budget::admit(self.installation_id, now)
         {
             let url = built.as_ref().map(|r| r.url().as_str()).unwrap_or("");
-            return Err(Box::new(RateLimited {
-                wait_secs: wait_secs.max(1),
-                message: not_sent_message(url, why),
-            }));
+            return Err(Box::new(RateLimited::logged(
+                wait_secs.max(1),
+                not_sent_message(url, why),
+                "budget",
+            )));
         }
         let resp = match req.send().await {
             Ok(r) => r,

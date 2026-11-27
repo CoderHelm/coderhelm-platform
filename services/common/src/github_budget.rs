@@ -228,6 +228,12 @@ impl Budget {
     }
 }
 
+/// The structured line each GitHub rate limit is logged with, refused by
+/// GitHub or held back here (`source`: "github" or "budget"). The install's
+/// alarm (infra/lib/monitoring-stack.ts) reads it against the worker's
+/// invocations, so a spent budget is seen while every caller still catches it.
+pub const RATE_LIMITED_EVENT: &str = "github_rate_limited";
+
 /// Why a request isn't sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {

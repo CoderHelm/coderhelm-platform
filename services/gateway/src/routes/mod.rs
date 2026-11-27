@@ -109,6 +109,7 @@ pub mod staging_cms;
 pub mod stale_prs;
 #[cfg(test)]
 mod stream_access;
+pub mod stream_probe;
 pub mod support;
 pub mod support_access;
 pub mod system;

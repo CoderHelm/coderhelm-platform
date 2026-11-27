@@ -474,6 +474,15 @@ export class UpdatesStack extends cdk.Stack {
       resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
     }));
 
+    // Chat runs in its own function and role: the watch after an update asks
+    // it to make Chat's own calls (services/gateway/src/routes/stream_probe.rs),
+    // so a grant Chat lost rolls the release back like a failing worker.
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "ProbeChatAfterUpdate",
+      actions: ["lambda:InvokeFunction"],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-streaming`],
+    }));
+
     // After an update the updater watches the new release (lambda/updater,
     // watch_step): it probes the worker through ModelCheckThroughWorker above,
     // and reads the worker's and the gateway's Errors and Invocations against
