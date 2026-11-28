@@ -4322,6 +4322,17 @@
               "null"
             ]
           },
+          "own_review": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunOwnReview",
+                "description": "CoderHelm's own review of the pull request: how many findings are\nopen, after how many fix rounds, and each one. While one is open its\nreview asks for changes and auto-merge holds. Null before it\nreviewed."
+              }
+            ]
+          },
           "pass_history": {
             "description": "The steps it went through, in order.",
             "examples": [
@@ -5451,6 +5462,69 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RunOwnReview": {
+        "description": "CoderHelm's own review of the run's pull request: how many findings are\nopen and what each one is.",
+        "properties": {
+          "for_a_person": {
+            "description": "Findings only a person can settle, with what they do.",
+            "examples": [
+              []
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "noted": {
+            "description": "Findings CoderHelm's rounds left open after every approach they\nhave: listed on the pull request as CoderHelm's note, never approved\nover.",
+            "examples": [
+              []
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "open": {
+            "description": "Findings open at CoderHelm's last review of the head. While above\nzero, CoderHelm's review asks for changes and auto-merge holds.",
+            "examples": [
+              1
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "open_findings": {
+            "description": "The open findings, as the review listed them.",
+            "examples": [
+              [
+                "The retry limit is read from the wrong setting (jobs/export.ts:41)"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rounds": {
+            "description": "Fix rounds CoderHelm took on its own findings.",
+            "examples": [
+              2
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "open",
+          "rounds",
+          "open_findings",
+          "noted",
+          "for_a_person"
+        ],
         "type": "object"
       },
       "RunPass": {
