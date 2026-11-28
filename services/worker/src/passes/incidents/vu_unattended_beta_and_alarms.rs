@@ -11,7 +11,7 @@
 //!   of several daily betas could install.
 //! - The watch after an update probed the worker and the gateway only. Chat
 //!   runs in its own function with its own role; it lost a grant and refused
-//!   every question for about a day with both of those healthy.
+//!   every question with both of those healthy.
 //! - The alarms counted Lambda Errors, which stay at 0 because the services
 //!   catch and log every error: no alarm moved while ERROR lines, GitHub
 //!   rate limits and the Chat outage piled up.
