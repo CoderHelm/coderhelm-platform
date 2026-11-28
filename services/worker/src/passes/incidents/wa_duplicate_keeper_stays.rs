@@ -69,7 +69,7 @@ fn closes(p: &Plan) -> Vec<(&str, &str)> {
 
 #[test]
 fn the_second_sweep_never_closes_the_keeper_or_keeps_a_closed_ticket() {
-    let title = "Give the banner images real or empty alt text";
+    let title = "Retry the export when the upload times out";
     // X finished; Y and Z still working; one topic, every pull request open.
     let mut v = vec![
         c(4, title, "running"),
@@ -104,7 +104,7 @@ fn the_second_sweep_never_closes_the_keeper_or_keeps_a_closed_ticket() {
 
 #[test]
 fn a_keeper_a_person_closed_is_picked_again_from_the_open_members() {
-    let title = "Stop file names as alt text";
+    let title = "Show the export retry count";
     let mut v = vec![
         c(2, title, "closed"),
         c(5, title, "completed"),
@@ -136,34 +136,18 @@ async fn a_family_filed_before_the_topic_rule_is_reconciled_on_it() {
     let fam = vec![
         c(
             30,
-            "Stop using image filenames as alt text in the image fragment",
+            "Retry the export when the upload times out",
             "completed",
         ),
-        c(
-            31,
-            "Image alt falls back to the asset filename in the queries",
-            "completed",
-        ),
-        c(
-            32,
-            "Image queries still fall back to the original filename for alt",
-            "completed",
-        ),
+        c(31, "Export upload gets one retry", "completed"),
+        c(32, "Export upload gets a second try", "completed"),
         c(
             33,
-            "Fix alt on the unused banner and card components",
+            "Fix the colors of the settings page dark theme",
             "completed",
         ),
-        c(
-            34,
-            "Remove the unused banner and card components",
-            "completed",
-        ),
-        c(
-            35,
-            "Coach images: fall back to the coach name for alt",
-            "completed",
-        ),
+        c(34, "Remove the settings page dark theme", "completed"),
+        c(35, "Show the export retry count", "completed"),
     ];
     let (same, maybe) = fd::matcher_pairs(&fam);
     for p in [(0, 1), (0, 2)] {
@@ -242,6 +226,11 @@ fn each_pull_request_closes_through_the_gate_unless_a_person_holds_it() {
     // Jira gets the close note it always got, and nothing more.
     assert_eq!(src.matches("conversation::jira(").count(), 2);
     assert!(close.contains("Say::status(\"run\", said.clone())"));
-    let note = fd::pr_close_note("ABC-30", "Fix alt", "harbor/web#41", "coderhelm/abc-31");
+    let note = fd::pr_close_note(
+        "ABC-30",
+        "Retry export",
+        "harbor/web#41",
+        "coderhelm/abc-31",
+    );
     assert!(note.contains("harbor/web#41") && note.contains("`coderhelm/abc-31` is kept"));
 }

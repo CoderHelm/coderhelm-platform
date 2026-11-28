@@ -804,21 +804,21 @@ mod tests {
         let v = vec![
             c(
                 "ABC-2",
-                "Stop filenames as alt in fragments",
+                "Retry the export when the upload times out",
                 "completed",
                 "01A",
                 true,
             ),
             c(
                 "ABC-3",
-                "Image alt falls back to the asset filename",
+                "Export upload gets one retry",
                 "completed",
                 "01B",
                 true,
             ),
             c(
                 "ABC-4",
-                "Coach image alt from the coach name",
+                "Dark theme for the settings page",
                 "completed",
                 "01C",
                 true,
@@ -955,10 +955,10 @@ mod tests {
 
     #[test]
     fn the_pull_request_note_names_the_keeper_and_keeps_the_branch() {
-        let n = pr_close_note("ABC-1", "Fix alt", "harbor/web#12", "coderhelm/abc-3");
+        let n = pr_close_note("ABC-1", "Retry export", "harbor/web#12", "coderhelm/abc-3");
         assert_eq!(
             n,
-            "Closed by CoderHelm as a duplicate follow-up (Fix alt): ABC-1 carries this work in harbor/web#12. \
+            "Closed by CoderHelm as a duplicate follow-up (Retry export): ABC-1 carries this work in harbor/web#12. \
              Its branch `coderhelm/abc-3` is kept."
         );
         assert!(!n.contains('\u{2192}'));
@@ -977,8 +977,8 @@ mod tests {
     #[test]
     fn the_comments_say_what_happened() {
         assert_eq!(
-            close_comment("ABC-1", "Fix alt"),
-            "Duplicate of ABC-1 (Fix alt). Closing; the work continues there. Closed by CoderHelm."
+            close_comment("ABC-1", "Retry export"),
+            "Duplicate of ABC-1 (Retry export). Closing; the work continues there. Closed by CoderHelm."
         );
         assert!(flag_comment("ABC-2", "Banner").contains("ABC-2"));
         assert!(!flag_comment("ABC-2", "Banner").contains('\u{2192}'));
