@@ -1,15 +1,34 @@
-# CoderHelm Platform: the self-hosted AI coding agent for GitHub and Jira on AWS
+# CoderHelm: an engineering platform for your tickets, pull requests, alerts and releases
+
+<!-- Screenshot of the dashboard goes here (made with sample data). -->
 
 [![CI](https://github.com/CoderHelm/coderhelm-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/CoderHelm/coderhelm-platform/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/CoderHelm/coderhelm-platform)](https://github.com/CoderHelm/coderhelm-platform/releases/latest)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE.md)
 [![Docs](https://img.shields.io/badge/docs-docs.coderhelm.com-555)](https://docs.coderhelm.com/self-host/)
 
-This repository is the engine of [CoderHelm](https://coderhelm.com), the AI coding agent that turns GitHub issues and Jira tickets into pull requests and then stays on the code. It holds the agent (a Rust gateway and worker on AWS Lambda), the AWS CDK infrastructure, the Jira app and the self-host installer that runs all of it in your own AWS account, with Claude through Amazon Bedrock or an Anthropic API key.
+[CoderHelm](https://coderhelm.com) is an engineering platform for teams on GitHub and Jira. It turns tickets into pull requests and stays on them after they open, reviews your team's pull requests, turns production alerts into fixes, finds and quarantines flaky tests, fixes vulnerable dependencies, and tags releases with notes. Chat answers questions about your code and cites the lines, knowledge syncs from the tools your team already writes in, and the App map shows how your repositories fit together. Run it in your own AWS account, or use the hosted service.
 
-The same code runs the hosted service at [app.coderhelm.com](https://app.coderhelm.com) and every self-hosted install. The dashboard, docs site and website are in [CoderHelm/coderhelm](https://github.com/CoderHelm/coderhelm).
+This repository is the engine: a Rust gateway and worker on AWS Lambda, the AWS CDK infrastructure, the Jira app and the self-host installer. The same code runs the hosted service at [app.coderhelm.com](https://app.coderhelm.com) and every self-hosted install. The dashboard, docs site and website are in [CoderHelm/coderhelm](https://github.com/CoderHelm/coderhelm).
 
 [Docs](https://docs.coderhelm.com) · [Self-host install guide](https://docs.coderhelm.com/self-host/install/) · [Releases](https://github.com/CoderHelm/coderhelm-platform/releases) · [API](https://docs.coderhelm.com/api) · [Changelog](https://docs.coderhelm.com/changelog) · [Security](https://docs.coderhelm.com/security)
+
+## Try it
+
+- **Hosted (open beta).** Sign up at [app.coderhelm.com](https://app.coderhelm.com) and paste your own Anthropic API key in **Settings, AI models**. Model usage goes on your Anthropic bill. See [Getting started](https://docs.coderhelm.com/getting-started).
+- **Self-hosted.** The [install guide](https://docs.coderhelm.com/self-host/install/) deploys CoderHelm into your AWS account as one CloudFormation stack from the browser, or use the terminal commands [below](#self-host-in-your-own-aws-account). You need:
+  - an AWS account you can administer, in a region with Lambda on ARM64, Cognito and SES;
+  - a GitHub account or organization where you can create a GitHub App (the installer creates it with one click);
+  - Claude through Amazon Bedrock in your account, or each team's own Anthropic API key.
+
+  You pay AWS directly. The installer's estimate for a small team is about $11 to $62 a month in AWS charges, before model usage; the build sandbox and logs are the parts that grow with use. See [Requirements](https://docs.coderhelm.com/self-host/requirements) for what it costs and why.
+
+## How it differs
+
+- **It runs in your account.** A self-hosted install is CloudFormation stacks in your AWS account. Your code, runs, reviews, knowledge and secrets stay there, and model calls go to Bedrock in that account or to Anthropic with your key. A fully private install sends nothing to CoderHelm; a [hybrid](https://docs.coderhelm.com/self-host/hybrid) one can borrow CoderHelm's address and apps, and its docs list exactly what passes through. The hosted service runs the same code.
+- **It stays on the pull request after it opens.** It fixes failing CI, answers review comments and resolves conflicts on its own pull requests, and with auto merge on it merges only the exact commit it reviewed after a person approves.
+- **Every agent action goes through permissions.** Each action is allowed, asked or denied by the team's [agent permissions](https://docs.coderhelm.com/concepts/agent-permissions); anything set to ask waits for a person.
+- **Source available.** The code is public under [FSL-1.1-ALv2](LICENSE.md): you can read it, run it and change it for your own use, and each release becomes Apache 2.0 two years after it ships.
 
 ## What runs here
 
@@ -17,8 +36,9 @@ The same code runs the hosted service at [app.coderhelm.com](https://app.coderhe
 - **After the pull request.** Fixes failing CI, answers review comments, resolves conflicts and, with auto merge on, merges only the exact commit it reviewed after a person approves.
 - **PR reviewer.** Reviews any pull request with the review label: line comments, a risk level, and a verdict that requests changes only for a named, evidenced problem.
 - **Alerts, tests and logs.** CloudWatch alarms through SNS become fix pull requests; flaky tests are detected and quarantined; chosen log groups are read every six hours.
+- **Releases.** Tags a release after merges and writes release notes, published to the GitHub release, Confluence or email; with auto merge on, it checks the deploy and reports only new failures.
 - **Security fixes and stale pull requests.** Dependency advisories checked for reachability in your code, with tiers, deadlines and daily limits; stale pull requests warned and closed, off by default.
-- **Chat, knowledge and MCP.** Chat reads the code and cites paths and lines; knowledge syncs from Notion, Confluence, Google Drive, Sanity, GitHub, websites and files, and can be used from Amazon Bedrock; CoderHelm is also an MCP server for Claude, Cursor and VS Code.
+- **Chat, knowledge, App map and MCP.** Chat reads the code and cites paths and lines; the App map is a plain-English map of how a team's repositories fit together; knowledge syncs from Notion, Confluence, Google Drive, Sanity, GitHub, websites and files, and can be used from Amazon Bedrock; CoderHelm is also an MCP server for Claude, Cursor and VS Code.
 - **Team controls.** Agent permissions (allow, ask or deny), custom roles, monthly token limits, usage and audit records, a public REST API with team API keys and signed outbound webhooks.
 
 Each of these has a page in the [docs](https://docs.coderhelm.com).
@@ -113,8 +133,8 @@ An install or update uses nothing from a release until two checks pass:
 If any check fails, nothing is installed. To check a release yourself with cosign:
 
 ```sh
-V=v0.8.59   # the release to check
 R=CoderHelm/coderhelm-platform
+V=$(curl -fsSL "https://api.github.com/repos/$R/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')   # the latest stable release, or set one
 COMMIT=$(git ls-remote "https://github.com/$R.git" "refs/tags/$V^{}" | cut -f1)
 for f in SHA256SUMS SHA256SUMS.sigstore.json; do
   curl --proto =https -fsSLO "https://github.com/$R/releases/download/$V/$f"
@@ -162,7 +182,7 @@ Build and test, the same commands CI runs:
 # Rust gateway and worker
 cd services
 cargo fmt --check --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cd ..
 bash scripts/rust-build.sh dist          # dist/gateway.zip and dist/worker.zip for Lambda
@@ -175,7 +195,7 @@ cd installer && npm test && cd ..
 
 # Smaller Lambdas
 python3 -m unittest discover -s lambda/tests
-node --test lambda/pre-signup/handler.test.js
+node --test lambda/pre-signup/handler.test.js lambda/custom-message/handler.test.js
 ```
 
 `npx cdk synth` uses the hosted deployment's config by default; pass `-c config=<file>` for another. Every deployment is built from one JSON config: see the [config reference](docs/self-host/config-reference.md). Secrets live in AWS Secrets Manager at `coderhelm/<stage>/secrets`, and a self-hosted install's are created and filled by the installer.
