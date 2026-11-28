@@ -1612,13 +1612,16 @@ pub enum Status {
     Declined,
     /// CoderHelm has no way to do it: `detail` says what access to grant.
     NoAccess,
+    /// Not done, on purpose: `detail` says why. A merge into a branch other
+    /// than the default one is never released, since a tag deploys production.
+    Skipped,
 }
 
 impl Status {
     pub fn finished(self) -> bool {
         matches!(
             self,
-            Status::Done | Status::Failed | Status::Declined | Status::NoAccess
+            Status::Done | Status::Failed | Status::Declined | Status::NoAccess | Status::Skipped
         )
     }
 }
@@ -2086,6 +2089,7 @@ fn status_words(s: &Step) -> String {
         Status::Failed => format!("Failed: {d}. Later steps wait."),
         Status::Declined => format!("Declined: {d}. Later steps wait."),
         Status::NoAccess => format!("Not done: CoderHelm can't do this yet. {d}."),
+        Status::Skipped => format!("Not done, on purpose: {d}."),
     }
 }
 
