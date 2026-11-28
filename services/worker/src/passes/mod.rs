@@ -1332,6 +1332,7 @@ pub mod followup_dedupe;
 pub mod followups;
 pub mod formatter;
 pub(crate) mod generators;
+pub mod github_admission;
 pub mod github_history;
 pub mod guide_pr;
 pub mod habits;
