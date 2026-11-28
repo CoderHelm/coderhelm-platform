@@ -146,6 +146,27 @@ class NetworkPreflight(unittest.TestCase):
         behind = dict(view, current={"version": "v0.8.90"})
         self.assertEqual(u.access_with_needed(behind, self.store.get("ACCESS_NEEDED"), {})["state"], "pending")
 
+    def test_a_need_with_no_refused_call_still_says_what_is_missing_and_who_applies_it(self):
+        # The incident: every call was one the preflight couldn't check, so the
+        # card read "the deploy role may not make  yet" and named nothing.
+        need = {"for": "v1.1.0", "needs": "v1.1.0", "version": "v0.8.90", "calls": [],
+                "template_url": "https://coderhelm-public.s3.amazonaws.com/launch/v1.1.0/access.json"}
+        wafv2 = {"use": None, "name": None, "services": "wafv2", "actions": ["wafv2:Get*", "wafv2:List*"],
+                 "line": "adds read access to wafv2 (wafv2:Get*, wafv2:List*)"}
+        view = {"state": "pending", "current": {"version": "v0.8.90"}, "adds": [wafv2], "rules": [],
+                "stack": "coderhelm-prod-access"}
+        line = u.access_with_needed(view, need, {})["summary"][0]
+        self.assertNotIn("make  yet", line)
+        self.assertIn("adds read access to wafv2", line)
+        self.assertIn("CoderHelm can't update coderhelm-prod-access itself", line)
+        self.assertIn("an AWS admin updates it with the template https://coderhelm-public.s3.amazonaws.com/launch/v1.1.0/access.json", line)
+        # Nothing on the card either: the versions.
+        line = u.access_with_needed({"state": "applied", "current": {"version": "v0.8.90"}}, need, {})["summary"][0]
+        self.assertIn("the access stack is at v0.8.90 and this needs v1.1.0's", line)
+        # Refused calls are still named first.
+        line = u.access_with_needed(view, dict(need, calls=["parent.X: ec2:CreateSecurityGroup"]), {})["summary"][0]
+        self.assertIn("the deploy role may not make ec2:CreateSecurityGroup yet", line)
+
     def test_the_current_deploy_role_may_add_a_network(self):
         u._clients["iam"] = deploy_role("current")
         self.cfn.access_version = "v1.0.0"

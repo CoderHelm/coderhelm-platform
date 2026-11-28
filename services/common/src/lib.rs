@@ -1,5 +1,12 @@
 //! Logic shared between the gateway and worker services.
 
+/// What an AWS SDK error was, as a log field (its code, never "service error").
+pub mod aws_error;
+/// Where a request's time went: its AWS calls, timed by an SDK interceptor.
+pub mod call_clock;
+/// DynamoDB's reserved words, and a check that no expression names one bare.
+pub mod dynamo_names;
+
 /// A repository's generated agent file: which files shape it, when a push
 /// makes it stale, and when the sweep writes it again by itself.
 pub mod agent_file;
@@ -343,6 +350,10 @@ pub mod reviewer_prefs;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.
 pub mod rewards;
+/// The one gate every run status write goes through: done with what it
+/// delivered, waiting on someone named with the evidence, or stopped with a
+/// typed reason and what was tried.
+pub mod run_ending;
 /// The one way a run is marked failed: always with a reason and a pass.
 pub mod run_events;
 pub mod run_fail;

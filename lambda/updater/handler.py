@@ -3530,7 +3530,8 @@ def access_stack_origin(cfn, st):
         # The Version output is the release whose permissions the stack applied
         # (its template's metadata changes before an update has finished).
         return {"kind": "access", "version": out.get("Version") or meta.get("version") or None,
-                "reader": READER_RESOURCE in (template.get("Resources") or {})}
+                "reader": READER_RESOURCE in (template.get("Resources") or {}),
+                "reader_parts": reader_parts(template)}
     return {"kind": "other", "version": None}
 
 
@@ -3547,6 +3548,20 @@ def _iso(t):
 READER_RESOURCE = "Reader"
 READER_LINE = ("adds the reader update: from then on each release brings its read-only permissions to "
                "CoderHelmLogReader in this account by itself, with no update stack for anyone to create")
+# The reader update's own resources (access-stack.ts ACCESS_SHAPE), but
+# ReaderNow, whose Version is every release's. When the release's differ
+# from the access stack's, the stack still runs an older reader update
+# (its code or its permissions), and only an admin's update of the stack
+# brings the release's.
+READER_PARTS = ("ReaderRole", "Reader", "ReaderAfterUpdate", "ReaderDaily", "ReaderFromUpdate", "ReaderFromDaily")
+READER_CHANGED_LINE = ("updates the reader update to this release's: until then CoderHelmLogReader in this account "
+                       "gets each release's reads as an older release's reader update brings them")
+
+
+def reader_parts(template):
+    """The reader update's resources of an access template, as canonical JSON (only those it has)."""
+    res = (template or {}).get("Resources") or {}
+    return {k: json.dumps(res[k], sort_keys=True) for k in READER_PARTS if k in res}
 
 
 def access_compute(env, cfn=None, iam=None, opener=None):
@@ -3619,6 +3634,11 @@ def access_compute(env, cfn=None, iam=None, opener=None):
     if READER_RESOURCE in (access.get("Resources") or {}) and not (ours and existing.get("reader")):
         changes.append({"resource": READER_RESOURCE, "lines": [READER_LINE]})
         rules.append(READER_LINE)
+    elif ours and existing.get("reader") and reader_parts(access) != existing.get("reader_parts"):
+        changes.append({"resource": READER_RESOURCE, "lines": [READER_CHANGED_LINE]})
+        rules.append(READER_CHANGED_LINE)
+    if existing:
+        existing.pop("reader_parts", None)
     view = {
         "state": "pending" if changes else "applied",
         "version": version,
@@ -3711,6 +3731,27 @@ def access_needed(store, env, now, entry, calls, cfn=None):
     access_view(store, env, now, force=True, cfn=cfn)
 
 
+def access_needed_line(need, view=None):
+    """Why the access card is needed, in one sentence that always says what
+    is missing and that CoderHelm can't apply it itself: the access stack
+    holds the install's own permissions, which no CoderHelm role may change
+    (TheAccessStackStays), so only an AWS admin's update of it brings them.
+    What is missing: the calls the deploy role was refused, else what the
+    release's access stack adds (the card's own lines), else the versions."""
+    calls = sorted({str(c).split(' on ')[0].split(': ')[-1] for c in need.get('calls') or [] if str(c).strip()})[:8]
+    if calls:
+        what = "the deploy role may not make " + ", ".join(calls) + " yet"
+    elif [x for x in (view or {}).get("summary") or [] if x]:
+        what = "the access stack " + "; ".join([x for x in view["summary"] if x][:4])
+    else:
+        what = (f"the access stack is at {need.get('version') or 'an older release'} and this needs "
+                f"{need.get('needs') or 'the running release'}'s")
+    stack = (view or {}).get("stack") or "the access stack"
+    return (f"needed to {need.get('for') or 'apply the last change'}: {what}. CoderHelm can't update "
+            f"{stack} itself (it holds the install's own permissions); an AWS admin updates it with the "
+            f"template {need.get('template_url') or (view or {}).get('template_url') or 'of the running release'}")
+
+
 def access_with_needed(view, need, options):
     """The access card decided for the switches as they are, and as needed
     (state pending) for a change the deploy role was refused, until the
@@ -3724,8 +3765,7 @@ def access_with_needed(view, need, options):
     if parse_version(have) and parse_version(need.get("needs")) and compare(have, need["needs"]) >= 0:
         return out
     out = dict(out or {"state": "unknown"})
-    line = (f"needed to {need.get('for') or 'apply the last change'}: the deploy role may not make "
-            + ", ".join(sorted({str(c).split(' on ')[0].split(': ')[-1] for c in need.get('calls') or []})[:8]) + " yet")
+    line = access_needed_line(need, out)
     out.update(state="pending", needed_for=need, summary=[line] + [s for s in out.get("summary") or [] if s != line])
     out.setdefault("template_url", need.get("template_url"))
     return out

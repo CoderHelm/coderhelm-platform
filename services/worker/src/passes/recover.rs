@@ -582,12 +582,14 @@ pub async fn stop_for_person(
 ) {
     let delta = usage.unrecorded();
     let failure = common::run_fail::RunFailure {
-        reason: &needs.detail,
+        cause: common::run_fail::Cause::NeedsYou {
+            reason: &needs.detail,
+            needs,
+        },
         pass: None,
         only_from: None,
         extra: vec![("duration_s", attr_n(duration))],
         add: super::usage_adds(&delta),
-        needs: Some(needs),
     };
     match common::run_fail::fail_run(
         &state.dynamo,
@@ -1007,7 +1009,11 @@ async fn heal_one(
                         .expression_attribute_values(":a", attr_s(common::run_status::AWAITING_CI))
                         .expression_attribute_values(
                             ":sri",
-                            attr_s(&format!("{}#{run_id}", common::run_status::AWAITING_CI)),
+                            common::run_ending::working(
+                                common::run_ending::Working::AwaitingCi,
+                                run_id,
+                            )
+                            .sri_attr(),
                         )
                         .expression_attribute_values(":failed", attr_s(common::run_status::FAILED))
                         .send()

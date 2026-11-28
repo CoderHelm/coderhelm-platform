@@ -73,6 +73,8 @@ aws-sdk-mwaa = { version = "1", default-features = false, features = ["default-h
 # public_urls: the deployment's URL when CloudFront picked it (single origin)
 aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
+# call_clock: an SDK interceptor that times each AWS call of a request
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
 # live: fakes stand in for the HTTP and AWS calls in tests
 async-trait = "0.1"
 sqlparser = { version = "0.59", features = ["visitor"] }

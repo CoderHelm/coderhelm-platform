@@ -3,9 +3,14 @@
 //! The follow-ups of one source ticket (its family: filed from it, and from
 //! those) are read with their latest runs, decided together, and:
 //!
+//! - each topic's keeper is decided once and recorded (`FOLLOWUP_KEEP#`),
+//!   and every later sweep, here or in the worker, keeps the recorded one
+//!   (`followup_dedupe::keeper`); a closed member is never kept;
 //! - each later duplicate's run is closed by CoderHelm with the same steps
 //!   as a person's close (`run_close::close_as_coderhelm`), saying
-//!   "Duplicate of KEY (topic). Closing; the work continues there.";
+//!   "Duplicate of KEY (topic). Closing; the work continues there.", once
+//!   the keeper, read again, still carries the work and no person
+//!   committed to the duplicate's pull request or asked for changes on it;
 //! - two follow-ups taking opposite approaches are both noted on Jira and
 //!   neither is closed.
 //!
@@ -18,7 +23,7 @@ use std::sync::Arc;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{extract::State, http::StatusCode, Extension, Json};
-use common::followup_dedupe::{self as fd, Candidate, Plan};
+use common::followup_dedupe::{self as fd, Candidate, Kept, Plan};
 use common::followup_tickets as ft;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -149,13 +154,17 @@ async fn candidate(state: &AppState, team_id: &str, key: &str) -> Option<Candida
             .await
             .ok()
             .flatten()?;
+        let has_pr = !super::run_close::run_prs(&item).is_empty();
+        let outcome = s(&item, "pr_outcome");
         return Some(Candidate {
             key: key.to_string(),
             title: s(&item, "title"),
             body: s(&item, "ticket_body"),
             run_id: latest.run_id.clone(),
             status: s(&item, "status"),
-            has_pr: !super::run_close::run_prs(&item).is_empty(),
+            has_pr,
+            pr_open: has_pr && !matches!(outcome.as_str(), "merged" | "closed"),
+            pr_merged: outcome == "merged",
         });
     }
     let record = super::jira_webhook::followup_record(state, team_id, key).await?;
@@ -166,6 +175,148 @@ async fn candidate(state: &AppState, team_id: &str, key: &str) -> Option<Candida
         body,
         ..Default::default()
     })
+}
+
+/// The keeper decisions recorded for `root`'s family; `None` when they
+/// can't be read (nothing is decided then).
+async fn kept_records(state: &AppState, team_id: &str, root: &str) -> Option<Vec<Kept>> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    loop {
+        let page = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+            .expression_attribute_values(":p", AttributeValue::S(team_id.to_string()))
+            .expression_attribute_values(":s", AttributeValue::S(fd::keep_record_prefix(root)))
+            .consistent_read(true)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .ok()?;
+        for i in page.items() {
+            let members = i
+                .get("members")
+                .and_then(|v| v.as_l().ok())
+                .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+                .unwrap_or_default();
+            out.push(Kept {
+                keep: s(i, "keep"),
+                members,
+                topic: s(i, "topic"),
+                at: s(i, "decided_at"),
+            });
+        }
+        match page.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Some(out)
+}
+
+/// Records `k` as decided, once (a record already there stands). False
+/// when it could not be written: nothing closes in its favour then.
+async fn record_keeper(state: &AppState, team_id: &str, root: &str, k: &Kept) -> bool {
+    let res = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(fd::keep_record_sk(root, &k.keep)))
+        .item("source", AttributeValue::S(root.to_string()))
+        .item("keep", AttributeValue::S(k.keep.clone()))
+        .item(
+            "members",
+            AttributeValue::L(
+                k.members
+                    .iter()
+                    .map(|m| AttributeValue::S(m.clone()))
+                    .collect(),
+            ),
+        )
+        .item("topic", AttributeValue::S(k.topic.clone()))
+        .item(
+            "decided_at",
+            AttributeValue::S(chrono::Utc::now().to_rfc3339()),
+        )
+        .condition_expression("attribute_not_exists(sk)")
+        .send()
+        .await;
+    match res {
+        Ok(_) => true,
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+        {
+            true
+        }
+        Err(e) => {
+            warn!(team_id, root, keep = %k.keep, error = %common::run_fail::error_text(&e), "Follow-up keeper not recorded");
+            false
+        }
+    }
+}
+
+/// Whether the duplicate's run (`run_id`) may lose its pull requests: no
+/// open one is held by a person ([`fd::person_holds`]). `Err` says why it
+/// stays, also when one can't be read.
+async fn no_person_holds(state: &AppState, team_id: &str, run_id: &str) -> Result<(), String> {
+    let item = super::run_close::load_run(state, team_id, run_id)
+        .await?
+        .ok_or("the run is gone")?;
+    if matches!(s(&item, "pr_outcome").as_str(), "merged" | "closed") {
+        return Ok(());
+    }
+    let prs = super::run_close::run_prs(&item);
+    if prs.is_empty() {
+        return Ok(());
+    }
+    let installation = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    let installation = match installation {
+        Some(i) => i,
+        None => super::api::get_team_installation_id(state, team_id)
+            .await
+            .map_err(|_| "no GitHub installation".to_string())?,
+    };
+    let token = crate::auth::github_app::get_installation_token(state, installation)
+        .await
+        .map_err(|e| format!("no GitHub token: {e}"))?;
+    for pr in prs {
+        let base = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            pr.owner, pr.repo, pr.number
+        );
+        let get = |url: String| {
+            let token = token.clone();
+            async move {
+                match super::merge_control::gh_get(state, &token, &url).await {
+                    Ok((200, v)) => Ok(v),
+                    Ok((code, _)) => Err(format!("GitHub answered {code}")),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let p = get(base.clone()).await?;
+        if p["state"].as_str() != Some("open") {
+            continue;
+        }
+        let commits = get(format!("{base}/commits?per_page=100")).await?;
+        let reviews = get(format!("{base}/reviews?per_page=100")).await?;
+        let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+        if fd::person_holds(&list(&commits), &list(&reviews)) {
+            return Err(format!(
+                "a person committed to #{} or asked for changes on it",
+                pr.number
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What one sweep decided and did.
@@ -204,7 +355,14 @@ pub async fn sweep(state: &AppState, team_id: &str, root: &str, apply: bool) -> 
         }
     }
     let judge = super::log_findings::GatewayJudge::for_team(state, team_id).await;
-    let plan = fd::decide(&cands, Some(&judge)).await;
+    let Some(kept) = kept_records(state, team_id, root).await else {
+        warn!(
+            team_id,
+            root, "Follow-up keeper records not read: nothing decided"
+        );
+        return Report::default();
+    };
+    let plan = fd::decide(&cands, Some(&judge), &kept).await;
     let mut report = Report {
         plan,
         ..Default::default()
@@ -221,7 +379,37 @@ pub async fn sweep(state: &AppState, team_id: &str, root: &str, apply: bool) -> 
     if !apply {
         return report;
     }
+    let mut unrecorded: Vec<String> = Vec::new();
+    for k in report.plan.record.clone() {
+        if !record_keeper(state, team_id, root, &k).await {
+            unrecorded.push(k.keep.clone());
+        }
+    }
     for c in report.plan.close.clone() {
+        if unrecorded.contains(&c.keep) {
+            report.not_closed.push((
+                c.dup.clone(),
+                "The keeper decision was not recorded.".into(),
+            ));
+            continue;
+        }
+        // The keeper, read again: it must still be in the running and, for
+        // a duplicate with an open pull request, still carry the work.
+        let dup_open = cands.iter().any(|x| x.key == c.dup && x.pr_open);
+        let keeper_ok = candidate(state, team_id, &c.keep)
+            .await
+            .is_some_and(|k| !k.out() && (!dup_open || k.holds_work()));
+        if !keeper_ok {
+            report.not_closed.push((
+                c.dup.clone(),
+                format!("{} no longer carries the work.", c.keep),
+            ));
+            continue;
+        }
+        if let Err(why) = no_person_holds(state, team_id, &c.run_id).await {
+            report.not_closed.push((c.dup.clone(), why));
+            continue;
+        }
         let said = fd::close_comment(&c.keep, &c.topic);
         let r = super::run_close::close_as_coderhelm(state, team_id, &c.run_id, &said).await;
         if r.ok() {

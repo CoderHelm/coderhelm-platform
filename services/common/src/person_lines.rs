@@ -23,6 +23,22 @@
 
 use std::collections::HashSet;
 
+/// A commit CoderHelm (or another app) made: its GitHub author is a bot
+/// (an app's `name[bot]`), or, with no linked account, its author email is
+/// a bot's noreply address. Every other commit is a person's.
+pub fn is_bot_commit(c: &serde_json::Value) -> bool {
+    let a = &c["author"];
+    if a["type"].as_str() == Some("Bot")
+        || a["login"].as_str().is_some_and(|l| l.ends_with("[bot]"))
+    {
+        return true;
+    }
+    a.is_null()
+        && c["commit"]["author"]["email"]
+            .as_str()
+            .is_some_and(|e| e.ends_with("[bot]@users.noreply.github.com"))
+}
+
 /// The marker of the one note on a pull request about a person's lines
 /// CoderHelm left alone; the note is edited in place.
 pub const NOTE_MARKER: &str = "<!-- coderhelm:person-lines -->";

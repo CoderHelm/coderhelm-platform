@@ -386,7 +386,11 @@ pub async fn run_now(
             .item("team_id", A::S(claims.team_id.clone()))
             .item("run_id", A::S(run_id.clone()))
             .item("status", A::S("queued".into()))
-            .item("status_run_id", A::S(format!("queued#{run_id}")))
+            .item(
+                "status_run_id",
+                common::run_ending::working(common::run_ending::Working::Queued, &run_id)
+                    .sri_attr(),
+            )
             .item("ticket_source", A::S("skill_run".into()))
             .item("ticket_id", A::S(format!("skill:{}", s.id)))
             .item("title", A::S(format!("Skill run: {}", s.skill_name)))

@@ -15,6 +15,7 @@
 //!
 //! Retry stays for a ticket edited directly.
 
+use common::run_ending::EndWrite;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -401,8 +402,10 @@ async fn claim(
         .condition_expression("#status = :waiting")
         .expression_attribute_names("#status", "status")
         .expression_attribute_names("#a", run_questions::FIELD_ANSWERS)
-        .expression_attribute_values(":s", AttributeValue::S("retried".into()))
-        .expression_attribute_values(":sri", AttributeValue::S(format!("retried#{run_id}")))
+        .run_status(
+            ":s",
+            &common::run_ending::gate(run_id, &common::run_ending::superseded(new_run_id)),
+        )
         .expression_attribute_values(":t", AttributeValue::S(now.to_string()))
         .expression_attribute_values(":a", AttributeValue::S(json))
         .expression_attribute_values(":nr", AttributeValue::S(new_run_id.to_string()))
@@ -453,7 +456,11 @@ async fn release(state: &AppState, team_id: &str, run_id: &str) {
             ":w",
             AttributeValue::S(common::run_status::NEEDS_INPUT.into()),
         )
-        .expression_attribute_values(":sri", AttributeValue::S(format!("needs_input#{run_id}")))
+        // Put back to the wait it had (`common::run_ending::restored`).
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::restored_sri(common::run_status::NEEDS_INPUT, run_id),
+        )
         .expression_attribute_values(":retried", AttributeValue::S("retried".into()))
         .send()
         .await
