@@ -1,4 +1,4 @@
-//! vu. Three failures on one install that each logged every day and that
+//! vy. Three failures on one install that each logged every day and that
 //! nobody could act on:
 //!
 //! - The agent's memory-read counter failed on every run, logged only as
@@ -9,7 +9,7 @@
 //!   in its template, but only for the databases its stack names, and the
 //!   stack the release keeps current there named none; nobody is ever asked
 //!   to update that role, so nothing could name it. The access stack that
-//!   runs that update was weeks behind, and its card said "the deploy role
+//!   runs that update was several releases behind, and its card said "the deploy role
 //!   may not make  yet", naming nothing.
 //! - Gateway requests hit the Lambda's 30 second limit with nothing logged
 //!   between START and END.
