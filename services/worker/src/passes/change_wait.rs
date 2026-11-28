@@ -151,7 +151,7 @@ pub async fn begin(
         .expression_attribute_names("#w", cw::FIELD)
         .ended_values()
         .expression_attribute_values(":s", attr_s(AWAITING_CHANGE))
-        .expression_attribute_values(":sri", attr_s(&format!("{AWAITING_CHANGE}#{run_id}")))
+        .expression_attribute_values(":sri", common::run_ending::working(common::run_ending::Working::AwaitingChange, run_id).sri_attr())
         .expression_attribute_values(":w", attr_s(&dep.to_json()))
         .expression_attribute_values(":em", attr_s(&line))
         .expression_attribute_values(":cp", attr_s("waiting"))
@@ -342,6 +342,7 @@ async fn check_one(state: &WorkerState, item: &HashMap<String, AttributeValue>) 
             )
             .await;
             let needs = common::run_recovery::NeedsYou {
+                kind: common::run_recovery::Kind::NeedsPerson,
                 why: common::handback::HumanOnly::ProductDecision,
                 action: format!(
                     "Reopen and merge {}, or change this ticket, then press Retry",

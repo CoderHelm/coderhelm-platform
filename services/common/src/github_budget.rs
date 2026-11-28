@@ -228,6 +228,12 @@ impl Budget {
     }
 }
 
+/// The structured line each GitHub rate limit is logged with, refused by
+/// GitHub or held back here (`source`: "github" or "budget"). The install's
+/// alarm (infra/lib/monitoring-stack.ts) reads it against the worker's
+/// invocations, so a spent budget is seen while every caller still catches it.
+pub const RATE_LIMITED_EVENT: &str = "github_rate_limited";
+
 /// Why a request isn't sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
@@ -381,6 +387,323 @@ pub fn count_attr(caller: &str) -> String {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect::<String>()
     )
+}
+
+/// Runs admitted against the installation's hour, before their steps start.
+///
+/// The per-request rules above hold each request as it leaves, so a fan-out
+/// of runs (many tickets started together) used to start every run at once:
+/// all of them spent until the share kept for people, then all of them waited
+/// for the reset together, each saying "Waiting for GitHub's hourly limit".
+/// Admission sits in front: a run's next GitHub-heavy step (a ticket step, a
+/// CI round) starts when what it is expected to spend fits what is left of the
+/// runs' share, after the steps already running and the runs ahead of it in
+/// line. Otherwise it waits its turn, in arrival order, and its page says when
+/// it starts.
+///
+/// - **What is left** is GitHub's own last word: the installation's
+///   `remaining` and `reset` from the rate-limit headers, less the share kept
+///   for people ([`PEOPLE_RESERVE_PCT`]). No reading yet is a full hour of the
+///   smallest budget; a reading past its reset is the full limit again.
+/// - **What a step spends** is learned per caller from the counts the worker
+///   already keeps ([`Ledger::cost`]): the mean of the steps it saw. A caller
+///   with nothing learned yet starts at [`FIRST_GUESS_PCT`] percent of the
+///   hour, until its first step reports.
+/// - **A running step holds its expected spend** until it ends, or for
+///   [`HOLD_SECS`] at most (a killed step). The requests it already sent also
+///   show in `remaining`, so a step is counted twice while it runs: admission
+///   errs on the side of waiting.
+/// - **The line keeps arrival order.** A run ahead in line always starts
+///   first; a run that stops coming back (ended, cancelled) leaves the line
+///   after [`LINE_STALE_SECS`].
+pub mod admission {
+    use super::{Budget, PEOPLE_RESERVE_PCT, SMALLEST_LIMIT};
+
+    /// The longest a running step holds its share: one invocation's life and
+    /// a minute.
+    pub const HOLD_SECS: u64 = 960;
+
+    /// A run in line that hasn't come back for this long left it.
+    pub const LINE_STALE_SECS: u64 = 2 * 900 + 120;
+
+    /// What a caller with no step learned is expected to spend, in percent
+    /// of the hour's budget.
+    pub const FIRST_GUESS_PCT: u64 = 2;
+
+    /// A step running now, holding what it is expected to spend.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Holder {
+        pub key: String,
+        pub need: u64,
+        /// Epoch seconds after which the hold is gone (a killed step).
+        pub until: u64,
+    }
+
+    /// A run waiting its turn.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Waiting {
+        pub key: String,
+        pub need: u64,
+        /// When it first asked (epoch milliseconds): the line's order.
+        pub arrived_ms: u64,
+        /// When it last asked (epoch seconds).
+        pub seen: u64,
+    }
+
+    /// One installation's admissions.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Ledger {
+        pub held: Vec<Holder>,
+        pub line: Vec<Waiting>,
+    }
+
+    /// Whether a step starts now.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Admit {
+        Go,
+        /// Not yet: how many runs are ahead of it, and when it is expected
+        /// to start (epoch seconds).
+        Wait {
+            ahead: usize,
+            start_at: u64,
+        },
+    }
+
+    /// What a step of `caller` is expected to spend: the mean of the steps
+    /// learned (`sum` requests over `steps` steps), or the first guess.
+    pub fn cost(sum: u64, steps: u64, limit: u64) -> u64 {
+        if steps == 0 {
+            return (limit.max(1) * FIRST_GUESS_PCT / 100).max(1);
+        }
+        sum.div_ceil(steps).max(1)
+    }
+
+    /// The runs' share of a whole hour of this budget.
+    fn hour_share(limit: u64) -> u64 {
+        limit - limit * PEOPLE_RESERVE_PCT / 100
+    }
+
+    /// The reading as it stands at `now`: what the runs may spend now, the
+    /// share of a whole hour, and when the next hour starts.
+    fn standing(budget: Option<Budget>, now: u64) -> (u64, u64, u64) {
+        let b = budget.unwrap_or(Budget {
+            remaining: SMALLEST_LIMIT,
+            limit: SMALLEST_LIMIT,
+            reset: 0,
+        });
+        let full = hour_share(b.limit);
+        if b.reset == 0 {
+            return (full, full, (now / 3600 + 1) * 3600);
+        }
+        if b.is_past(now) {
+            // A new hour began since the reading; the one after it starts an
+            // hour after that reset.
+            let mut next = b.reset + 3600;
+            while next <= now {
+                next += 3600;
+            }
+            return (full, full, next);
+        }
+        let reserve = b.limit * PEOPLE_RESERVE_PCT / 100;
+        (b.remaining.saturating_sub(reserve), full, b.reset)
+    }
+
+    impl Ledger {
+        /// Drops holds of steps that can't still be running and runs that
+        /// left the line.
+        pub fn prune(&mut self, now: u64) {
+            self.held.retain(|h| h.until > now);
+            self.line.retain(|w| w.seen + LINE_STALE_SECS > now);
+            self.line
+                .sort_by(|a, b| (a.arrived_ms, &a.key).cmp(&(b.arrived_ms, &b.key)));
+        }
+
+        fn outstanding(&self) -> u64 {
+            self.held.iter().map(|h| h.need).sum()
+        }
+
+        /// Whether `key`'s next step, expected to spend `need`, starts now.
+        /// `limited_until`: GitHub said the hour is spent until then. A step
+        /// that starts holds its share; one that waits keeps its place.
+        pub fn admit(
+            &mut self,
+            key: &str,
+            need: u64,
+            budget: Option<Budget>,
+            limited_until: Option<u64>,
+            now: u64,
+            now_ms: u64,
+        ) -> Admit {
+            self.prune(now);
+            let (left, full, next_hour) = standing(budget, now);
+            // A step larger than a whole hour's share still runs, alone.
+            let need = need.min(full).max(1);
+            // The same run already holding (an overlapping message of it):
+            // it is already counted.
+            if self.held.iter().any(|h| h.key == key) {
+                return Admit::Go;
+            }
+            let spent_until = limited_until.filter(|u| *u > now);
+            // First in line, or no line at all (a run not in it counts the
+            // whole line ahead of it).
+            let first = self.line.iter().take_while(|w| w.key != key).count() == 0;
+            let fits = spent_until.is_none() && self.outstanding() + need <= left;
+            if first && fits {
+                self.line.retain(|w| w.key != key);
+                self.held.push(Holder {
+                    key: key.to_string(),
+                    need,
+                    until: now + HOLD_SECS,
+                });
+                return Admit::Go;
+            }
+            match self.line.iter_mut().find(|w| w.key == key) {
+                Some(w) => {
+                    w.seen = now;
+                    w.need = need;
+                }
+                None => self.line.push(Waiting {
+                    key: key.to_string(),
+                    need,
+                    arrived_ms: now_ms,
+                    seen: now,
+                }),
+            }
+            self.prune(now);
+            let ahead = self.line.iter().take_while(|w| w.key != key).count();
+            let start_at = self.projected_start(key, left, full, next_hour, spent_until, now);
+            Admit::Wait { ahead, start_at }
+        }
+
+        /// When `key` is expected to start: the line ahead of it starts in
+        /// order as running steps end (at their hold's end, at the latest)
+        /// and as hours reset.
+        fn projected_start(
+            &self,
+            key: &str,
+            left: u64,
+            full: u64,
+            next_hour: u64,
+            spent_until: Option<u64>,
+            now: u64,
+        ) -> u64 {
+            let mut t = now;
+            let mut cap = left;
+            let mut hour = next_hour;
+            if let Some(u) = spent_until {
+                // Nothing goes before the reset GitHub named.
+                t = u;
+                cap = full;
+                hour = u + 3600;
+            }
+            let mut releases: Vec<(u64, u64)> =
+                self.held.iter().map(|h| (h.until.max(t), h.need)).collect();
+            releases.sort_unstable();
+            let mut held: u64 = if spent_until.is_some() {
+                0
+            } else {
+                self.outstanding()
+            };
+            if spent_until.is_some() {
+                releases.clear();
+            }
+            let mut releases = releases.into_iter().peekable();
+            for w in &self.line {
+                while held + w.need > cap {
+                    match releases.peek().copied() {
+                        Some((at, need)) if at < hour => {
+                            releases.next();
+                            t = t.max(at);
+                            held = held.saturating_sub(need);
+                        }
+                        _ => {
+                            t = t.max(hour);
+                            hour += 3600;
+                            cap = full;
+                            held = 0;
+                            releases = Vec::new().into_iter().peekable();
+                        }
+                    }
+                }
+                if w.key == key {
+                    return t;
+                }
+                held += w.need;
+            }
+            t
+        }
+
+        /// The step of `key` ended: what it held is free again.
+        pub fn release(&mut self, key: &str) {
+            self.held.retain(|h| h.key != key);
+        }
+
+        /// As kept on the installation's record: `key=need:until;...` and
+        /// `key=need:arrived_ms:seen;...`.
+        pub fn to_attrs(&self) -> (String, String) {
+            let held = self
+                .held
+                .iter()
+                .map(|h| format!("{}={}:{}", h.key, h.need, h.until))
+                .collect::<Vec<_>>()
+                .join(";");
+            let line = self
+                .line
+                .iter()
+                .map(|w| format!("{}={}:{}:{}", w.key, w.need, w.arrived_ms, w.seen))
+                .collect::<Vec<_>>()
+                .join(";");
+            (held, line)
+        }
+
+        pub fn from_attrs(held: &str, line: &str) -> Self {
+            let nums =
+                |v: &str| -> Vec<u64> { v.split(':').filter_map(|n| n.parse().ok()).collect() };
+            let held = held
+                .split(';')
+                .filter_map(|p| {
+                    let (k, v) = p.rsplit_once('=')?;
+                    match nums(v)[..] {
+                        [need, until] => Some(Holder {
+                            key: k.to_string(),
+                            need,
+                            until,
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect();
+            let line = line
+                .split(';')
+                .filter_map(|p| {
+                    let (k, v) = p.rsplit_once('=')?;
+                    match nums(v)[..] {
+                        [need, arrived_ms, seen] => Some(Waiting {
+                            key: k.to_string(),
+                            need,
+                            arrived_ms,
+                            seen,
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect();
+            Self { held, line }
+        }
+    }
+
+    /// What a run's page says while it waits its turn.
+    pub fn waiting_text(ahead: usize, start_at: u64) -> String {
+        let place = match ahead {
+            0 => "next in line".to_string(),
+            1 => "1 run ahead".to_string(),
+            n => format!("{n} runs ahead"),
+        };
+        format!(
+            "Waiting its turn for GitHub's hourly budget ({place}); starts by itself at about {}",
+            crate::github_wait::clock(start_at)
+        )
+    }
 }
 
 #[cfg(test)]

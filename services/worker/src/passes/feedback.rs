@@ -1,3 +1,4 @@
+use common::run_ending::EndWrite;
 use common::run_status::EndedValues;
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -480,13 +481,16 @@ pub async fn run(
             )
             .expression_attribute_names("#s", "status")
             .expression_attribute_names("#err", "error")
-            .expression_attribute_values(
+            .run_status(
                 ":s",
-                aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
-            )
-            .expression_attribute_values(
-                ":sri",
-                aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+                &common::run_ending::gate(
+                    &msg.run_id,
+                    &common::run_ending::delivered(
+                        common::run_status::COMPLETED,
+                        msg.pr_number,
+                        &common::run_ending::pr_url(&msg.repo_owner, &msg.repo_name, msg.pr_number),
+                    ),
+                ),
             )
             .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
             .send()
@@ -1895,17 +1899,26 @@ Rules:
             ":t",
             aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
         )
-        .expression_attribute_values(
+        // Waiting for CI on what it pushed, or delivered on its pull
+        // request, through the one gate (`common::run_ending`).
+        .run_status(
             ":s",
-            aws_sdk_dynamodb::types::AttributeValue::S(final_status.to_string()),
+            &if code_pushed {
+                common::run_ending::working(common::run_ending::Working::AwaitingCi, &msg.run_id)
+            } else {
+                common::run_ending::gate(
+                    &msg.run_id,
+                    &common::run_ending::delivered(
+                        common::run_status::COMPLETED,
+                        msg.pr_number,
+                        &common::run_ending::pr_url(&msg.repo_owner, &msg.repo_name, msg.pr_number),
+                    ),
+                )
+            },
         )
         .expression_attribute_values(
             ":p",
             aws_sdk_dynamodb::types::AttributeValue::S("feedback".to_string()),
-        )
-        .expression_attribute_values(
-            ":sri",
-            aws_sdk_dynamodb::types::AttributeValue::S(format!("{final_status}#{}", msg.run_id)),
         )
         .expression_attribute_values(
             ":entry",
@@ -3550,13 +3563,12 @@ async fn handle_wrong_repo(
             "SET #s = :s, status_run_id = :sri, updated_at = :t, error_message = :em",
         )
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(
+        .run_status(
             ":s",
-            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
-        )
-        .expression_attribute_values(
-            ":sri",
-            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+            &common::run_ending::gate(
+                &msg.run_id,
+                &common::run_ending::answered(&format!("the work moved to {target_repo}")),
+            ),
         )
         .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
         .expression_attribute_values(
@@ -3769,14 +3781,19 @@ pub(crate) async fn close_own_pr_outside(
         )
         .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", super::attr_s(fix_location::STATUS_OUTSIDE))
-        .expression_attribute_values(
-            ":sri",
-            super::attr_s(&format!(
-                "{}#{}",
-                fix_location::STATUS_OUTSIDE,
-                pr_ref.run_id
-            )),
+        // Waiting on the change outside the code, named, through the one
+        // gate (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                pr_ref.run_id,
+                &common::run_ending::RunEnd::Waiting(common::run_ending::Waiting {
+                    on: common::run_ending::WaitOn::OutsideChange {
+                        what: common::truncate_str(report.trim(), 300).to_string(),
+                    },
+                    evidence: report.clone(),
+                }),
+            ),
         )
         .expression_attribute_values(":t", super::attr_s(&now))
         .expression_attribute_values(":cp", super::attr_s("done"))
@@ -3808,17 +3825,20 @@ async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
         .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
         .condition_expression("#s = :running")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(
+        .run_status(
             ":s",
-            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+            &common::run_ending::gate(
+                &msg.run_id,
+                &common::run_ending::delivered(
+                    common::run_status::COMPLETED,
+                    msg.pr_number,
+                    &common::run_ending::pr_url(&msg.repo_owner, &msg.repo_name, msg.pr_number),
+                ),
+            ),
         )
         .expression_attribute_values(
             ":running",
             aws_sdk_dynamodb::types::AttributeValue::S("running".to_string()),
-        )
-        .expression_attribute_values(
-            ":sri",
-            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
         )
         .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
         .send()
@@ -4232,13 +4252,17 @@ async fn ensure_pr_open(
                 .expression_attribute_values(":cr", super::attr_s(CANCEL_PR_CLOSED_BY_HUMAN))
                 .expression_attribute_values(":cb", super::attr_s(who))
                 .expression_attribute_values(":po", super::attr_s("closed"))
-                .expression_attribute_values(
+                .run_status(
                     ":s",
-                    aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
-                )
-                .expression_attribute_values(
-                    ":sri",
-                    aws_sdk_dynamodb::types::AttributeValue::S(format!("cancelled#{}", msg.run_id)),
+                    &common::run_ending::gate(
+                        &msg.run_id,
+                        &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+                            reason: common::run_ending::Stop::CancelledBy {
+                                who: who.to_string(),
+                            },
+                            tried: Default::default(),
+                        }),
+                    ),
                 )
                 .expression_attribute_values(
                     ":cp",
@@ -4627,7 +4651,11 @@ async fn finish_branch_update(
         .expression_attribute_names("#s", "status")
         .ended_values()
         .expression_attribute_values(":s", A::S("awaiting_ci".to_string()))
-        .expression_attribute_values(":sri", A::S(format!("awaiting_ci#{}", msg.run_id)))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, &msg.run_id)
+                .sri_attr(),
+        )
         .expression_attribute_values(":t", A::S(now))
         .send()
         .await;

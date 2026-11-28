@@ -381,7 +381,9 @@ fn num(item: &HashMap<String, AttributeValue>, k: &str) -> u64 {
 /// nothing back, the log line still says it.
 pub async fn flush(state: &WorkerState) {
     let mut logged: HashSet<u64> = HashSet::new();
-    for u in drain() {
+    let unwritten = drain();
+    learn_step_costs(state, &step_costs(&unwritten)).await;
+    for u in unwritten {
         let sum = |f: fn(&Counts) -> u64| u.counts.iter().map(|(_, c)| f(c)).sum::<u64>();
         // Where the requests went, once per installation and message.
         let routes = if logged.insert(u.installation_id) {
@@ -466,6 +468,55 @@ pub async fn flush(state: &WorkerState) {
             if !common::run_fail::is_condition_failed(&e) {
                 warn!(installation = u.installation_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not record the GitHub budget");
             }
+        }
+    }
+}
+
+/// The callers whose steps are admitted (`passes::github_admission`), and
+/// so whose cost per step is learned.
+pub const ADMITTED: &[&str] = &[rules::caller::RUN, rules::caller::CI];
+
+/// What one handled message's admitted steps spent, by installation and
+/// caller: counted requests, summed over the hours the message crossed.
+pub fn step_costs(unwritten: &[Unwritten]) -> Vec<(u64, &'static str, u64)> {
+    let mut by: HashMap<(u64, &'static str), u64> = HashMap::new();
+    for u in unwritten {
+        for (caller, c) in &u.counts {
+            if ADMITTED.contains(caller) && c.sent > 0 {
+                *by.entry((u.installation_id, caller)).or_default() += c.sent;
+            }
+        }
+    }
+    let mut out: Vec<(u64, &'static str, u64)> =
+        by.into_iter().map(|((i, c), n)| (i, c, n)).collect();
+    out.sort_unstable();
+    out
+}
+
+/// Adds each step's spend to what admission learns a step costs: one step
+/// and its counted requests, per installation and caller.
+async fn learn_step_costs(state: &WorkerState, costs: &[(u64, &'static str, u64)]) {
+    let table = &state.config.analytics_table_name;
+    if table.is_empty() {
+        return;
+    }
+    for (installation, caller, sent) in costs {
+        let (sum, steps) = crate::passes::github_admission::cost_attrs(caller);
+        let res = state
+            .dynamo
+            .update_item()
+            .table_name(table)
+            .key("team_id", s(&rules::partition(*installation)))
+            .key("period", s(crate::passes::github_admission::PERIOD))
+            .update_expression("ADD #s :s, #n :one")
+            .expression_attribute_names("#s", sum)
+            .expression_attribute_names("#n", steps)
+            .expression_attribute_values(":s", n(*sent))
+            .expression_attribute_values(":one", n(1))
+            .send()
+            .await;
+        if let Err(e) = res {
+            warn!(installation, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not record what a step spent");
         }
     }
 }

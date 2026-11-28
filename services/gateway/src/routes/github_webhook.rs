@@ -2248,11 +2248,28 @@ async fn handle_pull_request(
             // A run a person closed stays closed; the merge is still recorded
             // (analytics count it as merged through `pr_outcome`).
             if merge_sets_status(run_status) {
-                expr.push_str(", #status = :s, status_run_id = :sri");
+                // Done: merged, with its pull request (`common::run_ending`).
+                let ending = common::run_ending::gate(
+                    &run_id,
+                    &common::run_ending::delivered(
+                        common::run_status::MERGED,
+                        pr["number"].as_u64().unwrap_or(0),
+                        pr["html_url"].as_str().unwrap_or(""),
+                    ),
+                );
+                expr.push_str(", #status = :s, status_run_id = :sri, #run_ending = :run_ending");
                 update = update
                     .expression_attribute_names("#status", "status")
-                    .expression_attribute_values(":s", attr_s("merged"))
-                    .expression_attribute_values(":sri", attr_s(&format!("merged#{run_id}")));
+                    .expression_attribute_names("#run_ending", common::run_ending::FIELD_ENDING)
+                    .expression_attribute_values(":s", ending.status_attr())
+                    .expression_attribute_values(
+                        ":sri",
+                        common::run_ending::Write::sri_attr(&ending),
+                    )
+                    .expression_attribute_values(
+                        ":run_ending",
+                        ending.ending().cloned().unwrap_or_else(|| attr_s("")),
+                    );
             }
             if let Some(n) = human_commits {
                 expr.push_str(", human_commits = :hc");

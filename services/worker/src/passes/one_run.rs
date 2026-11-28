@@ -3,6 +3,7 @@
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::one_run::{self, Claim, Holder};
+use common::run_ending::EndWrite;
 use tracing::{info, warn};
 
 use crate::models::TicketMessage;
@@ -236,10 +237,9 @@ async fn end_earlier_waits(state: &WorkerState, msg: &TicketMessage, run_id: &st
             )
             .condition_expression("#s = :ni")
             .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":r", s(common::run_status::RETRIED))
-            .expression_attribute_values(
-                ":sri",
-                s(&format!("{}#{old}", common::run_status::RETRIED)),
+            .run_status(
+                ":r",
+                &common::run_ending::gate(old, &common::run_ending::superseded(run_id)),
             )
             .expression_attribute_values(":n", s(run_id))
             .expression_attribute_values(":t", s(&now))

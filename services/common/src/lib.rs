@@ -350,6 +350,10 @@ pub mod reviewer_prefs;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.
 pub mod rewards;
+/// The one gate every run status write goes through: done with what it
+/// delivered, waiting on someone named with the evidence, or stopped with a
+/// typed reason and what was tried.
+pub mod run_ending;
 /// The one way a run is marked failed: always with a reason and a pass.
 pub mod run_events;
 pub mod run_fail;

@@ -735,6 +735,10 @@ pub struct NeedsYou {
     pub action: String,
     /// Why, in plain words.
     pub detail: String,
+    /// The kind of the error it stopped on, as it was classified when the
+    /// stop was decided (kept as the run's `error_kind`, never read again
+    /// from the words).
+    pub kind: Kind,
 }
 
 /// The backoff before try `n` (0-based) of a transient error.
@@ -751,6 +755,7 @@ pub fn next(c: &Classified, ledger: &Ledger, mark: &str) -> Next {
         Kind::Transient => {
             if repeats >= MAX_TRANSIENT_TRIES {
                 Next::NeedsYou(NeedsYou {
+                    kind: c.kind,
                     why: HumanOnly::Unrepaired,
                     action: "Press Retry once the service is answering again".into(),
                     detail: format!(
@@ -782,7 +787,7 @@ pub fn next(c: &Classified, ledger: &Ledger, mark: &str) -> Next {
         }
         Kind::Unknown => {
             if repeats >= MAX_UNKNOWN_TRIES {
-                Next::NeedsYou(unknown_stop(c))
+                Next::NeedsYou(unknown_stop(c, repeats))
             } else {
                 Next::Retry {
                     delay_secs: backoff_secs(0),
@@ -792,17 +797,37 @@ pub fn next(c: &Classified, ledger: &Ledger, mark: &str) -> Next {
     }
 }
 
-/// The stop for an error nobody classified, after its one retry.
-pub fn unknown_stop(c: &Classified) -> NeedsYou {
+/// The stop for an error nobody classified. `retries`: the retries the
+/// ledger holds for it. "Tried again" is said only for those: a stop that
+/// made none says so, never a retry that didn't happen.
+pub fn unknown_stop(c: &Classified, retries: usize) -> NeedsYou {
+    let tried = match retries {
+        0 => "and stopped without trying again".to_string(),
+        1 => "tried again once, and met it again".to_string(),
+        n => format!("tried again {n} times, and met it each time"),
+    };
     NeedsYou {
+        kind: c.kind,
         why: HumanOnly::Unrepaired,
         action: "Look at what stopped the run, put it right, then press Retry".into(),
         detail: format!(
-            "CoderHelm met an error it doesn't know how to repair, tried again once, and met it \
-             again: {}",
+            "CoderHelm met an error it doesn't know how to repair, {tried}: {}",
             c.plain
         ),
     }
+}
+
+/// The wait for the team's usage limit: what a person does, and the limit's
+/// own words. The one ending every run at the limit takes.
+pub fn usage_limit(reason: &str) -> NeedsYou {
+    let c = Classified {
+        kind: Kind::NeedsPerson,
+        repair: None,
+        person: Some(HumanOnly::UsageLimit),
+        plain: plain_words(reason.trim(), Kind::NeedsPerson, None, None),
+        signature: signature(reason, None),
+    };
+    needs_person(&c)
 }
 
 fn needs_person(c: &Classified) -> NeedsYou {
@@ -823,6 +848,7 @@ fn needs_person(c: &Classified) -> NeedsYou {
         HumanOnly::Unrepaired => "Look at what stopped the run, put it right, then press Retry",
     };
     NeedsYou {
+        kind: c.kind,
         why,
         action: action.into(),
         detail: c.plain.clone(),
@@ -860,6 +886,7 @@ fn unrepaired(c: &Classified, repair: &Repair, tried: usize) -> NeedsYou {
         }
     };
     NeedsYou {
+        kind: c.kind,
         why: if matches!(repair, Repair::ExpiredToken) {
             HumanOnly::Credential
         } else {
@@ -883,9 +910,10 @@ pub fn ending(reason: &str) -> Ending {
     if c.kind.resumable() {
         Ending::Parked(c)
     } else {
+        // No ledger here: nothing was tried again.
         let needs = match c.kind {
             Kind::NeedsPerson => needs_person(&c),
-            _ => unknown_stop(&c),
+            _ => unknown_stop(&c, 0),
         };
         Ending::NeedsYou(c, needs)
     }
@@ -1040,6 +1068,30 @@ mod tests {
             ending("Something nobody has seen before"),
             Ending::NeedsYou(..)
         ));
+    }
+
+    /// "Tried again" is written only when the ledger holds a retry.
+    #[test]
+    fn tried_again_is_said_only_for_a_recorded_retry() {
+        let c = classify("Something nobody has seen before: frobnicator returned 7");
+        match ending("Something nobody has seen before: frobnicator returned 7") {
+            Ending::NeedsYou(_, n) => {
+                assert!(!n.detail.contains("tried again"), "{}", n.detail);
+                assert!(n.detail.contains("without trying again"), "{}", n.detail);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut l = Ledger::default();
+        l.record(&c, "retry", "m", "t");
+        match next(&c, &l, "m") {
+            Next::NeedsYou(n) => assert!(n.detail.contains("tried again once"), "{}", n.detail),
+            other => panic!("{other:?}"),
+        }
+        let n = usage_limit(
+            "Monthly new tokens limit reached (5M of 4M). New model calls are stopped.",
+        );
+        assert_eq!(n.why, HumanOnly::UsageLimit);
+        assert!(n.action.contains("usage limit"));
     }
 
     #[test]

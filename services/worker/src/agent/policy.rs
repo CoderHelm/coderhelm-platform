@@ -8,6 +8,7 @@
 //! at the call site. A test in this module reads the worker's sources and
 //! fails when a tool executor is called anywhere else.
 
+use common::run_ending::EndWrite;
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -547,8 +548,10 @@ async fn write_run_stop(
             .update_expression(
                 "SET #s = :s, status_run_id = :sri, policy_note = :n, policy_approval = :a, updated_at = :t",
             )
-            .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
-            .expression_attribute_values(":sri", AttributeValue::S(format!("{status}#{run_id}"))),
+            .run_status(
+                ":s",
+                &common::run_ending::working(common::run_ending::Working::Queued, run_id),
+            ),
     };
     let r = update
         .expression_attribute_values(":n", AttributeValue::S(stop.note()))

@@ -28,6 +28,7 @@ use crate::models::{
 use crate::passes::attr_s;
 use crate::WorkerState;
 use common::reply_compose::Facts;
+use common::run_ending::EndWrite;
 use common::run_questions::Answer;
 use common::ticket_comments::{self as tc, Action, Comment, Settled, Source, Stage, Store};
 use common::ticket_state::{Intent, Note};
@@ -597,10 +598,17 @@ async fn stop_run(state: &WorkerState, t: &Ticket<'_>, by: &str) {
         )
         .condition_expression("#s IN (:running, :queued, :awaiting)")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(common::run_status::CANCELLED))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{}", common::run_status::CANCELLED, t.run_id)),
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                t.run_id,
+                &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+                    reason: common::run_ending::Stop::CancelledBy {
+                        who: format!("{by} (comment on the ticket)"),
+                    },
+                    tried: Default::default(),
+                }),
+            ),
         )
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":cb", attr_s(&format!("{by} (comment on the ticket)")))

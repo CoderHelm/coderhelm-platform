@@ -17,6 +17,7 @@
 //! of time hands off and the next one resumes where it stopped (and its
 //! progress token tells the step guard the run is moving).
 
+use common::run_ending::EndWrite;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -258,8 +259,12 @@ pub async fn complete_without_pr(
         .expression_attribute_names("#status", "status")
         .condition_expression(common::run_status::not_ended("#status"))
         .ended_values()
-        .expression_attribute_values(":s", super::attr_s("completed"))
-        .expression_attribute_values(":sri", super::attr_s(&format!("completed#{run_id}")))
+        // Finished with the deferred bumps as its answer, no pull request
+        // (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(run_id, &common::run_ending::answered(&note)),
+        )
         .usage_values(&delta)
         .expression_attribute_values(":d", super::attr_n(start.elapsed().as_secs()))
         .expression_attribute_values(":t", super::attr_s(&chrono::Utc::now().to_rfc3339()))

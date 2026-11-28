@@ -75,7 +75,10 @@ async fn an_unclassified_error_is_tried_once_then_needs_you_never_failed() {
     assert_eq!(rr::classify(odd).kind, Kind::Unknown);
     // The one failed-status write never writes it as failed.
     assert_ne!(
-        common::run_fail::status_for(odd),
+        common::run_fail::status_of(&common::run_fail::RunFailure {
+            cause: common::run_fail::Cause::Error(odd),
+            ..Default::default()
+        }),
         common::run_status::FAILED
     );
     // Tried once more first: one retry, then the stop.
@@ -99,10 +102,11 @@ fn the_orchestrator_recovers_before_anything_is_marked_failed() {
         .expect("the one failed write");
     let person = arm.find("recover::stop_for_person(").expect("needs you");
     assert!(recover < fail && recover < person);
-    // Every failed write reads the reason first: an unclassified one waits
-    // on a person.
+    // Every failed write for an error reads the error first: an
+    // unclassified one waits on a person. A stop the pass knew the reason
+    // for is typed and never read by the classifier (`vv`).
     let fail_fn = fn_src(src, "pub(crate) async fn fail_run(");
-    assert!(fail_fn.contains("common::run_fail::status_for(error_msg)"));
+    assert!(fail_fn.contains("common::run_fail::Cause::Error(error_msg)"));
     let funnel = include_str!("../../../../common/src/run_fail.rs");
     assert!(funnel.contains("rr::ending(&raw)"));
     // The sweep runs every 15 minutes and on each release's first start.

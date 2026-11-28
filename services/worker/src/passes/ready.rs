@@ -72,6 +72,7 @@
 //!   person. Every other hold says only what CoderHelm does when something
 //!   is queued to do it.
 
+use common::run_ending::EndWrite;
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -2143,8 +2144,10 @@ async fn record_hold(state: &WorkerState, team_id: &str, run_id: &str, hold: Dra
             )
             .condition_expression("#s = :held AND attribute_exists(draft_hold)")
             .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))
-            .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+            .run_status(
+                ":done",
+                &super::resume::delivered_now(state, team_id, run_id).await,
+            )
             .expression_attribute_values(":h", hold.to_attr())
             .expression_attribute_values(":t", attr_s(&now))
             .expression_attribute_values(":held", held)
@@ -2279,8 +2282,10 @@ async fn record_settled(state: &WorkerState, team_id: &str, run_id: &str, how: &
         )
         .condition_expression("#s = :held AND attribute_exists(draft_hold)")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))
-        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+        .run_status(
+            ":done",
+            &super::resume::delivered_now(state, team_id, run_id).await,
+        )
         .expression_attribute_values(":ds", attr_s(how))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":held", held)
