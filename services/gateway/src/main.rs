@@ -1890,6 +1890,12 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::hybrid_install::setup_settings),
         )
         .route("/api/brain/stream", post(routes::brain::brain_stream))
+        // The updater's probe of Chat after an update: the streaming role's
+        // own calls, answered only to a direct invoke (routes::stream_probe).
+        .route(
+            routes::stream_probe::PROBE_PATH,
+            post(routes::stream_probe::probe),
+        )
         .nest("/webhooks", webhook_routes)
         .nest("/hybrid", hybrid_routes())
         .route(

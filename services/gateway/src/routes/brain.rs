@@ -77,6 +77,34 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The structured line every Chat question ends with: `outcome` is
+/// "answered" or "failed". The services catch and log every error, so
+/// Lambda's Errors stay at 0 even while Chat fails every question; the
+/// install's alarm (infra/lib/monitoring-stack.ts, CHAT_ANSWER_EVENT there)
+/// reads these lines and alarms on the share that failed.
+pub const CHAT_ANSWER_EVENT: &str = "chat_answer";
+
+pub fn chat_answered(route: &str) {
+    info!(
+        event = CHAT_ANSWER_EVENT,
+        outcome = "answered",
+        route,
+        "Chat answered"
+    );
+}
+
+/// A question Chat couldn't answer for a reason that is the install's, not
+/// the person's (`why`: sign_in_check, model).
+pub fn chat_answer_failed(route: &str, why: &str) {
+    error!(
+        event = CHAT_ANSWER_EVENT,
+        outcome = "failed",
+        route,
+        why,
+        "Chat couldn't answer"
+    );
+}
+
 // ── Sources a question may use ──────────────────────────────────────────────
 
 /// One kind of source in the picker.
@@ -2639,6 +2667,9 @@ pub async fn brain_stream(
         &state.secrets.jwt_secret,
     );
     if let Err(r) = super::require_sso::check_scoped(&state, &claims, &minted_by).await {
+        if r.status().is_server_error() {
+            chat_answer_failed("/api/brain/stream", "sign_in_check");
+        }
         return Err(scoped_refusal(r.status()));
     }
     // The token carries the member's stored role; what it holds is read now,
@@ -2927,6 +2958,7 @@ pub async fn brain_stream(
             answer(&run, &sink, &user_id, &question, &history, &attachments).await
         else {
             // The model couldn't be reached: the error was sent, nothing is kept.
+            chat_answer_failed("/api/brain/stream", "model");
             sink.send("done", json!({})).await;
             return;
         };
@@ -2935,6 +2967,7 @@ pub async fn brain_stream(
             json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded, "map": map }),
         )
         .await;
+        chat_answered("/api/brain/stream");
         // Keep the exchange.
         let seq = thread.messages;
         let names: Vec<String> = attachments

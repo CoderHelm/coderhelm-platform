@@ -153,6 +153,8 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
     cfg,
     gatewayFunction: api.gatewayFunction,
     workerFunction: worker.workerFunction,
+    streamingFunction: streaming.streamingFunction,
+    updaterFunction: updates?.updaterFunction,
     table: database.table,
     ticketQueue: api.ticketQueue,
   });
