@@ -47,6 +47,26 @@ class FakeIam:
         return {"Role": {"RoleName": RoleName}}
 
 
+class FakeSm:
+    """Secrets Manager: the names of the account's secrets, two to a page."""
+
+    def __init__(self, names=(), fail=None):
+        self.names = list(names)
+        self.fail = fail
+        self.calls = []
+
+    def list_secrets(self, Filters, NextToken=None):
+        self.calls.append(Filters)
+        if self.fail:
+            raise self.fail
+        assert Filters == [{"Key": "name", "Values": ["coderhelm-readonly-"]}]
+        start = int(NextToken or 0)
+        page = {"SecretList": [{"Name": n, "ARN": f"arn:aws:secretsmanager:us-east-1:111122223333:secret:{n}-Ab12Cd"} for n in self.names[start:start + 2]]}
+        if start + 2 < len(self.names):
+            page["NextToken"] = str(start + 2)
+        return page
+
+
 class Waiter:
     def wait(self, **kw):
         pass
@@ -55,6 +75,7 @@ class Waiter:
 class FakeCfn:
     def __init__(self, root_status="UPDATE_COMPLETE", version="v0.9.4", reader_status=None, params=None, no_updates=False):
         self.root = {"StackName": "coderhelm-acme", "StackStatus": root_status,
+                     "StackId": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-acme/abc",
                      "Outputs": [{"OutputKey": "Version", "OutputValue": version}],
                      "Parameters": params if params is not None else [
                          {"ParameterKey": "InfrastructureVulnerabilities", "ParameterValue": "on"},
@@ -99,7 +120,7 @@ def written(cfn):
 class ReaderUpdateTests(unittest.TestCase):
     def test_after_a_release_update_the_reader_gets_that_releases_update_template(self):
         cfn = FakeCfn()
-        r = reader.keep(cfn, FakeIam(), "coderhelm-acme")
+        r = reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm())
         self.assertIn("creating", r)
         [(kind, kw)] = written(cfn)
         self.assertEqual(kind, "create")
@@ -114,7 +135,7 @@ class ReaderUpdateTests(unittest.TestCase):
 
     def test_only_read_only_groups_are_ever_switched_on(self):
         cfn = FakeCfn()
-        reader.keep(cfn, FakeIam(), "coderhelm-acme")
+        reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm())
         p = {x["ParameterKey"]: x["ParameterValue"] for x in written(cfn)[0][1]["Parameters"]}
         # Every parameter the template declares is given, and only those.
         self.assertEqual(sorted(p), sorted(declared()))
@@ -123,51 +144,71 @@ class ReaderUpdateTests(unittest.TestCase):
         for empty in ("KnowledgeBases", "ImportBuckets", "SyncKnowledgeBases", "WafLogResults", "WafLogKey", "DatabaseClusters", "Warehouses"):
             self.assertEqual(p[empty], "", empty)
 
+    def test_the_databases_an_admin_made_a_read_only_user_for_are_named(self):
+        # The incident: a data source in the install's own account, whose role
+        # nobody is asked to update, was refused rds-data:BeginTransaction on
+        # every check, because this stack named no database.
+        cfn = FakeCfn()
+        sm = FakeSm(["coderhelm-readonly-orders-db", "other-secret", "coderhelm-readonly-Bad_Name", "coderhelm-readonly-app-db"])
+        reader.keep(cfn, FakeIam(), "coderhelm-acme", sm)
+        p = {x["ParameterKey"]: x["ParameterValue"] for x in written(cfn)[0][1]["Parameters"]}
+        self.assertEqual(p["DatabaseClusters"], "arn:aws:rds:us-east-1:111122223333:cluster:app-db,arn:aws:rds:us-east-1:111122223333:cluster:orders-db")
+        self.assertEqual(len(sm.calls), 2, "every page read")
+        # Still nothing else: no warehouse, no maintenance.
+        self.assertEqual((p["Warehouses"], p["ApplyMaintenance"]), ("", "off"))
+
+    def test_unreadable_secrets_name_no_database_and_still_update_the_rest(self):
+        cfn = FakeCfn()
+        r = reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm(fail=Exception("AccessDenied")))
+        self.assertIn("creating", r)
+        p = {x["ParameterKey"]: x["ParameterValue"] for x in written(cfn)[0][1]["Parameters"]}
+        self.assertEqual(p["DatabaseClusters"], "")
+
     def test_a_template_without_a_parameter_never_gets_it(self):
         cfn = FakeCfn()
         cfn.get_template_summary = lambda TemplateURL: {"Parameters": [{"ParameterKey": "RoleName"}, {"ParameterKey": "InfrastructureVulnerabilities"}]}
-        reader.keep(cfn, FakeIam(), "coderhelm-acme")
+        reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm())
         self.assertEqual([x["ParameterKey"] for x in written(cfn)[0][1]["Parameters"]], ["InfrastructureVulnerabilities", "RoleName"])
 
     def test_the_next_release_updates_the_same_stack(self):
         cfn = FakeCfn(version="v0.9.5", reader_status="UPDATE_COMPLETE")
-        self.assertIn("updating", reader.keep(cfn, FakeIam(), "coderhelm-acme"))
+        self.assertIn("updating", reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm()))
         [(kind, kw)] = written(cfn)
         self.assertEqual(kind, "update")
         self.assertTrue(kw["TemplateURL"].endswith("/launch/v0.9.5/coderhelm-log-reader-update.yaml"))
 
     def test_already_current_is_not_a_failure(self):
         cfn = FakeCfn(reader_status="CREATE_COMPLETE", no_updates=True)
-        self.assertIn("already has v0.9.4's reads", reader.keep(cfn, FakeIam(), "coderhelm-acme"))
+        self.assertIn("already has v0.9.4's reads", reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm()))
 
     def test_no_reader_role_changes_nothing(self):
         cfn = FakeCfn()
-        self.assertIn("nothing to update", reader.keep(cfn, FakeIam(role=False), "coderhelm-acme"))
+        self.assertIn("nothing to update", reader.keep(cfn, FakeIam(role=False), "coderhelm-acme", FakeSm()))
         self.assertEqual(cfn.calls, [])
 
     def test_a_busy_install_or_reader_waits_for_the_next_run(self):
         cfn = FakeCfn(root_status="UPDATE_IN_PROGRESS")
-        self.assertIn("busy", reader.keep(cfn, FakeIam(), "coderhelm-acme"))
+        self.assertIn("busy", reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm()))
         self.assertEqual(written(cfn), [])
         cfn = FakeCfn(reader_status="UPDATE_IN_PROGRESS")
-        self.assertIn("busy", reader.keep(cfn, FakeIam(), "coderhelm-acme"))
+        self.assertIn("busy", reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm()))
         self.assertEqual(written(cfn), [])
 
     def test_a_failed_first_create_is_removed_and_made_again(self):
         cfn = FakeCfn(reader_status="ROLLBACK_COMPLETE")
-        reader.keep(cfn, FakeIam(), "coderhelm-acme")
+        reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm())
         self.assertEqual([c[0] for c in cfn.calls if c[0] != "summary"], ["delete", "create"])
 
     def test_only_a_release_version_names_a_template(self):
         cfn = FakeCfn(version="main")
-        self.assertIn("names no release", reader.keep(cfn, FakeIam(), "coderhelm-acme"))
+        self.assertIn("names no release", reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm()))
         for bad in ("../x", "v1.2", "", None):
             with self.assertRaises(ValueError):
                 reader.template_url(bad)
 
     def test_switches_the_stack_lacks_take_their_defaults(self):
         cfn = FakeCfn(params=[])
-        reader.keep(cfn, FakeIam(), "coderhelm-acme")
+        reader.keep(cfn, FakeIam(), "coderhelm-acme", FakeSm())
         p = {x["ParameterKey"]: x["ParameterValue"] for x in written(cfn)[0][1]["Parameters"]}
         self.assertEqual((p["InfrastructureVulnerabilities"], p["InspectorFindings"], p["HealthEvents"]), ("on", "off", "off"))
 
@@ -177,7 +218,7 @@ class HandlerTests(unittest.TestCase):
         class Broken(FakeCfn):
             def describe_stacks(self, StackName):
                 raise RuntimeError("throttled")
-        r = reader.handler({"detail": {"anything": "at all"}}, None, cfn=Broken(), iam=FakeIam(), root="coderhelm-acme")
+        r = reader.handler({"detail": {"anything": "at all"}}, None, cfn=Broken(), iam=FakeIam(), root="coderhelm-acme", sm=FakeSm())
         self.assertIn("next run tries again", r["result"])
 
     def test_as_a_custom_resource_it_always_answers_success(self):
@@ -186,8 +227,8 @@ class HandlerTests(unittest.TestCase):
         reader.respond = lambda event, status, reason: sent.append(status)
         try:
             ev = {"RequestType": "Create", "ResponseURL": "https://x", "StackId": "s", "RequestId": "r", "LogicalResourceId": "ReaderNow"}
-            reader.handler(ev, None, cfn=FakeCfn(root_status="UPDATE_IN_PROGRESS"), iam=FakeIam(), root="coderhelm-acme")
-            reader.handler(dict(ev, RequestType="Delete"), None, cfn=FakeCfn(), iam=FakeIam(), root="coderhelm-acme")
+            reader.handler(ev, None, cfn=FakeCfn(root_status="UPDATE_IN_PROGRESS"), iam=FakeIam(), root="coderhelm-acme", sm=FakeSm())
+            reader.handler(dict(ev, RequestType="Delete"), None, cfn=FakeCfn(), iam=FakeIam(), root="coderhelm-acme", sm=FakeSm())
         finally:
             reader.respond = orig
         self.assertEqual(sent, ["SUCCESS", "SUCCESS"])

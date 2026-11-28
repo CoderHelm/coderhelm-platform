@@ -1,5 +1,12 @@
 //! Logic shared between the gateway and worker services.
 
+/// What an AWS SDK error was, as a log field (its code, never "service error").
+pub mod aws_error;
+/// Where a request's time went: its AWS calls, timed by an SDK interceptor.
+pub mod call_clock;
+/// DynamoDB's reserved words, and a check that no expression names one bare.
+pub mod dynamo_names;
+
 /// A repository's generated agent file: which files shape it, when a push
 /// makes it stale, and when the sweep writes it again by itself.
 pub mod agent_file;

@@ -58,25 +58,36 @@ async fn main() -> Result<(), Error> {
 
     // Initialize AWS SDK
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let dynamo = aws_sdk_dynamodb::Client::new(&aws_config);
-    let sqs = aws_sdk_sqs::Client::new(&aws_config);
-    let ses = aws_sdk_sesv2::Client::new(&aws_config);
-    let s3 = aws_sdk_s3::Client::new(&aws_config);
-    let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
-    let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
-    let kms = aws_sdk_kms::Client::new(&aws_config);
+    // Every client times its calls into the request they serve
+    // (middleware::deadline): a request that runs out of time names them.
+    macro_rules! timed {
+        ($($sdk:ident)::+) => {
+            $($sdk)::+::Client::from_conf(
+                $($sdk)::+::config::Builder::from(&aws_config)
+                    .interceptor(common::call_clock::CallClock)
+                    .build(),
+            )
+        };
+    }
+    let dynamo = timed!(aws_sdk_dynamodb);
+    let sqs = timed!(aws_sdk_sqs);
+    let ses = timed!(aws_sdk_sesv2);
+    let s3 = timed!(aws_sdk_s3);
+    let cognito = timed!(aws_sdk_cognitoidentityprovider);
+    let lambda_client = timed!(aws_sdk_lambda);
+    let kms = timed!(aws_sdk_kms);
     // The hosted side of hybrid: CoderHelm's signing key in KMS (none on a
     // self-hosted install).
     common::hybrid::hosted_sig::init_signer(&kms);
-    let sts = aws_sdk_sts::Client::new(&aws_config);
-    let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    let sts = timed!(aws_sdk_sts);
+    let bedrock = timed!(aws_sdk_bedrockruntime);
     // Claude through Bedrock: set on every install, so a switch to Bedrock
     // in Settings needs no restart.
     common::model_provider::set_bedrock_client(bedrock.clone());
-    let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
-    let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
+    let scheduler = timed!(common::plugins::schedule::aws_sdk_scheduler);
+    let sm = timed!(aws_sdk_secretsmanager);
     // Where this deployment's dashboard and API are (config, or SSM).
-    common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
+    common::public_urls::init(timed!(common::public_urls::ssm)).await;
 
     // Load secrets from Secrets Manager
     let secrets_name =
@@ -1959,6 +1970,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         // Cross-origin answers for browsers (middleware::cors): outermost,
         // so preflights are answered before routing.
         .layer(axum_middleware::from_fn(middleware::cors::cors))
+        // Outermost: every request runs within its invocation's deadline,
+        // and one that runs out of time logs its route and where the time
+        // went, and answers 503 (middleware::deadline).
+        .layer(axum_middleware::from_fn(middleware::deadline::guard))
         .with_state(state)
 }
 
