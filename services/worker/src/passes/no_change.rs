@@ -32,6 +32,7 @@ use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::passes::{attr_n, attr_s, fix_location, RunUsageValues};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
+use common::run_ending::EndWrite;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -603,12 +604,20 @@ pub(crate) async fn finish(run: Run<'_>, plan: &super::plan::PlanResult, usage: 
         .condition_expression(common::run_status::not_ended("#status"))
         .expression_attribute_names("#status", "status")
         .expression_attribute_names("#nc", FIELD)
-        .expression_attribute_values(":s", attr_s(end.status))
+        // Done with the reason no change was needed (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                run_id,
+                &common::run_ending::RunEnd::Done(common::run_ending::Done::NoChange {
+                    why: end.note.clone(),
+                }),
+            ),
+        )
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("{}#{run_id}", end.status)))
         .expression_attribute_values(
             ":mcp",
             AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),

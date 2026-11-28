@@ -341,6 +341,7 @@ const CACHES: &[(&str, &str)] = &[
     ("common/src/review_check.rs::REFUSED", "installation id"),
     ("common/src/usage.rs::P", "model prices; install-wide config"),
     ("common/src/customer_guard/mod.rs::SET", "the common-words list; no data"),
+    ("common/src/dynamo_names.rs::SET", "DynamoDB's reserved-word list; no data"),
     ("common/src/usage.rs::WARNED", "model id; log throttle"),
     ("gateway/src/mcp_server.rs::SEEN", "grant or key id; throttle"),
     ("gateway/src/middleware/auth.rs::SEEN", "(team, user); throttle"),

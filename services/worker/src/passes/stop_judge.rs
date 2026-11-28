@@ -16,6 +16,7 @@
 //! these happens another way.
 
 use common::decision_log::{self, Record, Subject};
+use common::run_ending::EndWrite;
 use common::stop_judge::{self as judge, JudgeModel, JUDGMENT_EFFORT};
 pub use common::stop_judge::{Budget, Evidence, Judged, Kind, Picture, Related, Thread};
 use serde_json::Value;
@@ -599,10 +600,9 @@ pub async fn take_default(state: &WorkerState, team_id: &str, run_id: &str) {
         .update_expression("SET #s = :r, status_run_id = :sri, retried_as = :n, updated_at = :t")
         .condition_expression("#s = :ni")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":r", super::attr_s(common::run_status::RETRIED))
-        .expression_attribute_values(
-            ":sri",
-            super::attr_s(&format!("{}#{run_id}", common::run_status::RETRIED)),
+        .run_status(
+            ":r",
+            &common::run_ending::gate(run_id, &common::run_ending::superseded(&new_run)),
         )
         .expression_attribute_values(":n", super::attr_s(&new_run))
         .expression_attribute_values(":t", super::attr_s(&chrono::Utc::now().to_rfc3339()))

@@ -20,6 +20,7 @@
 //!   slot while it works ([`claim`]): a feedback or CI pass of the earlier
 //!   run waits for it instead of writing the branch at the same time.
 
+use common::run_ending::EndWrite;
 use common::run_round::{Round, State};
 use common::run_status::{self, EndedValues};
 use tracing::{info, warn};
@@ -268,8 +269,17 @@ pub async fn stop_busy(
         .condition_expression(run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        // Done: CoderHelm's own pull request that another run holds
+        // (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                run_id,
+                &common::run_ending::RunEnd::Done(common::run_ending::Done::CoveredBy {
+                    url: url.to_string(),
+                }),
+            ),
+        )
         .expression_attribute_values(":cb", attr_s(&record.to_string()))
         .expression_attribute_values(":em", attr_s(&note))
         .usage_values(&delta)

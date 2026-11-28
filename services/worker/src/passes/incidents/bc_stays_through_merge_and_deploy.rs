@@ -195,7 +195,7 @@ fn a_failed_deploy_gets_a_revert_ready_for_approval_with_the_evidence() {
     // The revert is opened ready, and nothing in it merges.
     let src = include_str!("../deploy_revert.rs");
     assert!(!src.contains("merge_pull_request("));
-    let build = fn_src(src, "\nasync fn build(");
+    let build = fn_src(src, "\nasync fn build<");
     assert!(build.contains("find_open_pr_for_branch("), "one per merge");
     let run = fn_src(include_str!("../health_check.rs"), "\npub async fn run(");
     assert!(run.contains("propose_revert(state, &github, &msg, jobs)"));

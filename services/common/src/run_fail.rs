@@ -5,13 +5,23 @@
 //! person can read) and in which pass (`failed_pass`). A test below reads the
 //! sources and refuses any other write of the failed status.
 //!
-//! The reason is read first (`run_recovery::ending`). Only an error CoderHelm
-//! gets past by itself (transient, or a state it repairs) is written as
-//! `failed`, and then in plain words with the raw error kept apart
-//! (`error_detail`): the self-heal sweep resumes it from its checkpoint.
-//! Anything else stops the run as "needs you" (`needs_input`, with what a
-//! person does and why): an error nobody classified never ends a run as
-//! `failed`, and no run shows a raw HTTP dump.
+//! What ends the run is a [`Cause`], and every ending goes through the one
+//! gate (`run_ending::gate`):
+//!
+//! - [`Cause::Error`]: an error a pass raised, read by
+//!   `run_recovery::ending`. Only one CoderHelm gets past by itself
+//!   (transient, or a state it repairs) is written as `failed`, in plain
+//!   words with the raw error kept apart (`error_detail`): the self-heal
+//!   sweep resumes it from its checkpoint. Anything else stops the run as
+//!   "needs you" (`needs_input`, with what a person does and why), and no
+//!   run shows a raw HTTP dump.
+//! - [`Cause::Stopped`]: a stop the pass knew the reason for (red checks,
+//!   its review still open, the run guard), typed. It is written as that
+//!   reason and never read again by the error classifier: red CI was read
+//!   as "an error it doesn't know how to repair, tried again once" with no
+//!   retry made.
+//! - [`Cause::NeedsYou`]: a wait only a person ends, decided by the
+//!   recovery path or by the usage limit.
 //!
 //! Two failed runs without a reason led here: a feedback pass that lost a race
 //! with a cancel wrote a raw "service error" under another field name over the
@@ -38,11 +48,47 @@ const MAX_REASON_CHARS: usize = 500;
 /// Statuses a failure never overwrites: the run already ended another way.
 const FINAL_STATUSES: [&str; 2] = ["cancelled", "merged"];
 
+/// What ends the run: see the module comment.
+#[derive(Debug, Clone)]
+pub enum Cause<'a> {
+    /// An error a pass raised, as it was raised (`error_text`).
+    Error(&'a str),
+    /// A stop the pass knew the reason for: `reason` is its sentence for a
+    /// person, `stop` the typed reason and what was tried.
+    Stopped {
+        reason: &'a str,
+        stop: crate::run_ending::Stopped,
+    },
+    /// A wait only a person ends: what they do and why (with the error's
+    /// kind as it was classified when that was decided).
+    NeedsYou {
+        reason: &'a str,
+        needs: &'a crate::run_recovery::NeedsYou,
+    },
+}
+
+impl Default for Cause<'_> {
+    fn default() -> Self {
+        Cause::Error("")
+    }
+}
+
+impl<'a> Cause<'a> {
+    /// The words a person reads.
+    pub fn reason(&self) -> &'a str {
+        match self {
+            Cause::Error(r)
+            | Cause::Stopped { reason: r, .. }
+            | Cause::NeedsYou { reason: r, .. } => r,
+        }
+    }
+}
+
 /// Why a run failed and where.
 #[derive(Debug, Clone, Default)]
 pub struct RunFailure<'a> {
-    /// What went wrong, for a person to read.
-    pub reason: &'a str,
+    /// What ended it.
+    pub cause: Cause<'a>,
     /// The pass the run was in. `None` keeps the pass the record names
     /// (`current_pass`), or [`BEFORE_FIRST_PASS`] when it names none.
     pub pass: Option<&'a str>,
@@ -54,15 +100,13 @@ pub struct RunFailure<'a> {
     /// Numbers added to fields in the same write (tokens, cost): what this
     /// invocation used, on top of what earlier ones recorded.
     pub add: Vec<(&'static str, AttributeValue)>,
-    /// The recovery path already decided only a person gets past it
-    /// (`run_recovery::next`): the run waits on them with this, whatever
-    /// the reason's own reading.
-    pub needs: Option<&'a crate::run_recovery::NeedsYou>,
 }
 
 /// The status-index sort key of a failed run.
 pub fn status_run_id(run_id: &str) -> String {
-    format!("{STATUS}#{run_id}")
+    crate::run_ending::restored(STATUS, run_id)
+        .map(|w| w.sri().to_string())
+        .unwrap_or_default()
 }
 
 /// A reason a person can read: trimmed, never empty, bounded.
@@ -97,23 +141,26 @@ pub struct Update {
     pub condition: String,
     pub names: HashMap<String, String>,
     pub values: HashMap<String, AttributeValue>,
+    /// The status it writes.
+    pub status: &'static str,
+    /// The self-heal sweep resumes the run from its checkpoint: an error
+    /// CoderHelm gets past by itself, parked as `failed`.
+    pub resumable: bool,
+    /// What the ticket hears.
+    pub said: String,
 }
 
-/// The status a stop for `reason` writes: `failed` only for an error the
-/// self-heal sweep resumes, else `needs_input` (`run_recovery::ending`).
-pub fn status_for(reason: &str) -> &'static str {
-    match crate::run_recovery::ending(&readable_reason(reason)) {
-        crate::run_recovery::Ending::Parked(_) => STATUS,
-        crate::run_recovery::Ending::NeedsYou(..) => crate::run_status::NEEDS_INPUT,
-    }
+/// The status the write for `f` sets.
+pub fn status_of(f: &RunFailure<'_>) -> &'static str {
+    update("", f, "").status
 }
 
-/// The write that ends `run_id` for a stop: `failed` (parked for the
-/// self-heal sweep) or "needs you" (see the module comment).
+/// The write that ends `run_id` for a stop (see the module comment).
 pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
+    use crate::run_ending::{self as re, RunEnd};
     use crate::run_recovery::{self as rr, Ending};
     let s = |v: &str| AttributeValue::S(v.to_string());
-    let raw = readable_reason(f.reason);
+    let raw = readable_reason(f.cause.reason());
     let mut names = HashMap::from([
         ("#s".to_string(), "status".to_string()),
         // Older writes put the reason under `error`; one field from now on.
@@ -121,39 +168,89 @@ pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
         ("#detail".to_string(), rr::FIELD_ERROR_DETAIL.to_string()),
         ("#kind".to_string(), rr::FIELD_ERROR_KIND.to_string()),
     ]);
-    let ending = match f.needs {
-        Some(n) => Ending::NeedsYou(rr::classify(&raw), n.clone()),
-        None => rr::ending(&raw),
+    // A wait on a person, through the gate with what they do.
+    let needs_you = |needs: &rr::NeedsYou| {
+        let wait = crate::run_wait::WaitingOn::action(&needs.action, &needs.detail, "")
+            .unwrap_or_else(|| {
+                crate::run_wait::WaitingOn::fixed(
+                    "Look at what stopped the run, then press Retry",
+                    &needs.detail,
+                    "",
+                )
+            });
+        let why = crate::handback::HandBack::new(needs.why, &needs.detail)
+            .unwrap_or_else(|| crate::handback::HandBack::of(needs.why));
+        crate::run_wait::needs_input_write(run_id, &wait, &why)
     };
-    let (status, sri, plain, kind, wait) = match ending {
-        Ending::Parked(c) => (
-            s(STATUS),
-            s(&status_run_id(run_id)),
-            c.plain.clone(),
-            c.kind,
-            None,
-        ),
-        Ending::NeedsYou(c, needs) => {
-            let wait = crate::run_wait::WaitingOn::action(&needs.action, &needs.detail, "")
-                .unwrap_or_else(|| {
-                    crate::run_wait::WaitingOn::fixed(
-                        "Look at what stopped the run, then press Retry",
-                        &needs.detail,
-                        "",
-                    )
-                });
-            let why = crate::handback::HandBack::new(needs.why, &needs.detail)
-                .unwrap_or_else(|| crate::handback::HandBack::of(needs.why));
-            let [st, sri, wo] = crate::run_wait::needs_input_values(run_id, &wait, &why);
-            (st, sri, needs.detail.clone(), c.kind, Some(wo))
+    let (write, plain, kind, wait, resumable, said) = match &f.cause {
+        // Only an error a pass raised is read by the classifier.
+        Cause::Error(_) => match rr::ending(&raw) {
+            Ending::Parked(c) => {
+                let w = re::gate(
+                    run_id,
+                    &RunEnd::Stopped(re::Stopped {
+                        reason: re::Stop::Error {
+                            kind: c.kind.code().to_string(),
+                            plain: c.plain.clone(),
+                        },
+                        tried: re::Tried::default(),
+                    }),
+                );
+                let said = format!("{} CoderHelm resumes the run by itself.", c.plain);
+                (
+                    w,
+                    c.plain.clone(),
+                    c.kind.code().to_string(),
+                    None,
+                    true,
+                    said,
+                )
+            }
+            Ending::NeedsYou(c, needs) => {
+                let (w, wo) = needs_you(&needs);
+                let said = format!("{} {}.", needs.detail, needs.action);
+                (
+                    w,
+                    needs.detail.clone(),
+                    c.kind.code().to_string(),
+                    Some(wo),
+                    false,
+                    said,
+                )
+            }
+        },
+        Cause::NeedsYou { needs, .. } => {
+            let kind = needs.kind;
+            let (w, wo) = needs_you(needs);
+            let said = format!("{} {}.", needs.detail, needs.action);
+            (
+                w,
+                needs.detail.clone(),
+                kind.code().to_string(),
+                Some(wo),
+                false,
+                said,
+            )
+        }
+        // A typed stop is written as itself.
+        Cause::Stopped { stop, .. } => {
+            let w = re::gate(run_id, &RunEnd::Stopped(stop.clone()));
+            let code = match w.ending() {
+                Some(AttributeValue::M(m)) => m
+                    .get("reason")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            (w, raw.clone(), code, None, false, raw.clone())
         }
     };
+    let status = write.status();
     let mut values = HashMap::from([
-        (":failed".to_string(), status),
-        (":sri".to_string(), sri),
         (":err".to_string(), s(&readable_reason(&plain))),
         (":detail".to_string(), s(&raw)),
-        (":kind".to_string(), s(kind.code())),
+        (":kind".to_string(), s(&kind)),
         (":t".to_string(), s(now)),
     ]);
     let pass = match f.pass.map(str::trim).filter(|p| !p.is_empty()) {
@@ -170,6 +267,7 @@ pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
         "SET #s = :failed, status_run_id = :sri, error_message = :err, failed_pass = {pass}, \
          #detail = :detail, #kind = :kind, updated_at = :t"
     );
+    write.add_to(":failed", &mut expression, &mut names, &mut values);
     if let Some(wo) = wait {
         names.insert("#wo".into(), crate::run_wait::FIELD_WAITING_ON.to_string());
         values.insert(":wo".into(), wo);
@@ -216,6 +314,9 @@ pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
         condition,
         names,
         values,
+        status,
+        resumable,
+        said,
     }
 }
 
@@ -283,7 +384,7 @@ mod tests {
         let u = update(
             "R1",
             &RunFailure {
-                reason: PASSING,
+                cause: Cause::Error(PASSING),
                 pass: Some("feedback"),
                 ..Default::default()
             },
@@ -316,7 +417,7 @@ mod tests {
             "HTTP status client error (422 Unprocessable Entity) for url (https://api.github.com/repos/o/r/pulls): {\"message\":\"Validation Failed\"}",
             "Monthly token limit exceeded (5 / 4 tokens). Increase your limit in Settings under Token Limit.",
         ] {
-            let u = update("R1", &RunFailure { reason, ..Default::default() }, "now");
+            let u = update("R1", &RunFailure { cause: Cause::Error(reason), ..Default::default() }, "now");
             assert_ne!(sv(&u, ":failed"), STATUS, "{reason}");
             assert_eq!(sv(&u, ":failed"), crate::run_status::NEEDS_INPUT, "{reason}");
             assert_eq!(sv(&u, ":sri"), "needs_input#R1");
@@ -327,9 +428,78 @@ mod tests {
             assert!(!wait.action.is_empty() && !wait.handback.is_empty());
             assert!(!sv(&u, ":err").contains("https://"), "{reason}");
             assert!(!sv(&u, ":err").contains('{'), "{reason}");
-            assert_ne!(status_for(reason), STATUS);
+            assert_ne!(u.status, STATUS);
+            assert!(!u.resumable);
         }
-        assert_eq!(status_for(PASSING), STATUS);
+        let parked = update(
+            "R1",
+            &RunFailure {
+                cause: Cause::Error(PASSING),
+                ..Default::default()
+            },
+            "now",
+        );
+        assert_eq!(parked.status, STATUS);
+        assert!(parked.resumable);
+    }
+
+    /// A red CI ending is a typed stop: written as itself, never read by the
+    /// error classifier, never "an error it doesn't know how to repair",
+    /// never "tried again" without a retry, and never resumed as a pause.
+    #[test]
+    fn a_red_ci_stop_is_never_read_as_an_unknown_error() {
+        use crate::run_ending::{RedCi, Stop, Stopped, Tried};
+        let red = RedCi {
+            checks: vec!["Deploy Staging".into()],
+            head: "0123456789abcdef0123456789abcdef01234567".into(),
+            base: "main".into(),
+            base_red: vec![],
+            excerpt: "expect(received).toEqual(expected)".into(),
+        };
+        let why = format!(
+            "{}. 2 CI fix rounds changed no code. The pull request stays a draft until CI passes",
+            red.reason()
+        );
+        let u = update(
+            "R1",
+            &RunFailure {
+                cause: Cause::Stopped {
+                    reason: &why,
+                    stop: Stopped {
+                        reason: Stop::RedCi(red),
+                        tried: Tried {
+                            rounds: 2,
+                            ..Default::default()
+                        },
+                    },
+                },
+                ..Default::default()
+            },
+            "now",
+        );
+        assert_eq!(sv(&u, ":failed"), STATUS);
+        assert_eq!(sv(&u, ":sri"), "failed#R1");
+        assert_eq!(sv(&u, ":kind"), "red_ci");
+        assert_ne!(sv(&u, ":kind"), "unknown");
+        assert!(!u.resumable, "a red check is no pause to resume");
+        assert!(!u.expression.contains("#wo"), "nobody is waited on");
+        for text in [sv(&u, ":err"), u.said.clone()] {
+            assert!(!text.contains("doesn't know how to repair"), "{text}");
+            assert!(!text.contains("tried again"), "{text}");
+            assert!(text.contains("Deploy Staging"), "{text}");
+        }
+        let ending = match &u.values[":run_ending"] {
+            AttributeValue::M(m) => m.clone(),
+            v => panic!("{v:?}"),
+        };
+        assert_eq!(ending["kind"], AttributeValue::S("stopped".into()));
+        assert!(ending["tried"].as_s().unwrap().contains("2 fix rounds"));
+        // The same words as an error a pass raised would have been read as
+        // unknown: the typed path is what keeps them from it.
+        assert_eq!(
+            crate::run_recovery::classify(&why).kind,
+            crate::run_recovery::Kind::Unknown
+        );
     }
 
     #[test]
@@ -337,7 +507,7 @@ mod tests {
         let u = update(
             "R1",
             &RunFailure {
-                reason: "boom",
+                cause: Cause::Error("boom"),
                 ..Default::default()
             },
             "now",
@@ -363,7 +533,7 @@ mod tests {
         let u = update(
             "R1",
             &RunFailure {
-                reason: "timed out",
+                cause: Cause::Error("timed out"),
                 only_from: Some("running"),
                 ..Default::default()
             },
@@ -378,7 +548,7 @@ mod tests {
         let u = update(
             "R1",
             &RunFailure {
-                reason: "x",
+                cause: Cause::Error("x"),
                 extra: vec![("cost_usd", AttributeValue::N("1.5".into()))],
                 ..Default::default()
             },
@@ -416,7 +586,7 @@ mod tests {
         let u = update(
             "R1",
             &RunFailure {
-                reason: "x",
+                cause: Cause::Error("x"),
                 add: vec![("cost_usd", AttributeValue::N("0.25".into()))],
                 ..Default::default()
             },

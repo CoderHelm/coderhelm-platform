@@ -137,7 +137,15 @@ pub fn settings_from(body: &Value) -> Result<Value, &'static str> {
         return Err("send an object of settings");
     };
     const KEYS: &[&str] = &[
-        "auto", "channel", "day", "hour", "timezone", "majors", "digest", "report",
+        "auto",
+        "channel",
+        "day",
+        "hour",
+        "timezone",
+        "majors",
+        "digest",
+        "report",
+        "gap_hours",
     ];
     if let Some(k) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
         let _ = k;

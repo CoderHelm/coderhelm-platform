@@ -327,9 +327,16 @@ impl engine::RunLog for Runs<'_> {
             return;
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let mut set = vec![
-            ("status", A::S(r.status.clone())),
-            ("status_run_id", A::S(format!("{}#{}", r.status, r.run_id))),
+        // Through the one gate (`common::run_ending`): finished with its
+        // result on the run page, stopped with its error, or working.
+        let ending = common::run_ending::for_job(
+            &r.status,
+            &r.run_id,
+            "the skill's result on the run page",
+            &r.error,
+        );
+        let mut set = common::run_ending::item_fields(&ending);
+        set.extend([
             ("ticket_source", A::S("skill_run".into())),
             ("ticket_id", A::S(format!("skill:{}", r.schedule_id))),
             ("title", A::S(format!("Skill run: {}", r.skill_name))),
@@ -341,7 +348,7 @@ impl engine::RunLog for Runs<'_> {
             ("tokens_out", A::N("0".into())),
             ("cost_usd", A::N(format!("{:.6}", r.cost_usd))),
             ("updated_at", A::S(now)),
-        ];
+        ]);
         if !r.error.is_empty() {
             set.push((
                 "error",

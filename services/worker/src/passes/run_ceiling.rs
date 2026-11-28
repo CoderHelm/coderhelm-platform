@@ -21,6 +21,14 @@
 //!
 //! Worked time is the time the worker spent on the run, not the calendar: a
 //! pull request can rightly wait days for CI or a person, and that costs nothing.
+//! It is the union of the run's invocations ([`Clock`]), never their sum: two
+//! messages of one run that overlap (a CI resume beside a review event, a wait
+//! sent on while a step runs) count their shared minutes once. A step that was
+//! killed never says when it ended; it is known killed only once its marker is
+//! older than the longest a step can live ([`STEP_SECS`] and
+//! [`KILLED_AFTER_SLACK_SECS`]), and only then counts for all of its time,
+//! recorded on the run (`ceil_killed`). A marker of an invocation still running
+//! is never a kill.
 //!
 //! Sized for the largest real work the caps allow, far above any loop's stop by
 //! `run_guard`: the existing 50-step ceiling at about $4 and 15 minutes a step,
@@ -48,8 +56,137 @@ pub const MAX_RUN_WORKED_SECS: u64 = 16 * 3600;
 /// USD in a run's life: 50 steps at about $4.
 pub const MAX_RUN_SPEND_USD: f64 = 200.0;
 
-/// What a step that never reported its end counts for: all of its time.
-const STEP_SECS: u64 = 900;
+/// What a step that never reported its end counts for: all of its time, the
+/// most one invocation lives (the worker's Lambda timeout).
+pub const STEP_SECS: u64 = 900;
+
+/// Past [`STEP_SECS`], how long before a marker is taken for a killed step:
+/// the function's start and its first write are not the same instant.
+pub const KILLED_AFTER_SLACK_SECS: u64 = 60;
+
+/// The run's worked time as intervals: the invocations running now (by
+/// invocation, when each started) and the counted time that could still
+/// overlap them. Everything here is epoch seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Clock {
+    /// Invocations that said they started and not yet that they ended.
+    pub live: std::collections::BTreeMap<String, u64>,
+    /// Counted time, merged, sorted: only what ends after the oldest live
+    /// start is kept, since nothing counted later can start before it.
+    pub spans: Vec<(u64, u64)>,
+}
+
+/// What an invocation's start found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Entered {
+    /// Markers of steps that were killed (older than any step lives).
+    pub killed: u32,
+    /// Seconds those kills add that weren't counted already.
+    pub charged: u64,
+}
+
+impl Clock {
+    /// Adds `[from, to)` to the counted time; returns the seconds of it that
+    /// weren't counted yet.
+    pub fn count(&mut self, from: u64, to: u64) -> u64 {
+        if to <= from {
+            return 0;
+        }
+        let covered: u64 = self
+            .spans
+            .iter()
+            .map(|&(s, e)| e.min(to).saturating_sub(s.max(from)))
+            .sum();
+        let (mut lo, mut hi) = (from, to);
+        let mut kept: Vec<(u64, u64)> = Vec::with_capacity(self.spans.len() + 1);
+        for &(s, e) in &self.spans {
+            if e < lo || s > hi {
+                kept.push((s, e));
+            } else {
+                lo = lo.min(s);
+                hi = hi.max(e);
+            }
+        }
+        kept.push((lo, hi));
+        kept.sort_unstable();
+        self.spans = kept;
+        (to - from) - covered
+    }
+
+    /// An invocation `id` starts at `now`. A marker older than any step
+    /// lives was a killed step: it is taken off and counts for all of its
+    /// time. A marker of a step that may still be running counts nothing.
+    pub fn enter(&mut self, id: &str, now: u64) -> Entered {
+        let dead: Vec<(String, u64)> = self
+            .live
+            .iter()
+            .filter(|(_, &at)| at + STEP_SECS + KILLED_AFTER_SLACK_SECS <= now)
+            .map(|(k, &at)| (k.clone(), at))
+            .collect();
+        let mut out = Entered::default();
+        for (k, at) in dead {
+            self.live.remove(&k);
+            out.killed += 1;
+            out.charged += self.count(at, at + STEP_SECS);
+        }
+        self.live.insert(id.to_string(), now);
+        self.prune(now);
+        out
+    }
+
+    /// Invocation `id`, which started at `started`, ends at `now`: the
+    /// seconds it adds are the part of its time nothing else counted.
+    pub fn leave(&mut self, id: &str, started: u64, now: u64) -> u64 {
+        // Its own marker says when it started; a marker already taken for
+        // a kill (it outlived the limit) still counts only what is new.
+        let from = self.live.remove(id).unwrap_or(started).min(started);
+        let added = self.count(from, now.max(from));
+        self.prune(now);
+        added
+    }
+
+    /// Drops counted time nothing to come can overlap: whatever ends before
+    /// the oldest live start (or `now`, with nothing live).
+    fn prune(&mut self, now: u64) {
+        let floor = self.live.values().copied().min().unwrap_or(now).min(now);
+        self.spans.retain(|&(_, e)| e > floor);
+    }
+
+    /// As kept on the run: `id=start;id=start` and `start-end,start-end`.
+    pub fn to_attrs(&self) -> (String, String) {
+        let live = self
+            .live
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let spans = self
+            .spans
+            .iter()
+            .map(|(s, e)| format!("{s}-{e}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        (live, spans)
+    }
+
+    pub fn from_attrs(live: &str, spans: &str) -> Self {
+        let live = live
+            .split(';')
+            .filter_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                Some((k.to_string(), v.parse().ok()?))
+            })
+            .collect();
+        let spans = spans
+            .split(',')
+            .filter_map(|p| {
+                let (s, e) = p.split_once('-')?;
+                Some((s.parse().ok()?, e.parse().ok()?))
+            })
+            .collect();
+        Self { live, spans }
+    }
+}
 
 /// A run's counts, for its whole life.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -240,64 +377,129 @@ pub async fn worked<F: std::future::Future>(
             .map_or(MAX_RUN_SPEND_USD, |t| t.spend_left()),
         None => MAX_RUN_SPEND_USD,
     };
+    let id = ulid::Ulid::new().to_string();
+    let started = now_epoch();
     if let Some((t, r)) = &run {
-        mark_entered(state, t, r).await;
+        mark_entered(state, t, r, &id, started).await;
     }
-    let started = std::time::Instant::now();
     let out = common::usage::with_run_allowance(Arc::new(RunAllowance::new(left)), fut).await;
     if let Some((t, r)) = &run {
-        mark_left(state, t, r, started.elapsed().as_secs()).await;
+        mark_left(state, t, r, &id, started).await;
     }
     out
 }
 
-/// A step is working. One still marked as working from before never reported
-/// its end (the function was killed), and counts for all of its time.
-async fn mark_entered(state: &WorkerState, team_id: &str, run_id: &str) {
-    let prior = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression("SET ceil_entered_at = :now")
-        .condition_expression("attribute_exists(run_id)")
-        .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
-        .send()
-        .await
-        .ok()
-        .and_then(|o| o.attributes)
-        .is_some_and(|a| a.contains_key("ceil_entered_at"));
-    if prior {
-        add_worked(state, team_id, run_id, STEP_SECS, false).await;
+fn now_epoch() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// Writes of the clock tried before the step's time is left uncounted (each
+/// lost write is another invocation's, which is read again).
+const CLOCK_WRITES: u32 = 8;
+
+/// An invocation starts: its marker is set, and any marker of a killed step
+/// is charged once.
+async fn mark_entered(state: &WorkerState, team_id: &str, run_id: &str, id: &str, now: u64) {
+    let killed = update_clock(state, team_id, run_id, |c| {
+        let e = c.enter(id, now);
+        (e.charged, e.killed)
+    })
+    .await;
+    if let Some((charged, killed)) = killed.filter(|(_, k)| *k > 0) {
+        warn!(
+            run_id,
+            killed,
+            charged,
+            "Run ceiling: a step of this run was killed and counts for all its time"
+        );
     }
 }
 
-async fn mark_left(state: &WorkerState, team_id: &str, run_id: &str, secs: u64) {
-    add_worked(state, team_id, run_id, secs, true).await;
+/// The invocation ends: it adds what of its time nothing else counted.
+async fn mark_left(state: &WorkerState, team_id: &str, run_id: &str, id: &str, started: u64) {
+    let now = now_epoch();
+    update_clock(state, team_id, run_id, |c| (c.leave(id, started, now), 0)).await;
 }
 
-async fn add_worked(state: &WorkerState, team_id: &str, run_id: &str, secs: u64, left: bool) {
-    let expr = if left {
-        "ADD ceil_worked_secs :s REMOVE ceil_entered_at"
-    } else {
-        "ADD ceil_worked_secs :s"
-    };
-    if let Err(e) = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(expr)
-        .condition_expression("attribute_exists(run_id)")
-        .expression_attribute_values(":s", attr_n(secs))
-        .send()
-        .await
-    {
-        warn!(run_id, error = %e, "Run ceiling: could not add the step's time");
+/// Reads the run's clock, applies `f` (seconds to add, kills found), and
+/// writes it back if nobody wrote in between; read again otherwise. The
+/// worked time itself is only ever added to.
+async fn update_clock(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    f: impl Fn(&mut Clock) -> (u64, u32),
+) -> Option<(u64, u32)> {
+    for _ in 0..CLOCK_WRITES {
+        let item = match state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .projection_expression("run_id, ceil_live, ceil_spans, ceil_ver")
+            .consistent_read(true)
+            .send()
+            .await
+        {
+            Ok(o) => o.item?,
+            Err(e) => {
+                warn!(run_id, error = %e, "Run ceiling: could not read the run's clock");
+                return None;
+            }
+        };
+        let s = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let ver: u64 = item
+            .get("ceil_ver")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let mut clock = Clock::from_attrs(&s("ceil_live"), &s("ceil_spans"));
+        let (secs, killed) = f(&mut clock);
+        let (live, spans) = clock.to_attrs();
+        let cond = if ver == 0 {
+            "attribute_exists(run_id) AND attribute_not_exists(ceil_ver)"
+        } else {
+            "attribute_exists(run_id) AND ceil_ver = :v0"
+        };
+        let mut req = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression(
+                "SET ceil_live = :live, ceil_spans = :spans, ceil_ver = :v1 \
+                 ADD ceil_worked_secs :s, ceil_killed :k REMOVE ceil_entered_at",
+            )
+            .condition_expression(cond)
+            .expression_attribute_values(":live", attr_s(&live))
+            .expression_attribute_values(":spans", attr_s(&spans))
+            .expression_attribute_values(":v1", attr_n(ver + 1))
+            .expression_attribute_values(":s", attr_n(secs))
+            .expression_attribute_values(":k", attr_n(killed));
+        if ver > 0 {
+            req = req.expression_attribute_values(":v0", attr_n(ver));
+        }
+        match req.send().await {
+            Ok(_) => return Some((secs, killed)),
+            Err(e) if common::run_fail::is_condition_failed(&e) => continue,
+            Err(e) => {
+                warn!(run_id, error = %e, "Run ceiling: could not add the step's time");
+                return None;
+            }
+        }
     }
+    warn!(
+        run_id,
+        "Run ceiling: the run's clock kept changing; this step's time is not added"
+    );
+    None
 }
 
 #[cfg(test)]

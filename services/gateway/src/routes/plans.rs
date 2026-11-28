@@ -4119,7 +4119,12 @@ pub async fn plan_chat_stream(
     );
     super::require_sso::check_scoped(&state, &claims, &minted_by)
         .await
-        .map_err(|r| r.status())?;
+        .map_err(|r| {
+            if r.status().is_server_error() {
+                super::brain::chat_answer_failed("/api/plans/chat/stream", "sign_in_check");
+            }
+            r.status()
+        })?;
 
     let messages_input = body["messages"].as_array().ok_or_else(|| {
         warn!("plan_chat_stream: missing messages array in body");

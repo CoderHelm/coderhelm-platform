@@ -16,6 +16,7 @@ pub mod chat_eval;
 #[cfg(test)]
 pub mod chat_eval_replay;
 pub mod chat_hints;
+pub mod chat_log;
 pub mod chat_policy;
 pub mod chat_setup;
 pub mod chat_understand;
@@ -91,6 +92,7 @@ pub mod run_activity;
 pub mod run_answer;
 pub mod run_checks;
 pub mod run_close;
+pub mod run_facts;
 pub mod run_outputs;
 pub mod run_search;
 pub mod run_start;
@@ -109,6 +111,7 @@ pub mod staging_cms;
 pub mod stale_prs;
 #[cfg(test)]
 mod stream_access;
+pub mod stream_probe;
 pub mod support;
 pub mod support_access;
 pub mod system;

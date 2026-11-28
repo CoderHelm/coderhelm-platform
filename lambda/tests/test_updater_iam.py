@@ -337,6 +337,8 @@ class EveryCallTheUpdaterMakes(unittest.TestCase):
         # lambda/updater, watch_step: the probe and the metrics, and nothing past them.
         worker = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{STACK}-worker"
         for action, resource, want in (("lambda:InvokeFunction", worker, "allowed"),
+                                       # Chat's probe (probe_chat): InvokeWithResponseStream is this action.
+                                       ("lambda:InvokeFunction", f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{STACK}-streaming", "allowed"),
                                        ("cloudwatch:GetMetricData", "*", "allowed"),
                                        ("cloudwatch:PutMetricAlarm", "*", "implicitDeny"),
                                        ("lambda:InvokeFunction", f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{STACK}-gateway", "implicitDeny")):
