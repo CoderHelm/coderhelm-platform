@@ -69,3 +69,32 @@ class ThisRepository(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def jobs_wf(jobs):
+    return "name: t\non: push\npermissions:\n  contents: read\njobs:\n" + jobs
+
+
+class SkippedAncestor(unittest.TestCase):
+    CHAIN = (
+        "  evidence:\n    if: github.event_name == 'schedule'\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+        "  plan:\n    needs: evidence\n    if: ${{ !cancelled() }}\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+    )
+
+    def test_a_bare_if_below_a_conditional_ancestor_fails(self):
+        p = cw.check_text("w", jobs_wf(self.CHAIN + "  tag:\n    needs: plan\n    if: needs.plan.outputs.count != '0'\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"))
+        self.assertTrue(any("job tag" in x and "evidence" in x for x in p), p)
+
+    def test_not_cancelled_with_the_result_passes(self):
+        cond = "${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}"
+        self.assertEqual(cw.check_text("w", jobs_wf(self.CHAIN + f"  tag:\n    needs: plan\n    if: {cond}\n    runs-on: ubuntu-latest\n    steps: [{{run: 'true'}}]\n")), [])
+
+    def test_an_explicit_success_means_the_skip_and_passes(self):
+        self.assertEqual(cw.check_text("w", jobs_wf(self.CHAIN + "  tag:\n    needs: plan\n    if: success() && needs.plan.outputs.count != '0'\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n")), [])
+
+    def test_no_conditional_ancestor_needs_no_status_function(self):
+        jobs = (
+            "  a:\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+            "  b:\n    needs: a\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n"
+        )
+        self.assertEqual(cw.check_text("w", jobs_wf(jobs)), [])

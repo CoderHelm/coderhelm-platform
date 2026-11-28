@@ -280,7 +280,10 @@ jobs:
   tag:
     name: Attest and tag ${{ matrix.tag }}
     needs: plan
-    if: needs.plan.outputs.count != '0'
+    # plan runs after evidence, which is skipped outside a promotion. Without a
+    # status function GitHub adds success(), which is false after that skip, and
+    # no beta is ever tagged (.github/scripts/check_workflows.py checks this).
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
     environment: release-auto
     strategy:
