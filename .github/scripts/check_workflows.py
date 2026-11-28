@@ -9,7 +9,13 @@ Fails (exit 1) when a workflow:
   repository's secrets on behalf of code or events a stranger controls);
 - puts untrusted values (`github.event.*`, `github.head_ref`, `inputs.*`) straight into
   a `run:` script, where they become shell code; pass them through `env:`;
-- has no top-level or per-job `permissions:` (the token's default can write).
+- has no top-level or per-job `permissions:` (the token's default can write);
+- gives a job an `if:` with no status function (`success()`, `failure()`,
+  `always()`, `cancelled()`) while a job it needs, directly or further up,
+  has an `if:` of its own. GitHub then adds `success()`, which is false
+  whenever that upstream job was skipped, so the job never runs on the paths
+  where it was skipped. Write `!cancelled() && needs.x.result == 'success' && ...`
+  to run after a skipped ancestor, or `success() && ...` to mean the skip.
 
     python3 .github/scripts/check_workflows.py [.github/workflows]
 """
@@ -25,6 +31,7 @@ DOCKER_PIN = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
 VERSION_COMMENT = re.compile(r"#\s*\S+")
 UNTRUSTED = re.compile(r"\$\{\{[^}]*\b(github\.event\.|github\.head_ref|inputs\.)[^}]*\}\}")
 FORBIDDEN_TRIGGERS = {"pull_request_target", "workflow_run"}
+STATUS_FN = re.compile(r"\b(success|failure|always|cancelled)\(\)")
 
 
 def _triggers(doc):
@@ -72,12 +79,46 @@ def check_text(name, text):
             if isinstance(job, dict) and "permissions" not in job:
                 problems.append(f"{name}: job {job_id} has no permissions (set them at the top or on the job)")
 
+    problems += _skipped_upstream(name, jobs)
+
     for job_id, job in jobs.items():
         for step in (job or {}).get("steps") or []:
             run = step.get("run") if isinstance(step, dict) else None
             if isinstance(run, str):
                 for m in UNTRUSTED.finditer(run):
                     problems.append(f"{name}: job {job_id}: {m.group(0)} is used inside run:; pass it through env: instead")
+    return problems
+
+
+def _needs(job):
+    n = (job or {}).get("needs") or []
+    return [n] if isinstance(n, str) else list(n)
+
+
+def _skipped_upstream(name, jobs):
+    """Jobs whose implicit success() is false whenever a conditional ancestor is skipped."""
+    problems = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict) or "if" not in job:
+            continue
+        cond = str(job["if"])
+        if STATUS_FN.search(cond):
+            continue
+        seen, todo, conditional = set(), _needs(job), []
+        while todo:
+            up = todo.pop()
+            if up in seen or up not in jobs:
+                continue
+            seen.add(up)
+            if isinstance(jobs[up], dict) and "if" in jobs[up]:
+                conditional.append(up)
+            todo += _needs(jobs[up])
+        if conditional:
+            problems.append(
+                f"{name}: job {job_id}: its if: has no status function, so it is skipped whenever "
+                f"{', '.join(sorted(conditional))} is skipped; start it with !cancelled() && (and check needs.*.result) "
+                f"or success() && if that skip is meant"
+            )
     return problems
 
 
@@ -97,7 +138,7 @@ def main(argv):
     if problems:
         print(f"{len(problems)} problem(s) in {len(files)} workflow(s)")
         return 1
-    print(f"{len(files)} workflows: every action pinned by SHA, no untrusted triggers or inputs in scripts")
+    print(f"{len(files)} workflows: every action pinned by SHA, no untrusted triggers or inputs in scripts, no job lost to a skipped ancestor")
     return 0
 
 
