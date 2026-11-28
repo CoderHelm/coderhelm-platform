@@ -347,6 +347,31 @@ jobs:
           cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native/access.json" "$RUNNER_TEMP/native"/stacks/*.json
           cp "$RUNNER_TEMP/native/coderhelm.json" ../dist/coderhelm.json
           tar -czf ../dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native" access.json stacks assets
+      # The release notes say what this release changes about permissions:
+      # every role, policy and resource policy of the native templates against
+      # the release an install moves from, compared as the install's updater
+      # compares them before an update (.github/scripts/iam_diff.py), so only
+      # a real difference in actions, resources or conditions is listed.
+      - name: Permission changes since the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTE="$RUNNER_TEMP/notes/permission-changes.md"
+          mkdir -p "$RUNNER_TEMP/notes" "$RUNNER_TEMP/prev"
+          PREV="$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName,isPrerelease,isDraft | python3 .github/scripts/iam_diff.py previous "$TAG")"
+          if [ -n "$PREV" ] && gh release download "$PREV" -R "$GITHUB_REPOSITORY" -p coderhelm.json -p coderhelm-native.tar.gz -D "$RUNNER_TEMP/prev"; then
+            tar -xzf "$RUNNER_TEMP/prev/coderhelm-native.tar.gz" -C "$RUNNER_TEMP/prev" access.json stacks
+            python3 .github/scripts/iam_diff.py diff "$RUNNER_TEMP/prev" "$RUNNER_TEMP/native" "$PREV" > "$NOTE"
+          else
+            printf '## Permission changes\n\nNo earlier release with native templates to compare with.\n' > "$NOTE"
+          fi
+          cat "$NOTE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes/
+          if-no-files-found: error
+          retention-days: 3
       - name: Checksums
         run: |
           (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh coderhelm.json coderhelm-native.tar.gz models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml > SHA256SUMS)
@@ -383,6 +408,11 @@ jobs:
         with:
           name: release-dist
           path: dist
+      # Kept beside dist/, never in it: dist holds exactly what SHA256SUMS lists.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
       - name: The files are the ones the build listed
         run: |
           cd dist
@@ -437,6 +467,7 @@ jobs:
           pre=false
           case "$TAG" in *-*) pre=true ;; esac
           NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Update: npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}. Check an install: npx -y github:${GITHUB_REPOSITORY} doctor. Verify it yourself: docs/self-host/updates-security.md."
+          NOTES="${NOTES}"$'\n\n'"$(cat notes/permission-changes.md)"
           if DRAFT=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .draft 2>/dev/null); then
             mkdir -p "$RUNNER_TEMP/old"
             if gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP/old"; then

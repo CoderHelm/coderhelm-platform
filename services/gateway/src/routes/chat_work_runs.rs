@@ -278,7 +278,16 @@ pub fn status_words(status: &str) -> &'static str {
 
 /// One run as a citable record. `full`: the run's whole item (notes, why it
 /// stopped); a listed run carries only what the list reads.
+#[cfg(test)]
 pub fn record(item: &Item) -> Found {
+    record_with(item, None)
+}
+
+/// [`record`], with CoderHelm's latest review verdict on its pull request
+/// when it was read. What CoderHelm decided about the run (its merge
+/// standing, its own review's open findings, what it waits on) comes from
+/// [`super::run_facts`], the reader the run page uses.
+pub fn record_with(item: &Item, review: Option<&super::run_checks::RunPrReview>) -> Found {
     let id = st(item, "run_id");
     let status = st(item, "status");
     let title = st(item, "title");
@@ -319,12 +328,22 @@ pub fn record(item: &Item) -> Found {
     field(&mut lines, "Current step", st(item, "current_pass"));
     field(&mut lines, "Started", st(item, "created_at"));
     field(&mut lines, "Last update", st(item, "updated_at"));
-    let why = [st(item, "error_message"), st(item, "error")]
-        .into_iter()
-        .find(|e| !e.trim().is_empty())
-        .unwrap_or("");
-    field(&mut lines, "Why it stopped", why);
-    field(&mut lines, "How it stopped", st(item, "stop_kind"));
+    // CoderHelm's own decisions on the run, as its page shows them: they
+    // answer what holds it before anything read elsewhere.
+    lines.extend(
+        super::run_facts::of_item(item)
+            .lines()
+            .into_iter()
+            .map(|(_, l)| l),
+    );
+    if let Some(r) = review {
+        lines.push(format!(
+            "CoderHelm's latest review verdict: {} on {} ({})",
+            r.verdict,
+            r.reviewed_sha.get(..7).unwrap_or(&r.reviewed_sha),
+            r.at
+        ));
+    }
     if status == common::run_status::CLOSED {
         let by = [st(item, "closed_by_name"), st(item, "closed_by")]
             .into_iter()
@@ -391,7 +410,16 @@ pub fn record(item: &Item) -> Found {
 
 /// The attributes a lookup reads for every run (the list's, and a few more).
 fn projection() -> (String, HashMap<String, String>) {
-    let extra = ["updated_at", "prs", "error_message", "stop_kind"];
+    let extra = [
+        "updated_at",
+        "prs",
+        "error_message",
+        "stop_kind",
+        common::merge_standing::FIELD,
+        common::run_wait::FIELD_WAITING_ON,
+        super::run_facts::OWN_REVIEW_OPEN,
+        super::run_facts::OWN_REVIEW_ROUNDS,
+    ];
     let names: HashMap<String, String> = super::run_search::LIST_ATTRS
         .iter()
         .chain(extra.iter())
@@ -469,15 +497,26 @@ async fn matching(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<I
         .collect())
 }
 
+/// The run's main pull request, as the run page reads its review verdict.
+fn primary_pr(item: &Item) -> Option<(String, u64)> {
+    let prs = common::run_prs::from_item(item);
+    common::run_prs::primary(&prs, st(item, "repo"))
+        .map(|p| (p.repo.clone(), p.pr_number))
+        .filter(|(_, n)| *n > 0)
+}
+
 /// The team's runs that match, newest first, the first few read in full.
 /// Only `team_id`'s partition is read.
 pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<Found>, String> {
     if let Some(id) = &ask.run_id {
-        return Ok(get_run(state, team_id, id)
-            .await?
-            .iter()
-            .map(record)
-            .collect());
+        let Some(item) = get_run(state, team_id, id).await? else {
+            return Ok(Vec::new());
+        };
+        let review = match primary_pr(&item) {
+            Some((repo, pr)) => super::run_checks::pr_review(state, team_id, &repo, pr).await,
+            None => None,
+        };
+        return Ok(vec![record_with(&item, review.as_ref())]);
     }
     let listed = Box::pin(matching(state, team_id, ask)).await?;
     let mut out = Vec::new();
@@ -490,7 +529,12 @@ pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<F
         } else {
             None
         };
-        out.push(record(full.as_ref().unwrap_or(listed)));
+        let item = full.as_ref().unwrap_or(listed);
+        let review = match full.as_ref().and_then(primary_pr) {
+            Some((repo, pr)) => super::run_checks::pr_review(state, team_id, &repo, pr).await,
+            None => None,
+        };
+        out.push(record_with(item, review.as_ref()));
     }
     Ok(out)
 }

@@ -164,7 +164,14 @@ DEFAULT_SETTINGS = {
     # answers finished on it. Nothing else. Stable promotion waits for such
     # a report from a live install, so a beta install helps by turning it on.
     "report": False,
+    # With day "any" (beta only): the hours at least between two installs.
+    "gap_hours": 2,
 }
+# The beta channel's window: any hour, at least gap_hours after the last
+# install. A beta ships several times a day; a weekly or daily hour would
+# take at most one of them.
+ANY_HOUR = "any"
+GAP_HOURS = (1, 168)
 DIGESTS = {"weekly": timedelta(days=7), "biweekly": timedelta(days=14), "off": None}
 
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
@@ -242,9 +249,9 @@ def validate_settings(raw, base=None):
             raise ValueError("channel: stable or beta")
         s["channel"] = ch
     if "day" in raw:
-        d = str(raw["day"]).lower()[:3] if raw["day"] != "daily" else "daily"
-        if d not in DAYS and d != "daily":
-            raise ValueError("day: mon to sun, or daily")
+        d = raw["day"] if raw["day"] in ("daily", ANY_HOUR) else str(raw["day"]).lower()[:3]
+        if d not in DAYS and d not in ("daily", ANY_HOUR):
+            raise ValueError("day: mon to sun, daily, or any (beta only)")
         s["day"] = d
     if "hour" in raw:
         if not isinstance(raw["hour"], int) or isinstance(raw["hour"], bool) or not 0 <= raw["hour"] <= 23:
@@ -267,6 +274,16 @@ def validate_settings(raw, base=None):
         if not isinstance(raw["report"], bool):
             raise ValueError("report: true or false")
         s["report"] = raw["report"]
+    if "gap_hours" in raw:
+        g = raw["gap_hours"]
+        if not isinstance(g, int) or isinstance(g, bool) or not GAP_HOURS[0] <= g <= GAP_HOURS[1]:
+            raise ValueError(f"gap_hours: {GAP_HOURS[0]} to {GAP_HOURS[1]}")
+        s["gap_hours"] = g
+    if s.get("day") == ANY_HOUR and not takes_prereleases(s.get("channel")):
+        if "day" in raw:
+            raise ValueError("day: any is for the beta channel; stable installs in its maintenance window")
+        # The channel moved to stable: its window is the default one again.
+        s["day"] = DEFAULT_SETTINGS["day"]
     return s
 
 
@@ -281,7 +298,11 @@ def zone(name):
 
 
 def in_window(now_utc, settings):
-    """True during the maintenance hour, in the install's time zone."""
+    """True during the maintenance hour, in the install's time zone. Day
+    "any" (the beta channel only) is every hour; the gap after the last
+    install is decide's (gap_wait)."""
+    if settings.get("day") == ANY_HOUR:
+        return takes_prereleases(settings.get("channel"))
     tz = zone(settings.get("timezone", "UTC")) or timezone.utc
     local = now_utc.astimezone(tz)
     day_ok = settings.get("day") == "daily" or DAYS[local.weekday()] == settings.get("day")
@@ -318,7 +339,30 @@ def pick_latest(releases, channel, current):
     return best
 
 
-def decide(now_utc, settings, current, releases, state, model_check=None):
+def gap_wait(now_utc, settings, last_install):
+    """When day is "any": the time the next install may start, or None now."""
+    if settings.get("day") != ANY_HOUR or not last_install:
+        return None
+    gap = timedelta(hours=int(settings.get("gap_hours") or DEFAULT_SETTINGS["gap_hours"]))
+    at = last_install + gap
+    return at if now_utc < at else None
+
+
+def last_install_at(store):
+    """When the newest update or rollback that changed the stack started, or None."""
+    for h in store.history(20):
+        if h.get("mode") not in ("update", "rollback"):
+            continue
+        if not (h.get("executed_at") or h.get("build_id") or h.get("status") == "succeeded"):
+            continue
+        try:
+            return datetime.fromisoformat(h.get("executed_at") or h.get("started_at") or "")
+        except ValueError:
+            continue
+    return None
+
+
+def decide(now_utc, settings, current, releases, state, model_check=None, last_install=None):
     """What the hourly check does: none, notify or update (with the reason)."""
     latest = pick_latest(releases, settings["channel"], current)
     if not latest:
@@ -338,6 +382,12 @@ def decide(now_utc, settings, current, releases, state, model_check=None):
         return {**quiet, "reason": "a major release waits for an admin"}
     if not in_window(now_utc, settings):
         return {**quiet, "reason": "waiting for the maintenance window"}
+    after = gap_wait(now_utc, settings, last_install)
+    if after:
+        return {**quiet, "reason": f"the last install was less than {settings.get('gap_hours')} hours ago; "
+                                   f"the next one starts after {after.strftime('%H:%M')} UTC"}
+    if settings.get("day") == ANY_HOUR:
+        return {"action": "update", "version": v, "reason": "auto-update: a beta installs at any hour"}
     return {"action": "update", "version": v, "reason": "auto-update in the maintenance window"}
 
 
@@ -3985,24 +4035,410 @@ def change_set_pages(cfn, cs_id, stack=None):
         kw["NextToken"] = page["NextToken"]
 
 
-def permission_changes(cfn, cs_id, stack):
-    """What the change set (and each part's nested change set) changes about
-    who may do what, read with property values (before and after)."""
-    out = []
-    seen = set()
+def read_change_set(cfn, cs_id, stack=None):
+    """(the first page without its changes, every change) of a change set,
+    read with property values (before and after)."""
+    kw = {"ChangeSetName": cs_id, "IncludePropertyValues": True}
+    if stack:
+        kw["StackName"] = stack
+    first, changes = None, []
+    while True:
+        page = cfn.describe_change_set(**kw)
+        if first is None:
+            first = {k: v for k, v in page.items() if k not in ("Changes", "NextToken")}
+        changes += page.get("Changes") or []
+        if not page.get("NextToken"):
+            return first, changes
+        kw["NextToken"] = page["NextToken"]
 
-    def walk(cid, part, stack_name):
-        for ch in change_set_pages(cfn, cid, stack_name):
+
+def permission_changes(cfn, cs_id, stack, env=None):
+    """What the change set (and each part's nested change set) changes about
+    who may do what. CloudFormation reports a Modify for every policy that
+    names another part's output or a parameter (its value is "known after
+    apply"), so a Modify counts only when the resource's properties, resolved
+    the way the template resolves them, differ between the running release
+    and the new one (policy_difference). An Add always counts, and so does a
+    Modify that can't be compared."""
+    found = []
+    seen = set()
+    sides = ChangeSides(cfn, env or {}, stack)
+
+    # Every change set is read first, so a comparison knows every part that changes.
+    def walk(cid, part, stack_name, physical):
+        first, changes = read_change_set(cfn, cid, stack_name)
+        sides.add(part, cid, stack_name or first.get("StackId") or physical, first, changes)
+        for ch in changes:
             rc = ch.get("ResourceChange") or {}
             why = permission_change(rc)
             if why:
-                out.append(f"{part}.{rc.get('LogicalResourceId')} ({rc.get('ResourceType')} {rc.get('Action')}: {why})")
+                found.append((part, rc, why))
             nested = rc.get("ChangeSetId")
             if rc.get("ResourceType") == "AWS::CloudFormation::Stack" and nested and nested not in seen:
                 seen.add(nested)
-                walk(nested, rc.get("LogicalResourceId"), None)
-    walk(cs_id, "parent", stack)
+                walk(nested, rc.get("LogicalResourceId"), None, rc.get("PhysicalResourceId"))
+    walk(cs_id, "parent", stack, stack)
+
+    out = []
+    for part, rc, why in found:
+        if rc.get("Action") in ("Modify", "Dynamic"):
+            try:
+                old, new = sides.sides(part)
+                differs = policy_difference(old, new, rc.get("LogicalResourceId"))
+            except Unknown as e:
+                differs = f"it couldn't be compared with the running release ({str(e)[:160]})"
+            except Exception as e:  # noqa: BLE001  never quietly fewer changes
+                if throttled(e):
+                    raise
+                differs = f"it couldn't be compared with the running release ({type(e).__name__}: {str(e)[:160]})"
+            if not differs:
+                logger.info(f"{part}.{rc.get('LogicalResourceId')}: reported as {rc.get('Action')}, "
+                            "but it grants exactly what the running release's does")
+                continue
+            why = f"{why}: {differs}"
+        out.append(f"{part}.{rc.get('LogicalResourceId')} ({rc.get('ResourceType')} {rc.get('Action')}: {why})")
     return out
+
+
+# ── Comparing a resource before and after a change set ────────────────────
+#
+# Each side is one stack's template with the values its parameters have on
+# that side: the running stack's own values before, the change set's after.
+# A Ref or GetAtt of one of the stack's resources is the same resource on
+# both sides (a name, "${Role.Arn}"), unless the change set replaces it. A
+# parameter whose value is known only after apply (another part's output)
+# keeps the running value when the parent feeds it the same way and that
+# output is the same on both sides. Anything else that can't be known raises
+# Unknown, and the change counts.
+
+class Unknown(ValueError):
+    """A value the comparison can't know before the change set runs."""
+
+
+AFTER_APPLY = re.compile(r"\{\{[^}]*\}\}")
+HIDDEN_VALUE = "****"
+_NO_VALUE = object()
+_MISSING = object()
+
+
+def _unknowable(v):
+    return v is None or (isinstance(v, str) and (v == HIDDEN_VALUE or AFTER_APPLY.search(v) is not None))
+
+
+def _side_value(side, name):
+    v = (side.get("values") or {}).get(name, _MISSING)
+    if v is _MISSING or _unknowable(v):
+        carry = side.get("carry")
+        if carry:
+            return carry(name)
+        raise Unknown(f"{name} isn't known before the change set runs")
+    return v
+
+
+def template_resolve(v, side):
+    """`v` as one side of a change set resolves it (see above). Raises Unknown.
+    A "symbolic" side (the release notes' diff, .github/scripts/iam_diff.py,
+    where no install's values are known) keeps both branches of a condition."""
+    symbolic = bool(side.get("symbolic"))
+    t = side.get("t") or {}
+    resources = t.get("Resources") or {}
+    params = t.get("Parameters") or {}
+    conds = t.get("Conditions") or {}
+    replaced = side.get("replaced") or set()
+    scope = side.get("scope") or ""
+    busy = set()
+
+    def token(lid, attr=None):
+        if lid in replaced:
+            raise Unknown(f"{lid} is replaced, so its {attr or 'id'} changes")
+        return "${" + (scope + "/" if scope else "") + lid + ("." + attr if attr else "") + "}"
+
+    def cond(name):
+        if name not in conds:
+            raise Unknown(f"no condition {name}")
+        if name in busy:
+            raise Unknown(f"the condition {name} names itself")
+        busy.add(name)
+        try:
+            return bool(r(conds[name]))
+        finally:
+            busy.discard(name)
+
+    def ref(name):
+        if name == "AWS::NoValue":
+            return _NO_VALUE
+        if name in resources and name not in params:
+            return token(name)
+        return _side_value(side, name)
+
+    def att(lid, attr):
+        if lid not in resources:
+            raise Unknown(f"no resource {lid}")
+        if isinstance(attr, str) and attr.startswith("Outputs.") and side.get("outputs"):
+            return side["outputs"](lid, attr[len("Outputs."):])
+        return token(lid, attr)
+
+    def sub(text, vars_):
+        def one(m):
+            name = m.group(1)
+            if name.startswith("!"):
+                return "${" + name[1:] + "}"
+            if name in vars_:
+                return str(vars_[name])
+            if "." in name and name.split(".", 1)[0] in resources:
+                return str(att(*name.split(".", 1)))
+            return str(ref(name))
+        return re.sub(r"\$\{([^}]+)\}", one, text)
+
+    def r(x):
+        if isinstance(x, list):
+            return [y for y in (r(i) for i in x) if y is not _NO_VALUE]
+        if not isinstance(x, dict):
+            return x
+        if len(x) == 1:
+            (k, a), = x.items()
+            if k == "Ref":
+                return ref(a)
+            if k == "Fn::GetAtt":
+                lid, attr = a.split(".", 1) if isinstance(a, str) else (a[0], r(a[1]))
+                return att(lid, attr)
+            if k == "Fn::Sub":
+                text, vars_ = (a, {}) if isinstance(a, str) else (a[0], r(a[1]))
+                return sub(text, vars_)
+            if k == "Fn::If":
+                if symbolic:
+                    return {k: [a[0]] + [{"Ref": "AWS::NoValue"} if y is _NO_VALUE else y for y in (r(a[1]), r(a[2]))]}
+                return r(a[1] if cond(a[0]) else a[2])
+            if k == "Condition":
+                return {k: a} if symbolic else cond(a)
+            if k == "Fn::Join":
+                parts = r(a[1])
+                if isinstance(parts, list) and all(isinstance(p, str) for p in parts):
+                    return str(a[0]).join(parts)
+                return {k: [a[0], parts]}
+            if k == "Fn::Select":
+                i, items = r(a[0]), r(a[1])
+                if isinstance(items, list) and str(i).isdigit() and int(i) < len(items):
+                    return items[int(i)]
+                return {k: [i, items]}
+            if k == "Fn::Split":
+                d, s = r(a[0]), r(a[1])
+                return s.split(d) if isinstance(d, str) and isinstance(s, str) else {k: [d, s]}
+            if k == "Fn::FindInMap":
+                m, k1, k2 = (r(p) for p in a[:3])
+                try:
+                    return r(t["Mappings"][m][k1][k2])
+                except (KeyError, TypeError):
+                    raise Unknown(f"no mapping {m}.{k1}.{k2}") from None
+            if symbolic and k in ("Fn::Equals", "Fn::Not", "Fn::And", "Fn::Or"):
+                return {k: r(a)}
+            if k == "Fn::Equals":
+                return r(a[0]) == r(a[1])
+            if k == "Fn::Not":
+                return not r(a[0])
+            if k == "Fn::And":
+                return all(r(i) for i in a)
+            if k == "Fn::Or":
+                return any(r(i) for i in a)
+            if k == "Fn::ImportValue":
+                raise Unknown("an export's value is read when the change set runs")
+        out = {}
+        for k, i in x.items():
+            y = r(i)
+            if y is not _NO_VALUE:
+                out[k] = y
+        return out
+    return r(v)
+
+
+# Properties that hold a policy document: compared as IAM means them.
+POLICY_DOCUMENTS = POLICY_PROPERTIES + ("AssumeRolePolicyDocument",)
+
+
+def _canonical_resource(res):
+    def walk(v, key=None):
+        if key in POLICY_DOCUMENTS and isinstance(v, (dict, str)):
+            try:
+                return json.loads(canonical_policy(v))
+            except (ValueError, TypeError, AttributeError):
+                return v
+        if isinstance(v, dict):
+            return {k: walk(x, k) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+    return walk(res)
+
+
+def resource_on(side, lid):
+    """The resource as that side deploys it: its type, whether its condition
+    holds, and its properties resolved and with policy documents canonical."""
+    res = ((side.get("t") or {}).get("Resources") or {}).get(lid)
+    if not res:
+        raise Unknown(f"{lid} isn't in that release's template")
+    on = True
+    if res.get("Condition"):
+        on = res["Condition"] if side.get("symbolic") else bool(template_resolve({"Condition": res["Condition"]}, side))
+    props = template_resolve(res.get("Properties") or {}, side) if on else {}
+    return _canonical_resource({"Type": res.get("Type"), "On": on, "Properties": props})
+
+
+def _documents(props, path=""):
+    """{path: policy document} for every policy document in the properties."""
+    out = {}
+    if isinstance(props, dict):
+        for k, v in props.items():
+            p = f"{path}.{k}" if path else k
+            if k in POLICY_DOCUMENTS and isinstance(v, dict):
+                out[p] = v
+            else:
+                out.update(_documents(v, p))
+    elif isinstance(props, list):
+        for i, v in enumerate(props):
+            name = v.get("PolicyName") if isinstance(v, dict) and isinstance(v.get("PolicyName"), str) else str(i)
+            out.update(_documents(v, f"{path}[{name}]"))
+    return out
+
+
+def _grants(doc):
+    """{(effect, action): the sorted (resources, conditions, principals) it applies to}."""
+    out = {}
+    for st in _as_list((doc or {}).get("Statement")):
+        where = json.dumps([st.get(k) for k in ("Resource", "NotResource", "Condition", "Principal", "NotPrincipal")], sort_keys=True)
+        for key in ("Action", "NotAction"):
+            for a in _as_list(st.get(key)):
+                name = a if key == "Action" else f"anything but {a}"
+                out.setdefault((st.get("Effect") or "Allow", name), set()).add(where)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def resource_difference(a, b):
+    """What changes from resource `a` to `b` (both from resource_on), in
+    words; "" when nothing does."""
+    if json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True):
+        return ""
+    if a["Type"] != b["Type"]:
+        return f"its type changes to {b['Type']}"
+    if a["On"] != b["On"]:
+        if isinstance(a["On"], str) or isinstance(b["On"], str):
+            return f"its condition changes to {b['On']}"
+        return "it is created" if b["On"] else "it is removed"
+    words = []
+    da, db = _documents(a["Properties"]), _documents(b["Properties"])
+    for p in sorted(set(da) | set(db)):
+        if p not in da:
+            words.append(f"adds the policy {p}")
+        elif p not in db:
+            words.append(f"removes the policy {p}")
+        elif da[p] != db[p]:
+            ga, gb = _grants(da[p]), _grants(db[p])
+            added = sorted(f"{e} {a}" if e != "Allow" else a for e, a in gb.keys() - ga.keys())
+            removed = sorted(f"{e} {a}" if e != "Allow" else a for e, a in ga.keys() - gb.keys())
+            moved = sorted(a for (e, a) in ga.keys() & gb.keys() if ga[(e, a)] != gb[(e, a)])
+            line = "; ".join(x for x in (
+                f"{p} allows {', '.join(added)}" if added else "",
+                f"{p} no longer allows {', '.join(removed)}" if removed else "",
+                f"{p}'s resources or conditions change for {', '.join(moved)}" if moved else "") if x)
+            words.append(line or f"{p}'s other fields change")
+    rest_a = {k: v for k, v in a["Properties"].items() if k not in POLICY_DOCUMENTS and k != "Policies"}
+    rest_b = {k: v for k, v in b["Properties"].items() if k not in POLICY_DOCUMENTS and k != "Policies"}
+    for k in sorted(set(rest_a) | set(rest_b)):
+        if json.dumps(rest_a.get(k), sort_keys=True) != json.dumps(rest_b.get(k), sort_keys=True):
+            words.append(f"its {k} changes")
+    if not words:
+        # Only the names or order of inline policies.
+        words.append("its inline policies change")
+    return "; ".join(words)[:400]
+
+
+def policy_difference(old_side, new_side, lid):
+    """"" when the resource grants exactly what the running release's does;
+    else what differs. Raises Unknown when a side can't be resolved."""
+    return resource_difference(resource_on(old_side, lid), resource_on(new_side, lid))
+
+
+class ChangeSides:
+    """Both sides of every stack a change set touches (the parent and each
+    part with a nested change set), each read once and only when asked."""
+
+    def __init__(self, cfn, env, root):
+        self.cfn, self.env, self.root = cfn, env, root
+        self.parts = {}
+        self._sides = {}
+        self._carrying = set()
+
+    def add(self, part, cs_id, stack, first, changes):
+        self.parts[part] = {"cs": cs_id, "stack": stack, "first": first or {}, "changes": changes}
+
+    def _template(self, **kw):
+        body = self.cfn.get_template(TemplateStage="Original", **kw).get("TemplateBody")
+        if isinstance(body, str):
+            body = json.loads(body)
+        if not isinstance(body, dict):
+            raise Unknown("CloudFormation returned no template")
+        return body
+
+    def sides(self, part):
+        if part in self._sides:
+            return self._sides[part]
+        info = self.parts.get(part)
+        if not info or not info.get("stack"):
+            raise Unknown(f"{part}'s stack isn't known")
+        stack = info["stack"]
+        replaced = {(c.get("ResourceChange") or {}).get("LogicalResourceId") for c in info["changes"]
+                    if (c.get("ResourceChange") or {}).get("Replacement") in ("True", "Conditional")}
+        running = self.cfn.describe_stacks(StackName=stack)["Stacks"][0]
+        old_values = cfn_values(running, self.env)
+        new_values = {k: v for k, v in old_values.items() if k.startswith("AWS::")}
+        for p in info["first"].get("Parameters") or []:
+            if p.get("UsePreviousValue"):
+                new_values[p.get("ParameterKey")] = old_values.get(p.get("ParameterKey"))
+            elif "ParameterValue" in p:
+                new_values[p.get("ParameterKey")] = p.get("ParameterValue")
+        old = {"t": self._template(StackName=stack), "values": old_values, "replaced": set(), "scope": part}
+        new = {"t": self._template(StackName=stack, ChangeSetName=info["cs"]), "values": new_values,
+               "replaced": replaced, "scope": part}
+        if part == "parent":
+            old["outputs"] = lambda lid, out: self._output(lid, out, 0)
+            new["outputs"] = lambda lid, out: self._output(lid, out, 1)
+        else:
+            new["carry"] = lambda name: self._carry(part, name, old_values)
+        self._sides[part] = (old, new)
+        return old, new
+
+    def _output(self, lid, out, which):
+        """The parent's GetAtt of a part's output, on one side."""
+        if lid not in self.parts:
+            # The part has no changes: its outputs are what they are now.
+            return "${" + lid + ".Outputs." + out + "}"
+        side = self.sides(lid)[which]
+        o = ((side["t"].get("Outputs") or {}).get(out)) or {}
+        if "Value" not in o:
+            raise Unknown(f"{lid} has no output {out}")
+        return template_resolve(o["Value"], side)
+
+    def _carry(self, part, name, old_values):
+        """A part's parameter known only after apply: its running value, when the
+        parent feeds it the same way on both sides and that resolves the same."""
+        if (part, name) in self._carrying:
+            raise Unknown(f"{part}'s {name} feeds itself")
+        if name not in old_values or _unknowable(old_values.get(name)):
+            raise Unknown(f"{part}'s {name} has no running value")
+        self._carrying.add((part, name))
+        try:
+            po, pn = self.sides("parent")
+
+            def feed(side):
+                res = ((side["t"].get("Resources") or {}).get(part)) or {}
+                params = (res.get("Properties") or {}).get("Parameters") or {}
+                if name not in params:
+                    raise Unknown(f"the parent doesn't feed {part}'s {name}")
+                return template_resolve(params[name], side)
+            if json.dumps(feed(po), sort_keys=True) != json.dumps(feed(pn), sort_keys=True):
+                raise Unknown(f"{part}'s {name} changes")
+            return old_values[name]
+        finally:
+            self._carrying.discard((part, name))
 
 
 def stage_release(env, version, template_sha256, lam=None):
@@ -4286,7 +4722,7 @@ def native_poll(store, env, now, cfn=None, wait=False):
             if not matches:
                 return None
             out = {"data_changes": data_changes(cfn, cs), "admin_changes": admin_changes(cs),
-                   "permission_changes": permission_changes(cfn, cs_id, env["NATIVE_STACK"])}
+                   "permission_changes": permission_changes(cfn, cs_id, env["NATIVE_STACK"], env)}
             if prepared_role(entry) or (prepared_role(entry) is None and entry.get("apply")):
                 stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
                 out["preflight"] = preflight(cfn, env, cs_id, stack)
@@ -4596,7 +5032,7 @@ RECOVERY_CALL_WAIT = 20   # the same for a person's Roll back (the page's own po
 RECOVERY_PAUSE = 5
 RECOVERY_VERIFY_LIMIT = timedelta(minutes=45)  # waiting longer for the release check of the target fails the rollback
 AUTO_ROLLBACK_ACTOR = "auto-rollback"
-HEALTH_PROBE = None       # tests replace it; None is probe_worker
+HEALTH_PROBE = None       # tests replace it; None is probe_release
 METRICS = None            # tests replace it; None is error_rates
 _deadline = None          # this invocation's end (handler sets it; none in tests)
 
@@ -4643,13 +5079,127 @@ def probe_worker(env, lam=None):
     return "fail", f"the worker answered {text}"
 
 
+# Chat runs in its own function with its own role (infra/lib/streaming-stack.ts),
+# so the worker answering says nothing about it: the gateway binary there
+# answers CHAT_PROBE_PATH with Chat's own calls (services/gateway/src/routes/
+# stream_probe.rs), and only to a direct invoke whose request context names
+# CHAT_PROBE_HOST.
+CHAT_PROBE_PATH = "/api/stream/probe"
+CHAT_PROBE_HOST = "coderhelm-probe.invalid"
+# The Lambda Web Adapter's streamed answer: its JSON head, these eight bytes, then the body.
+STREAM_HEAD_END = b"\x00" * 8
+
+
+def chat_function(env):
+    if env.get("STREAMING_FUNCTION_NAME"):
+        return env["STREAMING_FUNCTION_NAME"]
+    return f"{env['RESOURCE_PREFIX']}-streaming" if env.get("RESOURCE_PREFIX") else ""
+
+
+def chat_probe_event(now=None):
+    """A function URL request to the probe, as AWS would make one, but naming CHAT_PROBE_HOST."""
+    now = now or datetime.now(timezone.utc)
+    rid = uuid.uuid4().hex
+    return {
+        "version": "2.0", "routeKey": "$default", "rawPath": CHAT_PROBE_PATH, "rawQueryString": "",
+        "headers": {"content-type": "application/json", "host": CHAT_PROBE_HOST, "user-agent": "coderhelm-updater"},
+        "requestContext": {
+            "accountId": "anonymous", "apiId": "coderhelm-probe", "domainName": CHAT_PROBE_HOST,
+            "domainPrefix": "coderhelm-probe", "requestId": rid, "routeKey": "$default", "stage": "$default",
+            "time": now.strftime("%d/%b/%Y:%H:%M:%S +0000"), "timeEpoch": int(now.timestamp() * 1000),
+            "http": {"method": "POST", "path": CHAT_PROBE_PATH, "protocol": "HTTP/1.1",
+                     "sourceIp": "127.0.0.1", "userAgent": "coderhelm-updater"},
+        },
+        "body": "{}", "isBase64Encoded": False,
+    }
+
+
+def read_streamed(resp):
+    """(status, body bytes, error) of an InvokeWithResponseStream answer."""
+    chunks, error = [], ""
+    for ev in resp.get("EventStream") or []:
+        if "PayloadChunk" in ev:
+            chunks.append(ev["PayloadChunk"].get("Payload") or b"")
+        elif "InvokeComplete" in ev:
+            done = ev["InvokeComplete"]
+            if done.get("ErrorCode"):
+                error = f"{done.get('ErrorCode')}: {str(done.get('ErrorDetails') or '')[:300]}"
+    raw = b"".join(chunks)
+    status = resp.get("StatusCode") or 200
+    if STREAM_HEAD_END in raw:
+        head, raw = raw.split(STREAM_HEAD_END, 1)
+        try:
+            status = int(json.loads(head or b"{}").get("statusCode") or status)
+        except (ValueError, AttributeError):
+            pass
+    else:
+        # A buffered answer: {"statusCode": ..., "body": ...}.
+        try:
+            v = json.loads(raw or b"{}")
+            if isinstance(v, dict) and "statusCode" in v:
+                status, raw = int(v["statusCode"]), (v.get("body") or "").encode()
+        except ValueError:
+            pass
+    return status, raw, error
+
+
+def probe_chat(env, lam=None, now=None):
+    """("ok" | "fail" | "unknown", detail): Chat's own calls, made by the
+    streaming function with its own role (see CHAT_PROBE_PATH)."""
+    fn = chat_function(env)
+    if not fn:
+        return "unknown", "this install names no Chat function"
+    try:
+        r = (lam or probe_client()).invoke_with_response_stream(
+            FunctionName=fn, InvocationType="RequestResponse", Payload=json.dumps(chat_probe_event(now)).encode())
+        status, body, error = read_streamed(r)
+    except Exception as e:  # noqa: BLE001
+        if "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower():
+            return "fail", f"Chat didn't answer within {PROBE_TIMEOUT} seconds"
+        return "unknown", f"couldn't ask Chat ({type(e).__name__}: {str(e)[:200]})"
+    text = body[:400].decode("utf-8", "replace")
+    if error:
+        return "fail", f"Chat's function failed: {error}"
+    if status == 404:
+        # A release from before the probe.
+        return "unknown", "this release's Chat doesn't answer the probe"
+    if status >= 500:
+        return "fail", f"Chat answered {status}: {text}"
+    try:
+        answer = json.loads(body or b"{}")
+    except ValueError:
+        return "fail", f"Chat answered something that isn't JSON: {text}"
+    if not isinstance(answer, dict):
+        return "fail", f"Chat answered {text}"
+    if answer.get("refused"):
+        return "fail", "Chat's role is refused what Chat calls: " + "; ".join(str(x) for x in answer["refused"])[:400]
+    if answer.get("ok") is True:
+        return "ok", str(answer.get("version") or "")
+    return "unknown", f"Chat couldn't finish its checks ({answer.get('unknown', '?')} unanswered)"
+
+
+def probe_release(env):
+    """The worker's probe, then Chat's: a failure of either fails the release."""
+    w, wd = probe_worker(env)
+    if w == "fail":
+        return w, wd
+    c, cd = probe_chat(env)
+    if c == "fail":
+        return c, cd
+    if w == "ok" and c == "ok":
+        return "ok", wd or cd
+    return "unknown", "; ".join(d for r, d in ((w, wd), (c, cd)) if r != "ok")
+
+
 def watched_functions(env):
-    """The functions whose errors the watch reads: the worker and the gateway."""
+    """The functions whose errors the watch reads: the worker, the gateway and Chat's."""
     out = []
     if env.get("WORKER_FUNCTION_NAME"):
         out.append(env["WORKER_FUNCTION_NAME"])
     if env.get("RESOURCE_PREFIX"):
         out.append(f"{env['RESOURCE_PREFIX']}-gateway")
+    if chat_function(env):
+        out.append(chat_function(env))
     return out
 
 
@@ -4734,7 +5284,7 @@ def run_probe(env, w, now, health=None):
     """Probes until it passes, fails PROBE_ATTEMPTS times in a row, or this
     invocation runs short (the next poll goes on). Updates w["probe"]."""
     p = w["probe"]
-    health = health or HEALTH_PROBE or probe_worker
+    health = health or HEALTH_PROBE or probe_release
     while p.get("result") is None:
         result, detail = health(env)
         p["tries"] = int(p.get("tries") or 0) + 1
@@ -4785,7 +5335,7 @@ def watch_step(store, env, now, health=None, metrics=None, cfn=None):
             w["errors_note"] = fit(f"couldn't read the error metrics: {type(e).__name__}: {e}", 300)
         why = ""
         if p.get("result") == "fail":
-            why = f"the new worker failed its health check {p['fails']} times in a row ({p.get('detail')})"
+            why = f"the new release failed its health check {p['fails']} times in a row ({p.get('detail')})"
         elif tripped:
             why = f"errors rose after the update: {tripped}"
         if why:
@@ -5004,8 +5554,8 @@ def failing_now(store, env, now, health=None):
     w = store.get(WATCH) or {}
     if w.get("version") == env.get("CODERHELM_VERSION") and w.get("why") and w.get("status") in ("rolling_back", "rollback_failed"):
         return w["why"]
-    result, detail = (health or HEALTH_PROBE or probe_worker)(env)
-    return f"the worker fails its health check ({detail})" if result == "fail" else ""
+    result, detail = (health or HEALTH_PROBE or probe_release)(env)
+    return f"the release fails its health check ({detail})" if result == "fail" else ""
 
 
 def native_hold(store, env, entry):
@@ -5503,7 +6053,7 @@ def install_identity(env):
 def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, health=None):
     """`hint(channel, etag=...)` reads the channel's hint, latest.json or
     beta.json (fetch_latest in the Lambda; none in tests unless given).
-    `health(env)` probes the worker (probe_worker in the Lambda)."""
+    `health(env)` probes the worker and Chat (probe_release in the Lambda)."""
     probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
     current = env.get("CODERHELM_VERSION", "")
@@ -5852,7 +6402,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
             # Never an older release while a newer one is out.
             d = {"action": "none", "version": behind["version"], "reason": behind["reason"]}
         else:
-            d = decide(now, settings, current, rel, state, mc)
+            d = decide(now, settings, current, rel, state, mc, last_install=last_install_at(store))
         if d["action"] in ("notify", "update") and state.get("notified_version") != d.get("version"):
             # Seen once. No email: Settings, System shows a new release
             # (a major one too), and the digest sums them up.
