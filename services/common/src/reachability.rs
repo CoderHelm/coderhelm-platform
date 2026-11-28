@@ -18,6 +18,12 @@
 //!   not reachable;
 //! - neither the package nor any direct dependency that brings it in is
 //!   imported or named anywhere: present, not reachable;
+//! - and when every direct dependency that brings it in is a development
+//!   dependency (the `package.json` files list it only under
+//!   `devDependencies`): not loaded where the code runs. A lint script or a
+//!   build-tool config that names only development dependencies is such a
+//!   development load, and a type-only import (`import type`) loads
+//!   nothing at all;
 //! - otherwise the lines go to the model ([`Decision::Ask`]), and only when
 //!   there are lines to read: a package with nothing to show stays unknown
 //!   with the reason, at no cost.
@@ -411,6 +417,35 @@ fn idents(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a JavaScript `import ... from` loads nothing at runtime: `import
+/// type { X }`, or a list whose every name is a type (`{ type A, type B }`).
+/// TypeScript erases both.
+fn js_type_only(c: &regex::Captures<'_>) -> bool {
+    if c.get(1).is_some() {
+        return true;
+    }
+    let clause = c.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+    let Some(inner) = clause.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return false;
+    };
+    let items: Vec<&str> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !items.is_empty() && items.iter().all(|s| s.starts_with("type "))
+}
+
+/// The lines of a JavaScript file's type-only imports: they name a package
+/// in quotes, but load nothing, so they are no mention either.
+fn type_import_lines(p: &Patterns, text: &str) -> HashSet<u64> {
+    p.js_from
+        .captures_iter(text)
+        .filter(|c| js_type_only(c))
+        .filter_map(|c| c.get(3).map(|m| line_of(text, m.start())))
+        .collect()
+}
+
 /// The imports of one code file.
 fn imports_in(p: &Patterns, ecosystem: &str, text: &str) -> Vec<Import> {
     let mut out = vec![];
@@ -418,7 +453,7 @@ fn imports_in(p: &Patterns, ecosystem: &str, text: &str) -> Vec<Import> {
         "npm" => {
             for c in p.js_from.captures_iter(text) {
                 // `import type { X }` loads nothing at runtime.
-                if c.get(1).is_some() {
+                if js_type_only(&c) {
                     continue;
                 }
                 let m = c.get(3).expect("group");
@@ -658,6 +693,12 @@ pub struct Query {
     pub hints: Vec<String>,
     /// Transitive, and the lockfile doesn't say which package brings it in.
     pub parents_unknown: bool,
+    /// `parents` is the lockfile's whole list of what brings it in (not one
+    /// path a scanner reported).
+    pub parents_from_lockfile: bool,
+    /// The names (the package, its parents) the folder's `package.json`
+    /// files list only under `devDependencies` ([`dev_only_names`]).
+    pub dev_only: Vec<String>,
 }
 
 impl Query {
@@ -696,6 +737,10 @@ pub struct Facts {
     /// Lines that load the package or a parent by name without an import
     /// (config, scripts, build-tool files, quoted plugin names).
     pub mentions: Vec<EvidenceLine>,
+    /// Such lines that name only development dependencies
+    /// ([`Query::dev_only`]): a lint script, a build-tool config. They run
+    /// on a developer's machine or in CI, never in what ships.
+    pub dev_mentions: Vec<EvidenceLine>,
     /// Files read.
     pub files: usize,
 }
@@ -801,6 +846,11 @@ impl Scanner {
             Some(eco) => imports_in(&self.patterns, eco, text),
             None => vec![],
         };
+        let type_lines = if code_eco == Some("npm") {
+            type_import_lines(&self.patterns, text)
+        } else {
+            HashSet::new()
+        };
         let lines: Vec<&str> = text.lines().collect();
         let dep_lines = if is_package_json {
             package_json_dependency_lines(&lines)
@@ -849,10 +899,25 @@ impl Scanner {
                 }
                 continue;
             }
+            let dev = |name: &str| q.dev_only.iter().any(|d| d == name);
             if tooling {
-                for im in mine.iter().chain(theirs.iter().map(|(im, _)| im)) {
+                for im in &mine {
                     let t = lines.get(im.line as usize - 1).copied().unwrap_or("");
-                    push(&mut facts.mentions, ev(path, im.line, t));
+                    let into = if dev(&q.package) {
+                        &mut facts.dev_mentions
+                    } else {
+                        &mut facts.mentions
+                    };
+                    push(into, ev(path, im.line, t));
+                }
+                for (im, p) in &theirs {
+                    let t = lines.get(im.line as usize - 1).copied().unwrap_or("");
+                    let into = if dev(p) {
+                        &mut facts.dev_mentions
+                    } else {
+                        &mut facts.mentions
+                    };
+                    push(into, ev(path, im.line, t));
                 }
                 continue;
             }
@@ -908,14 +973,31 @@ impl Scanner {
             if config || same_eco {
                 for (n, line) in lines.iter().enumerate() {
                     let ln = n as u64 + 1;
-                    if import_lines.contains(&ln) || dep_lines.contains(&ln) {
+                    if import_lines.contains(&ln)
+                        || dep_lines.contains(&ln)
+                        || type_lines.contains(&ln)
+                    {
                         continue;
                     }
-                    let named = names
+                    let own = names.iter().any(|nm| mentions(line, nm, loose));
+                    let via: Vec<&String> = q
+                        .parents
                         .iter()
-                        .chain(q.parents.iter())
-                        .any(|nm| mentions(line, nm, loose));
-                    if named {
+                        .filter(|nm| mentions(line, nm, loose))
+                        .collect();
+                    if !own && via.is_empty() {
+                        continue;
+                    }
+                    // A line that names only development dependencies (a
+                    // lint script, a CLI's config) is a development load.
+                    let dev_only = if own {
+                        dev(&q.package) && via.iter().all(|p| dev(p))
+                    } else {
+                        via.iter().all(|p| dev(p))
+                    };
+                    if dev_only {
+                        push(&mut facts.dev_mentions, ev(path, ln, line));
+                    } else {
                         push(&mut facts.mentions, ev(path, ln, line));
                     }
                 }
@@ -1197,14 +1279,54 @@ pub fn decide(q: &Query, facts: &Facts) -> Decision {
     }
     // Neither it nor anything that brings it in is loaded by the code.
     if absence_is_conclusive(&q.ecosystem) && !q.parents_unknown {
+        let dev = |n: &String| q.dev_only.contains(n);
+        let dev_note = if facts.dev_mentions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Only development tools name it ({}: a script, a lint or build config), and those don't run in what ships.",
+                plural(files_of(&facts.dev_mentions), "file", "files")
+            )
+        };
+        // Every way in is a development dependency: it isn't installed
+        // where the code runs.
+        let only_dev = q.parents_from_lockfile
+            && if q.parents.is_empty() {
+                dev(&q.package)
+            } else {
+                q.parents.iter().all(dev)
+            };
+        if only_dev {
+            let summary = if q.parents.is_empty() {
+                format!(
+                    "{} is listed only under devDependencies, and nothing under {where_} that runs imports it, so it isn't loaded where the code runs.{dev_note}{tests_note}",
+                    q.package
+                )
+            } else {
+                format!(
+                    "Only development dependencies bring {} in ({}), and nothing under {where_} that runs imports them, so it isn't loaded where the code runs.{dev_note}{tests_note}",
+                    q.package,
+                    q.parents.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            return Decision::Settled(
+                Verdict::NotLoaded,
+                Evidence {
+                    summary,
+                    lines: lines(&[&facts.dev_mentions], 8),
+                    checked,
+                    confidence: "high".into(),
+                },
+            );
+        }
         let summary = if q.parents.is_empty() {
             format!(
-                "Nothing under {where_} imports {} or names it in a config file or script, so the code never loads it.{tests_note}",
+                "Nothing under {where_} imports {} or names it in a config file or script, so the code never loads it.{dev_note}{tests_note}",
                 q.package
             )
         } else {
             format!(
-                "Nothing under {where_} imports {} or the packages that bring it in ({}), and no config file or script names them, so the code never loads it.{tests_note}",
+                "Nothing under {where_} imports {} or the packages that bring it in ({}), and no config file or script names them, so the code never loads it.{dev_note}{tests_note}",
                 q.package,
                 q.parents.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
             )
@@ -1213,7 +1335,7 @@ pub fn decide(q: &Query, facts: &Facts) -> Decision {
             Verdict::NotReachable,
             Evidence {
                 summary,
-                lines: vec![],
+                lines: lines(&[&facts.dev_mentions], 8),
                 checked,
                 confidence: "medium".into(),
             },
@@ -1897,6 +2019,29 @@ pub fn package_json_names(text: &str) -> Vec<String> {
     out
 }
 
+/// The names some `package.json` lists under `devDependencies` and none
+/// lists under `dependencies`, `optionalDependencies` or
+/// `peerDependencies`: what a production install leaves out. A file that
+/// doesn't parse makes no name dev only (its runtime list is unknown).
+pub fn dev_only_names<'a>(package_jsons: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut dev: BTreeSet<String> = BTreeSet::new();
+    let mut runtime: BTreeSet<String> = BTreeSet::new();
+    for text in package_jsons {
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            return vec![];
+        };
+        for (k, _) in v["devDependencies"].as_object().into_iter().flatten() {
+            dev.insert(k.clone());
+        }
+        for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            for (k, _) in v[field].as_object().into_iter().flatten() {
+                runtime.insert(k.clone());
+            }
+        }
+    }
+    dev.difference(&runtime).cloned().collect()
+}
+
 // ── Pace ────────────────────────────────────────────────────────────────
 
 /// Model calls a tick may make: at most `per_tick`, and only while today's
@@ -1933,6 +2078,125 @@ mod tests {
             package: pkg.into(),
             ..Default::default()
         }
+    }
+
+    /// A type-only import names the package in quotes but loads nothing:
+    /// it is neither an import nor a mention.
+    #[test]
+    fn a_type_only_import_is_no_load() {
+        let mut query = q("left-pad");
+        query.parents = vec!["acme-cms".into()];
+        query.parents_from_lockfile = true;
+        let out = scan(
+            vec![query],
+            &[
+                (
+                    "apps/studio/field.tsx",
+                    "import type { FieldProps } from \"acme-cms\";\nimport { type A, type B } from 'acme-cms';\nexport const f = (p: FieldProps) => p;\n",
+                ),
+            ],
+        );
+        let (_, facts) = &out[0];
+        assert!(facts.mentions.is_empty(), "{:?}", facts.mentions);
+        assert!(facts.parent_imports.is_empty());
+        assert!(matches!(
+            decide(&out[0].0, &out[0].1),
+            Decision::Settled(Verdict::NotReachable, _)
+        ));
+        // A list with one value import still loads the package.
+        let mut query = q("left-pad");
+        query.parents = vec!["acme-cms".into()];
+        let out = scan(
+            vec![query],
+            &[(
+                "apps/studio/field.tsx",
+                "import { type A, render } from 'acme-cms';\nrender();\n",
+            )],
+        );
+        assert!(out[0].1.parent_imports.contains_key("acme-cms"));
+    }
+
+    /// Every way in is a development dependency (a linter, a CLI), and no
+    /// code that runs imports them: a lint script that names one is a
+    /// development load, and the package isn't loaded where the code runs.
+    #[test]
+    fn only_development_dependencies_bring_it_in_so_it_is_not_loaded() {
+        let pkg = "{\n  \"scripts\": {\n    \"lint\": \"acme-lint src\",\n    \"start\": \"node dist/main\"\n  },\n  \"dependencies\": { \"acme-server\": \"1.0.0\" },\n  \"devDependencies\": { \"acme-lint\": \"9.0.0\", \"acme-cli\": \"2.0.0\" }\n}\n";
+        let dev = dev_only_names([pkg]);
+        assert_eq!(dev, ["acme-cli", "acme-lint"]);
+        let mut query = q("tiny-yaml");
+        query.parents = vec!["acme-cli".into(), "acme-lint".into()];
+        query.parents_from_lockfile = true;
+        query.dev_only = dev.clone();
+        let out = scan(
+            vec![query.clone()],
+            &[
+                ("package.json", pkg),
+                (
+                    "eslint.config.mjs",
+                    "import acme from \"acme-lint\";\nexport default [acme];\n",
+                ),
+                (
+                    "src/main.ts",
+                    "import { serve } from 'acme-server';\nserve();\n",
+                ),
+            ],
+        );
+        let (_, facts) = &out[0];
+        assert!(facts.mentions.is_empty(), "{:?}", facts.mentions);
+        assert_eq!(facts.dev_mentions.len(), 2, "{:?}", facts.dev_mentions);
+        match decide(&out[0].0, &out[0].1) {
+            Decision::Settled(Verdict::NotLoaded, e) => {
+                assert!(
+                    e.summary.contains("Only development dependencies"),
+                    "{}",
+                    e.summary
+                );
+                assert!(e.summary.contains("development tools"), "{}", e.summary);
+                assert_eq!(e.lines.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        // One runtime parent too, not imported: present, not reachable, and
+        // the lint script is still only a development load.
+        let mut mixed = query.clone();
+        mixed.parents.push("acme-server-plugin".into());
+        let out = scan(vec![mixed], &[("package.json", pkg)]);
+        match decide(&out[0].0, &out[0].1) {
+            Decision::Settled(Verdict::NotReachable, e) => {
+                assert!(e.summary.contains("development tools"), "{}", e.summary)
+            }
+            other => panic!("{other:?}"),
+        }
+        // The parents from one reported path only: never called not loaded.
+        let mut partial = query.clone();
+        partial.parents_from_lockfile = false;
+        let out = scan(vec![partial], &[("package.json", pkg)]);
+        assert!(matches!(
+            decide(&out[0].0, &out[0].1),
+            Decision::Settled(Verdict::NotReachable, _)
+        ));
+        // A bundled front end imports a development dependency in code that
+        // ships: that is a load, and the model reads it.
+        let out = scan(
+            vec![query],
+            &[(
+                "src/app.ts",
+                "import { run } from 'acme-cli';\nrun(input);\n",
+            )],
+        );
+        assert!(matches!(decide(&out[0].0, &out[0].1), Decision::Ask(..)));
+    }
+
+    /// A name some manifest lists at runtime is never dev only, and a
+    /// manifest that doesn't parse makes nothing dev only.
+    #[test]
+    fn dev_only_needs_every_manifest_to_agree() {
+        let a = r#"{"devDependencies":{"left-pad":"1.0.0","acme-lint":"1.0.0"}}"#;
+        let b = r#"{"dependencies":{"left-pad":"1.0.0"}}"#;
+        assert_eq!(dev_only_names([a, b]), ["acme-lint"]);
+        assert!(dev_only_names([a, "{ not json"]).is_empty());
+        assert!(dev_only_names(Vec::<&str>::new()).is_empty());
     }
 
     #[test]
@@ -2412,7 +2676,11 @@ snapshots:
         let cfg = SecurityConfig::default();
         let (mut f, mut st) = critical(Verdict::Unknown);
         sec::retier(&mut f, &st, &cfg);
-        assert_eq!(f.tier, Some(Tier::P1));
+        assert_eq!(
+            f.tier,
+            Some(Tier::P2),
+            "not settled: not tiered as reachable"
+        );
         st.cards = vec!["new".into()];
         st.carded_tier = f.tier;
         let now = sec::parse_time("2026-11-10T12:00:00Z").unwrap();
@@ -2448,9 +2716,9 @@ snapshots:
         let (mut f, mut st) = critical(Verdict::Unknown);
         f.advisory.cvss = Some(7.5);
         sec::retier(&mut f, &st, &cfg);
-        assert_eq!(f.tier, Some(Tier::P1));
+        assert_eq!(f.tier, Some(Tier::P2));
         st.cards = vec!["new".into()];
-        st.carded_tier = Some(Tier::P1);
+        st.carded_tier = Some(Tier::P2);
         let kev: BTreeMap<String, String> =
             [("CVE-2021-23337".to_string(), "2026-12-01".to_string())].into();
         assert!(sec::apply_kev(&mut f, &kev));
@@ -2467,7 +2735,7 @@ snapshots:
         let (mut f, st) = critical(Verdict::Unknown);
         f.advisory.cvss = Some(5.0);
         sec::retier(&mut f, &st, &cfg);
-        assert_eq!(f.tier, Some(Tier::P2));
+        assert_eq!(f.tier, Some(Tier::P3));
         f.advisory.epss = Some(0.4);
         assert!(sec::retier(&mut f, &st, &cfg));
         assert_eq!(f.tier, Some(Tier::P1));
