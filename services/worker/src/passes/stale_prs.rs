@@ -26,6 +26,7 @@
 //! reason on the run page, instead of leaving it waiting on a review that
 //! will never come.
 
+use common::run_ending::EndWrite;
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -662,10 +663,18 @@ async fn end_run(
         )
         .condition_expression("attribute_exists(run_id) AND #s = :from")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":closed", attr_s(common::run_status::CLOSED))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{run_id}", common::run_status::CLOSED)),
+        .run_status(
+            ":closed",
+            &common::run_ending::gate(
+                &run_id,
+                &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+                    reason: common::run_ending::Stop::ClosedBy {
+                        who: "CoderHelm".into(),
+                        why: reason.to_string(),
+                    },
+                    tried: Default::default(),
+                }),
+            ),
         )
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":by", attr_s("coderhelm"))

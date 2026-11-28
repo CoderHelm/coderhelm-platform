@@ -1,3 +1,4 @@
+use common::run_ending::EndWrite;
 use common::run_status::EndedValues;
 use common::run_wait::{NeedsInput, WaitingOn};
 use std::collections::HashMap;
@@ -1331,6 +1332,7 @@ pub mod followup_dedupe;
 pub mod followups;
 pub mod formatter;
 pub(crate) mod generators;
+pub mod github_admission;
 pub mod github_history;
 pub mod guide_pr;
 pub mod habits;
@@ -2258,7 +2260,7 @@ async fn run_passes(
     if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
         warn!(run_id, team_id = %msg.team_id, %reason, "Run rejected: budget exceeded");
         let duration = start.elapsed().as_secs();
-        fail_run(state, msg, run_id, &reason, usage, duration).await;
+        let _ = end_at_usage_limit(state, msg, run_id, &reason, usage, duration).await;
         return Err(reason.into());
     }
 
@@ -5099,7 +5101,7 @@ false,
                             .condition_expression(common::run_status::not_ended("#s"))
                             .ended_values()
                             .expression_attribute_values(":s", attr_s("awaiting_ci"))
-                            .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+                            .expression_attribute_values(":sri", common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr())
                             .expression_attribute_values(":cp", attr_s("awaiting_ci"))
                             .expression_attribute_values(":pn", attr_n(pr_number))
                             .expression_attribute_values(":pu", attr_s(&pr_url))
@@ -5769,7 +5771,7 @@ false,
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("awaiting_ci"))
-                .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+                .expression_attribute_values(":sri", common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr())
                 .expression_attribute_values(
                     ":mcp",
                     AttributeValue::L(used_mcp_ids.iter().map(|id| attr_s(id)).collect()),
@@ -6165,8 +6167,19 @@ false,
                 .expression_attribute_names("#status", "status")
                 .condition_expression(common::run_status::not_ended("#status"))
                 .ended_values()
-                .expression_attribute_values(":s", attr_s("completed"))
-                .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+                // Delivered on the pull request that already matches
+                // (`common::run_ending`).
+                .run_status(
+                    ":s",
+                    &common::run_ending::gate(
+                        run_id,
+                        &common::run_ending::delivered(
+                            common::run_status::COMPLETED,
+                            pr_number,
+                            &pr_url,
+                        ),
+                    ),
+                )
                 .expression_attribute_values(":pn", attr_n(pr_number))
                 .expression_attribute_values(":pu", attr_s(&pr_url))
                 .expression_attribute_values(":b", attr_s(&branch_name))
@@ -7732,7 +7745,7 @@ false,
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":sri", common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr())
         .expression_attribute_values(
             ":mcp",
             AttributeValue::L(
@@ -9144,7 +9157,10 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         ))
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":r", attr_s("running"))
-        .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::Running, run_id).sri_attr(),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .ended_values()
         .send()
@@ -9218,7 +9234,10 @@ async fn create_run_record(
         .item("run_id", attr_s(run_id))
         .item("status", attr_s("running"))
         // Composite SK for status-index GSI: "running#<run_id>" for efficient status queries
-        .item("status_run_id", attr_s(&format!("running#{run_id}")))
+        .item(
+            "status_run_id",
+            common::run_ending::working(common::run_ending::Working::Running, run_id).sri_attr(),
+        )
         // Composite key for repo-index GSI
         .item("team_repo", attr_s(&format!("{}#{}", msg.team_id, repo)))
         .item(
@@ -9760,12 +9779,32 @@ async fn finish_without_code(
              fix_location = :fl, fix_decision = :fd, outside_change_report = :rep",
         )
         .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s(status))
+        // Waiting on the role's reads, on the change outside the code
+        // (named), or on the person `mark_run_needs_input` already named
+        // (its status kept): through the one gate (`common::run_ending`).
+        .run_status(
+            ":s",
+            &if waiting.is_some() {
+                common::run_ending::working(common::run_ending::Working::AwaitingSetup, run_id)
+            } else if outside {
+                common::run_ending::gate(
+                    run_id,
+                    &common::run_ending::RunEnd::Waiting(common::run_ending::Waiting {
+                        on: common::run_ending::WaitOn::OutsideChange {
+                            what: common::truncate_str(report.trim(), 300).to_string(),
+                        },
+                        evidence: report.to_string(),
+                    }),
+                )
+            } else {
+                common::run_ending::restored(status, run_id)
+                    .unwrap_or_else(|| common::run_ending::working(common::run_ending::Working::Running, run_id))
+            },
+        )
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .expression_attribute_values(
             ":mcp",
             AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),
@@ -10432,7 +10471,21 @@ pub(crate) async fn mark_run_stopped_by_guard(
         }
         self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
     } else {
-        fail_run(state, msg, run_id, reason, &TokenUsage::default(), 0).await;
+        stop_run(
+            state,
+            msg,
+            run_id,
+            reason,
+            common::run_ending::Stopped {
+                reason: common::run_ending::Stop::Guard {
+                    why: reason.to_string(),
+                },
+                tried: common::run_ending::Tried::default(),
+            },
+            &TokenUsage::default(),
+            0,
+        )
+        .await;
     }
     release_blocked_pr(state, msg).await;
 }
@@ -10960,11 +11013,83 @@ async fn release_blocked_pr(state: &WorkerState, msg: &TicketMessage) {
     }
 }
 
+/// Ends the run for an error a pass raised (its text with its causes,
+/// `run_fail::error_text`): read by the error classifier, the only ending
+/// that is. A stop whose reason the pass knows goes through [`stop_run`].
 pub(crate) async fn fail_run(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
     error_msg: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) {
+    end_with(
+        state,
+        msg,
+        run_id,
+        common::run_fail::Cause::Error(error_msg),
+        usage,
+        duration,
+    )
+    .await
+}
+
+/// Ends the run for a stop whose reason the pass knows, typed: `reason` is
+/// its sentence for a person, `stop` what stopped it and what was tried.
+/// Never read back by the error classifier.
+pub(crate) async fn stop_run(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    stop: common::run_ending::Stopped,
+    usage: &TokenUsage,
+    duration: u64,
+) {
+    end_with(
+        state,
+        msg,
+        run_id,
+        common::run_fail::Cause::Stopped { reason, stop },
+        usage,
+        duration,
+    )
+    .await
+}
+
+/// The run waits on the team's usage limit (`run_recovery::usage_limit`):
+/// the one ending every run at the limit takes, before its first pass or
+/// when a round's model calls are refused.
+pub(crate) async fn end_at_usage_limit(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let needs = common::run_recovery::usage_limit(reason);
+    end_with(
+        state,
+        msg,
+        run_id,
+        common::run_fail::Cause::NeedsYou {
+            reason,
+            needs: &needs,
+        },
+        usage,
+        duration,
+    )
+    .await;
+    Ok(())
+}
+
+async fn end_with(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    cause: common::run_fail::Cause<'_>,
     usage: &TokenUsage,
     duration: u64,
 ) {
@@ -10980,27 +11105,23 @@ pub(crate) async fn fail_run(
     // A tooling failure (the run's own environment) also records its kind
     // and the exact command and error, for the run page.
     let mut extra = vec![("duration_s", attr_n(duration))];
-    extra.extend(stop_gate::tooling_fields(error_msg));
+    if let common::run_fail::Cause::Error(e) = &cause {
+        extra.extend(stop_gate::tooling_fields(e));
+    }
     let failure = common::run_fail::RunFailure {
-        reason: error_msg,
+        cause,
         pass: None,
         only_from: None,
         extra,
         add: usage_adds(&delta),
-        needs: None,
     };
-    // The stop is read first (`common::run_recovery::ending`): only an
-    // error the self-heal sweep resumes is parked as `failed`; anything
-    // else waits on a person, saying what to do. The ticket hears the plain
-    // words, never the raw error.
-    let ended_as = common::run_fail::status_for(error_msg);
-    let said = match common::run_recovery::ending(error_msg) {
-        common::run_recovery::Ending::Parked(c) => {
-            format!("{} CoderHelm resumes the run by itself.", c.plain)
-        }
-        common::run_recovery::Ending::NeedsYou(_, n) => format!("{} {}.", n.detail, n.action),
-    };
-    if ended_as == common::run_fail::STATUS {
+    // The ending is decided once (`common::run_fail::update`): only an
+    // error the self-heal sweep resumes is parked as `failed` with its
+    // resume message; a typed stop is written as itself; a wait names what
+    // a person does. The ticket hears the plain words, never the raw error.
+    let decided = common::run_fail::update(run_id, &failure, "");
+    let ended_as = decided.status;
+    if decided.resumable {
         // The continuation the self-heal sweep sends: the same run, from
         // its checkpoint and its own plan.
         recover::keep_resume_message(state, msg, run_id).await;
@@ -11048,7 +11169,7 @@ pub(crate) async fn fail_run(
     // Check token usage against limit and send warning if needed
     check_token_usage_warning(state, &msg.team_id, usage).await;
 
-    notify_ticket_failed(state, msg, run_id, &said).await;
+    notify_ticket_failed(state, msg, run_id, &decided.said).await;
 }
 
 /// Tells the ticket the run failed and why: a GitHub issue comment or a Jira
@@ -11453,7 +11574,7 @@ async fn supersede_moved_prs(
 /// `number` in `repo` (`close_pull_request`, a write). Never waits on a
 /// card: a close the gate refuses or asks about leaves the pull request
 /// open, and `Err` says why.
-async fn may_close_own_pr(
+pub(crate) async fn may_close_own_pr(
     state: &WorkerState,
     provider: &crate::agent::provider::ModelProvider,
     repo: &str,
@@ -11484,7 +11605,7 @@ async fn may_close_own_pr(
 /// check, with `note` posted first (once: the note has its own slot on the
 /// pull request). A note that can't be posted leaves it open. The branch is
 /// kept.
-async fn close_own_pr(
+pub(crate) async fn close_own_pr(
     state: &WorkerState,
     provider: &crate::agent::provider::ModelProvider,
     github: &GitHubClient,

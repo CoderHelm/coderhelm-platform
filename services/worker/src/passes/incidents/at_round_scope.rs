@@ -283,8 +283,13 @@ fn a_planned_work_round_that_is_refused_its_file_says_so_once_and_stops() {
 
     // Round 1 pushed two files and was refused one edit: no task finished.
     assert!(!supervisor::progressed(false, 2, refused.len()));
-    let Next::Again { stalled } = finish_planned::next(&before, Some(&before), 2, &refused, &first)
-    else {
+    let Next::Again { stalled } = finish_planned::next(
+        &before,
+        Some(&before),
+        &finish_planned::Ran::Finished { files: 2 },
+        &refused,
+        &first,
+    ) else {
         panic!("round 1 goes on once, with a changed approach");
     };
     assert_eq!(stalled, 1);
@@ -293,8 +298,14 @@ fn a_planned_work_round_that_is_refused_its_file_says_so_once_and_stops() {
     assert!(second.feedback.contains("`.github/workflows/ci.yml`"));
 
     // Round 2 is refused the same edit: the work stops, and says which.
-    let next = finish_planned::next(&before, Some(&before), 1, &refused, &second);
-    end.status = finish_planned::run_status(&next, 1).into();
+    let next = finish_planned::next(
+        &before,
+        Some(&before),
+        &finish_planned::Ran::Finished { files: 1 },
+        &refused,
+        &second,
+    );
+    end.status = finish_planned::status_after(&next, 1).into();
     match next {
         Next::Stop(why) => {
             assert!(why.contains("made no progress"), "{why}");
@@ -310,20 +321,30 @@ fn a_planned_work_round_that_is_refused_its_file_says_so_once_and_stops() {
     // The same rounds with nothing refused go on as before (pushed files
     // are progress), and a finished task is progress whatever was refused.
     assert_eq!(
-        finish_planned::next(&before, Some(&before), 2, &[], &first),
+        finish_planned::next(
+            &before,
+            Some(&before),
+            &finish_planned::Ran::Finished { files: 2 },
+            &[],
+            &first
+        ),
         Next::Again { stalled: 0 }
     );
     assert_eq!(
-        finish_planned::next(&before, Some(&[]), 1, &refused, &first),
+        finish_planned::next(
+            &before,
+            Some(&[]),
+            &finish_planned::Ran::Finished { files: 1 },
+            &refused,
+            &first
+        ),
         Next::Ready
     );
 
     // The pipeline hands the round's refused edits to that decision.
     let resume = include_str!("../resume.rs");
     let after = fn_src(resume, "async fn after_planned_round(");
-    assert!(
-        after.contains("finish_planned::next(&before, after.as_deref(), files, refused, round)")
-    );
+    assert!(after.contains("finish_planned::next(&before, after.as_deref(), &ran, refused, round)"));
     assert!(after.contains("finish_planned::next_round(round, &items, stalled, refused,"));
     let round_fn = fn_src(resume, "async fn run_fix_round(");
     assert!(round_fn.contains("*refused = std::mem::take(&mut r.refused);"));

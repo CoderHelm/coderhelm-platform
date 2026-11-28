@@ -334,6 +334,9 @@ test("the reader update may write only CoderHelmLogReader's policy, only through
   for (const a of ["iam:AttachRolePolicy", "iam:UpdateAssumeRolePolicy", "iam:CreateRole", "iam:PassRole", "iam:CreatePolicy", "iam:PutRolePermissionsBoundary", "iam:DeleteRolePermissionsBoundary"]) {
     assert.ok(!can(a, role, via), a);
   }
+  // The databases an admin chose: the secrets' names, never a value.
+  assert.ok(can("secretsmanager:ListSecrets", "*"));
+  assert.ok(!can("secretsmanager:GetSecretValue", "arn:aws:secretsmanager:us-east-1:111122223333:secret:coderhelm-readonly-app-db-Ab12Cd"));
   // No IAM action outside that role (GetRole is the one read).
   for (const st of p.Statement) {
     const acts = ([] as string[]).concat(st.Action ?? []);

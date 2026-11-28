@@ -4,6 +4,7 @@
 //! of time, and when it can't finish leaves the run completed with the pull
 //! request open and a plain account of what the round pushed.
 
+use common::run_ending::EndWrite;
 use std::time::{Duration, Instant};
 
 use common::run_round::{self, Incomplete, Kind, Round};
@@ -234,10 +235,9 @@ async fn write_incomplete(
         .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
         .expression_attribute_names("#round", run_round::FIELD)
         .expression_attribute_names("#err", "error")
-        .expression_attribute_values(":s", attr_s(common::run_status::COMPLETED))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{run_id}", common::run_status::COMPLETED)),
+        .run_status(
+            ":s",
+            &super::resume::delivered_now(state, team_id, run_id).await,
         )
         .expression_attribute_values(":inc", inc.to_attr())
         .expression_attribute_values(":cp", attr_s("done"))

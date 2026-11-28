@@ -811,6 +811,149 @@ pub fn stack_list_url(region: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every operation of the two Data APIs' SDK clients (aws-sdk-rdsdata,
+    /// aws-sdk-redshiftdata), as the Rust method is named.
+    const DATA_API_OPERATIONS: &[(&str, &[&str])] = &[
+        (
+            "rds-data",
+            &[
+                "batch_execute_statement",
+                "begin_transaction",
+                "commit_transaction",
+                "execute_sql",
+                "execute_statement",
+                "rollback_transaction",
+            ],
+        ),
+        (
+            "redshift-data",
+            &[
+                "batch_execute_statement",
+                "cancel_statement",
+                "describe_statement",
+                "describe_table",
+                "execute_statement",
+                "get_statement_result",
+                "get_statement_result_v2",
+                "list_databases",
+                "list_schemas",
+                "list_statements",
+                "list_tables",
+            ],
+        ),
+    ];
+
+    fn pascal(op: &str) -> String {
+        op.split('_')
+            .map(|w| {
+                let mut c = w.chars();
+                c.next()
+                    .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The IAM actions the services' own (non-test) code calls on each Data
+    /// API, from its call sites: in each file that builds that API's
+    /// client, every `.operation()` of that client's operations.
+    fn data_api_calls() -> Vec<String> {
+        let services = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for c in ["common/src", "gateway/src", "worker/src"] {
+            rust_files(&services.join(c), &mut files);
+        }
+        let mut out: Vec<String> = Vec::new();
+        for f in files {
+            let src = std::fs::read_to_string(&f).unwrap();
+            // Only what ships: a module's tests (a live probe that proves a
+            // commit is refused) are left out.
+            let src = src.split("#[cfg(test)]").next().unwrap_or("");
+            let rds = src.contains("aws_sdk_rdsdata") || src.contains("rdsdata_client(");
+            let redshift = src.contains("aws_sdk_redshiftdata");
+            assert!(
+                !(rds && redshift),
+                "{}: one file per Data API, so each call is read as the right service's",
+                f.display()
+            );
+            let service = match (rds, redshift) {
+                (true, _) => "rds-data",
+                (_, true) => "redshift-data",
+                _ => continue,
+            };
+            let ops = DATA_API_OPERATIONS
+                .iter()
+                .find(|(s, _)| *s == service)
+                .unwrap()
+                .1;
+            for op in ops {
+                if src.contains(&format!(".{op}()")) {
+                    let a = format!("{service}:{}", pascal(op));
+                    if !out.contains(&a) {
+                        out.push(a);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_data_api_call_the_code_makes_is_granted_by_both_role_templates() {
+        let calls = data_api_calls();
+        // The reads as they are today: if one of these stops being found,
+        // the scan no longer sees the code, and this test proves nothing.
+        for a in [
+            "rds-data:BeginTransaction",
+            "rds-data:ExecuteStatement",
+            "rds-data:RollbackTransaction",
+            "redshift-data:ExecuteStatement",
+            "redshift-data:GetStatementResult",
+        ] {
+            assert!(calls.contains(&a.to_string()), "{a} not found in {calls:?}");
+        }
+        let listed: Vec<&str> = ABILITIES
+            .iter()
+            .filter(|a| a.key == "databases" || a.key == "warehouses")
+            .flat_map(|a| a.actions.iter().copied())
+            .collect();
+        for (name, t) in [
+            ("coderhelm-log-reader.yaml", ROLE_TEMPLATE),
+            ("coderhelm-log-reader-update.yaml", UPDATE_TEMPLATE),
+        ] {
+            let allowed = template_actions(t);
+            for a in &calls {
+                assert!(
+                    allowed.contains(a),
+                    "the code calls {a}, and {name} never allows it: every such call is refused"
+                );
+                assert!(
+                    listed.contains(&a.as_str()),
+                    "{a} is called but not in the databases or warehouses ability (the live check never asks for it)"
+                );
+            }
+        }
+        // Never one the role is denied: a commit or a batch is refused by design.
+        for a in &calls {
+            assert!(
+                !a.ends_with(":CommitTransaction") && !a.ends_with(":BatchExecuteStatement"),
+                "{a} is denied to the role by design"
+            );
+        }
+    }
+
     #[test]
     fn the_abilities_list_every_action_the_template_allows() {
         let mut listed: Vec<String> = ABILITIES

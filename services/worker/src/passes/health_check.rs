@@ -886,12 +886,19 @@ pub async fn run(state: &WorkerState, msg: HealthCheckMessage) -> Result<(), Box
             // A failed deploy of CoderHelm's own change: the revert is
             // opened, ready for the team's approval, with these failures as
             // its evidence. Never merged here.
+            let mut again = false;
             if let Verdict::Failed(jobs) = &verdict {
-                if let Some(line) = propose_revert(state, &github, &msg, jobs).await {
+                if let Some((line, retry)) = propose_revert(state, &github, &msg, jobs).await {
                     body = with_revert_line(&body, &line);
+                    again = retry;
                 }
             }
             upsert_comment(&github, &msg, &body).await;
+            // GitHub failed for a moment while the revert was built: the
+            // watch looks again, and that look builds it (one per merge).
+            if again && revert_looks_again(now, merged_at) {
+                send_tick(state, &msg, backoff(msg.attempts)).await;
+            }
             info!(pr = msg.pr_number, sha = %msg.merge_sha, ?verdict, "Health check reported");
         }
     }
@@ -920,15 +927,24 @@ pub fn with_revert_line(body: &str, line: &str) -> String {
     }
 }
 
+/// Whether a revert GitHub failed to build for a moment is built again on
+/// a later look: while the merge is inside the watch's safety ceiling, the
+/// same bound every other look of the watch has.
+pub fn revert_looks_again(now: i64, merged_at: i64) -> bool {
+    now - merged_at < SAFETY_CEILING_SECS
+}
+
 /// The deploy of a merge failed on checks that passed before it. When the
 /// merged pull request is CoderHelm's own, the revert pull request is
-/// opened (or found) and its line returned; `None` for anyone else's.
+/// opened (or found) and its line returned, with whether the watch should
+/// look again to build it (GitHub failed for a moment,
+/// `deploy_revert::Outcome::Retry`); `None` for anyone else's.
 async fn propose_revert(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &HealthCheckMessage,
     failed: &[Job],
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let run_id = super::review_pr::lookup_run_by_pr(
         state,
         &msg.team_id,
@@ -967,7 +983,8 @@ async fn propose_revert(
         ),
     )
     .await;
-    Some(line)
+    let again = matches!(outcome, super::deploy_revert::Outcome::Retry(_));
+    Some((line, again))
 }
 
 /// One comment per merge: edit the one already posted for this merge, or

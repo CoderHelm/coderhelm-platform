@@ -181,8 +181,9 @@ pub fn plan_close(item: Option<&Item>, close_pr: bool) -> ClosePlan {
 
 /// The write that closes the run, while its status is still `from`.
 pub struct CloseWrite {
-    pub expression: &'static str,
+    pub expression: String,
     pub condition: &'static str,
+    pub names: HashMap<String, String>,
     pub values: Item,
 }
 
@@ -194,17 +195,12 @@ pub fn close_write(
     now: &str,
 ) -> CloseWrite {
     let mut values = HashMap::from([
-        (":closed".to_string(), attr_s(run_status::CLOSED)),
-        (
-            ":sri".to_string(),
-            attr_s(&format!("{}#{run_id}", run_status::CLOSED)),
-        ),
         (":t".to_string(), attr_s(now)),
         (":by".to_string(), attr_s(&closer.email)),
         (":name".to_string(), attr_s(&closer.name)),
         (":from".to_string(), attr_s(from)),
     ]);
-    let expression = match reason {
+    let mut expression = match reason {
         Some(r) => {
             values.insert(":why".to_string(), attr_s(r));
             "SET #s = :closed, status_run_id = :sri, updated_at = :t, closed_at = :t, \
@@ -214,10 +210,30 @@ pub fn close_write(
             "SET #s = :closed, status_run_id = :sri, updated_at = :t, closed_at = :t, \
              closed_by = :by, closed_by_name = :name, closed_from = :from REMOVE close_reason"
         }
+    }
+    .to_string();
+    // Stopped by a person, named, through the one gate (`common::run_ending`).
+    let who = if closer.name.trim().is_empty() {
+        closer.email.clone()
+    } else {
+        closer.name.clone()
     };
+    let ending = common::run_ending::gate(
+        run_id,
+        &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+            reason: common::run_ending::Stop::ClosedBy {
+                who,
+                why: reason.unwrap_or("closed from the run page").to_string(),
+            },
+            tried: Default::default(),
+        }),
+    );
+    let mut names = HashMap::from([("#s".to_string(), "status".to_string())]);
+    ending.add_to(":closed", &mut expression, &mut names, &mut values);
     CloseWrite {
         expression,
         condition: "attribute_exists(run_id) AND #s = :from",
+        names,
         values,
     }
 }
@@ -263,16 +279,6 @@ pub fn reopened_wait(item: Option<&Item>) -> common::run_wait::WaitingOn {
                 "",
             )
         })
-}
-
-/// The status-index sort key of a reopened run. A failed run keeps the
-/// reason and pass it failed with; its key is the one `run_fail` writes.
-fn reopened_status_run_id(to: &str, run_id: &str) -> String {
-    if to == common::run_fail::STATUS {
-        common::run_fail::status_run_id(run_id)
-    } else {
-        format!("{to}#{run_id}")
-    }
 }
 
 /// The ids of a bulk close: trimmed, no blanks or repeats, at most
@@ -531,7 +537,7 @@ impl Ctx<'_> {
                 .set_key(Some(run_key(self.team_id, run_id)))
                 .update_expression(w.expression)
                 .condition_expression(w.condition)
-                .expression_attribute_names("#s", "status")
+                .set_expression_attribute_names(Some(w.names))
                 .set_expression_attribute_values(Some(w.values))
                 .send()
                 .await;
@@ -1046,7 +1052,8 @@ pub async fn reopen_run(
                  REMOVE closed_at, closed_by, closed_by_name, closed_from, close_reason",
             )
             .expression_attribute_values(":to", attr_s(to))
-            .expression_attribute_values(":sri", attr_s(&reopened_status_run_id(to, &run_id)))
+            // Back to the status it had (`common::run_ending::restored`).
+            .expression_attribute_values(":sri", common::run_ending::restored_sri(to, &run_id))
     };
     let res = update
         .expression_attribute_values(":t", attr_s(&now))
@@ -1386,12 +1393,12 @@ mod tests {
             ReopenPlan::NotClosed("completed".into())
         );
         assert_eq!(
-            reopened_status_run_id(common::run_fail::STATUS, "01R"),
-            common::run_fail::status_run_id("01R")
+            common::run_ending::restored_sri(common::run_fail::STATUS, "01R"),
+            attr_s(&common::run_fail::status_run_id("01R"))
         );
         assert_eq!(
-            reopened_status_run_id("needs_input", "01R"),
-            "needs_input#01R"
+            common::run_ending::restored_sri("needs_input", "01R"),
+            attr_s("needs_input#01R")
         );
     }
 

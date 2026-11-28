@@ -37,6 +37,7 @@
 //! Every limit is here. How they were sized is in [`worst_normal_run`], which a
 //! test holds against them.
 
+use common::run_ending::EndWrite;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -1100,13 +1101,19 @@ async fn wait_on_open_pr(
 async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason: &str) {
     if let Some(red) = super::resume::red_ci_blocks_completion(state, team_id, run_id).await {
         let why = format!("{}; {red}", reason.trim().trim_end_matches('.'));
+        // The guard's own stop, typed: never read back as an error.
         let failure = common::run_fail::RunFailure {
-            reason: &why,
+            cause: common::run_fail::Cause::Stopped {
+                reason: &why,
+                stop: common::run_ending::Stopped {
+                    reason: common::run_ending::Stop::Guard { why: why.clone() },
+                    tried: common::run_ending::Tried::default(),
+                },
+            },
             pass: None,
             only_from: None,
             extra: Vec::new(),
             add: Vec::new(),
-            needs: None,
         };
         match common::run_fail::fail_run(
             &state.dynamo,
@@ -1118,7 +1125,7 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
         .await
         {
             Ok(true) => {
-                let ended_as = common::run_fail::status_for(&why);
+                let ended_as = common::run_fail::status_of(&failure);
                 super::webhooks::emit_run(state, team_id, run_id, ended_as).await
             }
             Ok(false) => {}
@@ -1133,6 +1140,12 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
         &format!("Finished on its pull request; left open there: {reason}"),
     )
     .await;
+    // Delivered on the pull request its record names (`common::run_ending`).
+    let (number, url) = super::resume::record_pr(state, team_id, run_id).await;
+    let ending = common::run_ending::gate(
+        run_id,
+        &common::run_ending::delivered(run_status::COMPLETED, number, &url),
+    );
     let res = state
         .dynamo
         .update_item()
@@ -1146,11 +1159,7 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
         .condition_expression(run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(run_status::COMPLETED))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{run_id}", run_status::COMPLETED)),
-        )
+        .run_status(":s", &ending)
         .expression_attribute_values(":dr", attr_s(common::truncate_str(reason, 500)))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -1185,7 +1194,7 @@ async fn await_ci_on_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
         .expression_attribute_values(":s", attr_s(run_status::AWAITING_CI))
         .expression_attribute_values(
             ":sri",
-            attr_s(&format!("{}#{run_id}", run_status::AWAITING_CI)),
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
         )
         .expression_attribute_values(":dr", attr_s(common::truncate_str(reason, 500)))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))

@@ -1,4 +1,5 @@
 use aws_sdk_dynamodb::types::AttributeValue;
+use common::run_ending::EndWrite;
 use common::run_status::EndedValues;
 use common::run_wait::{NeedsInput, WaitingOn};
 use serde_json::Value;
@@ -1700,7 +1701,11 @@ pub async fn run(
                     .expression_attribute_values(":cp", attr_s("awaiting_ci"))
                     .expression_attribute_values(
                         ":sri",
-                        attr_s(&format!("awaiting_ci#{}", msg.run_id)),
+                        common::run_ending::working(
+                            common::run_ending::Working::AwaitingCi,
+                            &msg.run_id,
+                        )
+                        .sri_attr(),
                     )
                     // Never resurrect a cancelled run — the condition makes this
                     // force-reset a no-op once the run is cancelled.
@@ -2334,7 +2339,11 @@ pub async fn run(
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":expected", attr_s("awaiting_ci"))
         .expression_attribute_values(":new_s", attr_s("running"))
-        .expression_attribute_values(":sri", attr_s(&format!("running#{}", msg.run_id)))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::Running, &msg.run_id)
+                .sri_attr(),
+        )
         .expression_attribute_values(":cp", attr_s("test"))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
@@ -3205,6 +3214,9 @@ pub async fn run(
             ));
         }
         feedback.push_str(&content_brief);
+        // The round's verdict on what the failure needs, read after it
+        // (`common::content_gap::after_round`).
+        feedback.push_str(common::content_gap::CAUSE_ASK);
 
         // The CI fix is a round of its own (common::run_round): its own
         // budget, on the run record while it works, and parked for a fresh
@@ -3428,7 +3440,7 @@ pub async fn run(
                                             max_attempts,
                                             &tried,
                                             &why,
-                                        );
+                                        ) + common::content_gap::CAUSE_ASK;
                                         continue 'fix;
                                     }
                                     super::round::clear(state, &msg.team_id, &msg.run_id).await;
@@ -3563,6 +3575,45 @@ pub async fn run(
                                 )
                                 .await;
                             }
+                            // The round changed no code: what it found
+                            // missing decides (`common::content_gap::after_round`).
+                            // Content the test reads that isn't there ends
+                            // the loop with that content named before merge,
+                            // never a failed run, whether or not the change
+                            // carries a step that supplies it.
+                            if let common::content_gap::Verdict::AwaitsStep { gap, step } =
+                                content_after_round(
+                                    state,
+                                    &msg.team_id,
+                                    &msg.run_id,
+                                    result.evidence.latest_notes(),
+                                    &gap_text,
+                                    test_failed,
+                                )
+                                .await
+                            {
+                                super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                                super::webhooks::emit_ci_fix_completed(
+                                    state,
+                                    &ci_fix,
+                                    "no_changes",
+                                    0,
+                                )
+                                .await;
+                                let check = failing_wf.first().cloned().unwrap_or_default();
+                                return finish_awaits_content(
+                                    state,
+                                    &ticket_msg,
+                                    &msg.run_id,
+                                    &github,
+                                    &pr_ref,
+                                    &usage,
+                                    wall_clock_secs(created_at, &start),
+                                    &events,
+                                    (&gap, &step, &check, &repro_head),
+                                )
+                                .await;
+                            }
                             let said = result
                                 .evidence
                                 .notes
@@ -3653,7 +3704,7 @@ pub async fn run(
                                     max_attempts,
                                     &tried,
                                     &fresh,
-                                );
+                                ) + common::content_gap::CAUSE_ASK;
                                 continue 'fix;
                             }
                             warn!(
@@ -4455,6 +4506,17 @@ pub async fn run(
             mark_events_processed(state, &msg.run_id, &events).await;
             match end {
                 RoundEnd::Parked => return Ok(()),
+                RoundEnd::Limited(why) => {
+                    return super::end_at_usage_limit(
+                        state,
+                        &ctx.ticket_msg,
+                        &msg.run_id,
+                        &why,
+                        &ctx.usage,
+                        wall_clock_secs(created_at, &start),
+                    )
+                    .await;
+                }
                 // A review-fix round that used every step it had: what it
                 // landed and its account are the head's to review now, and
                 // the ledger takes the next round in a fresh step. Never a
@@ -4741,7 +4803,7 @@ struct PrRef<'a> {
 }
 
 /// How a round's invocation ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RoundEnd {
     /// The round's work is done; `files` changed.
     Done { files: usize },
@@ -4750,6 +4812,10 @@ enum RoundEnd {
     /// It can't finish: the run is completed with the round named as not
     /// finished, and Resume can run it again.
     Incomplete,
+    /// The team's usage limit refused its model calls: it never ran, and no
+    /// round runs until the limit is raised or the month turns. The limit's
+    /// words.
+    Limited(String),
 }
 
 /// Parks a round for a fresh invocation: the run waits (awaiting_ci) with
@@ -5130,6 +5196,20 @@ async fn run_fix_round(
                 )
                 .await;
             }
+            // The team's usage limit refused the round's model calls: it
+            // never ran, and running it again meets the same limit. Typed by
+            // the call that refused (`model_retry::ModelErrorKind`), never read
+            // from the words.
+            if let Some(m) = common::model_retry::model_error(err)
+                .filter(|m| m.kind == common::model_retry::ModelErrorKind::LimitReached)
+            {
+                let why = m.to_string();
+                warn!(run_id = msg.run_id, reason = %why, "Fix round refused by the usage limit: it never ran");
+                // Nothing of it to keep: the run waits on the limit, and
+                // the round starts again from the head after it.
+                super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                return Ok(RoundEnd::Limited(why));
+            }
             warn!(run_id = msg.run_id, error = %e, "Fix round met an error; taking the way around it");
             // GitHub refusing for a while (its hourly limit, a 5xx, no
             // answer) is known from the error itself, else from what this
@@ -5320,7 +5400,11 @@ async fn run_pending_round(
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":expected", attr_s("awaiting_ci"))
         .expression_attribute_values(":new_s", attr_s("running"))
-        .expression_attribute_values(":sri", attr_s(&format!("running#{}", msg.run_id)))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::Running, &msg.run_id)
+                .sri_attr(),
+        )
         .expression_attribute_values(":cp", attr_s("implement"))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
@@ -5424,6 +5508,17 @@ async fn run_pending_round(
     }
     match end {
         RoundEnd::Parked => {}
+        RoundEnd::Limited(why) => {
+            super::end_at_usage_limit(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                &why,
+                &ctx.usage,
+                wall_clock_secs(created_at, start),
+            )
+            .await?;
+        }
         RoundEnd::Incomplete => {
             complete_run_with_status(
                 state,
@@ -5556,7 +5651,11 @@ pub(crate) async fn start_conflict_round(
         .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
         .expression_attribute_values(":ac", attr_s("awaiting_ci"))
         .expression_attribute_values(":completed", attr_s("completed"))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, &run_id)
+                .sri_attr(),
+        )
         .expression_attribute_values(":r", round.to_attr())
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
@@ -5958,10 +6057,17 @@ async fn after_planned_round(
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     start: &std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use super::finish_planned::{self, Next};
-    let files = match end {
-        RoundEnd::Done { files } => files,
-        RoundEnd::Parked | RoundEnd::Incomplete => 0,
+    use super::finish_planned::{self, Next, Ran};
+    // How the round ended decides whether it counts as a stall: only one
+    // that ran to its end can (`finish_planned::next`).
+    let ran = match end {
+        RoundEnd::Done { files } => Ran::Finished { files },
+        RoundEnd::Parked | RoundEnd::Incomplete => Ran::Unfinished,
+        RoundEnd::Limited(why) => Ran::Limited(why),
+    };
+    let files = match ran {
+        Ran::Finished { files } => files,
+        _ => 0,
     };
     let body = match ctx
         .github
@@ -6027,8 +6133,8 @@ async fn after_planned_round(
         }
     }
     let duration = wall_clock_secs(created_at, start);
-    let next = finish_planned::next(&before, after.as_deref(), files, refused, round);
-    let status = finish_planned::run_status(&next, files);
+    let next = finish_planned::next(&before, after.as_deref(), &ran, refused, round);
+    let status = finish_planned::status_after(&next, files);
     match next {
         Next::Ready => {
             super::add_progress_note(
@@ -6128,6 +6234,31 @@ async fn after_planned_round(
             {
                 send_delayed_resume(state, msg, 5).await;
             }
+        }
+        Next::WaitLimit(why) => {
+            // The round never ran: the run waits on the usage limit, as every
+            // run at the limit does. The planned work stays listed and its
+            // rounds go on from here on Retry.
+            debug_assert_eq!(status, common::run_status::NEEDS_INPUT);
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "Planned-work round {} didn't run: the team's usage limit refused its model calls. It is not counted as a round without progress.",
+                    round.number
+                ),
+            )
+            .await;
+            super::end_at_usage_limit(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                &why,
+                &ctx.usage,
+                duration,
+            )
+            .await?;
         }
         Next::Stop(reason) => {
             super::add_progress_note(state, &msg.team_id, &msg.run_id, &reason).await;
@@ -6854,7 +6985,7 @@ async fn set_run_awaiting_ci(
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":sri", common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr())
         .send()
         .await;
     match res {
@@ -7405,7 +7536,10 @@ pub(crate) async fn review_head_again(
         .condition_expression("#s = :was AND attribute_not_exists(guard_open)")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":aw", attr_s(AWAITING_CI))
-        .expression_attribute_values(":sri", attr_s(&format!("{AWAITING_CI}#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
+        )
         .expression_attribute_values(":was", attr_s(&status))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
@@ -7443,7 +7577,7 @@ pub(crate) async fn review_head_again(
             .condition_expression("#s = :aw")
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":was", attr_s(&status))
-            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+            .expression_attribute_values(":sri", common::run_ending::restored_sri(&status, run_id))
             .expression_attribute_values(":aw", attr_s(AWAITING_CI))
             .send()
             .await;
@@ -7667,7 +7801,10 @@ pub(crate) async fn queue_own_review_round(
         .expression_attribute_names("#fh", OWN_FIX_HEAD)
         .expression_attribute_names("#hd", OWN_REVIEW_HANDED)
         .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
+        )
         .expression_attribute_values(":was", attr_s(&status))
         .expression_attribute_values(":h", attr_s(head))
         .expression_attribute_values(":zero", attr_n(0))
@@ -7718,7 +7855,7 @@ pub(crate) async fn queue_own_review_round(
             .expression_attribute_names("#s", "status")
             .expression_attribute_names("#fh", OWN_FIX_HEAD)
             .expression_attribute_values(":was", attr_s(&status))
-            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+            .expression_attribute_values(":sri", common::run_ending::restored_sri(&status, run_id))
             .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
             .expression_attribute_values(":h", attr_s(head))
             .expression_attribute_values(":one", attr_n(1))
@@ -8158,6 +8295,33 @@ async fn content_verdict(
     common::content_gap::classify(failure, test_failed, &steps)
 }
 
+/// [`common::content_gap::after_round`] for a round that changed no code,
+/// against the run's own outside steps read fresh.
+async fn content_after_round(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    account: &str,
+    failure: &str,
+    test_failed: bool,
+) -> common::content_gap::Verdict {
+    let steps = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("fix_decision")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| super::outside_exec::decision_of(&i))
+        .map(|d| content_steps(&d))
+        .unwrap_or_default();
+    common::content_gap::after_round(account, failure, false, test_failed, &steps)
+}
+
 /// A failing test waits only on the change's own content step that
 /// CoderHelm can't run: no fix round is spent on it. The pull request says
 /// what to run before merge, the run's note says it, the pull request goes
@@ -8383,6 +8547,32 @@ async fn hand_off_red_ci(
         )
         .await;
     }
+    // The base branch is read again now, at the ending, not only when the
+    // round started: a base that turned red on these checks since then
+    // makes them the base's, and the run finishes with its own work done.
+    let red = red_ci_now(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        github,
+        (pr.owner, pr.repo, pr.branch),
+        &checks,
+        excerpt,
+    )
+    .await;
+    if red.all_on_base() {
+        return finish_red_on_base(
+            state,
+            ticket_msg,
+            &msg.run_id,
+            github,
+            pr,
+            &red,
+            usage,
+            duration,
+        )
+        .await;
+    }
     // What the fix rounds said goes on the pull request only as far as the
     // record bears it out (`common::ci_repro`).
     let head = super::round::branch_head(github, pr.owner, pr.repo, pr.branch).await;
@@ -8508,12 +8698,6 @@ pub(crate) async fn end_red_ci_rounds(
     }
     // The one ready decision: a failing check holds the draft, named.
     mark_pr_ready(state, &msg.team_id, github, pr.owner, pr.repo, number).await;
-    let tally = ci_tally(state, &msg.team_id, run_id).await;
-    let reason = format!(
-        "{}. {}",
-        ci_failing_reason(checks, excerpt, tally),
-        tried.join("; ")
-    );
     if ending != super::supervisor::Ending::Failed {
         error!(
             run_id,
@@ -8521,8 +8705,215 @@ pub(crate) async fn end_red_ci_rounds(
             "Red checks after the rounds must end the run failed"
         );
     }
-    warn!(run_id, reason = %reason, "CI stays red after the fix rounds and nothing can come out: the run failed");
-    super::fail_run(state, ticket_msg, run_id, &reason, usage, duration).await;
+    stop_red(
+        state,
+        ticket_msg,
+        run_id,
+        github,
+        &pr,
+        (checks, excerpt, tried),
+        "Nothing on this branch can come out to make these checks pass",
+        usage,
+        duration,
+    )
+    .await
+}
+
+/// The red checks as they stand at a run's ending: the head's failing checks
+/// (`fallback` when the head's can't be read) and, read now, those of them
+/// the base branch has red too. An end-to-end check red on the base names a
+/// check, not a test, so it is never called the base's here (as at the
+/// round's start: `ci_repro` compares those test by test).
+pub(crate) fn red_of(
+    head: &str,
+    head_failing: &std::collections::BTreeSet<String>,
+    base: &str,
+    base_failing: &std::collections::BTreeSet<String>,
+    fallback: &[String],
+    excerpt: &str,
+) -> common::run_ending::RedCi {
+    let checks: Vec<String> = if head_failing.is_empty() {
+        fallback.to_vec()
+    } else {
+        head_failing.iter().cloned().collect()
+    };
+    let set: std::collections::BTreeSet<String> = checks.iter().cloned().collect();
+    let (_, on_base) = split_base_failures(&set, base_failing);
+    common::run_ending::RedCi {
+        checks,
+        head: head.to_string(),
+        base: base.to_string(),
+        base_red: on_base
+            .into_iter()
+            .filter(|c| !super::e2e_reads::is_e2e_name(c))
+            .collect(),
+        excerpt: excerpt.trim().to_string(),
+    }
+}
+
+/// [`red_of`] from GitHub, now: the head of `branch` and the run's base
+/// branch, both read at the ending.
+pub(crate) async fn red_ci_now(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    github: &GitHubClient,
+    (owner, repo, branch): (&str, &str, &str),
+    fallback: &[String],
+    excerpt: &str,
+) -> common::run_ending::RedCi {
+    let head = super::round::branch_head(github, owner, repo, branch).await;
+    let at = if head.is_empty() {
+        branch
+    } else {
+        head.as_str()
+    };
+    let head_failing = match github.list_ci_for_ref(owner, repo, at).await {
+        Ok(c) => failing_check_names(&c),
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the head's checks at the ending");
+            Default::default()
+        }
+    };
+    let mut base = run_text(state, team_id, run_id, "base_branch").await;
+    if base.trim().is_empty() {
+        base = "main".to_string();
+    }
+    let base_failing = match github.list_ci_for_ref(owner, repo, &base).await {
+        Ok(b) => failing_check_names(&b),
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the base branch's checks at the ending");
+            Default::default()
+        }
+    };
+    let fallback: Vec<String> = if fallback.is_empty() {
+        vec!["the pull request's checks".to_string()]
+    } else {
+        fallback.to_vec()
+    };
+    red_of(at, &head_failing, &base, &base_failing, &fallback, excerpt)
+}
+
+/// Every failing check fails on the base branch too, read at the ending:
+/// red before this change. The run finishes with its own work done
+/// (`ci_end` = `red_on_base`), the pull request goes ready by the one ready
+/// decision, and those checks are the base's to fix.
+#[allow(clippy::too_many_arguments)]
+async fn finish_red_on_base(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    red: &common::run_ending::RedCi,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let team_id = &ticket_msg.team_id;
+    super::record_ci_outcome(
+        state,
+        team_id,
+        run_id,
+        super::CiOutcome::RedOnBase(red.base_red.clone()),
+    )
+    .await;
+    super::record_ci_outcome(
+        state,
+        team_id,
+        run_id,
+        super::CiOutcome::HandedOff(super::GaveUp::RedOnBase),
+    )
+    .await;
+    info!(run_id, checks = ?red.checks, base = %red.base, "Read again at the ending, every failing check is red on the base too: finishing");
+    super::add_progress_note(
+        state,
+        team_id,
+        run_id,
+        &format!(
+            "Read again at the ending, every failing check ({}) also fails on {}, so this pull request didn't cause them. CoderHelm finished the run with this change's own work done; those checks are the base branch's to fix.",
+            red.checks.join(", "),
+            red.base
+        ),
+    )
+    .await;
+    mark_pr_ready(state, team_id, github, pr.owner, pr.repo, pr.number).await;
+    end_run(
+        state,
+        ticket_msg,
+        run_id,
+        common::run_status::COMPLETED,
+        None,
+        (pr.url, pr.number, pr.branch),
+        usage,
+        duration,
+        None,
+        None,
+    )
+    .await
+}
+
+/// The run's own checks stay red at its ending: the base is read again
+/// ([`red_ci_now`]); red on the base too, the run finishes
+/// ([`finish_red_on_base`]); else it stops with the typed reason, the
+/// checks and head named, and what was tried (`common::run_ending::Stop::RedCi`).
+/// Never handed to the error classifier.
+#[allow(clippy::too_many_arguments)]
+async fn stop_red(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    (checks, excerpt, tried): (&[String], &str, &[String]),
+    context: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let red = red_ci_now(
+        state,
+        &ticket_msg.team_id,
+        run_id,
+        github,
+        (pr.owner, pr.repo, pr.branch),
+        checks,
+        excerpt,
+    )
+    .await;
+    if red.all_on_base() {
+        return finish_red_on_base(state, ticket_msg, run_id, github, pr, &red, usage, duration)
+            .await;
+    }
+    let tally = ci_tally(state, &ticket_msg.team_id, run_id).await;
+    let rounds = common::ci_unrelated::rounds_said(tally.rounds, tally.pushed);
+    let context = context.trim().trim_end_matches('.');
+    let reason = [red.reason(), rounds, context.to_string()]
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(". ");
+    let reason = format!(
+        "{reason}. Every fix and revert CoderHelm tried is on pull request #{}.",
+        pr.number
+    );
+    warn!(run_id, reason = %reason, "CI stays red at the ending: the run stops with the checks named");
+    super::stop_run(
+        state,
+        ticket_msg,
+        run_id,
+        &reason,
+        common::run_ending::Stopped {
+            reason: common::run_ending::Stop::RedCi(red),
+            tried: common::run_ending::Tried {
+                retries: 0,
+                rounds: tally.rounds,
+                pushed: tally.pushed,
+                steps: tried.to_vec(),
+            },
+        },
+        usage,
+        duration,
+    )
+    .await;
     Ok(())
 }
 
@@ -8958,10 +9349,34 @@ async fn wait_on_person(
     });
     let super::supervisor::Ending::HandBack(hand_back) = ending else {
         if let Some(red) = red {
+            // A typed stop with the checks named and the base read again at
+            // the ending (`stop_red`), never prose for the error classifier.
             let why = red_ending_text(reason, &red, pr_number);
-            warn!(run_id, reason = %why, "CI stays red after the supervisor's ladder: the run failed");
-            super::fail_run(state, msg, run_id, &why, usage, duration).await;
-            return Ok(());
+            let github = GitHubClient::new(
+                &state.secrets.github_app_id,
+                &state.secrets.github_private_key,
+                msg.installation_id,
+                &state.http,
+            )?;
+            let pr = PrRef {
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                branch,
+                number: pr_number,
+                url: pr_url,
+            };
+            return stop_red(
+                state,
+                msg,
+                run_id,
+                &github,
+                &pr,
+                (&[], "", &[]),
+                &why,
+                usage,
+                duration,
+            )
+            .await;
         }
         // The completion guard: never "completed" while the run's own
         // review asks for changes on the head. It goes on while it can; past
@@ -8973,10 +9388,27 @@ async fn wait_on_person(
                 super::own_review_ledger::Completion::Complete
                 | super::own_review_ledger::Completion::Defer(_) => {}
                 super::own_review_ledger::Completion::Continue(_) => return Ok(()),
-                super::own_review_ledger::Completion::Hold(why) => {
-                    let why = format!("{reason}\n{why}");
+                super::own_review_ledger::Completion::Hold(open) => {
+                    let why = format!("{reason}\n{open}");
                     warn!(run_id, reason = %why, "Own review still asks for changes after every approach: the run is not completed");
-                    super::fail_run(state, msg, run_id, &why, usage, duration).await;
+                    super::stop_run(
+                        state,
+                        msg,
+                        run_id,
+                        &why,
+                        common::run_ending::Stopped {
+                            reason: common::run_ending::Stop::ReviewOpen { items: open },
+                            tried: common::run_ending::Tried {
+                                steps: vec![
+                                    "every approach its own review ledger holds".to_string()
+                                ],
+                                ..Default::default()
+                            },
+                        },
+                        usage,
+                        duration,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -9421,11 +9853,23 @@ async fn end_run(
         ))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error");
+    // Every ending through the one gate (`common::run_ending`): a wait on a
+    // person with what they do, or the pull request it delivered.
     let update = match &wait {
         Some((hb, w)) => update.needs_input(run_id, w, hb),
-        None => update
-            .expression_attribute_values(":s", attr_s(status))
-            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}"))),
+        None => {
+            debug_assert!(
+                status == common::run_status::COMPLETED || status == common::run_status::MERGED,
+                "end_run ends a run delivered on its pull request: {status}"
+            );
+            update.run_status(
+                ":s",
+                &common::run_ending::gate(
+                    run_id,
+                    &common::run_ending::delivered(status, pr_number, pr_url),
+                ),
+            )
+        }
     };
     let res = update
         .expression_attribute_values(":pr", attr_s(pr_url))
@@ -9632,7 +10076,10 @@ pub(crate) async fn resume_limit_ended(
         .expression_attribute_names("#round", run_round::FIELD)
         .expression_attribute_values(":from", attr_s(&status))
         .expression_attribute_values(":s", attr_s(common::run_status::AWAITING_CI))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
+        )
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()));
     update = match &parked {
         Some(round) => update
@@ -9708,7 +10155,10 @@ async fn release_for_wait(state: &WorkerState, team_id: &str, run_id: &str) {
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
         .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
-        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(
+            ":sri",
+            common::run_ending::working(common::run_ending::Working::AwaitingCi, run_id).sri_attr(),
+        )
         .expression_attribute_values(":running", attr_s(common::run_status::RUNNING))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
@@ -10403,6 +10853,13 @@ async fn set_run_complete(
         )
         .await;
     }
+    // Delivered on the pull request the record names, through the one gate
+    // (`common::run_ending`).
+    let (pr_number, pr_url) = record_pr(state, team_id, run_id).await;
+    let ending = common::run_ending::gate(
+        run_id,
+        &common::run_ending::delivered(status, pr_number, &pr_url),
+    );
     let _ = state
         .dynamo
         .update_item()
@@ -10418,10 +10875,9 @@ async fn set_run_complete(
         // "completed" — the single terminal-success status. This path used
         // to write "success", which every status filter in the gateway and
         // dashboard missed (dedup, comment routing, retry eligibility).
-        .expression_attribute_values(":s", attr_s(status))
+        .run_status(":s", &ending)
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .expression_attribute_values(":d", attr_n(duration))
         .send()
         .await;
@@ -10438,6 +10894,48 @@ async fn set_run_complete(
     if status == common::run_status::COMPLETED {
         super::pr_watch::after_completion(state, team_id, run_id).await;
     }
+}
+
+/// The write for a run delivered on the pull request its record names,
+/// through the one gate (`common::run_ending`).
+pub(crate) async fn delivered_now(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> common::run_ending::Write {
+    let (number, url) = record_pr(state, team_id, run_id).await;
+    common::run_ending::gate(
+        run_id,
+        &common::run_ending::delivered(common::run_status::COMPLETED, number, &url),
+    )
+}
+
+/// The pull request a run record names (0 and empty when none).
+pub(crate) async fn record_pr(state: &WorkerState, team_id: &str, run_id: &str) -> (u64, String) {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("pr_number, pr_url")
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let url = item
+        .get("pr_url")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    (number, url)
 }
 
 /// How a run whose CI passed ends: completed. The work was asked for and

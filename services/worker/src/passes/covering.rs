@@ -29,6 +29,7 @@
 //! loop guard or its ceiling stopped never gets here.
 
 use common::own_pr::{self, NotOwn, PrFacts};
+use common::run_ending::EndWrite;
 use common::run_status::{self, EndedValues};
 use common::stop_rules::covering::{self as cov, Carried, Outcome, Record, Superseded};
 use common::stop_rules::existing_work::{Covered, OpenPr};
@@ -834,8 +835,21 @@ pub async fn finish(
         .condition_expression(run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        // Done: the pull request that already does the work
+        // (`common::run_ending`).
+        .run_status(
+            ":s",
+            &common::run_ending::gate(
+                run_id,
+                &common::run_ending::RunEnd::Done(common::run_ending::Done::CoveredBy {
+                    url: if rec.url.is_empty() {
+                        format!("{}#{}", rec.repo, rec.number)
+                    } else {
+                        rec.url.clone()
+                    },
+                }),
+            ),
+        )
         .expression_attribute_values(
             ":cb",
             attr_s(&serde_json::to_string(rec).unwrap_or_default()),

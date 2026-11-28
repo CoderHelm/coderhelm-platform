@@ -1892,6 +1892,7 @@ dependencies = [
  "aws-sdk-ssm",
  "aws-sdk-sts",
  "aws-sdk-wafv2",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "base64 0.22.1",
  "chrono",
