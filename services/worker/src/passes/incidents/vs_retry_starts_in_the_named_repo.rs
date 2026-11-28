@@ -159,11 +159,11 @@ fn the_earlier_runs_pull_request_there_is_closed_once_through_the_gate() {
 
     let src = mod_src();
     // The agent-permission check comes before the note and the close.
-    let close = fn_src(src, "\nasync fn close_own_pr(");
+    let close = fn_src(src, "\npub(crate) async fn close_own_pr(");
     let gate = close.find("may_close_own_pr(").unwrap();
     assert!(gate < close.find("Say::note(").unwrap());
     assert!(gate < close.find("close_pull_request(").unwrap());
-    let may = fn_src(src, "\nasync fn may_close_own_pr(");
+    let may = fn_src(src, "\npub(crate) async fn may_close_own_pr(");
     assert!(may.contains("tool: \"close_pull_request\""));
     assert_eq!(
         common::agent_policy::registry::BUILTIN

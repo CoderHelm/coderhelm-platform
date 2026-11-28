@@ -747,16 +747,7 @@ pub enum ResetDecision {
 /// `name[bot]`), or, with no linked account, its author email is a bot's
 /// noreply address.
 pub fn is_bot_commit(c: &serde_json::Value) -> bool {
-    let a = &c["author"];
-    if a["type"].as_str() == Some("Bot")
-        || a["login"].as_str().is_some_and(|l| l.ends_with("[bot]"))
-    {
-        return true;
-    }
-    a.is_null()
-        && c["commit"]["author"]["email"]
-            .as_str()
-            .is_some_and(|e| e.ends_with("[bot]@users.noreply.github.com"))
+    common::person_lines::is_bot_commit(c)
 }
 
 /// Whether a run's existing branch may be restarted from its base: never
