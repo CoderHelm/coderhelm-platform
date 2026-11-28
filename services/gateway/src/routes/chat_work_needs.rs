@@ -51,14 +51,28 @@ pub enum Urgency {
     Now,
     Today,
     Later,
+    /// A run whose status says it waits on an answer, but which stored no
+    /// question and names nothing for a person to do: not a need, listed
+    /// on its own with what its record says stopped it, so it can be
+    /// cleared or retried.
+    Stopped,
 }
 
 impl Urgency {
+    /// The groups in the order the answer gives them.
+    pub const ALL: [Urgency; 4] = [
+        Urgency::Now,
+        Urgency::Today,
+        Urgency::Later,
+        Urgency::Stopped,
+    ];
+
     pub fn heading(self) -> &'static str {
         match self {
             Urgency::Now => "Needs you now",
             Urgency::Today => "Today",
             Urgency::Later => "When you can",
+            Urgency::Stopped => "Stopped without a question",
         }
     }
 
@@ -67,7 +81,13 @@ impl Urgency {
             Urgency::Now => "now",
             Urgency::Today => "today",
             Urgency::Later => "when you can",
+            Urgency::Stopped => "stopped without a question",
         }
+    }
+
+    /// A real need: something waits on the person.
+    pub fn is_need(self) -> bool {
+        self != Urgency::Stopped
     }
 }
 
@@ -252,6 +272,108 @@ pub fn jira_ids_from_runs(items: &[Item], email: &str) -> Vec<String> {
     out
 }
 
+/// What a `needs_input` run waits on, from the evidence its record holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Wait {
+    /// The questions it stored.
+    Asked {
+        action: String,
+        detail: String,
+        since: String,
+    },
+    /// One named action it waits on from a person (review its pull
+    /// request, grant a permission, approve a call), with where.
+    Named {
+        action: String,
+        detail: String,
+        since: String,
+        url: Option<String>,
+    },
+    /// Nothing: no question, no named action. Why it stopped, from its
+    /// record.
+    Stopped { why: String },
+}
+
+/// Why a run stopped, from its record, in one line.
+fn stop_reason(item: &Item) -> String {
+    let err = [st(item, "error_message"), st(item, "error")]
+        .into_iter()
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or("");
+    let kind = st(item, "stop_kind");
+    let step = st(item, "current_pass");
+    let mut parts: Vec<String> = Vec::new();
+    if !err.is_empty() {
+        parts.push(format!("Why it stopped: {}", clip(err, 300)));
+    }
+    if !kind.is_empty() {
+        parts.push(format!("How it stopped: {kind}"));
+    }
+    if parts.is_empty() {
+        parts.push(format!(
+            "Its status says it waits on an answer, but it stored no question and named nothing \
+             for a person to do{}",
+            if step.is_empty() {
+                String::new()
+            } else {
+                format!(" (last step: {step})")
+            }
+        ));
+    }
+    parts.join(". ")
+}
+
+/// A `needs_input` run's need, only with its evidence: the questions it
+/// stored, or the one action it names ([`common::run_wait::WaitingOn`]). A
+/// wait that says "answer the questions" with none stored is no evidence.
+pub fn waiting_run_need(item: &Item, updated: &str) -> Wait {
+    let asked: Option<common::run_questions::Asked> = item
+        .get(common::run_questions::FIELD_QUESTIONS)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|j| serde_json::from_str(j).ok());
+    if let Some(a) = asked.filter(|a| a.questions.iter().any(|q| !q.question.trim().is_empty())) {
+        let n = a.questions.len();
+        return Wait::Asked {
+            action: if n == 1 {
+                "Answer the run's question".to_string()
+            } else {
+                format!("Answer the run's {n} questions")
+            },
+            detail: common::run_questions::plain(&a.questions),
+            since: if a.asked_at.is_empty() {
+                updated.to_string()
+            } else {
+                a.asked_at
+            },
+        };
+    }
+    if let Some(w) = common::run_wait::WaitingOn::of_item(item).filter(|w| w.questions == 0) {
+        let mut detail = clip(&w.detail, 400);
+        let err = [st(item, "error_message"), st(item, "error")]
+            .into_iter()
+            .find(|e| !e.trim().is_empty())
+            .unwrap_or("");
+        if !err.is_empty() {
+            detail = format!("{detail}\nWhy it stopped: {}", clip(err, 300))
+                .trim()
+                .to_string();
+        }
+        return Wait::Named {
+            action: w.action,
+            detail,
+            since: if w.since.is_empty() {
+                updated.to_string()
+            } else {
+                w.since
+            },
+            url: Some(w.url).filter(|u| !u.trim().is_empty()),
+        };
+    }
+    Wait::Stopped {
+        why: stop_reason(item),
+    }
+}
+
 /// What the team's runs need: answers, outside changes, and Coderhelm's
 /// open pull requests on the person's own work. Returns the needs and how
 /// many old waiting runs were left out.
@@ -285,39 +407,51 @@ pub fn from_runs(items: &[Item], me: &Me, my_tickets: &[String], now: Time) -> (
                     old += 1;
                     continue;
                 }
-                let asked: Option<common::run_questions::Asked> = i
-                    .get(common::run_questions::FIELD_QUESTIONS)
-                    .and_then(|v| v.as_s().ok())
-                    .and_then(|j| serde_json::from_str(j).ok());
-                let (n, detail, since) = match &asked {
-                    Some(a) if !a.questions.is_empty() => (
-                        a.questions.len(),
-                        common::run_questions::plain(&a.questions),
-                        if a.asked_at.is_empty() {
-                            updated.clone()
-                        } else {
-                            a.asked_at.clone()
-                        },
-                    ),
-                    _ => (0, String::new(), updated.clone()),
+                let wait = waiting_run_need(i, &updated);
+                let requested = !by.is_empty()
+                    || !st(i, "requester_email").is_empty()
+                    || !st(i, "requester_key").is_empty();
+                let urgency = match (&wait, mine, !requested) {
+                    (Wait::Stopped { .. }, _, _) => Urgency::Stopped,
+                    // Started by this person, or for their ticket.
+                    (_, true, _) => Urgency::Now,
+                    // Someone else started it: it waits on them first.
+                    (_, false, false) => Urgency::Today,
+                    // Nobody is recorded as its requester: it can't be
+                    // said to wait on this person, so it ranks lowest.
+                    (_, false, true) => Urgency::Later,
                 };
-                let action = match n {
-                    0 => "Answer what the run asked, on its page".to_string(),
-                    1 => "Answer the run's question".to_string(),
-                    n => format!("Answer the run's {n} questions"),
+                let what = if !mine && !requested {
+                    format!("{} (no requester recorded)", run_what(i))
+                } else {
+                    format!("{}{for_whom}", run_what(i))
+                };
+                let (action, detail, since, link) = match wait {
+                    Wait::Asked {
+                        action,
+                        detail,
+                        since,
+                    } => (action, detail, since, page.clone()),
+                    Wait::Named {
+                        action,
+                        detail,
+                        since,
+                        url,
+                    } => (action, detail, since, url.unwrap_or_else(|| page.clone())),
+                    Wait::Stopped { why } => (
+                        "Nothing was asked: retry it or close it on its page".to_string(),
+                        why,
+                        updated.clone(),
+                        page.clone(),
+                    ),
                 };
                 out.push(Need {
-                    // A run started by someone else waits on them first.
-                    urgency: if mine || by.is_empty() {
-                        Urgency::Now
-                    } else {
-                        Urgency::Today
-                    },
-                    rank: 50 + days_since(&since, now).min(30),
+                    urgency,
+                    rank: 50 + days_since(&since, now).min(30) + if mine { 10 } else { 0 },
                     kind: "run",
-                    what: format!("{}{for_whom}", run_what(i)),
+                    what,
                     action,
-                    link: page,
+                    link,
                     since,
                     detail,
                     loc: st(i, "repo").to_string(),
@@ -1139,20 +1273,29 @@ pub fn rank(mut needs: Vec<Need>) -> Vec<Need> {
 
 /// The count line: "6 things need you: 2 now, 3 today, 1 when you can."
 pub fn count_line(needs: &[Need]) -> String {
-    if needs.is_empty() {
-        return "Nothing is waiting on you right now in the places Coderhelm could read.".into();
+    let stopped = needs.iter().filter(|x| !x.urgency.is_need()).count();
+    let also = match stopped {
+        0 => String::new(),
+        1 => " 1 run is stopped without a question.".to_string(),
+        n => format!(" {n} runs are stopped without a question."),
+    };
+    let real = needs.len() - stopped;
+    if real == 0 {
+        return format!(
+            "Nothing is waiting on you right now in the places Coderhelm could read.{also}"
+        );
     }
-    let parts: Vec<String> = [Urgency::Now, Urgency::Today, Urgency::Later]
+    let parts: Vec<String> = Urgency::ALL
         .into_iter()
+        .filter(|u| u.is_need())
         .filter_map(|u| {
             let n = needs.iter().filter(|x| x.urgency == u).count();
             (n > 0).then(|| format!("{n} {}", u.word()))
         })
         .collect();
     format!(
-        "{} {} you: {}.",
-        needs.len(),
-        if needs.len() == 1 {
+        "{real} {} you: {}.{also}",
+        if real == 1 {
             "thing needs"
         } else {
             "things need"
@@ -1171,7 +1314,7 @@ fn read_words(r: &Read) -> String {
 }
 
 /// How the answer is written.
-pub const ANSWER_SHAPE: &str = "Write the answer in exactly this shape. First the count line. Then each group in the order given (skip an empty one), with its heading, and one line per item, most urgent first: a markdown link to the item named by what it is, then exactly what they need to do, then since when, and its citation. Under a run's line, keep its questions with their possible answers as a short nested list. Then, for every source that couldn't be read or wasn't checked, one plain sentence that says so (for example \"GitHub couldn't be read, so your pull requests aren't listed\"), in that source's own words: never say a system isn't connected unless its line says exactly that. Don't add items that aren't listed here.";
+pub const ANSWER_SHAPE: &str = "Write the answer in exactly this shape. First the count line. Then each group in the order given (skip an empty one), with its heading, and one line per item, most urgent first: a markdown link to the item named by what it is, then exactly what they need to do, then since when, and its citation. Under a run's line, keep its questions with their possible answers as a short nested list. A run under \"Stopped without a question\" asked nothing: say what stopped it, in its own line's words, and never tell them to answer it. Then, for every source that couldn't be read or wasn't checked, one plain sentence that says so (for example \"GitHub couldn't be read, so your pull requests aren't listed\"), in that source's own words: never say a system isn't connected unless its line says exactly that. Don't add items that aren't listed here.";
 
 /// How the list is used when the question is something else (an
 /// orientation, a status, a judgement): only what answers it.
@@ -1203,7 +1346,7 @@ pub fn render_for(
         count_line(&report.needs)
     );
     let mut ids: Vec<String> = Vec::new();
-    for u in [Urgency::Now, Urgency::Today, Urgency::Later] {
+    for u in Urgency::ALL {
         let group: Vec<&Need> = report.needs.iter().filter(|n| n.urgency == u).collect();
         if group.is_empty() {
             continue;
@@ -2035,5 +2178,129 @@ pub(crate) mod tests {
             Some("https://team.atlassian.net/browse/ABC-11")
         );
         assert_eq!(summary, "2 items, 1 source not read");
+    }
+
+    /// A run left `needs_input` with nothing asked, by anyone.
+    fn parked(id: &str, extra: &[(&str, &str)]) -> Item {
+        with(
+            run(
+                id,
+                "needs_input",
+                "ABC-30",
+                "Tidy the export logs",
+                "acme/api",
+            ),
+            &[&[("updated_at", "2026-11-15T09:00:00Z")], extra].concat(),
+        )
+    }
+
+    /// A need is listed only with its evidence: a run with no question and
+    /// nothing named is never "answer the run", and says what stopped it.
+    #[test]
+    fn a_run_with_no_question_is_listed_as_stopped_with_its_reason() {
+        let m = me();
+        let failed = parked(
+            "03A",
+            &[
+                ("requester_email", ME),
+                (
+                    "error_message",
+                    "the fix round failed: the monthly model token limit was reached",
+                ),
+            ],
+        );
+        let empty = parked("03B", &[("current_pass", "done")]);
+        let (n, _) = from_runs(&[failed, empty], &m, &[], now());
+        assert_eq!(n.len(), 2, "{n:?}");
+        for x in &n {
+            assert_eq!(x.urgency, Urgency::Stopped, "{x:?}");
+            assert!(!x.action.to_lowercase().contains("answer"), "{x:?}");
+        }
+        assert!(
+            n[0].detail.contains("monthly model token limit"),
+            "{:?}",
+            n[0]
+        );
+        assert!(n[1].detail.contains("stored no question"), "{:?}", n[1]);
+        assert!(n[1].detail.contains("last step: done"), "{:?}", n[1]);
+        // Counted on their own, never as things that need the person.
+        let line = count_line(&rank(n));
+        assert!(line.starts_with("Nothing is waiting on you"), "{line}");
+        assert!(
+            line.contains("2 runs are stopped without a question"),
+            "{line}"
+        );
+    }
+
+    /// A wait that names its action (review a pull request, grant a
+    /// permission) is listed with that action and where to do it.
+    #[test]
+    fn a_named_wait_is_listed_with_its_action() {
+        let w = json!({"action": "Grant the app read access to the export bucket",
+                       "detail": "Only an admin can grant it", "url": "https://github.com/acme/api/pull/7",
+                       "since": "2026-11-15T10:00:00Z"});
+        let item = parked(
+            "03C",
+            &[("requester_email", ME), ("waiting_on", &w.to_string())],
+        );
+        let (n, _) = from_runs(&[item], &me(), &[], now());
+        assert_eq!(n[0].urgency, Urgency::Now);
+        assert_eq!(
+            n[0].action,
+            "Grant the app read access to the export bucket"
+        );
+        assert_eq!(n[0].link, "https://github.com/acme/api/pull/7");
+        // "Answer the questions" with none stored is no evidence.
+        let w = json!({"action": "Answer CoderHelm's question on the run page", "questions": 1,
+                       "since": "2026-11-15T10:00:00Z"});
+        let item = parked("03D", &[("waiting_on", &w.to_string())]);
+        let (n, _) = from_runs(&[item], &me(), &[], now());
+        assert_eq!(n[0].urgency, Urgency::Stopped);
+    }
+
+    /// Urgency comes from who the run waits on: the asker's own first, then
+    /// a named colleague's, and one with no requester recorded last.
+    #[test]
+    fn a_run_with_no_requester_ranks_below_the_askers_and_a_colleagues() {
+        let mine = waiting_run("04A", "ABC-40", ME);
+        let colleague = waiting_run("04B", "ABC-41", "sam@example.com");
+        let mut nobody = waiting_run("04C", "ABC-42", "");
+        nobody.remove("requester_name");
+        let (n, _) = from_runs(&[nobody, colleague, mine], &me(), &[], now());
+        let n = rank(n);
+        let order: Vec<(Urgency, &str)> = n.iter().map(|x| (x.urgency, x.link.as_str())).collect();
+        assert_eq!(
+            order,
+            [
+                (Urgency::Now, "/runs/detail?id=04A"),
+                (Urgency::Today, "/runs/detail?id=04B"),
+                (Urgency::Later, "/runs/detail?id=04C"),
+            ]
+        );
+        assert!(n[2].what.contains("no requester recorded"));
+    }
+
+    /// Every need that asks for an answer carries the question.
+    #[test]
+    fn every_answer_need_carries_its_question() {
+        let items = vec![
+            waiting_run("05A", "ABC-50", ME),
+            parked("05B", &[("requester_email", ME)]),
+            parked("05C", &[("error_message", "the build failed")]),
+        ];
+        let (n, _) = from_runs(&items, &me(), &[], now());
+        for x in n.iter().filter(|x| x.action.starts_with("Answer")) {
+            assert!(!x.detail.trim().is_empty(), "{x:?}");
+            assert_ne!(x.urgency, Urgency::Stopped);
+        }
+        let mut reg = common::knowledge::answer::Registry::default();
+        let r = Report {
+            needs: rank(n),
+            ..Default::default()
+        };
+        let (text, _) = render(&r, &mut reg, "2026-11-16 12:00 UTC");
+        let stopped = text.find("## Stopped without a question").unwrap();
+        assert!(text.find("## Needs you now").unwrap() < stopped);
+        assert!(text.contains("Count line: 1 thing needs you: 1 now. 2 runs are stopped"));
     }
 }

@@ -170,7 +170,13 @@ fn what_the_review_settled_is_not_planned_work_left() {
     let after = finish_planned::drop_settled(vec![item.to_string()], &settled);
     let r = finish_planned::first_round_of(&[item.to_string()], chrono::Utc::now()).unwrap();
     assert_eq!(
-        finish_planned::next(&[item.to_string()], Some(&after), 0, &other, &r),
+        finish_planned::next(
+            &[item.to_string()],
+            Some(&after),
+            &finish_planned::Ran::Finished { files: 0 },
+            &other,
+            &r
+        ),
         finish_planned::Next::Ready
     );
     let src = include_str!("../resume.rs");

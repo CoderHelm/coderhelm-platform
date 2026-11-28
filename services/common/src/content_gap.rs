@@ -29,6 +29,13 @@
 //!   fails a build or deploy on missing content degrades instead (the field
 //!   left out, a warning logged), and the content step is listed for before
 //!   merge.
+//! - **After a round that changed no code, its verdict decides.**
+//!   [`after_round`]: every CI fix round ends its account with what the
+//!   failure needs ([`CAUSE_ASK`], read by [`cause_of`]). Content the test
+//!   reads that isn't there ends the loop with that content named before
+//!   merge, whether or not the change carries a step for it: a run never
+//!   fails on a content gap it can't fill. The failure's own words
+//!   ([`names_gap`]) are only the fallback when a round wrote no verdict.
 //! - **Rounds that meet the same failure change approach.**
 //!   [`repeat_brief`]: the next round is told what the last one concluded
 //!   and must take a different hypothesis, or the tolerant-code route when
@@ -208,6 +215,104 @@ pub fn classify(failure: &str, test_failed: bool, steps: &[Step]) -> Verdict {
         },
         None => Verdict::TolerateFirst(gap),
     }
+}
+
+/// What a CI fix round found the failure needs, from the one line its
+/// account ends with ([`CAUSE_ASK`]). The round reproduced the failure and
+/// read the code; this is its verdict, a value, not words searched for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cause {
+    /// The code is wrong: a code change fixes it.
+    Code,
+    /// The code is right and data it reads isn't there: what is missing,
+    /// and where.
+    Content(String),
+    /// A change outside the repository (infrastructure, a setting).
+    OutsideChange(String),
+}
+
+/// The line a CI fix round's account starts its verdict with.
+pub const CAUSE_LINE: &str = "Cause:";
+
+/// What every CI fix round is asked to end its account with.
+pub const CAUSE_ASK: &str = "\n\nEnd your account with one line that says what the failure needs, \
+     exactly one of:\n\
+     `Cause: code` (you changed the code, or a code change fixes it),\n\
+     `Cause: content: <the content that is missing and where, as the failing test reads it>` \
+     (the code is right and the test reads CMS, dataset or fixture data that isn't there),\n\
+     `Cause: outside_change: <what>` (infrastructure or a setting outside this repository).";
+
+/// The round's verdict, from the last [`CAUSE_LINE`] its account wrote.
+/// `None` when it wrote none.
+pub fn cause_of(account: &str) -> Option<Cause> {
+    let line = account
+        .lines()
+        .rev()
+        .map(|l| l.trim().trim_matches('`').trim())
+        .find(|l| l.starts_with(CAUSE_LINE))?;
+    let rest = line[CAUSE_LINE.len()..].trim();
+    let (kind, what) = rest.split_once(':').unwrap_or((rest, ""));
+    let what = what.trim().trim_matches('`').trim().to_string();
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "code" => Some(Cause::Code),
+        "content" if !what.is_empty() => Some(Cause::Content(what)),
+        "outside_change" if !what.is_empty() => Some(Cause::OutsideChange(what)),
+        _ => None,
+    }
+}
+
+/// What the CI loop does after a fix round that changed no code
+/// (`changed_code` false), judged from what the round found missing
+/// ([`cause_of`]), never from a list of words: a failing test that reads
+/// content which isn't there ends the loop with that content named before
+/// merge, whether or not the change carries a step that supplies it. A
+/// waiting content step of the change's own is named when it is the one
+/// (`steps`); otherwise the content itself is the step. A round that wrote
+/// no verdict falls back to the failure's own words ([`names_gap`]).
+pub fn after_round(
+    account: &str,
+    failure: &str,
+    changed_code: bool,
+    test_failed: bool,
+    steps: &[Step],
+) -> Verdict {
+    if changed_code || !test_failed {
+        return Verdict::NotContent;
+    }
+    let gap = match cause_of(account) {
+        Some(Cause::Content(missing)) => Gap {
+            run: run_named(&missing),
+            line: crate::truncate_str(&missing, 300).to_string(),
+        },
+        Some(_) => return Verdict::NotContent,
+        None => match names_gap(failure) {
+            Some(g) => g,
+            None => return Verdict::NotContent,
+        },
+    };
+    let want = gap.run.as_deref().map(key).filter(|k| k.len() >= 4);
+    let own = steps
+        .iter()
+        .filter(|s| s.writes_content && !s.done)
+        .find(|s| {
+            want.as_deref()
+                .is_some_and(|k| s.text.to_lowercase().contains(k))
+        })
+        .or_else(|| {
+            let open: Vec<&Step> = steps
+                .iter()
+                .filter(|s| s.writes_content && !s.done)
+                .collect();
+            (open.len() == 1).then(|| open[0])
+        });
+    let step = match own {
+        Some(s) => crate::truncate_str(s.text.trim(), 300).to_string(),
+        None => format!(
+            "Add the content the test reads, in the environment it runs against: {}",
+            gap.line.trim_end_matches('.')
+        ),
+    };
+    Verdict::AwaitsStep { gap, step }
 }
 
 /// What a CI fix round is told when the failure names a content gap.
@@ -512,6 +617,58 @@ mod tests {
         assert!(s.contains("Before merge"));
         assert!(s.contains("ready for review"));
         assert!(!s.contains("stays a draft"));
+    }
+
+    /// The round's verdict decides, whatever words the failure used, and a
+    /// gap the change has no step for still ends the loop with the content
+    /// named before merge.
+    #[test]
+    fn a_round_that_finds_content_missing_ends_the_loop_with_no_step_of_its_own() {
+        let failure =
+            "Error: Absent staging content: /blocks needs a Card whose image has alt text";
+        // No word of the old list in it.
+        assert!(names_gap(failure).is_none());
+        let account = "I reproduced it. The code renders alt text when the CMS has it.\n\
+                       Cause: content: /blocks needs a Card block whose image has alt text in staging";
+        match after_round(account, failure, false, true, &[]) {
+            Verdict::AwaitsStep { gap, step } => {
+                assert!(gap.line.contains("Card block whose image has alt text"));
+                assert!(step.starts_with("Add the content the test reads"), "{step}");
+            }
+            v => panic!("{v:?}"),
+        }
+        // A change's own waiting step is the one named.
+        let steps = [step("Run the alt-text-cards migration on staging", false)];
+        match after_round(
+            "Cause: content: run the alt-text-cards migration",
+            failure,
+            false,
+            true,
+            &steps,
+        ) {
+            Verdict::AwaitsStep { step, .. } => assert!(step.contains("alt-text-cards")),
+            v => panic!("{v:?}"),
+        }
+        // Code changed, a code verdict, or a build failure: not a content end.
+        assert_eq!(
+            after_round(account, failure, true, true, &[]),
+            Verdict::NotContent
+        );
+        assert_eq!(
+            after_round("Cause: code", failure, false, true, &[]),
+            Verdict::NotContent
+        );
+        assert_eq!(
+            after_round(account, failure, false, false, &[]),
+            Verdict::NotContent
+        );
+        // No verdict written: the failure's own words are the fallback.
+        assert!(matches!(
+            after_round("no idea", ADDR, false, true, &[]),
+            Verdict::AwaitsStep { .. }
+        ));
+        assert_eq!(cause_of("Cause: content:"), None);
+        assert_eq!(cause_of("`Cause: code`"), Some(Cause::Code));
     }
 
     #[test]

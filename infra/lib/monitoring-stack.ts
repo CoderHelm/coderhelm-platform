@@ -9,11 +9,41 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 
+/**
+ * The structured lines the services write for these alarms
+ * (services/common/src/github_budget.rs RATE_LIMITED_EVENT,
+ * services/gateway/src/routes/brain.rs CHAT_ANSWER_EVENT). The services catch
+ * and log every error, so Lambda's own Errors metric stays at 0 while they
+ * fail: these alarms read the log lines instead.
+ */
+export const LOG_EVENTS = { rateLimited: "github_rate_limited", chatAnswer: "chat_answer" } as const;
+
+/**
+ * Each alarm is a share of the traffic, never a count: an install with ten
+ * questions a day and one with ten thousand alarm on the same failing share.
+ * The share is held over most of an hour, so one bad minute doesn't page.
+ */
+export const LOG_ALARMS = {
+  period: cdk.Duration.minutes(15),
+  evaluationPeriods: 4,
+  datapointsToAlarm: 3,
+  /** ERROR lines per 100 invocations of the function. */
+  errorLinesPercent: 10,
+  /** GitHub rate-limit lines per 100 worker invocations. */
+  rateLimitedPercent: 20,
+  /** Chat questions that failed, of every question asked. */
+  chatFailedPercent: 20,
+} as const;
+
 interface MonitoringStackProps extends cdk.StackProps {
   stage: string;
   cfg: ResolvedConfig;
   gatewayFunction: lambda.Function;
   workerFunction: lambda.Function;
+  /** Chat's streams (infra/lib/streaming-stack.ts). */
+  streamingFunction: lambda.Function;
+  /** The self-host updater, when the install has one. */
+  updaterFunction?: lambda.Function;
   table: dynamodb.TableV2;
   ticketQueue: sqs.Queue;
 }
@@ -245,6 +275,77 @@ export class MonitoringStack extends cdk.Stack {
         }).addAlarmAction(new actions.SnsAction(alertTopic));
       }
     }
+
+    // ── Alarms on what the services log, as a share of their traffic ──────
+    const logsOf = (id: string, fn: lambda.Function) =>
+      logs.LogGroup.fromLogGroupName(this, `${id}LogGroup`, cdk.Fn.join("", ["/aws/lambda/", fn.functionName]));
+    const count = (id: string, logGroup: logs.ILogGroup, pattern: logs.IFilterPattern, metricName: string) =>
+      new logs.MetricFilter(this, id, {
+        logGroup,
+        filterPattern: pattern,
+        metricNamespace: "CoderHelm/Logs",
+        metricName,
+        metricValue: "1",
+        defaultValue: 0,
+      }).metric({ period: LOG_ALARMS.period, statistic: "Sum" });
+    const shareAlarm = (id: string, name: string, description: string, expression: string, usingMetrics: Record<string, cloudwatch.IMetric>, percent: number) => {
+      const alarm = new cloudwatch.Alarm(this, id, {
+        alarmName: `${prefix}-${name}`,
+        alarmDescription: description,
+        metric: new cloudwatch.MathExpression({ expression, usingMetrics, period: LOG_ALARMS.period, label: name }),
+        threshold: percent,
+        evaluationPeriods: LOG_ALARMS.evaluationPeriods,
+        datapointsToAlarm: LOG_ALARMS.datapointsToAlarm,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      alarm.addAlarmAction(new actions.SnsAction(alertTopic));
+      return alarm;
+    };
+    // The Rust services log JSON (tracing, `level` at the top); the Python
+    // updater logs Lambda's text lines ("[ERROR]\t<time>\t<request>\t<message>").
+    const jsonError = logs.FilterPattern.stringValue("$.level", "=", "ERROR");
+    const textError = logs.FilterPattern.literal('"[ERROR]"');
+    const logged: [string, string, lambda.Function, logs.IFilterPattern][] = [
+      ["Gateway", "gateway", props.gatewayFunction, jsonError],
+      ["Worker", "worker", props.workerFunction, jsonError],
+      ["Streaming", "streaming", props.streamingFunction, jsonError],
+      ...(props.updaterFunction ? [["Updater", "updater", props.updaterFunction, textError] as [string, string, lambda.Function, logs.IFilterPattern]] : []),
+    ];
+    const groups: Record<string, logs.ILogGroup> = {};
+    for (const [id, name, fn, pattern] of logged) {
+      groups[name] = logsOf(id, fn);
+      const errorLines = count(`${id}ErrorLinesFilter`, groups[name], pattern, `${id}ErrorLines`);
+      shareAlarm(
+        `${id}ErrorLinesAlarm`,
+        `${name}-error-lines`,
+        `The ${name} logged an ERROR line on ${LOG_ALARMS.errorLinesPercent}% or more of its invocations for most of an hour. Its Lambda Errors stay at 0 because every error is caught: read the ERROR lines in its log group.`,
+        "IF(calls > 0, 100 * errors / calls, 0)",
+        { errors: errorLines, calls: fn.metricInvocations({ period: LOG_ALARMS.period, statistic: "Sum" }) },
+        LOG_ALARMS.errorLinesPercent,
+      );
+    }
+    const rateLimited = count("GitHubRateLimitedFilter", groups.worker, logs.FilterPattern.stringValue("$.event", "=", LOG_EVENTS.rateLimited), "GitHubRateLimited");
+    shareAlarm(
+      "GitHubRateLimitedAlarm",
+      "github-rate-limited",
+      `GitHub refused or held back requests on ${LOG_ALARMS.rateLimitedPercent}% or more of the worker's invocations for most of an hour: the installation's hourly budget is spent, and runs, reviews and checks wait for it.`,
+      "IF(calls > 0, 100 * limited / calls, 0)",
+      { limited: rateLimited, calls: props.workerFunction.metricInvocations({ period: LOG_ALARMS.period, statistic: "Sum" }) },
+      LOG_ALARMS.rateLimitedPercent,
+    );
+    const answered = count("ChatAnsweredFilter", groups.streaming,
+      logs.FilterPattern.all(logs.FilterPattern.stringValue("$.event", "=", LOG_EVENTS.chatAnswer), logs.FilterPattern.stringValue("$.outcome", "=", "answered")), "ChatAnswered");
+    const chatFailed = count("ChatAnswerFailedFilter", groups.streaming,
+      logs.FilterPattern.all(logs.FilterPattern.stringValue("$.event", "=", LOG_EVENTS.chatAnswer), logs.FilterPattern.stringValue("$.outcome", "=", "failed")), "ChatAnswerFailed");
+    shareAlarm(
+      "ChatAnswerFailedAlarm",
+      "chat-answer-failed",
+      `Chat couldn't answer ${LOG_ALARMS.chatFailedPercent}% or more of the questions asked for most of an hour (its sign-in check or the model failed). Read the "Chat couldn't answer" lines in the streaming function's log group.`,
+      "IF(failed + answered > 0, 100 * failed / (failed + answered), 0)",
+      { failed: chatFailed, answered },
+      LOG_ALARMS.chatFailedPercent,
+    );
 
     // Dashboard
     const dashboard = new cloudwatch.Dashboard(this, "Dashboard", {

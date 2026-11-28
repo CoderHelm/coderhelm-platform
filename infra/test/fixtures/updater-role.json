@@ -91,6 +91,12 @@
           "Sid": "ModelCheckThroughWorker"
         },
         {
+          "Action": "lambda:InvokeFunction",
+          "Effect": "Allow",
+          "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-streaming",
+          "Sid": "ProbeChatAfterUpdate"
+        },
+        {
           "Action": "cloudwatch:GetMetricData",
           "Effect": "Allow",
           "Resource": "*",

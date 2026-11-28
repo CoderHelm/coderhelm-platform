@@ -20,6 +20,7 @@
 //!   `followup_tickets::DAILY_CAP_PER_SOURCE` closes per source a day;
 //! - every close is logged (`FOLLOWUP_CLOSE_LOG#`) and traced.
 
+use common::run_ending::EndWrite;
 use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -336,10 +337,18 @@ async fn close_duplicate(
         )
         .condition_expression("attribute_exists(run_id) AND #s = :from")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":closed", attr_s(common::run_status::CLOSED))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{}", common::run_status::CLOSED, c.run_id)),
+        .run_status(
+            ":closed",
+            &common::run_ending::gate(
+                &c.run_id,
+                &common::run_ending::RunEnd::Stopped(common::run_ending::Stopped {
+                    reason: common::run_ending::Stop::ClosedBy {
+                        who: "CoderHelm".into(),
+                        why: format!("a duplicate of {}", c.keep),
+                    },
+                    tried: Default::default(),
+                }),
+            ),
         )
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":by", attr_s("coderhelm"))

@@ -99,6 +99,14 @@ Each step checks what you did before it moves on. When a check fails, fix it and
 
 **`update` says there isn't enough space.** Releases are kept in `~/.coderhelm/releases`. Delete old ones (keep the one you run), or set `CODERHELM_HOME` to a bigger disk.
 
+## The install's own alarms
+
+Every install alarms into its alerts topic (`<prefix>-alerts`; subscribe an email or a chat channel to it). The services catch and log their errors, so Lambda's own `Errors` metric stays at 0 even when they fail; these alarms read the log lines instead, each as a share of the traffic over most of an hour, never a count:
+
+- **`<prefix>-gateway-error-lines`, `-worker-error-lines`, `-streaming-error-lines`, `-updater-error-lines`**: that function logged an ERROR line on 10% or more of its invocations. Read the ERROR lines in its log group.
+- **`<prefix>-github-rate-limited`**: GitHub refused or held back requests on 20% or more of the worker's invocations. The installation's hourly budget is spent; runs, reviews and checks wait for the next hour.
+- **`<prefix>-chat-answer-failed`**: Chat couldn't answer 20% or more of the questions asked (its sign-in check or the model failed). Read the "Chat couldn't answer" lines in the streaming function's log group.
+
 ## Links point to localhost
 
 Links in comments and emails come from the public URL. Without a domain it is read from SSM (`/coderhelm-<stage>/public-url`) when a function starts; if a function started before the first deploy finished, it retries every 30 seconds. Check the parameter exists, then send a request (any page) to refresh it.
