@@ -160,7 +160,8 @@ jobs:
   deploy:
     name: CDK Deploy
     needs: [gate, build]
-    if: needs.gate.outputs.changed == 'true'
+    # Skipped with build: both run only when something changed.
+    if: success() && needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -236,7 +237,8 @@ jobs:
   release:
     name: Self-host release
     needs: [gate, deploy]
-    if: needs.gate.outputs.changed == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.stable_release
+    # Skipped with deploy: nothing is released without one.
+    if: success() && needs.gate.outputs.changed == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.stable_release
     uses: ./.github/workflows/auto-release.yml
     permissions:
       contents: write # the tag and the release notes
