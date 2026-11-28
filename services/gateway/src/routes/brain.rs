@@ -1521,6 +1521,11 @@ struct Run {
     github_linked: bool,
     /// The knowledge bases the asker may read, by name.
     kb_names: Vec<String>,
+    /// Their sync health, read when the question came in
+    /// (`common::knowledge::health`).
+    kb_health: Vec<common::knowledge::health::Health>,
+    /// The same bases, `(id, name)`.
+    kb_bases: Vec<(String, String)>,
     /// The team has a built app map this question may read (read at the
     /// first map lookup).
     has_map: bool,
@@ -1628,6 +1633,113 @@ async fn run_note(state: &AppState, team_id: &str, ids: &[String]) -> String {
     format!("\nThe question is about these runs of the team (their current state):\n{lines}")
 }
 
+/// The sync health of `bases` (`(id, name)`), read from their sources as
+/// the Knowledge page reads them. A base whose sources can't be read has no
+/// health to say.
+async fn knowledge_health(
+    state: &AppState,
+    team_id: &str,
+    bases: &[(String, String)],
+) -> Vec<common::knowledge::health::Health> {
+    use common::knowledge::{health, sources::store};
+    let now = chrono::Utc::now().timestamp();
+    let reads = bases.iter().map(|(id, name)| async move {
+        match store::base_sources(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            id,
+        )
+        .await
+        {
+            Ok(sources) => Some(health::of_base(id, name, &sources, now)),
+            Err(e) => {
+                warn!(error = %e, "Chat: knowledge sources not read for their health");
+                None
+            }
+        }
+    });
+    futures::future::join_all(reads)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+impl Run {
+    /// A base's sync health line, for its passages; empty when it has none.
+    fn health_line(&self, kb_id: &str) -> String {
+        self.kb_health
+            .iter()
+            .find(|h| h.kb_id == kb_id)
+            .map(|h| h.line())
+            .unwrap_or_default()
+    }
+
+    /// What the answer must say first about the bases in `kb_ids` that are
+    /// failing, retrying or behind their schedule; empty when none is.
+    fn health_warnings(&self, kb_ids: &[String]) -> String {
+        self.kb_health
+            .iter()
+            .filter(|h| kb_ids.contains(&h.kb_id))
+            .filter_map(|h| h.warning())
+            .map(|w| format!("\n{w}"))
+            .collect()
+    }
+
+    /// The bases a knowledge search reads: all of them, or the one named.
+    fn bases_named(&self, source: &str) -> Result<Vec<String>, String> {
+        bases_named(&self.kb_ids, &self.kb_bases, source)
+    }
+}
+
+/// The bases `(id, name)` a knowledge search reads: every one in `all`, or
+/// the one `source` names.
+fn bases_named(
+    all: &[String],
+    bases: &[(String, String)],
+    source: &str,
+) -> Result<Vec<String>, String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Ok(all.to_vec());
+    }
+    let picked: Vec<String> = bases
+        .iter()
+        .filter(|(_, n)| n.trim().eq_ignore_ascii_case(source))
+        .map(|(id, _)| id.clone())
+        .collect();
+    if picked.is_empty() {
+        let names: Vec<&str> = bases.iter().map(|(_, n)| n.as_str()).collect();
+        Err(format!(
+            "Error: no knowledge base is named \"{source}\". Pick one of: {}, or leave source out to search them all.",
+            names.join(", ")
+        ))
+    } else {
+        Ok(picked)
+    }
+}
+
+/// The knowledge search tool: an optional base to search, by name, when
+/// there is more than one.
+fn knowledge_def(kb_names: &[String]) -> Value {
+    let mut props = json!({
+        "query": {"type": "string", "description": "What to look for"}
+    });
+    if kb_names.len() > 1 {
+        props["source"] = json!({
+            "type": "string",
+            "enum": kb_names,
+            "description": "Search only this knowledge base (when the question names one). Leave it out to search them all."
+        });
+    }
+    json!({
+        "name": KNOWLEDGE_TOOL,
+        "description": "Search the team's knowledge bases again with different words, or one base by name. Returns passages as <source> blocks you can cite; a passage's source_health says when its base last synced and whether a source of it is failing.",
+        "input_schema": {"type": "object", "properties": props, "required": ["query"]}
+    })
+}
+
 /// The tools this question may call.
 fn tool_defs(run: &Run) -> Vec<Value> {
     let mut tools: Vec<Value> = Vec::new();
@@ -1639,13 +1751,7 @@ fn tool_defs(run: &Run) -> Vec<Value> {
         tools.extend(common::app_map::tool_defs());
     }
     if !run.kb_ids.is_empty() {
-        tools.push(json!({
-            "name": KNOWLEDGE_TOOL,
-            "description": "Search the team's knowledge bases again with different words. Returns passages as <source> blocks you can cite.",
-            "input_schema": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "What to look for"}
-            }, "required": ["query"]}
-        }));
+        tools.push(knowledge_def(&run.kb_names));
     }
     let repo_enum: Vec<Value> = {
         let mut r: Vec<&String> = run.repos.keys().collect();
@@ -1885,6 +1991,10 @@ async fn run_tool(
     match name {
         KNOWLEDGE_TOOL => {
             let q = input["query"].as_str().unwrap_or("");
+            let kb_ids = match run.bases_named(input["source"].as_str().unwrap_or("")) {
+                Ok(ids) => ids,
+                Err(e) => return (e, "Unknown knowledge base".into(), true),
+            };
             let meter = crate::model_call::chat_meter(state, &run.team_id);
             let titan = Titan {
                 client: &state.bedrock,
@@ -1897,7 +2007,7 @@ async fn run_tool(
                 &titan,
                 &super::knowledge::retriever(state, "brain", &servers, Some(&run.user_email)),
                 &run.team_id,
-                &run.kb_ids,
+                &kb_ids,
                 q,
                 6,
                 chrono::Utc::now(),
@@ -1907,9 +2017,15 @@ async fn run_tool(
                 Ok(found) if !found.hits.is_empty() => {
                     run.note_found(&found.hits);
                     super::knowledge::reembed(state, &run.team_id, &found.stale).await;
-                    let ids = reg.add_hits(&found.hits);
+                    let ids = reg.add_hits_with_health(&found.hits, &|kb| run.health_line(kb));
+                    let read: Vec<String> = found.hits.iter().map(|h| h.kb_id.clone()).collect();
                     (
-                        format!("{}{}", reg.render(&ids), unreached_note(&found.unreached)),
+                        format!(
+                            "{}{}{}",
+                            run.health_warnings(&read).trim_start(),
+                            reg.render(&ids),
+                            unreached_note(&found.unreached)
+                        ),
                         format!("{} passages", ids.len()),
                         false,
                     )
@@ -1917,7 +2033,11 @@ async fn run_tool(
                 Ok(found) => {
                     super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                     (
-                        format!("No passages matched.{}", unreached_note(&found.unreached)),
+                        format!(
+                            "No passages matched.{}{}",
+                            unreached_note(&found.unreached),
+                            run.health_warnings(&kb_ids)
+                        ),
                         "No passages matched".into(),
                         false,
                     )
@@ -2145,7 +2265,14 @@ async fn setup(run: &Run, reg: &mut Registry) -> (String, String, bool) {
         github_linked: run.github_linked,
         connections,
         repos,
-        knowledge: run.kb_names.clone(),
+        knowledge: run
+            .kb_bases
+            .iter()
+            .map(|(id, name)| match run.health_line(id) {
+                l if l.is_empty() => name.clone(),
+                l => format!("{name} (sync: {l})"),
+            })
+            .collect(),
         runs,
         records,
         reads,
@@ -2167,6 +2294,8 @@ struct BrainTools<'a> {
     called: Vec<String>,
     /// The team's app map, read at the first map lookup.
     map: Option<common::app_map::Lookups>,
+    /// Tool calls that failed, for the answer's log line.
+    failed: usize,
 }
 
 impl BrainTools<'_> {
@@ -2301,6 +2430,10 @@ impl Toolbox for BrainTools<'_> {
             }
             super::chat_policy::Checked::Stop(note) => return Called::Stop(note),
         };
+        if is_error {
+            self.failed += 1;
+            super::chat_log::tool_failed(&self.run.team_id, name, &kind, &text);
+        }
         Called::Done {
             text,
             label,
@@ -2754,6 +2887,12 @@ pub async fn brain_stream(
         && base_open(crate::lookups::CODE)
         && common::app_map::has_graph(&state.s3, &state.config.bucket_name, &claims.team_id).await;
     let picks_kbs = picks.knowledge.clone();
+    let picked_bases: Vec<(String, String)> = readable_bases
+        .iter()
+        .filter(|b| picks_kbs.contains(&b.id))
+        .map(|b| (b.id.clone(), b.name.clone()))
+        .collect();
+    let kb_health = knowledge_health(&state, &claims.team_id, &picked_bases).await;
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
@@ -2781,6 +2920,8 @@ pub async fn brain_stream(
             .filter(|b| picks_kbs.contains(&b.id))
             .map(|b| b.name.clone())
             .collect(),
+        kb_health,
+        kb_bases: picked_bases,
         understood,
         role: claims.role.clone(),
         github_linked: claims
@@ -3017,6 +3158,7 @@ async fn answer(
     history: &[Message],
     attachments: &[AttachmentRef],
 ) -> Option<(Final, Vec<Value>, Option<Value>)> {
+    let started = std::time::Instant::now();
     let mut reg = Registry::default();
     let state = &run.state;
 
@@ -3045,7 +3187,7 @@ async fn answer(
             Ok(found) => {
                 run.note_found(&found.hits);
                 super::knowledge::reembed(state, &run.team_id, &found.stale).await;
-                first_ids.extend(reg.add_hits(&found.hits));
+                first_ids.extend(reg.add_hits_with_health(&found.hits, &|kb| run.health_line(kb)));
             }
             Err(e) => warn!(error = %e, "Chat retrieval failed"),
         }
@@ -3098,6 +3240,8 @@ async fn answer(
     let mut notes = mention_note(&run.code_repos, question);
     let offered: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     notes.push_str(&understood.notes(&offered));
+    // A base the answer may read that is failing or behind: said first.
+    notes.push_str(&run.health_warnings(&run.kb_ids));
     // A status question's answer is in the tickets, pull requests and runs,
     // an orientation's in the team's setup, a correction's in a check made
     // now: an answer that didn't look there goes back once.
@@ -3131,8 +3275,9 @@ async fn answer(
         used: Used::default(),
         called: Vec::new(),
         map: None,
+        failed: 0,
     };
-    let model = chat_agent::ApiModel {
+    let api_model = chat_agent::ApiModel {
         http: reqwest::Client::new(),
         api_key: run.api_key.clone(),
         meter: crate::model_call::chat_meter(state, &run.team_id),
@@ -3140,6 +3285,9 @@ async fn answer(
         check_model_id: run.check_model_id.clone(),
         kind_of: kind_of_tool,
     };
+    // Counts the answer's turns and whether the limit forced it, for the log.
+    let model = super::chat_log::Counted::new(&api_model);
+
     let ask = chat_agent::Ask {
         system: system_prompt(&run.code_repos, run.github_token.is_some()),
         messages,
@@ -3152,14 +3300,9 @@ async fn answer(
     let out = chat_agent::run(&model, &mut toolbox, sink, &mut reg, ask)
         .await
         .ok()?;
-    info!(
-        team_id = %run.team_id,
-        calls = out.calls.len(),
-        rechecked = out.rechecked,
-        grounded = out.fin.grounded,
-        cited = out.fin.citations.len(),
-        "Chat answered"
-    );
+    super::chat_log::Answered::of(&model, started, understood.intent().key(), toolbox.failed)
+        .with(&out)
+        .log(&run.team_id);
     let map = toolbox
         .map
         .as_ref()
@@ -3808,5 +3951,101 @@ mod tests {
             "notion: search pages"
         );
         assert!(tool_label("search_knowledge", &json!({"query": "leave"})).contains("leave"));
+    }
+
+    /// A knowledge search can name its base, and only a base the question
+    /// may read.
+    #[test]
+    fn a_knowledge_search_can_name_one_base() {
+        let bases = vec![
+            ("kb-wiki".to_string(), "Northwind wiki".to_string()),
+            ("kb-docs".to_string(), "Harbor docs".to_string()),
+        ];
+        let all: Vec<String> = bases.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(bases_named(&all, &bases, "").unwrap(), all);
+        assert_eq!(
+            bases_named(&all, &bases, "northwind WIKI").unwrap(),
+            ["kb-wiki"]
+        );
+        let e = bases_named(&all, &bases, "Payroll").unwrap_err();
+        assert!(e.contains("Northwind wiki, Harbor docs"), "{e}");
+        let names: Vec<String> = bases.iter().map(|(_, n)| n.clone()).collect();
+        let def = knowledge_def(&names);
+        assert_eq!(
+            def["input_schema"]["properties"]["source"]["enum"],
+            json!(["Northwind wiki", "Harbor docs"])
+        );
+        assert_eq!(def["input_schema"]["required"], json!(["query"]));
+        // One base: nothing to choose.
+        assert!(knowledge_def(&names[..1])
+            .to_string()
+            .find("\"source\"")
+            .is_none());
+    }
+
+    /// A passage from a failing source says so where the answer reads it,
+    /// and on the citation; a passage from a current base doesn't say it
+    /// is failing.
+    #[test]
+    fn a_passage_from_a_failing_source_carries_its_health() {
+        use common::knowledge::health::{Health, Trouble};
+        use common::knowledge::search::Hit;
+        let failing = Health {
+            kb_id: "kb-wiki".into(),
+            name: "Northwind wiki".into(),
+            synced: true,
+            last_good: "2026-03-09T22:00:00Z".into(),
+            failing: vec![Trouble {
+                source: "Wiki".into(),
+                since: "2026-03-09T22:30:00Z".into(),
+                message: "The sign-in was refused.".into(),
+                fix: "Reconnect to sign in again.".into(),
+            }],
+            ..Default::default()
+        };
+        let current = Health {
+            kb_id: "kb-docs".into(),
+            name: "Harbor docs".into(),
+            synced: true,
+            last_good: "2026-03-10T11:55:00Z".into(),
+            ..Default::default()
+        };
+        let health = [failing, current];
+        let line = |kb: &str| {
+            health
+                .iter()
+                .find(|h| h.kb_id == kb)
+                .map(|h| h.line())
+                .unwrap_or_default()
+        };
+        let hit = |kb: &str, name: &str| Hit {
+            kb_id: kb.into(),
+            kb_name: name.into(),
+            file_id: format!("f-{kb}"),
+            file_name: format!("{name} page"),
+            text: "Deploys go out on Tuesdays.".into(),
+            ..Default::default()
+        };
+        let mut reg = Registry::default();
+        let ids = reg.add_hits_with_health(
+            &[
+                hit("kb-wiki", "Northwind wiki"),
+                hit("kb-docs", "Harbor docs"),
+            ],
+            &line,
+        );
+        let wiki = reg.get(&ids[0]).unwrap();
+        assert!(wiki.health.starts_with("NOT CURRENT"), "{}", wiki.health);
+        assert!(reg
+            .render(&ids[..1])
+            .contains("source_health=\"NOT CURRENT: last good sync 2026-03-09T22:00:00Z"));
+        let docs = reg.get(&ids[1]).unwrap();
+        assert!(docs.health.starts_with("current"), "{}", docs.health);
+        assert!(!docs.health.contains("failing"));
+        // The citation carries it too.
+        let cited = serde_json::to_value(wiki).unwrap();
+        assert!(cited["health"].as_str().unwrap().contains("failing since"));
+        assert!(health[0].warning().unwrap().contains("first line"));
+        assert!(health[1].warning().is_none());
     }
 }

@@ -1024,7 +1024,7 @@ pub struct RunDraftHoldReason {
     pub todo: String,
 }
 
-fn draft_hold_of(item: &run_search::Item) -> Option<RunDraftHold> {
+pub(crate) fn draft_hold_of(item: &run_search::Item) -> Option<RunDraftHold> {
     let h = common::draft_hold::DraftHold::of_item(item)?;
     Some(RunDraftHold {
         kind: match h.kind {
@@ -1139,7 +1139,7 @@ pub struct RunPreview {
     pub e2e_covered: bool,
 }
 
-fn preview_of(item: &run_search::Item) -> Option<RunPreview> {
+pub(crate) fn preview_of(item: &run_search::Item) -> Option<RunPreview> {
     let st = item
         .get(common::preview::FIELD)
         .and_then(|v| v.as_s().ok())
@@ -1175,7 +1175,7 @@ fn preview_of(item: &run_search::Item) -> Option<RunPreview> {
 
 /// What the run's pull request waits on, in one line, from what the run
 /// records (`common::waiting_line`). None before it has a pull request.
-fn waiting_line_of(item: &run_search::Item) -> Option<String> {
+pub(crate) fn waiting_line_of(item: &run_search::Item) -> Option<String> {
     let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
     let pr = item
         .get("pr_number")
@@ -1196,7 +1196,7 @@ fn waiting_line_of(item: &run_search::Item) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-fn merge_standing_of(item: &run_search::Item) -> Option<RunMergeStanding> {
+pub(crate) fn merge_standing_of(item: &run_search::Item) -> Option<RunMergeStanding> {
     let s = item
         .get(common::merge_standing::FIELD)
         .and_then(|v| v.as_s().ok())
@@ -1210,7 +1210,7 @@ fn merge_standing_of(item: &run_search::Item) -> Option<RunMergeStanding> {
     })
 }
 
-fn waiting_on_of(item: &run_search::Item) -> Option<RunWaitingOn> {
+pub(crate) fn waiting_on_of(item: &run_search::Item) -> Option<RunWaitingOn> {
     let w = common::run_wait::WaitingOn::of_item(item)?;
     Some(RunWaitingOn {
         action: w.action,
@@ -1494,6 +1494,12 @@ pub struct Run {
     /// at the pull request.
     #[schema(example = json!(null))]
     pub merge_standing: Option<RunMergeStanding>,
+    /// CoderHelm's own review of the pull request: how many findings are
+    /// open, after how many fix rounds, and each one. While one is open its
+    /// review asks for changes and auto-merge holds. Null before it
+    /// reviewed.
+    #[schema(example = json!(null))]
+    pub own_review: Option<super::run_facts::RunOwnReview>,
     /// What the run's pull request waits on, in one plain line, and
     /// whether it is ready for review: "Waiting on: an approving review from
     /// a person on #12 (this repo requires one before CoderHelm merges).
@@ -1524,7 +1530,7 @@ pub struct Run {
 }
 
 /// The public values a run's code generator was missing, as the API shows them.
-fn codegen_env_missing_of(item: &run_search::Item) -> Option<CodegenEnvMissing> {
+pub(crate) fn codegen_env_missing_of(item: &run_search::Item) -> Option<CodegenEnvMissing> {
     let m = item.get("codegen_env_missing")?.as_m().ok()?;
     let s = |k: &str| {
         m.get(k)
@@ -1545,7 +1551,7 @@ fn codegen_env_missing_of(item: &run_search::Item) -> Option<CodegenEnvMissing> 
 }
 
 /// The run's unfinished fix round, as the API shows it.
-fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
+pub(crate) fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
     let inc = common::run_round::Incomplete::from_item(item)?;
     let status = item
         .get("status")
@@ -2104,7 +2110,8 @@ pub async fn get_run(
 }
 
 /// A run's token use and cost: the run's own, or summed from its traces.
-struct RunUsage {
+#[derive(Default)]
+pub(crate) struct RunUsage {
     tokens_in: u64,
     tokens_out: u64,
     cache_read: u64,
@@ -2112,8 +2119,10 @@ struct RunUsage {
     cost_usd: f64,
 }
 
-/// The run `get_run` answers with, from its row in the runs table.
-fn run_of(
+/// The run `get_run` answers with, from its row in the runs table. What
+/// CoderHelm decided about it comes from [`super::run_facts`], the reader
+/// Chat's runs lookup uses too.
+pub(crate) fn run_of(
     item: &run_search::Item,
     run_id: &str,
     usage: RunUsage,
@@ -2156,6 +2165,22 @@ fn run_of(
         })
     };
     let asked = run_asked(item);
+    // Destructured whole: a fact the page doesn't show doesn't compile.
+    let super::run_facts::RunFacts {
+        error,
+        stop_kind,
+        tooling_failure,
+        covered_by,
+        no_change,
+        waiting_on,
+        draft_hold,
+        merge_standing,
+        waiting_line,
+        preview,
+        round_incomplete,
+        codegen_env_missing,
+        own_review,
+    } = super::run_facts::of_item(item);
     Run {
         trigger: run_trigger::trigger(item, lookups),
         run_id: run_id.to_string(),
@@ -2198,7 +2223,7 @@ fn run_of(
             })
             .unwrap_or_default(),
         duration_s: num("duration_s"),
-        error: st("error_message"),
+        error,
         policy_note: st("policy_note"),
         github_wait: st("github_wait"),
         policy_approval: st("policy_approval").filter(|s| !s.is_empty()),
@@ -2213,10 +2238,10 @@ fn run_of(
         outside_change_report: st("outside_change_report"),
         // A run that stopped on its own environment, and a run an open pull
         // request already covers.
-        stop_kind: st("stop_kind").filter(|s| !s.is_empty()),
-        tooling_failure: st("tooling_failure").and_then(|s| serde_json::from_str(&s).ok()),
-        covered_by: st("covered_by").and_then(|s| serde_json::from_str(&s).ok()),
-        no_change: st("no_change").and_then(|s| serde_json::from_str(&s).ok()),
+        stop_kind,
+        tooling_failure,
+        covered_by,
+        no_change,
         traceability: st(common::trace::FIELD).and_then(|s| serde_json::from_str(&s).ok()),
         exploration: {
             let code_map: Option<RunCodeMapRefresh> =
@@ -2278,17 +2303,14 @@ fn run_of(
             .collect(),
         answers_url: st("answers_url"),
         continued_run_id: st("continued_run_id"),
-        round_incomplete: round_incomplete_of(item),
-        codegen_env_missing: codegen_env_missing_of(item),
-        waiting_on: if st("status").as_deref() == Some(common::run_status::NEEDS_INPUT) {
-            waiting_on_of(item)
-        } else {
-            None
-        },
-        draft_hold: draft_hold_of(item),
-        merge_standing: merge_standing_of(item),
-        waiting_line: waiting_line_of(item),
-        preview: preview_of(item),
+        round_incomplete,
+        codegen_env_missing,
+        waiting_on,
+        draft_hold,
+        merge_standing,
+        waiting_line,
+        preview,
+        own_review,
         checks: None,
         pr_review: None,
         pr_review_comments: None,
