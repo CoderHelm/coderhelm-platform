@@ -692,12 +692,32 @@ async fn retire_card(state: &WorkerState, team_id: &str, approval_id: &str, tag:
 /// setting already said yes.
 async fn team_release(
     state: &WorkerState,
+    github: &GitHubClient,
     msg: &ReleaseStepsMessage,
     cfg: &super::review_actions::OnApproveConfig,
     base_branch: &str,
     s: &mut Step,
 ) {
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    // A release tag deploys production: a merge into a feature branch is not
+    // released, and its deploy step says so rather than waiting on a tag.
+    match github.get_default_branch(owner, repo).await {
+        Ok(d) if d == base_branch => {}
+        Ok(d) => {
+            s.status = Status::Skipped;
+            s.detail = format!(
+                "merged into `{base_branch}`, not `{d}`: CoderHelm releases only `{d}`, so this \
+                 deploys when `{base_branch}` is merged into `{d}`"
+            );
+            return;
+        }
+        Err(e) => {
+            // Unknown which branch releases: nothing is armed this tick; the
+            // next one looks again.
+            warn!(pr = msg.pr_number, error = %e, "release: could not read the default branch");
+            return;
+        }
+    }
     if let Some(why) =
         super::review_actions::release_blocked(state, &msg.team_id, owner, repo).await
     {
@@ -1711,7 +1731,7 @@ async fn tick(
                     // end.
                     if cfg.auto_tag {
                         let base = rec.base_branch.clone();
-                        team_release(state, msg, &cfg, &base, &mut rec.steps[i]).await;
+                        team_release(state, &github, msg, &cfg, &base, &mut rec.steps[i]).await;
                         continue;
                     }
                 }
@@ -1946,11 +1966,19 @@ async fn start(
     if s.kind == Kind::Deploy && matches!(s.trigger, Some(On::Tag(_))) {
         let cfg = super::review_actions::OnApproveConfig::load(state, team_id, owner, repo).await;
         match super::review_actions::cut_tag_if_new(github, &cfg, owner, repo, merge_sha).await {
-            Ok(Some(tag)) => {
+            Ok(super::review_actions::Cut::NotOnDefaultBranch(d)) => {
+                s.status = Status::Skipped;
+                s.detail = format!(
+                    "not tagged: `{d}` doesn't hold this commit, and CoderHelm cuts release tags \
+                     only from `{d}`, since a tag deploys production"
+                );
+                return;
+            }
+            Ok(super::review_actions::Cut::New(tag)) => {
                 s.tag = tag;
                 s.tag_sha = merge_sha.to_string();
             }
-            Ok(None) => {
+            Ok(super::review_actions::Cut::AlreadyTagged) => {
                 // Already tagged (the team's own tagging on merge).
                 s.tag = github
                     .list_tags(owner, repo)

@@ -396,8 +396,31 @@ pub(crate) async fn post_merge_actions(
     // sweep for the repo, so several merges in the window share one release tag
     // (and one prod deploy). In immediate mode (window = 0) we tag now, but
     // idempotently (skip if this commit is already tagged).
-    let batched_tag = cfg.auto_tag && cfg.tag_batch_minutes > 0;
-    if cfg.auto_tag {
+    // Only a merge into the default branch is released: a tag deploys
+    // production, and a feature branch's head is not what production runs.
+    // Unreadable reads as not the default branch; the push to the default
+    // branch, or the hourly catch-up, still releases what main holds.
+    let released_branch = if cfg.auto_tag {
+        match github.get_default_branch(owner, repo).await {
+            Ok(d) if d == base_branch => true,
+            Ok(d) => {
+                info!(pr_number, %base_branch, default_branch = %d, "Merged into a branch other than the default one: no release");
+                lines.push(not_released_line(base_branch, &d));
+                false
+            }
+            Err(e) => {
+                warn!(pr_number, error = %e, "Couldn't read the default branch: no release from this merge");
+                lines.push(format!(
+                    "🏷️ No release from this merge: GitHub didn't say which branch is the default one ({e}). A merge into it is released by the next push or the hourly catch-up."
+                ));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let batched_tag = released_branch && cfg.tag_batch_minutes > 0;
+    if released_branch {
         if batched_tag {
             schedule_tag_sweep(
                 state,
@@ -417,7 +440,8 @@ pub(crate) async fn post_merge_actions(
             ));
         } else {
             match cut_tag_if_new(github, cfg, owner, repo, head_sha).await {
-                Ok(Some(tag)) => {
+                Ok(Cut::NotOnDefaultBranch(d)) => lines.push(not_released_line(base_branch, &d)),
+                Ok(Cut::New(tag)) => {
                     super::release_notes::after_tag(
                         state,
                         github,
@@ -432,7 +456,7 @@ pub(crate) async fn post_merge_actions(
                     .await;
                     lines.push(format!("🏷️ Tagged `{tag}`."));
                 }
-                Ok(None) => {
+                Ok(Cut::AlreadyTagged) => {
                     lines.push("🏷️ This commit is already tagged — no new release cut.".to_string())
                 }
                 Err(e) => {
@@ -469,19 +493,59 @@ pub(crate) async fn post_merge_actions(
     lines
 }
 
-/// Cut the next release tag at `sha`, unless that commit is already tagged.
-/// Returns `Ok(Some(tag))` when a new tag was created, `Ok(None)` when `sha`
-/// already carries a tag (idempotent no-op). That "already tagged" check is what
-/// makes the batched sweep safe to run more than once for the same HEAD — a
-/// duplicate sweep (from a race or a fail-open claim) becomes a clean no-op
-/// instead of a redundant release.
+/// What cutting a release tag did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// A new release tag, at the commit.
+    New(String),
+    /// The commit already carries a tag: nothing to release.
+    AlreadyTagged,
+    /// The commit is not on the repository's default branch (a merge into a
+    /// feature branch). A release tag deploys production, so a commit main
+    /// doesn't hold is never released; the branch named is the default one.
+    NotOnDefaultBranch(String),
+}
+
+/// Pure: whether the default branch holds a commit, from GitHub's comparison
+/// of the default branch (head) against the commit (base). Anything else,
+/// "behind" or "diverged", is a commit only another branch has.
+pub fn default_branch_holds(compare_status_default_vs_sha: &str) -> bool {
+    matches!(compare_status_default_vs_sha, "ahead" | "identical")
+}
+
+/// The one line said when a merge is not released because it went into a
+/// branch other than the default one.
+pub fn not_released_line(base_branch: &str, default_branch: &str) -> String {
+    format!(
+        "🏷️ No release: this merged into `{base_branch}`, not `{default_branch}`. CoderHelm \
+         cuts release tags only from `{default_branch}`, since a tag deploys production."
+    )
+}
+
+/// Cut the next release tag at `sha`, unless that commit is already tagged or
+/// the default branch doesn't hold it. Every release tag CoderHelm cuts goes
+/// through here, and a tag deploys production, so this is where a commit from
+/// a feature branch is refused. The "already tagged" check is what makes the
+/// batched sweep safe to run more than once for the same HEAD — a duplicate
+/// sweep (from a race or a fail-open claim) becomes a clean no-op instead of a
+/// redundant release.
 pub(crate) async fn cut_tag_if_new(
     github: &GitHubClient,
     cfg: &OnApproveConfig,
     owner: &str,
     repo: &str,
     sha: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Cut, Box<dyn std::error::Error + Send + Sync>> {
+    // Unreadable is an error, never a release: a commit is tagged only once
+    // GitHub has said the default branch holds it.
+    let default_branch = github.get_default_branch(owner, repo).await?;
+    let status = github
+        .compare_status(owner, repo, sha, &default_branch)
+        .await?;
+    if !default_branch_holds(&status) {
+        warn!(repo = %format!("{owner}/{repo}"), sha = %short_sha(sha), %default_branch, %status, "Release tag refused: the default branch doesn't hold the commit");
+        return Ok(Cut::NotOnDefaultBranch(default_branch));
+    }
     // An unreadable tag list is an error: read as "no tags", the next version
     // would restart at the seed.
     let tags = github
@@ -496,7 +560,7 @@ pub(crate) async fn cut_tag_if_new(
         .iter()
         .any(|t| t["commit"]["sha"].as_str() == Some(sha))
     {
-        return Ok(None);
+        return Ok(Cut::AlreadyTagged);
     }
     let tag = if cfg.tag_mode == "date" {
         format!(
@@ -512,7 +576,7 @@ pub(crate) async fn cut_tag_if_new(
         next_semver_tag(&names, &cfg.tag_prefix)
     };
     github.create_tag_ref(owner, repo, &tag, sha).await?;
-    Ok(Some(tag))
+    Ok(Cut::New(tag))
 }
 
 /// Ensure exactly ONE tag sweep is armed for this repo's current batch window.
@@ -708,13 +772,21 @@ pub async fn run_tag_sweep(
         &state.http,
     )?;
 
-    // "Release now" with nothing waiting doesn't know the branch yet.
-    if msg.base_branch.is_empty() {
+    // A release is always of the default branch: a tag deploys production.
+    // The branch the window was opened with is only where a merge landed
+    // ("Release now" with nothing waiting knows none), and a window opened
+    // from a feature branch still releases only what the default branch holds.
+    {
         match github
             .get_default_branch(&msg.repo_owner, &msg.repo_name)
             .await
         {
-            Ok(b) => msg.base_branch = b,
+            Ok(b) => {
+                if !msg.base_branch.is_empty() && msg.base_branch != b {
+                    info!(repo = %format!("{owner}/{repo}"), opened_on = %msg.base_branch, default_branch = %b, "Tag sweep: releases the default branch, not the branch the window was opened on");
+                }
+                msg.base_branch = b
+            }
             Err(e) => {
                 retry_or_wait(
                     state,
@@ -815,7 +887,12 @@ pub async fn run_tag_sweep(
         clear_failure(state, &msg.team_id, owner, repo).await;
     }
     match cut {
-        Ok(Some(tag)) => {
+        Ok(Cut::NotOnDefaultBranch(d)) => {
+            // Said once, not retried: a later merge into the default branch
+            // opens its own release.
+            info!(repo = %format!("{owner}/{repo}"), base = %msg.base_branch, default_branch = %d, "Tag sweep: the head is not on the default branch — no release");
+        }
+        Ok(Cut::New(tag)) => {
             info!(%tag, repo = %format!("{owner}/{repo}"), "Batched release tag cut");
             super::release_notes::after_tag(
                 state,
@@ -848,7 +925,7 @@ pub async fn run_tag_sweep(
                 .await;
             }
         }
-        Ok(None) => {
+        Ok(Cut::AlreadyTagged) => {
             info!(repo = %format!("{owner}/{repo}"), "Tag sweep: HEAD already tagged — skipped")
         }
         Err(e) => {
