@@ -11574,7 +11574,7 @@ async fn supersede_moved_prs(
 /// `number` in `repo` (`close_pull_request`, a write). Never waits on a
 /// card: a close the gate refuses or asks about leaves the pull request
 /// open, and `Err` says why.
-async fn may_close_own_pr(
+pub(crate) async fn may_close_own_pr(
     state: &WorkerState,
     provider: &crate::agent::provider::ModelProvider,
     repo: &str,
@@ -11605,7 +11605,7 @@ async fn may_close_own_pr(
 /// check, with `note` posted first (once: the note has its own slot on the
 /// pull request). A note that can't be posted leaves it open. The branch is
 /// kept.
-async fn close_own_pr(
+pub(crate) async fn close_own_pr(
     state: &WorkerState,
     provider: &crate::agent::provider::ModelProvider,
     github: &GitHubClient,

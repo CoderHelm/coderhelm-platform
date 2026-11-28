@@ -144,6 +144,8 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
         run_id: format!("01M87{n:04}"),
         status: status.into(),
         has_pr: true,
+        pr_open: true,
+        pr_merged: false,
     };
     vec![
         c(
@@ -190,7 +192,7 @@ fn family() -> Vec<common::followup_dedupe::Candidate> {
 }
 
 #[tokio::test]
-async fn a_duplicate_closes_only_when_the_matcher_and_the_check_agree() {
+async fn a_duplicate_closes_only_when_the_check_and_the_matcher_lean_the_same_way() {
     use common::followup_dedupe as fd;
     let fam = family();
     // What the matcher reads on its own: 12/22 and 14/19 the same, 21/20 not.
@@ -201,13 +203,16 @@ async fn a_duplicate_closes_only_when_the_matcher_and_the_check_agree() {
     // The check agrees on 12/22, says nothing of 14/19, reads 21/20 as the
     // same, and 16/18 as opposed.
     let check = FakeCheck("SAME ABC-12 ABC-22\nSAME ABC-21 ABC-20\nOPPOSED ABC-16 ABC-18");
-    let plan = fd::decide(&fam, Some(&check)).await;
+    let plan = fd::decide(&fam, Some(&check), &[]).await;
     let closes: Vec<(&str, &str)> = plan
         .close
         .iter()
         .map(|c| (c.dup.as_str(), c.keep.as_str()))
         .collect();
-    assert_eq!(closes, vec![("ABC-22", "ABC-12")]);
+    // 21/20 the matcher finds near (maybe) and the check reads as the same
+    // work: the topic key filing uses, so it closes too
+    // (`wa_duplicate_keeper_stays`).
+    assert_eq!(closes, vec![("ABC-20", "ABC-21"), ("ABC-22", "ABC-12")]);
     // Disagreements and the fix against the delete are flagged, never closed.
     let flags: Vec<(&str, &str, bool)> = plan
         .flag
@@ -215,16 +220,15 @@ async fn a_duplicate_closes_only_when_the_matcher_and_the_check_agree() {
         .map(|f| (f.a.as_str(), f.b.as_str(), f.opposed))
         .collect();
     assert!(flags.contains(&("ABC-14", "ABC-19", false)), "{flags:?}");
-    assert!(flags.contains(&("ABC-21", "ABC-20", false)), "{flags:?}");
     assert!(flags.contains(&("ABC-16", "ABC-18", true)), "{flags:?}");
-    let c = &plan.close[0];
+    let c = &plan.close[1];
     assert_eq!(
         fd::close_comment(&c.keep, &c.topic),
         "Duplicate of ABC-12 (Stop using file names as alt text in the image fragment). \
          Closing; the work continues there. Closed by CoderHelm."
     );
     // Without the check's answer nothing closes.
-    assert_eq!(fd::decide(&fam, None).await, fd::Plan::default());
+    assert_eq!(fd::decide(&fam, None, &[]).await, fd::Plan::default());
 }
 
 #[test]
@@ -241,8 +245,8 @@ fn duplicates_close_on_the_hourly_sweep_with_a_persons_close_steps() {
         "#s = :closed",
         "release_ticket_lock(",
         "merge_gate::stop(",
-        "conversation::github(",
-        "close_pull_request(",
+        "may_close_own_pr(",
+        "close_own_pr(",
         "conversation::jira(",
         "log_close(",
         "take_close_slot(",
