@@ -1,10 +1,9 @@
-//! vu. A person asked Chat why auto-merge was held on a run. The run page
+//! vx. A person asked Chat why auto-merge was held on a run. The run page
 //! said CoderHelm's own review still asked for changes, with its open
-//! finding, but Chat's run record never read it: Chat blamed the branch
-//! rules and the pull request was merged by hand past the finding. The same
-//! week "What needs my answer?" listed runs that asked nothing as
+//! finding, but Chat's run record never read it, so Chat blamed the branch
+//! rules. "What needs my answer?" listed runs that asked nothing as
 //! questions, ranked runs with no requester first, and an answer came from
-//! a wiki whose sync was failing without saying so. The failed tool calls
+//! a knowledge source whose sync was failing without saying so. The failed tool calls
 //! and the answers stopped on the budget left nothing in the logs.
 //!
 //! Guarantees: one reader of a run's decisions for the run page and Chat;
