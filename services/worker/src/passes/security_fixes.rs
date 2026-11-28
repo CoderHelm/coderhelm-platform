@@ -79,8 +79,15 @@ const TRIAGE_MAX_CHARS: usize = 8_000;
 /// read reuses the verdict without the model).
 const TRIAGE_RECHECK_DAYS: i64 = 7;
 /// What the triage key starts with: a new way of reading the code reads
-/// every finding again once.
-const TRIAGE_VERSION: &str = "code-2";
+/// every finding again once. The code check costs no model call; the
+/// model is asked again only when the lines it would read changed
+/// ([`TRIAGE_ASK_VERSION`]).
+const TRIAGE_VERSION: &str = "code-3";
+/// What a kept model answer's key starts with: the same question (the
+/// advisories, the version, the scope and the lines) reuses the answer
+/// whatever the code check's version. Changed only when the question
+/// itself changes (its instructions).
+const TRIAGE_ASK_VERSION: &str = "code-2";
 /// OSV records read per sync (shared by every repository in the tick).
 const OSV_HYDRATE_MAX: usize = 1_500;
 /// OSV records read at once.
@@ -1510,9 +1517,12 @@ fn triage_due(f: &Finding, st: &FindingState, now: chrono::DateTime<Utc>) -> boo
         .is_none_or(|t| now - t >= Duration::days(TRIAGE_RECHECK_DAYS))
 }
 
-/// The groups to read, the most urgent first: the lowest tier, then the
-/// highest score (criticals before highs), runtime before scope unknown
-/// before dev.
+/// The groups to read, the most urgent first: the lowest tier, then on
+/// the exploited list, then the highest EPSS (the chance of exploitation),
+/// then the highest score (criticals before highs), runtime before scope
+/// unknown before dev. A verdict not yet settled has a provisional tier
+/// that leaves out reachability, so the risk the advisory carries on its
+/// own decides which the model reads first.
 fn triage_order(
     findings: &[(Finding, FindingState)],
     groups: &BTreeMap<String, Vec<usize>>,
@@ -1522,10 +1532,18 @@ fn triage_order(
         sec::Scope::Unknown => 1,
         sec::Scope::Dev => 2,
     };
-    let mut order: Vec<(Option<sec::Tier>, i64, u8, String)> = groups
+    type Rank = (Option<sec::Tier>, bool, i64, i64, u8, String);
+    let mut order: Vec<Rank> = groups
         .iter()
         .map(|(k, idxs)| {
             let tier = idxs.iter().filter_map(|i| findings[*i].0.tier).min();
+            let kev = idxs.iter().any(|i| findings[*i].0.advisory.kev);
+            let epss = idxs
+                .iter()
+                .filter_map(|i| findings[*i].0.advisory.epss)
+                .map(|e| (e * 10_000.0) as i64)
+                .max()
+                .unwrap_or(0);
             let score = idxs
                 .iter()
                 .map(|i| (sec::score(&findings[*i].0, &findings[*i].1) * 10.0) as i64)
@@ -1536,11 +1554,11 @@ fn triage_order(
                 .map(|i| scope_rank(findings[*i].0.scope))
                 .min()
                 .unwrap_or(1);
-            (tier, -score, scope, k.clone())
+            (tier, !kev, -epss, -score, scope, k.clone())
         })
         .collect();
     order.sort();
-    order.into_iter().map(|(_, _, _, k)| k).collect()
+    order.into_iter().map(|(_, _, _, _, _, k)| k).collect()
 }
 
 /// The lockfiles that say how a manifest's packages come in: the manifest
@@ -1596,6 +1614,7 @@ async fn code_decisions(
     let snap = cx.gh.code_snapshot(owner, name, &branch).await?;
     let tree = snap.tree().await;
     let mut locks: HashMap<String, Option<String>> = HashMap::new();
+    let mut manifests: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut queries = vec![];
     for idxs in groups {
         let lead = &findings[idxs[0]].0;
@@ -1673,6 +1692,46 @@ async fn code_decisions(
             [one] => reach::Query::dir_of(one),
             _ => reach::Query::dir_of(&lead.manifest),
         };
+        // Which of its ways in only development installs have: every
+        // `package.json` the folder holds (each workspace's).
+        let mut dev_only = vec![];
+        if lead.ecosystem == "npm" {
+            let mut texts: Vec<&str> = vec![];
+            for p in tree.iter().filter(|p| {
+                p.starts_with(&dir)
+                    && (p.as_str() == "package.json" || p.ends_with("/package.json"))
+                    && !p.contains("node_modules/")
+            }) {
+                if !manifests.contains_key(p) {
+                    manifests.insert(p.clone(), snap.read_file(p).await);
+                }
+            }
+            for (p, t) in &manifests {
+                if p.starts_with(&dir) {
+                    match t {
+                        Some(t) => texts.push(t),
+                        // An unread manifest: nothing is known to be dev only.
+                        None => {
+                            texts.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            if !texts.is_empty() {
+                dev_only = reach::dev_only_names(texts);
+            }
+            // A direct dependency that a runtime one also brings in is
+            // installed in production either way.
+            if ancestry.direct
+                && !ancestry
+                    .parents
+                    .iter()
+                    .all(|p| dev_only.iter().any(|d| d == p))
+            {
+                dev_only.retain(|d| *d != lead.package);
+            }
+        }
         queries.push(reach::Query {
             ecosystem: lead.ecosystem.clone(),
             package: lead.package.clone(),
@@ -1681,6 +1740,8 @@ async fn code_decisions(
             symbols,
             hints,
             parents_unknown,
+            parents_from_lockfile: ancestry.found,
+            dev_only,
         });
     }
     let mut scanner = reach::Scanner::new(queries);
@@ -1726,7 +1787,7 @@ async fn triage_decided(
     let gk = sec::group_key(&lead);
     let members: Vec<&Finding> = idxs.iter().map(|i| &findings[*i].0).collect();
     let key = sec::group_triage_key(&members, &evidence.lines);
-    let key = common::content_hash(&format!("{TRIAGE_VERSION}|{key}"));
+    let key = common::content_hash(&format!("{TRIAGE_ASK_VERSION}|{key}"));
     if let Some((v, e)) = load_group_verdict(cx, &gk, &key).await {
         apply_verdict(cx, findings, idxs, v, &e).await;
         return Triaged::Reused;

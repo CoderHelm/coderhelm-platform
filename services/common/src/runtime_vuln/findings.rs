@@ -528,8 +528,8 @@ mod tests {
         assert_eq!(x.verdict, Verdict::Unknown);
         assert_eq!(
             x.tier,
-            Some(sec::Tier::P1),
-            "8.1, a runtime, hardware not known from code"
+            Some(sec::Tier::P2),
+            "8.1, a runtime, hardware not known from code: not settled, so not tiered as reachable"
         );
         assert!(
             x.path.iter().any(|p| p.contains("AVX-512 VBMI")),

@@ -137,6 +137,17 @@ pub enum Verdict {
     Pending,
 }
 
+impl Verdict {
+    /// Whether reachability is settled: reachable, not reachable or not
+    /// loaded. Unknown and pending are not.
+    pub fn settled(self) -> bool {
+        matches!(
+            self,
+            Verdict::Reachable | Verdict::NotReachable | Verdict::NotLoaded
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -331,7 +342,9 @@ pub struct Finding {
     pub verdict: Verdict,
     pub evidence: Option<Evidence>,
     pub tier: Option<Tier>,
-    /// The verdict is still being checked, so the tier may change once it is.
+    /// The verdict isn't settled (unknown, or still being checked), so the
+    /// tier and the due date leave reachability out and may change once it
+    /// settles.
     pub tier_provisional: bool,
     /// Why its fix hasn't started though it is due (a daily limit), in
     /// plain words; None when nothing holds it.
@@ -1324,11 +1337,16 @@ pub fn severity_word(score: f64) -> &'static str {
 
 /// The tier, from the verdict, scope, score, the exploited list and EPSS.
 /// P0 needs evidence: malware; on CISA's exploited list and loaded at
-/// runtime (reachable, or a runtime dependency not yet read); or CVSS 9+ and
-/// reachable. A verdict not yet known ("unknown", or "pending" while it is
-/// checked) is never P0 on its score alone: at most P1, when the score is
-/// high and the dependency is a runtime one (or EPSS is 0.1+), otherwise P2
-/// or P3. A pending verdict's tier is provisional ([`Finding::tier_provisional`]).
+/// runtime (reachable, or a runtime dependency not yet settled); or CVSS 9+
+/// and reachable.
+///
+/// A verdict not settled ("unknown", or "pending" while it is checked) is
+/// not tiered as if reachable: the score alone puts it one tier below the
+/// reachable tier (CVSS 7+ is P2, under that P3), and only evidence that
+/// doesn't depend on reachability raises it: on the exploited list (P1, or
+/// P0 for a runtime dependency) or EPSS 0.1+ (P1). Its tier, and the due
+/// date that follows from it, is provisional ([`Finding::tier_provisional`])
+/// until the verdict settles.
 pub fn tier_of(f: &Finding, st: &FindingState) -> Tier {
     let a = &f.advisory;
     if a.malware {
@@ -1359,13 +1377,14 @@ pub fn tier_of(f: &Finding, st: &FindingState) -> Tier {
                 Tier::P3
             }
         }
-        // Unknown or still being checked: no evidence either way yet.
+        // Unknown or still being checked: no evidence of reachability
+        // either way, so only what doesn't depend on it ranks it high.
         _ => {
             if a.kev && runtime {
                 Tier::P0
-            } else if a.kev || likely || (s >= 7.0 && runtime) {
+            } else if a.kev || likely {
                 Tier::P1
-            } else if s >= 4.0 {
+            } else if s >= 7.0 {
                 Tier::P2
             } else {
                 Tier::P3
@@ -1400,7 +1419,7 @@ pub fn due_at(f: &Finding, tier: Tier, cfg: &SecurityConfig) -> DateTime<Utc> {
 /// the tier rose.
 pub fn retier(f: &mut Finding, st: &FindingState, cfg: &SecurityConfig) -> bool {
     let t = tier_of(f, st);
-    f.tier_provisional = f.verdict == Verdict::Pending;
+    f.tier_provisional = !f.verdict.settled();
     let rose = f.tier.is_some_and(|old| t < old);
     f.tier = Some(t);
     f.due_at = due_at(f, t, cfg).to_rfc3339();
@@ -3702,7 +3721,8 @@ fn verdict_words(v: Verdict) -> &'static str {
         Verdict::Reachable => "Reachable",
         Verdict::NotReachable => "Present, not reachable",
         Verdict::NotLoaded => "Not loaded at runtime",
-        Verdict::Unknown | Verdict::Pending => "Unknown",
+        Verdict::Unknown => "Not settled (reachability unknown)",
+        Verdict::Pending => "Not settled (being checked)",
     }
 }
 
@@ -6002,9 +6022,10 @@ pub fn overview_counts(findings: &[(Finding, FindingState)], now: DateTime<Utc>)
         .filter(|g| g.status.is_open())
         .collect();
     let gtier = |t: Tier| open_groups.iter().filter(|g| g.tier == Some(t)).count();
-    let settled = open
+    let settled = open.iter().filter(|f| f.verdict.settled()).count();
+    let not_settled = open
         .iter()
-        .filter(|f| !matches!(f.verdict, Verdict::Pending))
+        .filter(|f| f.verdict == Verdict::Unknown)
         .count();
     json!({
         "groups": {
@@ -6020,7 +6041,8 @@ pub fn overview_counts(findings: &[(Finding, FindingState)], now: DateTime<Utc>)
         },
         "verdicts": {
             "settled": settled,
-            "checking": open.len() - settled,
+            "not_settled": not_settled,
+            "checking": open.len() - settled - not_settled,
         },
         "counts": {
             "open": open.len(),
@@ -6452,11 +6474,20 @@ mod tests {
             f.scope = Scope::Unknown;
             assert_eq!(tier_of(&f, &st), Tier::P2, "{v:?}: critical, scope unknown");
             f.scope = Scope::Runtime;
-            assert_eq!(tier_of(&f, &st), Tier::P1, "{v:?}: critical, runtime");
+            assert_eq!(
+                tier_of(&f, &st),
+                Tier::P2,
+                "{v:?}: critical, runtime: not tiered as if reachable"
+            );
+            f.advisory.epss = Some(0.2);
+            assert_eq!(tier_of(&f, &st), Tier::P1, "{v:?}: likely exploited");
+            f.advisory.epss = Some(0.01);
+            f.advisory.cvss = Some(5.0);
+            assert_eq!(tier_of(&f, &st), Tier::P3, "{v:?}: medium, runtime");
             f.advisory.cvss = None;
             assert_eq!(
                 tier_of(&f, &crit),
-                Tier::P1,
+                Tier::P2,
                 "{v:?}: critical word, runtime"
             );
             assert_eq!(
@@ -6484,6 +6515,12 @@ mod tests {
         assert!(
             f.tier_provisional,
             "a pending verdict's tier is provisional"
+        );
+        f.verdict = Verdict::Unknown;
+        retier(&mut f, &st, &SecurityConfig::default());
+        assert!(
+            f.tier_provisional,
+            "an unknown verdict isn't settled: its tier is provisional"
         );
         f.verdict = Verdict::Reachable;
         retier(&mut f, &st, &SecurityConfig::default());
