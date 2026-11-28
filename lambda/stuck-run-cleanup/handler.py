@@ -492,16 +492,34 @@ def over_ceiling_reason(what, run, branch=""):
     return f"CoderHelm ended this run: it reached {what}, and nothing further runs on it. {where} Retry starts a new run from there."
 
 
+# The run attribute every ending keeps (services/common/src/run_ending.rs,
+# FIELD_ENDING): a test there reads this file.
+ENDING_FIELD = "run_ending"
+
+
+def run_ending(kind, reason, status, evidence, tried=""):
+    """The ending this sweep writes, in the shape the one gate writes it
+    (`common::run_ending`): done, waiting or stopped, with its evidence."""
+    ending = {"kind": kind, "reason": reason, "status": status, "evidence": evidence[:1500]}
+    if kind == "stopped":
+        ending["tried"] = tried or "nothing before it stopped"
+        ending["retries"] = 0
+    return ending
+
+
 def over_ceiling_update(run_id, code, reason, now_iso):
     """The update that hands a run over its ceiling to a person. `guard_open`
     keeps any queued step of it from starting again."""
     return (
-        "SET #s = :new, status_run_id = :sri, error_message = :err, current_pass = :cp, "
-        "updated_at = :now, guard_open = :yes, loop_stop_reason = :code, "
+        "SET #s = :new, status_run_id = :sri, run_ending = :run_ending, error_message = :err, "
+        "current_pass = :cp, updated_at = :now, guard_open = :yes, loop_stop_reason = :code, "
         "loop_stop_detail = :err, loop_stopped_at = :now, waiting_on = :wo",
         {
             ":new": NEEDS_INPUT,
             ":sri": f"{NEEDS_INPUT}#{run_id}",
+            ":run_ending": run_ending(
+                "waiting", "person", NEEDS_INPUT, f"the team: read why CoderHelm ended this run. {reason}"
+            ),
             ":err": reason,
             ":cp": "done",
             ":now": now_iso,
@@ -768,36 +786,48 @@ def handler(event, context):
             names["#round"] = ROUND_FIELD
             names["#inc"] = INCOMPLETE_FIELD
             update = (
-                "SET #s = :new, status_run_id = :sri, #inc = :inc, current_pass = :cp, "
-                "updated_at = :now REMOVE #round"
+                "SET #s = :new, status_run_id = :sri, run_ending = :run_ending, #inc = :inc, "
+                "current_pass = :cp, updated_at = :now REMOVE #round"
             )
             values.update(
                 {
                     ":new": "completed",
                     ":sri": f"completed#{run_id}",
+                    ":run_ending": run_ending(
+                        "done", "pr", "completed", f"pull request {run.get('pr_url') or run.get('pr_number')}"
+                    ),
                     ":inc": record,
                     ":cp": "done",
                 }
             )
             logger.warning(f"Run {run_id}: {status_line(record['reason'])}")
         elif orig_status == "awaiting_ci":
-            update = "SET #s = :new, status_run_id = :sri, error_message = :err, updated_at = :now"
+            update = (
+                "SET #s = :new, status_run_id = :sri, run_ending = :run_ending, "
+                "error_message = :err, updated_at = :now"
+            )
             values.update(
                 {
                     ":new": "completed",
                     ":sri": f"completed#{run_id}",
+                    ":run_ending": run_ending(
+                        "done", "pr", "completed", f"pull request {run.get('pr_url') or run.get('pr_number')}"
+                    ),
                     ":err": "CI did not conclude within 26h — finalized for human review (auto-cleanup)",
                 }
             )
         else:
             update = (
-                "SET #s = :new, status_run_id = :sri, error_message = :err, "
-                "failed_pass = :pass, updated_at = :now"
+                "SET #s = :new, status_run_id = :sri, run_ending = :run_ending, "
+                "error_message = :err, failed_pass = :pass, updated_at = :now"
             )
             values.update(
                 {
                     ":new": "failed",
                     ":sri": f"failed#{run_id}",
+                    ":run_ending": run_ending(
+                        "stopped", "error:transient", "failed", failure_message(pass_name)
+                    ),
                     ":err": failure_message(pass_name),
                     ":pass": pass_name or BEFORE_FIRST_PASS,
                 }

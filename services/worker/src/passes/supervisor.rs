@@ -1064,6 +1064,8 @@ mod tests {
             "finish_incomplete(",
             "complete_run_with_status(",
             "fail_run(",
+            "stop_run(",
+            "stop_red(",
             "end_run(",
         ] {
             if ci_fix.contains(ends) {
@@ -1094,7 +1096,12 @@ mod tests {
                     .into(),
             ),
         }
-        for (i, _) in resume.match_indices("fail_run(") {
+        let ends_failed = resume
+            .match_indices("fail_run(")
+            .chain(resume.match_indices("stop_run("))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        for i in ends_failed {
             let before = &resume[..i];
             let owner = ["\nasync fn ", "\npub(crate) async fn "]
                 .iter()
@@ -1108,7 +1115,7 @@ mod tests {
                         .to_string()
                 })
                 .unwrap_or_default();
-            if !["wait_on_person", "end_red_ci_rounds"].contains(&owner.as_str()) {
+            if !["wait_on_person", "stop_red"].contains(&owner.as_str()) {
                 bad.push(format!(
                     "resume.rs: `{owner}` fails a run; only the supervisor's ending may"
                 ));

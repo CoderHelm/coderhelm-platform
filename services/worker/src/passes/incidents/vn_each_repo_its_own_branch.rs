@@ -122,7 +122,10 @@ fn the_error_is_a_missing_branch_said_in_plain_words() {
     assert!(!c.plain.contains("api.github.com") && !c.plain.contains('{'));
     // Parked for the sweep, never "needs you" and never a raw dump.
     assert_eq!(
-        common::run_fail::status_for(&incident_error()),
+        common::run_fail::status_of(&common::run_fail::RunFailure {
+            cause: common::run_fail::Cause::Error(&incident_error()),
+            ..Default::default()
+        }),
         common::run_status::FAILED
     );
     // A compare whose head isn't pushed yet is no diff.

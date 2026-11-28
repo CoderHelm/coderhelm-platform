@@ -197,7 +197,7 @@ fn the_pipeline_ends_a_no_change_plan_through_this_ending() {
     let body = &src[src.find("pub(crate) async fn finish(").unwrap()..];
     for needed in [
         "super::add_progress_note(state, &msg.team_id, run_id, &end.note)",
-        "attr_s(end.status)",
+        "common::run_ending::Done::NoChange {",
         "#nc = :nc",
         "expression_attribute_names(\"#nc\", FIELD)",
         "notify_alert_no_change(",

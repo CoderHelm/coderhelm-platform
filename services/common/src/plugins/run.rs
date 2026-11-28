@@ -40,6 +40,7 @@ use super::schedule::Queue;
 use super::{code, flag, new_id, store_err, Refusal};
 use crate::mcp_credentials::Cipher;
 use crate::messages::PluginRunMessage;
+use crate::run_ending::EndPut;
 use crate::tool_registry::{Grant, Risk};
 
 pub const PREFIX: &str = "PKGRUN#";
@@ -1070,8 +1071,13 @@ impl RunLog for RunsTable {
             .table_name(&self.table)
             .item("team_id", A::S(team.to_string()))
             .item("run_id", A::S(r.run_id.clone()))
-            .item("status", A::S(status.to_string()))
-            .item("status_run_id", A::S(format!("{status}#{}", r.run_id)))
+            // Through the one gate (`run_ending`).
+            .run_status(&crate::run_ending::for_job(
+                status,
+                &r.run_id,
+                "the plugin's result on the run page",
+                &r.reason,
+            ))
             .item("ticket_source", A::S("plugin".into()))
             .item("ticket_id", A::S(format!("plugin:{}", r.plugin_id)))
             .item("title", A::S(r.title()))
